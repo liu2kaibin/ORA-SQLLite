@@ -5,6 +5,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::Result;
+
+use super::pager::{Pager, PagerConfig};
+
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct TempDatabase {
@@ -29,6 +33,18 @@ impl TempDatabase {
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+impl PagerConfig {
+    pub(super) fn test_default(page_size: u32) -> Self {
+        Self::new(page_size, [0x5a; 16]).expect("test pager config uses a supported page size")
+    }
+}
+
+pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
+    let temp = TempDatabase::new("pager");
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
+    Ok((temp, pager))
 }
 
 impl Drop for TempDatabase {

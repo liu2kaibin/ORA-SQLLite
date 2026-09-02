@@ -5,6 +5,7 @@ mod codec;
 mod file;
 mod header;
 mod page;
+mod pager;
 mod slotted;
 
 #[cfg(test)]
