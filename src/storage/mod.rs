@@ -9,6 +9,7 @@ mod overflow;
 mod page;
 mod pager;
 mod slotted;
+mod validate;
 
 #[cfg(test)]
 mod test_support;

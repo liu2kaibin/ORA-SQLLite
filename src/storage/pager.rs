@@ -8,7 +8,7 @@ use std::{
 use super::{
     PageId, PageRef,
     btree::{
-        INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, LeafCell, TreeKind,
+        BTree, INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, LeafCell, TreeKind,
         decode_internal_leftmost, decode_leaf_right_sibling,
     },
     cache::{PageCache, PageHandle},
@@ -18,6 +18,7 @@ use super::{
     overflow,
     page::{PageFrame, PageType},
     slotted::SlottedPage,
+    validate::{validate_freelist, validate_tree},
 };
 use crate::{DbError, ErrorCode, Result};
 
@@ -167,12 +168,43 @@ impl Pager {
         let page_count = self.file.page_count();
         Freelist::walk(root, page_count, |page_id| self.read_frame(page_id))
     }
+
+    pub(super) fn catalog_tree(&mut self, kind: TreeKind) -> Result<Option<BTree>> {
+        self.require_ready()?;
+        let page_id = self.header.catalog_root();
+        if page_id.0 == 0 {
+            return Ok(None);
+        }
+        if page_id.0 >= self.page_count() {
+            return Err(corruption("catalog root is outside the database"));
+        }
+        let frame = self.read_frame(page_id)?;
+        let root = PageRef::new(page_id, frame.header().generation())?;
+        if TreeKind::from_root_page_type(frame.header().page_type()) != Some(kind) {
+            return Err(corruption(
+                "catalog root page type does not match the requested tree kind",
+            ));
+        }
+        let tree = BTree::from_root(kind, root);
+        validate_tree(self, &tree)?;
+        Ok(Some(tree))
+    }
 }
 
 pub(super) trait PageSource {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle>;
 
+    fn read_page_by_id(&mut self, _page_id: PageId) -> Result<PageHandle> {
+        Err(corruption(
+            "page source cannot read a page without a generation",
+        ))
+    }
+
     fn page_count(&self) -> Result<u64>;
+
+    fn freelist_root(&self) -> Result<PageId> {
+        Ok(PageId(0))
+    }
 }
 
 impl PageSource for Pager {
@@ -180,8 +212,17 @@ impl PageSource for Pager {
         self.read(reference)
     }
 
+    fn read_page_by_id(&mut self, page_id: PageId) -> Result<PageHandle> {
+        let frame = self.read_frame(page_id)?;
+        Ok(Rc::new(RefCell::new(frame)))
+    }
+
     fn page_count(&self) -> Result<u64> {
         Ok(self.page_count())
+    }
+
+    fn freelist_root(&self) -> Result<PageId> {
+        Ok(self.header.freelist_root())
     }
 }
 
@@ -373,7 +414,12 @@ impl WriteBatch<'_> {
                 "released page cannot become the catalog root in the same batch",
             ));
         }
-        self.read(root)?;
+        let page_type = self.read(root)?.borrow().header().page_type();
+        let kind = TreeKind::from_root_page_type(page_type)
+            .ok_or_else(|| corruption("catalog root must reference a B+Tree page"))?;
+        let tree = BTree::from_root(kind, root);
+        validate_tree(self, &tree)?;
+        self.track_tree(kind, root)?;
 
         let mut header = self.current_header();
         header.set_catalog_root(root.page_id());
@@ -561,7 +607,17 @@ impl WriteBatch<'_> {
                 Some(frame.header().generation()),
             )?;
         }
-        self.validate_freelist()?;
+        let tracked_trees = self.tracked_trees.clone();
+        let mut live_pages = BTreeSet::new();
+        for (kind, root) in tracked_trees {
+            let tree = BTree::from_root(kind, root);
+            let report = validate_tree(self, &tree)?;
+            if !live_pages.is_disjoint(&report.all_live_pages()) {
+                return Err(corruption("tracked B+Trees overlap in live pages"));
+            }
+            live_pages.extend(report.all_live_pages());
+        }
+        validate_freelist(self, &live_pages)?;
         Ok(())
     }
 
@@ -760,6 +816,12 @@ impl PageSource for WriteBatch<'_> {
         self.read(reference)
     }
 
+    fn read_page_by_id(&mut self, page_id: PageId) -> Result<PageHandle> {
+        self.require_active()?;
+        let frame = self.read_frame_by_id(page_id)?;
+        Ok(Rc::new(RefCell::new(frame)))
+    }
+
     fn page_count(&self) -> Result<u64> {
         let appended = u64::try_from(self.new_pages.len())
             .map_err(|_| corruption("new page count exceeds u64"))?;
@@ -767,6 +829,10 @@ impl PageSource for WriteBatch<'_> {
             .page_count()
             .checked_add(appended)
             .ok_or_else(|| corruption("batch target page count overflow"))
+    }
+
+    fn freelist_root(&self) -> Result<PageId> {
+        Ok(self.current_header().freelist_root())
     }
 }
 
@@ -791,6 +857,7 @@ fn corruption(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use std::{
+        ops::Bound,
         rc::Rc,
         sync::{Arc, Mutex},
     };
@@ -803,7 +870,7 @@ mod tests {
 
     use super::super::{
         PageId, PageRef,
-        btree::{BTree, TreeKind, encode_internal_leftmost},
+        btree::{BTree, INTERNAL_METADATA_END, InternalCell, TreeKind, encode_internal_leftmost},
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
         freelist::Freelist,
         page::{PageFrame, PageType},
@@ -1008,22 +1075,141 @@ mod tests {
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
-            let root = batch
-                .allocate_append(PageType::Catalog)
-                .expect("allocate catalog page");
+            let tree = BTree::create(&mut batch, TreeKind::Table).expect("create catalog tree");
+            let root = tree.root();
             batch.set_catalog_root(root).expect("set catalog root");
             batch.commit().expect("commit catalog root");
             root
         };
         drop(pager);
 
-        let reopened = Pager::open(
+        let mut reopened = Pager::open(
             temp.path(),
             super::super::file::OpenMode::ReadOnly,
             PagerConfig::test_default(4096),
         )
         .expect("reopen pager");
         assert_eq!(reopened.header.catalog_root(), root.page_id());
+        assert_eq!(
+            reopened
+                .catalog_tree(TreeKind::Table)
+                .expect("recover catalog tree")
+                .expect("catalog root exists")
+                .root(),
+            root
+        );
+    }
+
+    #[test]
+    fn catalog_tree_persists_mixed_values_and_read_only_reopen_never_changes_bytes() {
+        for page_size in [4096, 8192, 16384] {
+            let temp = TempDatabase::new("pager-catalog-reopen");
+            let mut pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))
+                .expect("create pager");
+            let mut expected = Vec::new();
+            let root = {
+                let mut batch = pager.begin_write().expect("begin write");
+                let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+                for index in 0..120u16 {
+                    let key = format!("k{index:04}").into_bytes();
+                    let value = if index % 31 == 0 {
+                        vec![u8::try_from(index % 251).expect("byte"); 5000]
+                    } else {
+                        vec![u8::try_from(index % 251).expect("byte"); 700]
+                    };
+                    tree.insert(&mut batch, &key, &value)
+                        .expect("insert tree value");
+                    if index % 9 != 0 {
+                        expected.push((key, value));
+                    }
+                }
+                for index in (0..120u16).filter(|index| index % 9 == 0) {
+                    let key = format!("k{index:04}").into_bytes();
+                    assert!(
+                        tree.delete(&mut batch, &key)
+                            .expect("delete tree value")
+                            .is_some()
+                    );
+                }
+                batch
+                    .set_catalog_root(tree.root())
+                    .expect("publish catalog root");
+                let root = tree.root();
+                batch.commit().expect("commit catalog tree");
+                root
+            };
+            drop(pager);
+
+            let before_second_open = std::fs::read(temp.path()).expect("read committed bytes");
+            let mut reopened = Pager::open(
+                temp.path(),
+                OpenMode::ReadOnly,
+                PagerConfig::test_default(page_size),
+            )
+            .expect("open persisted pager");
+            let tree = reopened
+                .catalog_tree(TreeKind::Table)
+                .expect("recover catalog tree")
+                .expect("catalog tree exists");
+            assert_eq!(tree.root(), root);
+            let mut actual = Vec::new();
+            let mut cursor = tree
+                .scan(&mut reopened, Bound::Unbounded, Bound::Unbounded)
+                .expect("scan recovered tree");
+            while let Some(pair) = cursor.next().expect("read recovered pair") {
+                actual.push(pair);
+            }
+            assert_eq!(actual, expected, "page size {page_size}");
+            drop(cursor);
+            drop(reopened);
+
+            let _second_open = Pager::open(
+                temp.path(),
+                OpenMode::ReadOnly,
+                PagerConfig::test_default(page_size),
+            )
+            .expect("second read-only open");
+            assert_eq!(
+                std::fs::read(temp.path()).expect("read after second open"),
+                before_second_open,
+                "read-only reopen must not write at page size {page_size}",
+            );
+        }
+    }
+
+    #[test]
+    fn commit_preflight_rejects_a_tracked_tree_with_a_bad_separator_before_file_io() {
+        let temp = TempDatabase::new("pager-tree-preflight");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let before = std::fs::read(temp.path()).expect("read pristine database");
+        let error = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            for index in 0..30u8 {
+                let key = format!("k{index:03}").into_bytes();
+                tree.insert(&mut batch, &key, &[index; 700])
+                    .expect("insert value");
+            }
+            let root = tree.root();
+            let frame = batch.modify(root).expect("modify internal root");
+            {
+                let mut page =
+                    SlottedPage::open(frame, INTERNAL_METADATA_END).expect("open root slots");
+                let original = InternalCell::decode(&page.cell(0).expect("read separator"))
+                    .expect("decode separator");
+                page.remove(0).expect("remove separator");
+                let replacement = InternalCell::new(b"z".to_vec(), original.right())
+                    .expect("bad replacement separator");
+                page.insert(0, &replacement.encode().expect("encode replacement"))
+                    .expect("insert replacement separator");
+            }
+            batch.commit().expect_err("bad tracked tree must reject")
+        };
+
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_file_is_unchanged(&temp, &before);
+        assert!(!pager.is_poisoned());
     }
 
     #[test]
@@ -1096,9 +1282,8 @@ mod tests {
         let (_temp, mut pager) = test_pager(4096).expect("create test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin catalog batch");
-            let root = batch
-                .allocate(PageType::Catalog)
-                .expect("allocate catalog root");
+            let tree = BTree::create(&mut batch, TreeKind::Table).expect("create catalog tree");
+            let root = tree.root();
             batch.set_catalog_root(root).expect("set catalog root");
             batch.commit().expect("commit catalog root");
             root

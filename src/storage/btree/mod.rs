@@ -25,6 +25,14 @@ pub(super) enum TreeKind {
 }
 
 impl TreeKind {
+    pub(super) const fn from_root_page_type(page_type: PageType) -> Option<Self> {
+        match page_type {
+            PageType::TableLeaf | PageType::TableInternal => Some(Self::Table),
+            PageType::IndexLeaf | PageType::IndexInternal => Some(Self::Index),
+            PageType::Catalog | PageType::Freelist | PageType::Overflow => None,
+        }
+    }
+
     pub(super) const fn leaf_page_type(self) -> PageType {
         match self {
             Self::Table => PageType::TableLeaf,
@@ -37,6 +45,12 @@ impl TreeKind {
             Self::Table => PageType::TableInternal,
             Self::Index => PageType::IndexInternal,
         }
+    }
+}
+
+impl BTree {
+    pub(in crate::storage) const fn from_root(kind: TreeKind, root: PageRef) -> Self {
+        Self { kind, root }
     }
 }
 
