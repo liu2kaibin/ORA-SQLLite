@@ -1,5 +1,6 @@
 use super::{
-    PageId,
+    PageId, PageRef,
+    checksum::{stamp_page_checksum, verify_page_checksum},
     codec::{Decoder, Encoder},
 };
 use crate::{DbError, ErrorCode, Result};
@@ -227,6 +228,84 @@ fn corruption(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
 }
 
+#[derive(Debug)]
+pub(super) struct PageFrame {
+    bytes: Vec<u8>,
+    header: PageHeader,
+}
+
+impl PageFrame {
+    pub(super) fn new_zeroed(
+        page_type: PageType,
+        page_ref: PageRef,
+        page_size: u32,
+    ) -> Result<Self> {
+        let header = PageHeader::new(
+            page_type,
+            page_ref.page_id(),
+            page_ref.generation(),
+            page_size,
+        )?;
+        Ok(Self {
+            bytes: vec![0; page_size as usize],
+            header,
+        })
+    }
+
+    pub(super) fn decode(
+        bytes: Vec<u8>,
+        expected_page_id: PageId,
+        expected_page_type: Option<PageType>,
+        expected_generation: Option<u64>,
+    ) -> Result<Self> {
+        verify_page_checksum(&bytes)?;
+        let page_size = u32::try_from(bytes.len())
+            .map_err(|_| corruption("page frame exceeds supported size"))?;
+        let header = PageHeader::decode(&bytes[..PAGE_HEADER_LEN], page_size)?;
+
+        if header.page_id() != expected_page_id {
+            return Err(corruption(
+                "page frame id does not match the requested page",
+            ));
+        }
+        if expected_page_type.is_some_and(|page_type| header.page_type() != page_type) {
+            return Err(corruption(
+                "page frame type does not match the requested page",
+            ));
+        }
+        if expected_generation.is_some_and(|generation| header.generation() != generation) {
+            return Err(corruption(
+                "page frame generation does not match the requested page",
+            ));
+        }
+
+        Ok(Self { bytes, header })
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    pub(super) const fn header(&self) -> &PageHeader {
+        &self.header
+    }
+
+    pub(super) fn prepare_for_write(&mut self) -> Result<()> {
+        self.header.set_checksum(0);
+        self.bytes[..PAGE_HEADER_LEN].copy_from_slice(&self.header.encode());
+        let page_size = u32::try_from(self.bytes.len())
+            .map_err(|_| corruption("page frame exceeds supported size"))?;
+        self.header = PageHeader::decode(&self.bytes[..PAGE_HEADER_LEN], page_size)?;
+        let checksum = stamp_page_checksum(&mut self.bytes)?;
+        self.header.set_checksum(checksum);
+        Ok(())
+    }
+}
+
 #[test]
 fn page_header_round_trips() {
     let header = PageHeader::new(PageType::TableLeaf, PageId(42), 3, 4096).expect("page header");
@@ -400,4 +479,26 @@ fn page_header_accessors_and_setters_round_trip() {
     assert_eq!(header.payload_start(), 8192);
     assert_eq!(header.right_sibling(), Some(PageId(8)));
     assert_eq!(header.checksum(), 0xa1b2_c3d4);
+}
+
+#[test]
+fn frame_decode_checks_crc_id_type_and_generation() {
+    let expected = PageRef::new(PageId(5), 2).expect("page reference");
+    let mut frame =
+        PageFrame::new_zeroed(PageType::TableLeaf, expected, 4096).expect("zeroed page frame");
+    frame.prepare_for_write().expect("prepare page frame");
+
+    PageFrame::decode(
+        frame.bytes().to_vec(),
+        PageId(5),
+        Some(PageType::TableLeaf),
+        Some(2),
+    )
+    .expect("matching frame");
+    assert_eq!(
+        PageFrame::decode(frame.bytes().to_vec(), PageId(6), None, None)
+            .expect_err("wrong page id")
+            .code(),
+        ErrorCode::Corruption
+    );
 }

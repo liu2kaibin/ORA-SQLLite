@@ -1,3 +1,4 @@
+mod cache;
 mod checksum;
 mod codec;
 mod file;
