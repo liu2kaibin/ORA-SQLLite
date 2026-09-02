@@ -1,5 +1,13 @@
 mod checksum;
 mod codec;
+mod header;
+mod page;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PageId(pub(super) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Lsn(pub(super) u64);
 
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
