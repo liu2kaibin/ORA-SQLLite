@@ -126,10 +126,9 @@ impl Pager {
             dirty: BTreeMap::new(),
             new_pages: BTreeSet::new(),
             pending_generations: BTreeMap::new(),
-            pending_releases: BTreeSet::new(),
+            pending_releases: BTreeMap::new(),
             committed_freelist,
             candidate_header: None,
-            freelist_prepared: false,
             finished: false,
         })
     }
@@ -183,10 +182,9 @@ pub(super) struct WriteBatch<'a> {
     dirty: BTreeMap<PageId, PageFrame>,
     new_pages: BTreeSet<PageId>,
     pending_generations: BTreeMap<PageId, u64>,
-    pending_releases: BTreeSet<PageId>,
+    pending_releases: BTreeMap<PageId, PageRef>,
     committed_freelist: FreelistWalk,
     candidate_header: Option<DatabaseHeader>,
-    freelist_prepared: bool,
     finished: bool,
 }
 
@@ -208,6 +206,11 @@ impl WriteBatch<'_> {
 
     pub(super) fn modify(&mut self, reference: PageRef) -> Result<&mut PageFrame> {
         self.require_active()?;
+        if self.pending_releases.contains_key(&reference.page_id()) {
+            return Err(corruption(
+                "released page cannot become dirty in the same batch",
+            ));
+        }
         if !self.dirty.contains_key(&reference.page_id()) {
             let handle = self.pager.read(reference)?;
             let mut source = handle.borrow_mut();
@@ -265,20 +268,25 @@ impl WriteBatch<'_> {
         }
 
         let (root_reference, mut trunk) = {
-            let frame = self.freelist_frame(root)?;
+            let frame = self.read_frame_by_id(root)?;
             (
                 PageRef::new(root, frame.header().generation())?,
-                Freelist::decode(frame)?,
+                Freelist::decode(&frame)?,
             )
         };
 
-        if let Some(page_id) = Freelist::allocate(&mut trunk) {
+        if let Some(page_id) = trunk.leaves().last().copied() {
+            let generation = self.next_generation(page_id)?;
+            let allocated = Freelist::allocate(&mut trunk)
+                .ok_or_else(|| corruption("freelist leaf disappeared before allocation"))?;
+            debug_assert_eq!(allocated, page_id);
             Freelist::write(self.freelist_frame(root)?, &trunk)?;
-            return self.allocate_reused(page_id, page_type);
+            return self.allocate_reused(page_id, generation, page_type);
         }
 
+        let generation = self.next_generation(root_reference.page_id())?;
         self.stage_freelist_root(trunk.next().map_or(PageId(0), PageRef::page_id));
-        self.allocate_reused(root_reference.page_id(), page_type)
+        self.allocate_reused(root_reference.page_id(), generation, page_type)
     }
 
     pub(super) fn rollback(&mut self) -> Result<()> {
@@ -289,6 +297,11 @@ impl WriteBatch<'_> {
 
     pub(super) fn set_catalog_root(&mut self, root: PageRef) -> Result<()> {
         self.require_active()?;
+        if self.pending_releases.contains_key(&root.page_id()) {
+            return Err(corruption(
+                "released page cannot become the catalog root in the same batch",
+            ));
+        }
         self.read(root)?;
 
         let mut header = self.current_header();
@@ -299,6 +312,15 @@ impl WriteBatch<'_> {
 
     pub(super) fn release_later(&mut self, reference: PageRef) -> Result<()> {
         self.require_active()?;
+        if self.pending_releases.contains_key(&reference.page_id()) {
+            return Err(corruption("page is already pending release in this batch"));
+        }
+        self.validate_releasable(reference)?;
+        self.pending_releases.insert(reference.page_id(), reference);
+        Ok(())
+    }
+
+    fn validate_releasable(&mut self, reference: PageRef) -> Result<()> {
         if reference.page_id().0 == 0 {
             return Err(corruption("database header cannot enter the freelist"));
         }
@@ -321,13 +343,10 @@ impl WriteBatch<'_> {
             ));
         }
         self.read(reference)?;
-        if !self.pending_releases.insert(reference.page_id()) {
-            return Err(corruption("page is already pending release in this batch"));
-        }
         Ok(())
     }
 
-    pub(super) fn commit(&mut self) -> Result<()> {
+    pub(super) fn commit(mut self) -> Result<()> {
         self.require_active()?;
         self.prepare_freelist_releases()?;
         self.validate_for_commit()?;
@@ -393,13 +412,12 @@ impl WriteBatch<'_> {
     }
 
     fn prepare_freelist_releases(&mut self) -> Result<()> {
-        if self.freelist_prepared {
-            return Ok(());
+        let releases = self.pending_releases.values().copied().collect::<Vec<_>>();
+        for reference in &releases {
+            self.validate_releasable(*reference)?;
         }
-        self.freelist_prepared = true;
-
-        let releases = self.pending_releases.iter().copied().collect::<Vec<_>>();
-        for page_id in releases {
+        for reference in releases {
+            let page_id = reference.page_id();
             self.release_to_freelist(page_id)?;
         }
         Ok(())
@@ -445,18 +463,25 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
-    fn allocate_reused(&mut self, page_id: PageId, page_type: PageType) -> Result<PageRef> {
-        let old_frame = self.read_frame_by_id(page_id)?;
-        let generation = old_frame
-            .header()
-            .generation()
-            .checked_add(1)
-            .ok_or_else(|| corruption("page generation overflow while reusing freelist page"))?;
+    fn allocate_reused(
+        &mut self,
+        page_id: PageId,
+        generation: u64,
+        page_type: PageType,
+    ) -> Result<PageRef> {
         let reference = PageRef::new(page_id, generation)?;
         let frame = PageFrame::new_zeroed(page_type, reference, self.pager.header.page_size())?;
         self.dirty.insert(page_id, frame);
         self.pending_generations.insert(page_id, generation);
         Ok(reference)
+    }
+
+    fn next_generation(&mut self, page_id: PageId) -> Result<u64> {
+        self.read_frame_by_id(page_id)?
+            .header()
+            .generation()
+            .checked_add(1)
+            .ok_or_else(|| corruption("page generation overflow while reusing freelist page"))
     }
 
     fn validate_freelist(&mut self) -> Result<()> {
@@ -534,7 +559,6 @@ impl WriteBatch<'_> {
         self.pending_releases.clear();
         self.committed_freelist = FreelistWalk::default();
         self.candidate_header = None;
-        self.freelist_prepared = false;
         self.finished = true;
     }
 }
@@ -617,7 +641,7 @@ mod tests {
         btree::encode_internal_leftmost,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
         freelist::Freelist,
-        page::PageType,
+        page::{PageFrame, PageType},
         slotted::SlottedPage,
         test_support::{TempDatabase, test_pager},
     };
@@ -889,6 +913,114 @@ mod tests {
             ErrorCode::Corruption
         );
         batch.rollback().expect("rollback catalog release batch");
+    }
+
+    #[test]
+    fn release_then_modify_rejects_a_live_and_free_page_before_file_io() {
+        let temp = TempDatabase::new("pager-release-then-modify");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let page = {
+            let mut batch = pager.begin_write().expect("begin allocation batch");
+            let page = batch.allocate(PageType::TableLeaf).expect("allocate page");
+            batch.commit().expect("commit page");
+            page
+        };
+        let before = std::fs::read(temp.path()).expect("read database before rejected overlap");
+
+        {
+            let mut batch = pager.begin_write().expect("begin overlap batch");
+            batch.release_later(page).expect("defer page release");
+            assert_eq!(
+                batch
+                    .modify(page)
+                    .expect_err("released page cannot become dirty")
+                    .code(),
+                ErrorCode::Corruption
+            );
+            batch.rollback().expect("rollback rejected overlap batch");
+        }
+
+        assert_file_is_unchanged(&temp, &before);
+        pager
+            .read(page)
+            .expect("original live page remains readable");
+    }
+
+    #[test]
+    fn release_then_set_catalog_root_rejects_a_live_and_free_page_before_file_io() {
+        let temp = TempDatabase::new("pager-release-then-catalog-root");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let page = {
+            let mut batch = pager.begin_write().expect("begin allocation batch");
+            let page = batch
+                .allocate(PageType::Catalog)
+                .expect("allocate catalog page");
+            batch.commit().expect("commit page");
+            page
+        };
+        let before = std::fs::read(temp.path()).expect("read database before rejected overlap");
+
+        {
+            let mut batch = pager.begin_write().expect("begin overlap batch");
+            batch.release_later(page).expect("defer page release");
+            assert_eq!(
+                batch
+                    .set_catalog_root(page)
+                    .expect_err("released page cannot become catalog root")
+                    .code(),
+                ErrorCode::Corruption
+            );
+            batch.rollback().expect("rollback rejected overlap batch");
+        }
+
+        assert_file_is_unchanged(&temp, &before);
+        assert_eq!(pager.header.catalog_root(), PageId(0));
+    }
+
+    #[test]
+    fn leaf_generation_overflow_preserves_the_batch_freelist_state() {
+        let temp = TempDatabase::new("pager-freelist-leaf-generation-overflow");
+        let mut pager = pager_with_freelist(&temp, 1, &[u64::MAX]);
+        let before = std::fs::read(temp.path()).expect("read database before rejected reuse");
+        let mut batch = pager.begin_write().expect("begin overflow batch");
+
+        for _ in 0..2 {
+            assert_eq!(
+                batch
+                    .allocate(PageType::TableLeaf)
+                    .expect_err("generation overflow must reject allocation")
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+        batch.rollback().expect("rollback overflow batch");
+
+        assert_file_is_unchanged(&temp, &before);
+        assert_eq!(pager.header.freelist_root(), PageId(1));
+    }
+
+    #[test]
+    fn empty_root_generation_overflow_preserves_the_staged_root() {
+        let temp = TempDatabase::new("pager-freelist-root-generation-overflow");
+        let mut pager = pager_with_freelist(&temp, u64::MAX, &[]);
+        let before = std::fs::read(temp.path()).expect("read database before rejected reuse");
+        let mut batch = pager.begin_write().expect("begin overflow batch");
+
+        for _ in 0..2 {
+            assert_eq!(
+                batch
+                    .allocate(PageType::TableLeaf)
+                    .expect_err("generation overflow must reject allocation")
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+        batch.rollback().expect("rollback overflow batch");
+
+        assert_file_is_unchanged(&temp, &before);
+        assert_eq!(pager.header.freelist_root(), PageId(1));
     }
 
     #[test]
@@ -1403,6 +1535,58 @@ mod tests {
                 .expect("reopen file for faults")
                 .with_faults(faults);
         pager
+    }
+
+    fn pager_with_freelist(
+        temp: &TempDatabase,
+        root_generation: u64,
+        leaf_generations: &[u64],
+    ) -> Pager {
+        let page_count = u64::try_from(leaf_generations.len())
+            .expect("leaf count fits u64")
+            .checked_add(2)
+            .expect("page count fits u64");
+        let mut file =
+            DatabaseFile::create(temp.path(), 4096, [0x8a; 16], DEFAULT_MAX_DATABASE_BYTES)
+                .expect("create database file");
+        file.extend_to_pages(page_count)
+            .expect("extend database file");
+
+        let mut trunk = Freelist::empty_trunk(None);
+        for (index, generation) in leaf_generations.iter().copied().enumerate() {
+            let page_id = PageId(u64::try_from(index).expect("leaf index fits u64") + 2);
+            let reference = PageRef::new(page_id, generation).expect("leaf reference");
+            let mut leaf =
+                PageFrame::new_zeroed(PageType::TableLeaf, reference, 4096).expect("leaf frame");
+            leaf.prepare_for_write().expect("prepare leaf frame");
+            file.write_page(page_id, leaf.bytes())
+                .expect("write leaf page");
+            Freelist::release(&mut trunk, page_id, 4096).expect("append freelist leaf");
+        }
+
+        let root = PageRef::new(PageId(1), root_generation).expect("freelist root reference");
+        let mut root_frame =
+            PageFrame::new_zeroed(PageType::Freelist, root, 4096).expect("freelist root frame");
+        Freelist::write(&mut root_frame, &trunk).expect("encode freelist root");
+        root_frame
+            .prepare_for_write()
+            .expect("prepare freelist root");
+        file.write_page(PageId(1), root_frame.bytes())
+            .expect("write freelist root");
+        file.sync_all().expect("sync freelist pages");
+
+        let mut header = file.header();
+        header.set_freelist_root(PageId(1));
+        file.write_header(header).expect("publish freelist root");
+        file.sync_all().expect("sync database header");
+        drop(file);
+
+        Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .expect("open pager with freelist")
     }
 
     fn commit_fault_points() -> Vec<FaultPoint> {

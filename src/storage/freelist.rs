@@ -249,7 +249,10 @@ impl Freelist {
                     return Err(corruption("freelist has duplicate leaf page ids"));
                 }
                 let leaf_frame = read_page(*leaf)?;
-                if leaf_frame.header().page_id() != *leaf || leaf_frame.header().generation() == 0 {
+                if leaf_frame.header().page_id() != *leaf
+                    || leaf_frame.header().generation() == 0
+                    || leaf_frame.header().page_type() == PageType::Freelist
+                {
                     return Err(corruption(
                         "freelist leaf reference does not match its page",
                     ));
@@ -380,6 +383,68 @@ mod tests {
         assert_eq!(
             duplicate
                 .expect_err("duplicate freelist leaf must reject")
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn walk_rejects_malformed_references_and_freelist_leaves() {
+        let mut partial_next = trunk_frame(PageId(1), None, &[]).expect("trunk frame");
+        partial_next.bytes_mut()[48..56].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(
+            Freelist::decode(&partial_next)
+                .expect_err("partial next trunk reference must reject")
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let generation_mismatch = Freelist::walk(PageId(1), 3, |page_id| match page_id {
+            PageId(1) => trunk_frame(
+                PageId(1),
+                Some(PageRef::new(PageId(2), 2).expect("next trunk reference")),
+                &[],
+            ),
+            PageId(2) => trunk_frame(PageId(2), None, &[]),
+            _ => unreachable!("walk must not read an unexpected page"),
+        });
+        assert_eq!(
+            generation_mismatch
+                .expect_err("next trunk generation mismatch must reject")
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let out_of_range = Freelist::walk(PageId(1), 2, |page_id| match page_id {
+            PageId(1) => trunk_frame(PageId(1), None, &[PageId(2)]),
+            _ => unreachable!("out-of-range leaf must reject before a read"),
+        });
+        assert_eq!(
+            out_of_range
+                .expect_err("out-of-range leaf must reject")
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let overlap = Freelist::walk(PageId(1), 2, |page_id| {
+            assert_eq!(page_id, PageId(1));
+            trunk_frame(PageId(1), None, &[PageId(1)])
+        });
+        assert_eq!(
+            overlap
+                .expect_err("trunk page cannot also be a leaf")
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let invalid_leaf_type = Freelist::walk(PageId(1), 3, |page_id| match page_id {
+            PageId(1) => trunk_frame(PageId(1), None, &[PageId(2)]),
+            PageId(2) => trunk_frame(PageId(2), None, &[]),
+            _ => unreachable!("walk must not read an unexpected page"),
+        });
+        assert_eq!(
+            invalid_leaf_type
+                .expect_err("freelist page cannot masquerade as a leaf")
                 .code(),
             ErrorCode::Corruption
         );
