@@ -354,6 +354,7 @@ mod tests {
         storage::{
             PageRef, overflow,
             pager::{Pager, PagerConfig},
+            slotted::SlottedPage,
             test_support::{TempDatabase, test_pager},
         },
     };
@@ -400,6 +401,18 @@ mod tests {
         batch.commit().unwrap();
 
         assert_eq!(tree.get(&mut pager, b"large").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn inline_threshold_uses_compacted_free_space_at_the_exact_boundary() {
+        assert!(matches!(
+            insert_into_fragmented_leaf(4005).unwrap(),
+            ValueStorage::Inline(value) if value.len() == 4005
+        ));
+        assert!(matches!(
+            insert_into_fragmented_leaf(4006).unwrap(),
+            ValueStorage::Overflow(_)
+        ));
     }
 
     #[test]
@@ -605,5 +618,41 @@ mod tests {
 
     fn test_value(value: u32) -> Vec<u8> {
         vec![value as u8; 40]
+    }
+
+    fn insert_into_fragmented_leaf(value_len: usize) -> Result<ValueStorage> {
+        let (_temp, mut pager) = test_pager(4096)?;
+        let mut batch = pager.begin_write()?;
+        let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
+        let root = tree.root();
+        let existing = super::super::LeafCell::inline(b"a".to_vec(), b"x".to_vec())?.encode()?;
+        {
+            let frame = batch.modify(root)?;
+            SlottedPage::open(frame, super::super::LEAF_METADATA_END)?.insert(0, &existing)?;
+            let old_offset = usize::from(u16::from_le_bytes(
+                frame.bytes()[56..58]
+                    .try_into()
+                    .expect("slot offset is two bytes"),
+            ));
+            let fragmented_offset = old_offset - 64;
+            frame
+                .bytes_mut()
+                .copy_within(old_offset..old_offset + existing.len(), fragmented_offset);
+            frame.bytes_mut()[56..58].copy_from_slice(
+                &u16::try_from(fragmented_offset)
+                    .expect("fragmented offset fits u16")
+                    .to_le_bytes(),
+            );
+            frame.set_layout(1, 60, u16::try_from(fragmented_offset).unwrap())?;
+            let page = SlottedPage::open(frame, super::super::LEAF_METADATA_END)?;
+            assert_eq!(page.compacted_free()?, 4022);
+            assert_eq!(page.contiguous_free()?, 3958);
+        }
+
+        tree.insert(&mut batch, b"b", &vec![0x5a; value_len])?;
+        let Node::Leaf(leaf) = load_node(&mut batch, TreeKind::Table, root)? else {
+            panic!("threshold insert unexpectedly split the root");
+        };
+        Ok(leaf.cells[1].storage().clone())
     }
 }

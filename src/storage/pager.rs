@@ -720,13 +720,48 @@ mod tests {
 
     use super::super::{
         PageId, PageRef,
-        btree::encode_internal_leftmost,
+        btree::{BTree, TreeKind, encode_internal_leftmost},
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
         freelist::Freelist,
         page::{PageFrame, PageType},
         slotted::SlottedPage,
         test_support::{TempDatabase, test_pager},
     };
+
+    #[test]
+    fn refreshing_one_tracked_tree_preserves_another_same_kind_tree() {
+        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let mut batch = pager.begin_write().expect("begin write");
+        let mut growing = BTree::create(&mut batch, TreeKind::Table).expect("create growing tree");
+        let mut other = BTree::create(&mut batch, TreeKind::Table).expect("create other tree");
+        other
+            .insert(&mut batch, b"other", b"value")
+            .expect("track other tree");
+        let other_root = other.root();
+        let old_growing_root = growing.root();
+
+        for value in 0..8u32 {
+            let mut key = vec![0x61; 1024];
+            key[..4].copy_from_slice(&value.to_be_bytes());
+            growing
+                .insert(&mut batch, &key, b"v")
+                .expect("grow first tree root");
+        }
+
+        assert_ne!(growing.root(), old_growing_root);
+        assert!(batch.tracked_trees.contains(&(TreeKind::Table, other_root)));
+        assert!(
+            batch
+                .tracked_trees
+                .contains(&(TreeKind::Table, growing.root()))
+        );
+        assert!(
+            !batch
+                .tracked_trees
+                .contains(&(TreeKind::Table, old_growing_root))
+        );
+        assert_eq!(batch.tracked_trees.len(), 2);
+    }
 
     #[test]
     fn uncommitted_dirty_pages_are_invisible_after_rollback() {
