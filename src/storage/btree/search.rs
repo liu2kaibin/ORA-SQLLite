@@ -330,9 +330,14 @@ impl BTreeCursor<'_> {
             };
             let leaf = load_leaf(self.pager, self.kind, reference)?;
             if let Some(previous) = self.previous_leaf_last_key.as_deref()
-                && leaf.cells.first().is_some_and(|cell| cell.key() < previous)
+                && leaf
+                    .cells
+                    .first()
+                    .is_some_and(|cell| cell.key() <= previous)
             {
-                return Err(corruption("B+Tree leaf chain keys decrease"));
+                return Err(corruption(
+                    "B+Tree leaf chain keys are not strictly ordered",
+                ));
             }
 
             if let Some(cell) = leaf.cells.get(self.next_slot) {
@@ -777,6 +782,38 @@ mod tests {
             cursor
                 .next()
                 .expect_err("decreasing leaf keys must fail")
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn scan_rejects_leaf_chains_with_duplicate_boundary_keys() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let root = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let root = write_leaf(&mut batch, &[(b"bee", b"left")]);
+            let right = write_leaf(&mut batch, &[(b"bee", b"right")]);
+            link_right_sibling(&mut batch, root, right);
+            batch.commit().expect("commit duplicate leaf chain");
+            root
+        };
+        let tree = BTree {
+            kind: TreeKind::Table,
+            root,
+        };
+        let mut cursor = tree
+            .scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            .expect("start scan");
+
+        assert_eq!(
+            cursor.next().expect("first leaf row"),
+            Some((b"bee".to_vec(), b"left".to_vec()))
+        );
+        assert_eq!(
+            cursor
+                .next()
+                .expect_err("duplicate boundary key must fail")
                 .code(),
             ErrorCode::Corruption
         );
