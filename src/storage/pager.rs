@@ -122,6 +122,7 @@ impl Pager {
             ));
         }
         let committed_freelist = self.walk_freelist()?;
+        let committed_catalog = self.snapshot_catalog_reachability()?;
 
         Ok(WriteBatch {
             pager: self,
@@ -130,6 +131,7 @@ impl Pager {
             pending_generations: BTreeMap::new(),
             pending_releases: BTreeMap::new(),
             committed_freelist,
+            committed_catalog,
             candidate_header: None,
             tracked_trees: Vec::new(),
             finished: false,
@@ -167,6 +169,22 @@ impl Pager {
         let root = self.header.freelist_root();
         let page_count = self.file.page_count();
         Freelist::walk(root, page_count, |page_id| self.read_frame(page_id))
+    }
+
+    fn snapshot_catalog_reachability(&mut self) -> Result<Option<(PageRef, BTreeSet<PageId>)>> {
+        let page_id = self.header.catalog_root();
+        if page_id.0 == 0 {
+            return Ok(None);
+        }
+        if page_id.0 >= self.page_count() {
+            return Err(corruption("catalog root is outside the database"));
+        }
+        let frame = self.read_frame(page_id)?;
+        let root = PageRef::new(page_id, frame.header().generation())?;
+        let kind = TreeKind::from_root_page_type(frame.header().page_type())
+            .ok_or_else(|| corruption("catalog root does not reference a B+Tree page"))?;
+        let report = validate_tree(self, &BTree::from_root(kind, root))?;
+        Ok(Some((root, report.all_live_pages())))
     }
 
     pub(super) fn catalog_tree(&mut self, kind: TreeKind) -> Result<Option<BTree>> {
@@ -234,6 +252,7 @@ pub(super) struct WriteBatch<'a> {
     pending_generations: BTreeMap<PageId, u64>,
     pending_releases: BTreeMap<PageId, PageRef>,
     committed_freelist: FreelistWalk,
+    committed_catalog: Option<(PageRef, BTreeSet<PageId>)>,
     candidate_header: Option<DatabaseHeader>,
     tracked_trees: Vec<(TreeKind, PageRef)>,
     finished: bool,
@@ -426,15 +445,13 @@ impl WriteBatch<'_> {
         let tree = BTree::from_root(kind, root);
         validate_tree(self, &tree)?;
 
-        if let Some(current_tree) = self.current_catalog_tree()? {
-            let current_report = validate_tree(self, &current_tree)?;
-            if current_tree.root() != root
-                && current_report.all_live_pages().contains(&root.page_id())
-            {
-                return Err(corruption(
-                    "reachable non-root catalog tree page cannot become the catalog root",
-                ));
-            }
+        if let Some((committed_root, committed_pages)) = &self.committed_catalog
+            && *committed_root != root
+            && committed_pages.contains(&root.page_id())
+        {
+            return Err(corruption(
+                "reachable non-root catalog tree page cannot become the catalog root",
+            ));
         }
 
         let mut header = self.current_header();
@@ -744,21 +761,6 @@ impl WriteBatch<'_> {
         self.candidate_header.unwrap_or(self.pager.header)
     }
 
-    fn current_catalog_tree(&mut self) -> Result<Option<BTree>> {
-        let page_id = self.current_header().catalog_root();
-        if page_id.0 == 0 {
-            return Ok(None);
-        }
-        if page_id.0 >= self.target_page_count()? {
-            return Err(corruption("catalog root is outside the database"));
-        }
-        let frame = self.read_frame_by_id(page_id)?;
-        let root = PageRef::new(page_id, frame.header().generation())?;
-        let kind = TreeKind::from_root_page_type(frame.header().page_type())
-            .ok_or_else(|| corruption("catalog root does not reference a B+Tree page"))?;
-        Ok(Some(BTree::from_root(kind, root)))
-    }
-
     fn stage_freelist_root(&mut self, root: PageId) {
         let mut header = self.current_header();
         header.set_freelist_root(root);
@@ -799,6 +801,7 @@ impl WriteBatch<'_> {
         self.pending_generations.clear();
         self.pending_releases.clear();
         self.committed_freelist = FreelistWalk::default();
+        self.committed_catalog = None;
         self.candidate_header = None;
         self.tracked_trees.clear();
         self.finished = true;
@@ -1307,6 +1310,108 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::Corruption);
         assert_file_is_unchanged(&temp, &before);
         assert_eq!(pager.header.catalog_root(), tree.root().page_id());
+    }
+
+    #[test]
+    fn catalog_root_split_can_publish_and_reopen_the_new_tracked_root() {
+        let temp = TempDatabase::new("pager-catalog-root-split");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let mut tree = {
+            let mut batch = pager.begin_write().expect("begin initial batch");
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            for index in 0..4u8 {
+                let key = format!("k{index:03}").into_bytes();
+                tree.insert(&mut batch, &key, &[index; 700])
+                    .expect("insert initial value");
+            }
+            batch
+                .set_catalog_root(tree.root())
+                .expect("publish initial root");
+            batch.commit().expect("commit initial root");
+            tree
+        };
+        let original_root = tree.root();
+
+        {
+            let mut batch = pager.begin_write().expect("begin split batch");
+            for index in 4..30u8 {
+                let key = format!("k{index:03}").into_bytes();
+                tree.insert(&mut batch, &key, &[index; 700])
+                    .expect("insert split value");
+            }
+            assert_ne!(
+                tree.root(),
+                original_root,
+                "fixture must split the catalog root"
+            );
+            batch
+                .set_catalog_root(tree.root())
+                .expect("publish the split root");
+            batch.commit().expect("commit split root");
+        }
+        drop(pager);
+
+        let mut reopened = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .expect("reopen split tree");
+        let recovered = reopened
+            .catalog_tree(TreeKind::Table)
+            .expect("recover split tree")
+            .expect("catalog root exists");
+        let mut cursor = recovered
+            .scan(&mut reopened, Bound::Unbounded, Bound::Unbounded)
+            .expect("scan recovered split tree");
+        let mut count = 0u8;
+        while cursor.next().expect("read recovered value").is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 30);
+    }
+
+    #[test]
+    fn unchanged_registered_catalog_root_can_be_published_again() {
+        let temp = TempDatabase::new("pager-catalog-unchanged-root");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let root = {
+            let mut batch = pager.begin_write().expect("begin initial batch");
+            let tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            batch
+                .track_tree(TreeKind::Table, tree.root())
+                .expect("register root");
+            batch.set_catalog_root(tree.root()).expect("publish root");
+            batch.commit().expect("commit root");
+            tree.root()
+        };
+
+        {
+            let mut batch = pager.begin_write().expect("begin unchanged-root batch");
+            batch
+                .track_tree(TreeKind::Table, root)
+                .expect("register old root");
+            batch.set_catalog_root(root).expect("republish old root");
+            batch.commit().expect("commit unchanged root");
+        }
+        drop(pager);
+
+        let mut reopened = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .expect("reopen unchanged root");
+        assert_eq!(
+            reopened
+                .catalog_tree(TreeKind::Table)
+                .expect("recover unchanged root")
+                .expect("catalog root exists")
+                .root(),
+            root
+        );
     }
 
     #[test]
