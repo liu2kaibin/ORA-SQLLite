@@ -7,10 +7,15 @@ use std::{
 
 use super::{
     PageId, PageRef,
+    btree::{
+        INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, LeafCell, decode_internal_leftmost,
+        decode_leaf_right_sibling,
+    },
     cache::{PageCache, PageHandle},
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
     header::DatabaseHeader,
     page::{PageFrame, PageType},
+    slotted::SlottedPage,
 };
 use crate::{DbError, ErrorCode, Result};
 
@@ -50,6 +55,7 @@ pub(super) struct Pager {
 
 impl Pager {
     pub(super) fn create(path: &Path, config: PagerConfig) -> Result<Self> {
+        let cache = PageCache::new(config.cache_pages)?;
         let file = DatabaseFile::create(
             path,
             config.page_size,
@@ -57,7 +63,6 @@ impl Pager {
             config.max_database_bytes,
         )?;
         let header = file.header();
-        let cache = PageCache::new(config.cache_pages)?;
 
         Ok(Self {
             file,
@@ -311,6 +316,7 @@ impl WriteBatch<'_> {
                     "new page image generation does not match its allocation",
                 ));
             }
+            validate_page_body(frame)?;
             frame.prepare_for_write()?;
             PageFrame::decode(
                 frame.bytes().to_vec(),
@@ -360,6 +366,41 @@ impl WriteBatch<'_> {
     }
 }
 
+fn validate_page_body(frame: &mut PageFrame) -> Result<()> {
+    match frame.header().page_type() {
+        PageType::TableLeaf | PageType::IndexLeaf => validate_leaf_page(frame),
+        PageType::TableInternal | PageType::IndexInternal => validate_internal_page(frame),
+        PageType::Catalog | PageType::Overflow | PageType::Freelist => Ok(()),
+    }
+}
+
+fn validate_leaf_page(frame: &mut PageFrame) -> Result<()> {
+    let cells = {
+        let page = SlottedPage::open(frame, LEAF_METADATA_END)?;
+        page.cells()?
+    };
+    decode_leaf_right_sibling(
+        &frame.bytes()[LEAF_METADATA_END - 8..LEAF_METADATA_END],
+        frame.header().right_sibling(),
+    )?;
+    for cell in cells {
+        LeafCell::decode(&cell)?;
+    }
+    Ok(())
+}
+
+fn validate_internal_page(frame: &mut PageFrame) -> Result<()> {
+    let cells = {
+        let page = SlottedPage::open(frame, INTERNAL_METADATA_END)?;
+        page.cells()?
+    };
+    decode_internal_leftmost(&frame.bytes()[INTERNAL_METADATA_END - 16..INTERNAL_METADATA_END])?;
+    for cell in cells {
+        InternalCell::decode(&cell)?;
+    }
+    Ok(())
+}
+
 impl PageSource for WriteBatch<'_> {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.read(reference)
@@ -399,8 +440,10 @@ mod tests {
 
     use super::super::{
         PageId, PageRef,
+        btree::encode_internal_leftmost,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
         page::PageType,
+        slotted::SlottedPage,
         test_support::{TempDatabase, test_pager},
     };
 
@@ -756,6 +799,192 @@ mod tests {
             assert_eq!(write_error.code(), ErrorCode::Io);
             assert!(write_error.to_string().contains("reopen"));
         }
+    }
+
+    #[test]
+    fn invalid_leaf_sibling_metadata_fails_before_file_io() {
+        for page_type in [PageType::TableLeaf, PageType::IndexLeaf] {
+            let temp = TempDatabase::new("pager-invalid-leaf-metadata");
+            let mut pager =
+                Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+            let before = std::fs::read(temp.path()).expect("read database before commit");
+            let error = {
+                let mut batch = pager.begin_write().expect("begin write");
+                let page = batch.allocate_append(page_type).expect("allocate page");
+                batch.modify(page).expect("modify page").bytes_mut()[48..56]
+                    .copy_from_slice(&1u64.to_le_bytes());
+                match batch.commit() {
+                    Ok(()) => panic!("invalid leaf sibling metadata must reject commit"),
+                    Err(error) => error,
+                }
+            };
+
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert_file_is_unchanged(&temp, &before);
+            assert!(!pager.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn malformed_leaf_layout_fails_before_file_io() {
+        let temp = TempDatabase::new("pager-invalid-leaf-layout");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let before = std::fs::read(temp.path()).expect("read database before commit");
+        let error = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let page = batch
+                .allocate_append(PageType::TableLeaf)
+                .expect("allocate leaf");
+            let frame = batch.modify(page).expect("modify leaf");
+            frame.set_layout(1, 60, 4095).expect("set bounded layout");
+            frame.bytes_mut()[56..60].copy_from_slice(&[50, 0, 1, 0]);
+            match batch.commit() {
+                Ok(()) => panic!("malformed leaf layout must reject commit"),
+                Err(error) => error,
+            }
+        };
+
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_file_is_unchanged(&temp, &before);
+        assert!(!pager.is_poisoned());
+    }
+
+    #[test]
+    fn malformed_leaf_cell_fails_before_file_io() {
+        let temp = TempDatabase::new("pager-invalid-leaf-cell");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let before = std::fs::read(temp.path()).expect("read database before commit");
+        let error = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let page = batch
+                .allocate_append(PageType::TableLeaf)
+                .expect("allocate leaf");
+            {
+                let frame = batch.modify(page).expect("modify leaf");
+                let mut slotted = SlottedPage::open(frame, 56).expect("open empty leaf");
+                slotted.insert(0, &[0]).expect("insert raw malformed cell");
+            }
+            match batch.commit() {
+                Ok(()) => panic!("malformed leaf cell must reject commit"),
+                Err(error) => error,
+            }
+        };
+
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_file_is_unchanged(&temp, &before);
+        assert!(!pager.is_poisoned());
+    }
+
+    #[test]
+    fn invalid_internal_leftmost_metadata_fails_before_file_io() {
+        for page_type in [PageType::TableInternal, PageType::IndexInternal] {
+            let temp = TempDatabase::new("pager-invalid-internal-metadata");
+            let mut pager =
+                Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+            let before = std::fs::read(temp.path()).expect("read database before commit");
+            let error = {
+                let mut batch = pager.begin_write().expect("begin write");
+                batch.allocate_append(page_type).expect("allocate page");
+                match batch.commit() {
+                    Ok(()) => panic!("invalid internal leftmost metadata must reject commit"),
+                    Err(error) => error,
+                }
+            };
+
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert_file_is_unchanged(&temp, &before);
+            assert!(!pager.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn malformed_internal_cell_fails_before_file_io() {
+        let temp = TempDatabase::new("pager-invalid-internal-cell");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let before = std::fs::read(temp.path()).expect("read database before commit");
+        let error = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let page = batch
+                .allocate_append(PageType::TableInternal)
+                .expect("allocate internal page");
+            {
+                let frame = batch.modify(page).expect("modify internal page");
+                frame.bytes_mut()[48..64].copy_from_slice(&encode_internal_leftmost(
+                    PageRef::new(PageId(1), 1).expect("leftmost reference"),
+                ));
+                let mut slotted = SlottedPage::open(frame, 64).expect("open internal page");
+                slotted.insert(0, &[0]).expect("insert raw malformed cell");
+            }
+            match batch.commit() {
+                Ok(()) => panic!("malformed internal cell must reject commit"),
+                Err(error) => error,
+            }
+        };
+
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_file_is_unchanged(&temp, &before);
+        assert!(!pager.is_poisoned());
+    }
+
+    #[test]
+    fn cache_configuration_failure_does_not_create_a_database_file() {
+        let temp = TempDatabase::new("pager-cache-config");
+        let mut invalid_config = PagerConfig::test_default(4096);
+        invalid_config.cache_pages = 0;
+
+        let error = match Pager::create(temp.path(), invalid_config) {
+            Ok(_) => panic!("zero cache capacity must reject pager creation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert!(!temp.path().exists());
+
+        let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .expect("retry after rejected pager creation");
+        assert_eq!(pager.page_count(), 1);
+    }
+
+    #[test]
+    fn dropping_an_unfinished_batch_leaves_the_file_unchanged() {
+        let temp = TempDatabase::new("pager-drop-batch");
+        let mut pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let before = std::fs::read(temp.path()).expect("read database before batch");
+        let page;
+        {
+            let mut batch = pager.begin_write().expect("begin write");
+            page = batch
+                .allocate_append(PageType::TableLeaf)
+                .expect("allocate append");
+            batch
+                .modify(page)
+                .expect("modify private image")
+                .bytes_mut()[100] = 0x5c;
+        }
+
+        assert_file_is_unchanged(&temp, &before);
+        assert_eq!(
+            pager
+                .read(page)
+                .expect_err("dropped page is invisible")
+                .code(),
+            ErrorCode::Corruption
+        );
+        assert!(!pager.is_poisoned());
+    }
+
+    fn assert_file_is_unchanged(temp: &TempDatabase, before: &[u8]) {
+        let after = std::fs::read(temp.path()).expect("read database after rejected commit");
+        assert_eq!(after, before);
+        assert_eq!(
+            std::fs::metadata(temp.path())
+                .expect("database metadata after rejected commit")
+                .len(),
+            u64::try_from(before.len()).expect("test database length fits u64")
+        );
     }
 
     fn pager_with_faults(temp: &TempDatabase, faults: Arc<dyn FaultInjector>) -> Pager {
