@@ -3,25 +3,63 @@ mod codec;
 mod header;
 mod page;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct PageId(pub(super) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct PageRef {
+    page_id: PageId,
+    generation: u64,
+}
+
+impl PageRef {
+    pub(super) fn new(page_id: PageId, generation: u64) -> crate::Result<Self> {
+        if page_id.0 == 0 {
+            return Err(crate::DbError::new(
+                crate::ErrorCode::Corruption,
+                "page references cannot point to the database header",
+            ));
+        }
+        if generation == 0 {
+            return Err(crate::DbError::new(
+                crate::ErrorCode::Corruption,
+                "page reference generation must be nonzero",
+            ));
+        }
+
+        Ok(Self {
+            page_id,
+            generation,
+        })
+    }
+
+    pub(super) const fn page_id(self) -> PageId {
+        self.page_id
+    }
+
+    pub(super) const fn generation(self) -> u64 {
+        self.generation
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Lsn(pub(super) u64);
 
-fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpenMode {
+    ReadOnly,
+    ReadWrite,
+}
 
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ 0x82f6_3b78;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-
-    !crc
+#[test]
+fn page_ref_rejects_header_page_and_zero_generation() {
+    assert_eq!(
+        PageRef::new(PageId(0), 1).unwrap_err().code(),
+        crate::ErrorCode::Corruption
+    );
+    assert_eq!(
+        PageRef::new(PageId(1), 0).unwrap_err().code(),
+        crate::ErrorCode::Corruption
+    );
+    assert_eq!(PageRef::new(PageId(7), 3).unwrap().page_id(), PageId(7));
 }

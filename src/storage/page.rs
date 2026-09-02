@@ -44,6 +44,7 @@ pub(super) struct PageHeader {
     payload_start: u16,
     right_sibling: Option<PageId>,
     checksum: u32,
+    page_size: u32,
 }
 
 impl PageHeader {
@@ -67,7 +68,77 @@ impl PageHeader {
             payload_start: page_size as u16,
             right_sibling: None,
             checksum: 0,
+            page_size,
         })
+    }
+
+    pub(super) const fn page_type(&self) -> PageType {
+        self.page_type
+    }
+
+    pub(super) const fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    pub(super) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) const fn cell_count(&self) -> u16 {
+        self.cell_count
+    }
+
+    pub(super) const fn slot_end(&self) -> u16 {
+        self.slot_end
+    }
+
+    pub(super) const fn payload_start(&self) -> u16 {
+        self.payload_start
+    }
+
+    pub(super) const fn right_sibling(&self) -> Option<PageId> {
+        self.right_sibling
+    }
+
+    pub(super) const fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    pub(super) fn set_checksum(&mut self, checksum: u32) {
+        self.checksum = checksum;
+    }
+
+    pub(super) fn set_generation(&mut self, generation: u64) -> Result<()> {
+        if generation == 0 {
+            return Err(corruption("page generation must be nonzero"));
+        }
+        self.generation = generation;
+        Ok(())
+    }
+
+    pub(super) fn set_right_sibling(&mut self, right_sibling: Option<PageId>) -> Result<()> {
+        if right_sibling.is_some_and(|page_id| page_id.0 == 0) {
+            return Err(corruption("right sibling page id must be nonzero"));
+        }
+        self.right_sibling = right_sibling;
+        Ok(())
+    }
+
+    pub(super) fn set_layout(
+        &mut self,
+        cell_count: u16,
+        slot_end: u16,
+        payload_start: u16,
+    ) -> Result<()> {
+        validate_layout(slot_end, payload_start, self.page_size)?;
+        self.cell_count = cell_count;
+        self.slot_end = slot_end;
+        self.payload_start = payload_start;
+        Ok(())
     }
 
     pub(super) fn encode(&self) -> [u8; PAGE_HEADER_LEN] {
@@ -118,15 +189,7 @@ impl PageHeader {
         if reserved_1 != 0 || reserved_2 != 0 || reserved_3.iter().any(|&byte| byte != 0) {
             return Err(corruption("page header reserved bytes are nonzero"));
         }
-        if usize::from(slot_end) < PAGE_HEADER_LEN {
-            return Err(corruption("page slot directory overlaps the header"));
-        }
-        if u32::from(payload_start) > page_size {
-            return Err(corruption("page payload starts beyond the page boundary"));
-        }
-        if slot_end > payload_start {
-            return Err(corruption("page free-space boundaries cross"));
-        }
+        validate_layout(slot_end, payload_start, page_size)?;
 
         Ok(Self {
             page_type,
@@ -138,8 +201,22 @@ impl PageHeader {
             payload_start,
             right_sibling,
             checksum,
+            page_size,
         })
     }
+}
+
+fn validate_layout(slot_end: u16, payload_start: u16, page_size: u32) -> Result<()> {
+    if usize::from(slot_end) < PAGE_HEADER_LEN {
+        return Err(corruption("page slot directory overlaps the header"));
+    }
+    if u32::from(payload_start) > page_size {
+        return Err(corruption("page payload starts beyond the page boundary"));
+    }
+    if slot_end > payload_start {
+        return Err(corruption("page free-space boundaries cross"));
+    }
+    Ok(())
 }
 
 const fn is_valid_page_size(page_size: u32) -> bool {
@@ -292,4 +369,35 @@ fn page_header_decode_requires_exact_layout_size() {
             .code(),
         crate::ErrorCode::Corruption
     );
+}
+
+#[test]
+fn page_header_mutators_preserve_bounds() {
+    let mut header = PageHeader::new(PageType::TableLeaf, PageId(1), 1, 4096).unwrap();
+    header.set_layout(2, 56, 4000).expect("valid layout");
+    assert_eq!(header.cell_count(), 2);
+    assert_eq!(
+        header.set_layout(2, 4001, 4000).unwrap_err().code(),
+        crate::ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn page_header_accessors_and_setters_round_trip() {
+    let mut header = PageHeader::new(PageType::TableLeaf, PageId(7), 1, 8192).unwrap();
+    header.set_generation(2).expect("generation");
+    header
+        .set_right_sibling(Some(PageId(8)))
+        .expect("right sibling");
+    header.set_checksum(0xa1b2_c3d4);
+
+    assert_eq!(header.page_type(), PageType::TableLeaf);
+    assert_eq!(header.flags(), 0);
+    assert_eq!(header.page_id(), PageId(7));
+    assert_eq!(header.generation(), 2);
+    assert_eq!(header.cell_count(), 0);
+    assert_eq!(header.slot_end(), 48);
+    assert_eq!(header.payload_start(), 8192);
+    assert_eq!(header.right_sibling(), Some(PageId(8)));
+    assert_eq!(header.checksum(), 0xa1b2_c3d4);
 }
