@@ -842,58 +842,138 @@ mod tests {
 
     #[test]
     fn delete_returns_overflow_value_and_releases_the_whole_chain() {
-        let (_temp, mut pager) = test_pager(4096).unwrap();
-        let value = vec![0x5a; 9000];
-        let (mut tree, overflow_pages) = {
-            let mut batch = pager.begin_write().unwrap();
-            let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
-            tree.insert(&mut batch, b"large", &value).unwrap();
-            let Node::Leaf(leaf) = load_node(&mut batch, TreeKind::Table, tree.root()).unwrap()
-            else {
-                panic!("single large value must remain in a leaf root");
+        for page_size in [4096, 8192, 16384] {
+            let (_temp, mut pager) = test_pager(page_size).unwrap();
+            let value = vec![0x5a; usize::try_from(page_size).unwrap() * 3];
+            let (mut tree, overflow_pages) = {
+                let mut batch = pager.begin_write().unwrap();
+                let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+                tree.insert(&mut batch, b"large", &value).unwrap();
+                let Node::Leaf(leaf) = load_node(&mut batch, TreeKind::Table, tree.root()).unwrap()
+                else {
+                    panic!("single large value must remain in a leaf root");
+                };
+                let ValueStorage::Overflow(first) = leaf.cells[0].storage() else {
+                    panic!("large value must use overflow pages");
+                };
+                let pages =
+                    overflow::collect_chain(&mut batch, *first, leaf.cells[0].total_value_len())
+                        .unwrap();
+                batch.commit().unwrap();
+                (tree, pages)
             };
-            let ValueStorage::Overflow(first) = leaf.cells[0].storage() else {
-                panic!("large value must use overflow pages");
-            };
-            let pages =
-                overflow::collect_chain(&mut batch, *first, leaf.cells[0].total_value_len())
-                    .unwrap();
-            batch.commit().unwrap();
-            (tree, pages)
-        };
 
-        {
-            let mut batch = pager.begin_write().unwrap();
-            assert_eq!(tree.delete(&mut batch, b"large").unwrap(), Some(value));
-            batch.commit().unwrap();
+            {
+                let mut batch = pager.begin_write().unwrap();
+                assert_eq!(tree.delete(&mut batch, b"large").unwrap(), Some(value));
+                batch.commit().unwrap();
+            }
+            let replacements = {
+                let mut batch = pager.begin_write().unwrap();
+                let pages = (0..overflow_pages.len())
+                    .map(|_| batch.allocate(TreeKind::Table.leaf_page_type()).unwrap())
+                    .collect::<Vec<_>>();
+                for page in &pages {
+                    SlottedPage::open(
+                        batch.modify(*page).unwrap(),
+                        super::super::LEAF_METADATA_END,
+                    )
+                    .unwrap();
+                }
+                batch.commit().unwrap();
+                pages
+            };
+            assert_eq!(
+                replacements
+                    .iter()
+                    .map(|page| page.page_id())
+                    .collect::<HashSet<_>>(),
+                overflow_pages
+                    .iter()
+                    .map(|page| page.page_id())
+                    .collect::<HashSet<_>>()
+            );
+            for stale in overflow_pages {
+                assert_eq!(pager.read(stale).unwrap_err().code(), ErrorCode::Corruption);
+            }
         }
-        let replacements = {
-            let mut batch = pager.begin_write().unwrap();
-            let pages = (0..overflow_pages.len())
-                .map(|_| batch.allocate(TreeKind::Table.leaf_page_type()).unwrap())
-                .collect::<Vec<_>>();
-            for page in &pages {
-                SlottedPage::open(
-                    batch.modify(*page).unwrap(),
-                    super::super::LEAF_METADATA_END,
+    }
+
+    #[test]
+    fn deletion_error_restores_partially_staged_overflow_releases() {
+        for page_size in [4096, 8192, 16384] {
+            let (_temp, mut pager) = test_pager(page_size).unwrap();
+            let value = vec![0x6b; usize::try_from(page_size).unwrap() * 3];
+            let (mut tree, first, chain) = {
+                let mut batch = pager.begin_write().unwrap();
+                let target = batch.allocate(TreeKind::Table.leaf_page_type()).unwrap();
+                let first = overflow::write_value(&mut batch, &value).unwrap().unwrap();
+                let chain =
+                    overflow::collect_chain(&mut batch, first, u64::try_from(value.len()).unwrap())
+                        .unwrap();
+                let wrong_sibling = overflow::write_value(&mut batch, b"wrong type")
+                    .unwrap()
+                    .unwrap();
+                rewrite_leaf(
+                    &mut batch,
+                    target,
+                    Some(wrong_sibling),
+                    &[LeafCell::overflow(
+                        b"a".to_vec(),
+                        u64::try_from(value.len()).unwrap(),
+                        first,
+                    )
+                    .unwrap()],
                 )
                 .unwrap();
+                let root = batch
+                    .allocate(TreeKind::Table.internal_page_type())
+                    .unwrap();
+                rewrite_internal(
+                    &mut batch,
+                    root,
+                    target,
+                    &[InternalCell::new(b"z".to_vec(), wrong_sibling).unwrap()],
+                )
+                .unwrap();
+                batch.commit().unwrap();
+                (
+                    BTree {
+                        kind: TreeKind::Table,
+                        root,
+                    },
+                    first,
+                    chain,
+                )
+            };
+            let old_root = tree.root();
+            {
+                let mut batch = pager.begin_write().unwrap();
+                assert_eq!(
+                    tree.delete(&mut batch, b"a").unwrap_err().code(),
+                    ErrorCode::Corruption
+                );
+                assert_eq!(tree.root(), old_root);
+                assert_eq!(
+                    overflow::read_value(&mut batch, first, u64::try_from(value.len()).unwrap(),)
+                        .unwrap(),
+                    value
+                );
+                assert_eq!(
+                    get_from_source(&mut batch, &tree, b"a").unwrap(),
+                    Some(value.clone())
+                );
+                batch.commit().unwrap();
             }
-            batch.commit().unwrap();
-            pages
-        };
-        assert_eq!(
-            replacements
-                .iter()
-                .map(|page| page.page_id())
-                .collect::<HashSet<_>>(),
-            overflow_pages
-                .iter()
-                .map(|page| page.page_id())
-                .collect::<HashSet<_>>()
-        );
-        for stale in overflow_pages {
-            assert_eq!(pager.read(stale).unwrap_err().code(), ErrorCode::Corruption);
+            assert_eq!(tree.get(&mut pager, b"a").unwrap(), Some(value));
+            let mut batch = pager.begin_write().unwrap();
+            let appended = batch.allocate(TreeKind::Table.leaf_page_type()).unwrap();
+            assert!(
+                !chain
+                    .iter()
+                    .any(|page| page.page_id() == appended.page_id())
+            );
+            batch.rollback().unwrap();
         }
     }
 
