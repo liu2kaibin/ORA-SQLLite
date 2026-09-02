@@ -115,6 +115,10 @@ fn numeric_round_trip_is_little_endian() {
     encoder.put_u64(0x0102_0304_0506_0708);
     let bytes = encoder.into_bytes();
     assert_eq!(&bytes[..2], &[0x34, 0x12]);
+    assert_eq!(
+        &bytes[2..],
+        &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+    );
     let mut decoder = Decoder::new(&bytes);
     assert_eq!(decoder.get_u16().expect("u16"), 0x1234);
     assert_eq!(decoder.get_u64().expect("u64"), 0x0102_0304_0506_0708);
