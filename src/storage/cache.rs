@@ -205,9 +205,14 @@ fn access_clock_overflow_preserves_lru_eviction_order() {
         .insert_clean(handle(3))
         .expect("insert after clock overflow");
 
-    assert!(cache.get(PageId(1)).is_some());
+    cache
+        .insert_clean(handle(4))
+        .expect("evict oldest page after clock overflow");
+
+    assert!(cache.get(PageId(1)).is_none());
     assert!(cache.get(PageId(2)).is_none());
     assert!(cache.get(PageId(3)).is_some());
+    assert!(cache.get(PageId(4)).is_some());
 }
 
 fn handle(id: u64) -> PageHandle {
