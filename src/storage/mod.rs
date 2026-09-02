@@ -3,6 +3,7 @@ mod cache;
 mod checksum;
 mod codec;
 mod file;
+mod freelist;
 mod header;
 mod page;
 mod pager;
