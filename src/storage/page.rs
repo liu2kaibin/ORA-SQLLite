@@ -294,6 +294,15 @@ impl PageFrame {
         &self.header
     }
 
+    pub(super) fn set_layout(
+        &mut self,
+        cell_count: u16,
+        slot_end: u16,
+        payload_start: u16,
+    ) -> Result<()> {
+        self.header.set_layout(cell_count, slot_end, payload_start)
+    }
+
     pub(super) fn prepare_for_write(&mut self) -> Result<()> {
         self.header.set_checksum(0);
         self.bytes[..PAGE_HEADER_LEN].copy_from_slice(&self.header.encode());
@@ -459,6 +468,27 @@ fn page_header_mutators_preserve_bounds() {
         header.set_layout(2, 4001, 4000).unwrap_err().code(),
         crate::ErrorCode::Corruption
     );
+}
+
+#[test]
+fn frame_layout_mutator_updates_the_authoritative_header() {
+    let reference = PageRef::new(PageId(1), 1).expect("page reference");
+    let mut frame =
+        PageFrame::new_zeroed(PageType::TableLeaf, reference, 4096).expect("zeroed page frame");
+
+    frame.set_layout(2, 56, 4000).expect("valid frame layout");
+    frame.prepare_for_write().expect("prepared page frame");
+
+    let decoded = PageFrame::decode(
+        frame.bytes().to_vec(),
+        PageId(1),
+        Some(PageType::TableLeaf),
+        Some(1),
+    )
+    .expect("decoded page frame");
+    assert_eq!(decoded.header().cell_count(), 2);
+    assert_eq!(decoded.header().slot_end(), 56);
+    assert_eq!(decoded.header().payload_start(), 4000);
 }
 
 #[test]

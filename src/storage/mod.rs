@@ -1,9 +1,11 @@
+mod btree;
 mod cache;
 mod checksum;
 mod codec;
 mod file;
 mod header;
 mod page;
+mod slotted;
 
 #[cfg(test)]
 mod test_support;
