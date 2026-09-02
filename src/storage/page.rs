@@ -502,3 +502,57 @@ fn frame_decode_checks_crc_id_type_and_generation() {
         ErrorCode::Corruption
     );
 }
+
+#[test]
+fn frame_decode_rejects_checksum_corruption() {
+    let mut bytes = encoded_frame(PageType::TableLeaf, 5, 2);
+    bytes[100] ^= 1;
+
+    assert_eq!(
+        PageFrame::decode(bytes, PageId(5), Some(PageType::TableLeaf), Some(2))
+            .expect_err("checksum corruption")
+            .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn frame_decode_rejects_mismatched_page_type() {
+    assert_eq!(
+        PageFrame::decode(
+            encoded_frame(PageType::TableLeaf, 5, 2),
+            PageId(5),
+            Some(PageType::Catalog),
+            Some(2),
+        )
+        .expect_err("mismatched page type")
+        .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn frame_decode_rejects_mismatched_generation() {
+    assert_eq!(
+        PageFrame::decode(
+            encoded_frame(PageType::TableLeaf, 5, 2),
+            PageId(5),
+            Some(PageType::TableLeaf),
+            Some(3),
+        )
+        .expect_err("mismatched generation")
+        .code(),
+        ErrorCode::Corruption
+    );
+}
+
+fn encoded_frame(page_type: PageType, page_id: u64, generation: u64) -> Vec<u8> {
+    let mut frame = PageFrame::new_zeroed(
+        page_type,
+        PageRef::new(PageId(page_id), generation).expect("page reference"),
+        4096,
+    )
+    .expect("page frame");
+    frame.prepare_for_write().expect("prepared page frame");
+    frame.bytes().to_vec()
+}

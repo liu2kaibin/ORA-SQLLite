@@ -132,6 +132,84 @@ fn lru_skips_pinned_pages_and_reports_busy_when_all_are_pinned() {
     drop(pin_three);
 }
 
+#[test]
+fn zero_cache_capacity_returns_type_error() {
+    assert_eq!(
+        PageCache::new(0).expect_err("zero cache capacity").code(),
+        ErrorCode::Type
+    );
+}
+
+#[test]
+fn cache_length_never_exceeds_capacity() {
+    let mut cache = PageCache::new(2).expect("cache");
+
+    for page_id in 1..=4 {
+        cache
+            .insert_clean(handle(page_id))
+            .expect("insert unpinned page");
+        assert!(cache.len() <= 2);
+    }
+
+    assert_eq!(cache.len(), 2);
+    assert!(cache.get(PageId(1)).is_none());
+    assert!(cache.get(PageId(2)).is_none());
+    assert!(cache.get(PageId(3)).is_some());
+    assert!(cache.get(PageId(4)).is_some());
+}
+
+#[test]
+fn equal_last_used_entries_evict_the_smaller_page_id() {
+    let mut cache = PageCache::new(2).expect("cache");
+    cache.insert_clean(handle(2)).expect("insert page two");
+    cache.insert_clean(handle(1)).expect("insert page one");
+    cache
+        .entries
+        .get_mut(&PageId(1))
+        .expect("page one")
+        .last_used = 7;
+    cache
+        .entries
+        .get_mut(&PageId(2))
+        .expect("page two")
+        .last_used = 7;
+
+    cache.insert_clean(handle(3)).expect("evict tied page");
+
+    assert!(cache.get(PageId(1)).is_none());
+    assert!(cache.get(PageId(2)).is_some());
+    assert!(cache.get(PageId(3)).is_some());
+}
+
+#[test]
+fn remove_returns_the_entry_and_updates_length() {
+    let mut cache = PageCache::new(2).expect("cache");
+    cache.insert_clean(handle(1)).expect("insert page one");
+    assert_eq!(cache.len(), 1);
+
+    let removed = cache.remove(PageId(1)).expect("removed page");
+    assert_eq!(removed.borrow().header().page_id(), PageId(1));
+    assert_eq!(cache.len(), 0);
+    assert!(cache.remove(PageId(1)).is_none());
+}
+
+#[test]
+fn access_clock_overflow_preserves_lru_eviction_order() {
+    let mut cache = PageCache::new(2).expect("cache");
+    cache.insert_clean(handle(1)).expect("insert page one");
+    cache.insert_clean(handle(2)).expect("insert page two");
+    cache.get(PageId(1)).expect("refresh page one");
+    cache.access_clock = u64::MAX;
+
+    cache
+        .insert_clean(handle(3))
+        .expect("insert after clock overflow");
+
+    assert!(cache.get(PageId(1)).is_some());
+    assert!(cache.get(PageId(2)).is_none());
+    assert!(cache.get(PageId(3)).is_some());
+}
+
 fn handle(id: u64) -> PageHandle {
     Rc::new(RefCell::new(
         PageFrame::new_zeroed(
