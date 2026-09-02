@@ -129,7 +129,7 @@ fn walk_chain(
     }
 
     let max_hops = source
-        .page_count()
+        .page_count()?
         .checked_sub(1)
         .ok_or_else(|| corruption("database has no header page"))?;
     let mut current = first;
@@ -362,24 +362,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_value_stays_inline_and_allocates_no_overflow_page() {
-        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
-        let before = pager.page_count();
-
-        let result = {
-            let mut batch = pager.begin_write().expect("begin empty value write");
-            let result = write_value(&mut batch, b"").expect("empty value write");
-            batch.commit().expect("commit empty value write");
-            result
-        };
-
-        assert_eq!(result, None);
-        assert_eq!(pager.page_count(), before);
-    }
-
-    #[test]
     fn overflow_round_trips_one_page_boundaries() {
         for page_size in [4096, 8192, 16384] {
+            let (_temp, mut pager) = test_pager(page_size).expect("create test pager");
+            let before = pager.page_count();
+            let empty = {
+                let mut batch = pager.begin_write().expect("begin empty value write");
+                let result = write_value(&mut batch, b"").expect("empty value write");
+                batch.commit().expect("commit empty value write");
+                result
+            };
+            assert_eq!(empty, None);
+            assert_eq!(pager.page_count(), before);
+
             let capacity =
                 usize::try_from(page_size).expect("test page size fits usize") - CHUNK_OFFSET;
             for len in [1, capacity, capacity + 1] {
@@ -406,6 +401,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn batch_overlay_reads_a_multi_page_overflow_chain_before_commit() {
+        let value = vec![0x27; 9000];
+        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let mut batch = pager.begin_write().expect("begin overflow write");
+        let first = write_value(&mut batch, &value)
+            .expect("write overflow value")
+            .expect("nonempty value allocates a page");
+
+        assert_eq!(
+            collect_chain(&mut batch, first, value.len() as u64)
+                .expect("collect batch-local overflow chain")
+                .len(),
+            3
+        );
+        assert_eq!(
+            read_value(&mut batch, first, value.len() as u64)
+                .expect("read batch-local overflow value"),
+            value
+        );
+        batch
+            .rollback()
+            .expect("rollback batch-local overflow value");
     }
 
     #[test]
@@ -621,8 +641,8 @@ mod tests {
             Ok(Rc::new(RefCell::new(frame)))
         }
 
-        fn page_count(&self) -> u64 {
-            self.page_count
+        fn page_count(&self) -> Result<u64> {
+            Ok(self.page_count)
         }
     }
 

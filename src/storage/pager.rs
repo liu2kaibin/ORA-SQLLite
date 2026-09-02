@@ -171,7 +171,7 @@ impl Pager {
 pub(super) trait PageSource {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle>;
 
-    fn page_count(&self) -> u64;
+    fn page_count(&self) -> Result<u64>;
 }
 
 impl PageSource for Pager {
@@ -179,8 +179,8 @@ impl PageSource for Pager {
         self.read(reference)
     }
 
-    fn page_count(&self) -> u64 {
-        self.page_count()
+    fn page_count(&self) -> Result<u64> {
+        Ok(self.page_count())
     }
 }
 
@@ -612,8 +612,13 @@ impl PageSource for WriteBatch<'_> {
         self.read(reference)
     }
 
-    fn page_count(&self) -> u64 {
-        self.pager.page_count()
+    fn page_count(&self) -> Result<u64> {
+        let appended = u64::try_from(self.new_pages.len())
+            .map_err(|_| corruption("new page count exceeds u64"))?;
+        self.pager
+            .page_count()
+            .checked_add(appended)
+            .ok_or_else(|| corruption("batch target page count overflow"))
     }
 }
 
