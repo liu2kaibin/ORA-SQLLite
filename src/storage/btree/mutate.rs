@@ -104,6 +104,449 @@ impl BTree {
 
         Ok(())
     }
+
+    pub(in crate::storage) fn delete(
+        &mut self,
+        batch: &mut WriteBatch<'_>,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        validate_key(key)?;
+        let old_root = self.root;
+        let checkpoint = batch.checkpoint_mutation()?;
+        let result = self.delete_inner(batch, key).and_then(|removed| {
+            batch
+                .refresh_tree(self.kind, old_root, self.root)
+                .map(|()| removed)
+        });
+        match result {
+            Ok(removed) => Ok(removed),
+            Err(error) => {
+                self.root = old_root;
+                batch.restore_mutation(checkpoint);
+                Err(error)
+            }
+        }
+    }
+
+    fn delete_inner(&mut self, batch: &mut WriteBatch<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let (leaf_ref, mut leaf, path) = descend_with_path(batch, self.kind, self.root, key)?;
+        let delete_at = lower_bound(&leaf.cells, key);
+        let Some(cell) = leaf.cells.get(delete_at).filter(|cell| cell.key() == key) else {
+            return Ok(None);
+        };
+        let removed = read_cell_value(batch, cell)?;
+        if let super::ValueStorage::Overflow(first) = cell.storage() {
+            for reference in overflow::collect_chain(batch, *first, cell.total_value_len())? {
+                batch.release_btree_later(reference)?;
+            }
+        }
+        leaf.cells.remove(delete_at);
+        repair_after_delete(
+            batch,
+            self.kind,
+            &mut self.root,
+            leaf_ref,
+            Node::Leaf(leaf),
+            path,
+        )?;
+        Ok(Some(removed))
+    }
+}
+
+fn read_cell_value(batch: &mut WriteBatch<'_>, cell: &LeafCell) -> Result<Vec<u8>> {
+    match cell.storage() {
+        super::ValueStorage::Inline(value) => Ok(value.clone()),
+        super::ValueStorage::Overflow(first) => {
+            overflow::read_value(batch, *first, cell.total_value_len())
+        }
+    }
+}
+
+fn repair_after_delete(
+    batch: &mut WriteBatch<'_>,
+    kind: super::TreeKind,
+    root: &mut PageRef,
+    mut current_ref: PageRef,
+    mut current: Node,
+    mut path: SearchPath,
+) -> Result<()> {
+    loop {
+        if current_ref == *root {
+            match current {
+                Node::Leaf(leaf) => {
+                    rewrite_leaf(batch, current_ref, leaf.right_sibling, &leaf.cells)?
+                }
+                Node::Internal(internal) if internal.cells.is_empty() => {
+                    *root = internal.leftmost;
+                    batch.release_btree_later(current_ref)?;
+                }
+                Node::Internal(internal) => {
+                    rewrite_internal(batch, current_ref, internal.leftmost, &internal.cells)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let page_len = batch.read(current_ref)?.borrow().bytes().len();
+        if !node_is_underfull(page_len, &current)? {
+            rewrite_node(batch, current_ref, &current)?;
+            let minimum = node_minimum(batch, kind, &current)?;
+            propagate_minimum(batch, kind, current_ref, minimum, path)?;
+            return Ok(());
+        }
+
+        let (parent_ref, child_index) = path
+            .pop()
+            .ok_or_else(|| corruption("B+Tree deletion path ended before the root"))?;
+        let mut parent = match load_node(batch, kind, parent_ref)? {
+            Node::Internal(parent) => parent,
+            Node::Leaf(_) => return Err(corruption("B+Tree path parent is a leaf page")),
+        };
+        if child_index > parent.cells.len() || parent_child(&parent, child_index)? != current_ref {
+            return Err(corruption("B+Tree deletion path does not match its parent"));
+        }
+        if child_index > 0 && !matches!(&current, Node::Leaf(leaf) if leaf.cells.is_empty()) {
+            let minimum = node_minimum(batch, kind, &current)?;
+            parent.cells[child_index - 1] = InternalCell::new(minimum, current_ref)?;
+        }
+
+        let left = if child_index > 0 {
+            let reference = parent_child(&parent, child_index - 1)?;
+            Some((reference, load_node(batch, kind, reference)?))
+        } else {
+            None
+        };
+        let right = if child_index < parent.cells.len() {
+            let reference = parent_child(&parent, child_index + 1)?;
+            Some((reference, load_node(batch, kind, reference)?))
+        } else {
+            None
+        };
+
+        let left_borrow = if let Some((_, left_node)) = &left {
+            borrow_candidate(
+                page_len,
+                left_node,
+                &current,
+                parent.cells[child_index - 1].key(),
+                BorrowSide::Left,
+            )?
+        } else {
+            None
+        };
+        let right_borrow = if let Some((_, right_node)) = &right {
+            borrow_candidate(
+                page_len,
+                right_node,
+                &current,
+                parent.cells[child_index].key(),
+                BorrowSide::Right,
+            )?
+        } else {
+            None
+        };
+
+        let use_left = match (&left_borrow, &right_borrow) {
+            (Some(left), Some(right)) => left.moved <= right.moved,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if use_left {
+            let candidate = left_borrow.expect("left borrow exists");
+            let (left_ref, _) = left.expect("left sibling exists");
+            rewrite_node(batch, left_ref, &candidate.donor)?;
+            rewrite_node(batch, current_ref, &candidate.receiver)?;
+            parent.cells[child_index - 1] = InternalCell::new(candidate.separator, current_ref)?;
+            rewrite_internal(batch, parent_ref, parent.leftmost, &parent.cells)?;
+            let parent_minimum = subtree_minimum(batch, kind, parent_ref)?;
+            propagate_minimum(batch, kind, parent_ref, parent_minimum, path)?;
+            return Ok(());
+        }
+        if let Some(candidate) = right_borrow {
+            let (right_ref, _) = right.expect("right sibling exists");
+            rewrite_node(batch, right_ref, &candidate.donor)?;
+            rewrite_node(batch, current_ref, &candidate.receiver)?;
+            parent.cells[child_index] = InternalCell::new(candidate.separator, right_ref)?;
+            rewrite_internal(batch, parent_ref, parent.leftmost, &parent.cells)?;
+            let parent_minimum = subtree_minimum(batch, kind, parent_ref)?;
+            propagate_minimum(batch, kind, parent_ref, parent_minimum, path)?;
+            return Ok(());
+        }
+
+        if let Some((left_ref, left_node)) = &left {
+            let separator = parent.cells[child_index - 1].key().to_vec();
+            let merged = merge_nodes(left_node, &current, separator)?;
+            if node_fits(page_len, &merged)? {
+                rewrite_node(batch, *left_ref, &merged)?;
+                batch.release_btree_later(current_ref)?;
+                parent.cells.remove(child_index - 1);
+                current_ref = parent_ref;
+                current = Node::Internal(parent);
+                continue;
+            }
+        }
+
+        let Some((right_ref, right_node)) = right else {
+            return Err(corruption("underfull B+Tree page has no mergeable sibling"));
+        };
+        let separator = parent.cells[child_index].key().to_vec();
+        let merged = merge_nodes(&current, &right_node, separator)?;
+        if !node_fits(page_len, &merged)? {
+            return Err(corruption(
+                "underfull B+Tree siblings do not fit after compaction",
+            ));
+        }
+        rewrite_node(batch, current_ref, &merged)?;
+        batch.release_btree_later(right_ref)?;
+        parent.cells.remove(child_index);
+        current_ref = parent_ref;
+        current = Node::Internal(parent);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BorrowSide {
+    Left,
+    Right,
+}
+
+struct BorrowCandidate {
+    moved: usize,
+    donor: Node,
+    receiver: Node,
+    separator: Vec<u8>,
+}
+
+fn borrow_candidate(
+    page_len: usize,
+    donor: &Node,
+    receiver: &Node,
+    parent_separator: &[u8],
+    side: BorrowSide,
+) -> Result<Option<BorrowCandidate>> {
+    let mut donor = clone_node(donor);
+    let mut receiver = clone_node(receiver);
+    let mut separator = parent_separator.to_vec();
+    let maximum = node_cell_count(&donor).saturating_sub(1);
+    for moved in 1..=maximum {
+        rotate_one(&mut donor, &mut receiver, &mut separator, side)?;
+        if !node_is_underfull(page_len, &receiver)? && !node_is_underfull(page_len, &donor)? {
+            return Ok(Some(BorrowCandidate {
+                moved,
+                donor,
+                receiver,
+                separator,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn rotate_one(
+    donor: &mut Node,
+    receiver: &mut Node,
+    separator: &mut Vec<u8>,
+    side: BorrowSide,
+) -> Result<()> {
+    match (donor, receiver, side) {
+        (Node::Leaf(donor), Node::Leaf(receiver), BorrowSide::Left) => {
+            let cell = donor
+                .cells
+                .pop()
+                .ok_or_else(|| corruption("left leaf donor is empty"))?;
+            receiver.cells.insert(0, cell);
+            *separator = receiver.cells[0].key().to_vec();
+        }
+        (Node::Leaf(donor), Node::Leaf(receiver), BorrowSide::Right) => {
+            if donor.cells.is_empty() {
+                return Err(corruption("right leaf donor is empty"));
+            }
+            receiver.cells.push(donor.cells.remove(0));
+            *separator = donor
+                .cells
+                .first()
+                .ok_or_else(|| corruption("right leaf borrow emptied its donor"))?
+                .key()
+                .to_vec();
+        }
+        (Node::Internal(donor), Node::Internal(receiver), BorrowSide::Left) => {
+            let cell = donor
+                .cells
+                .pop()
+                .ok_or_else(|| corruption("left internal donor is empty"))?;
+            let old_receiver_leftmost = receiver.leftmost;
+            receiver.leftmost = cell.right();
+            receiver.cells.insert(
+                0,
+                InternalCell::new(separator.clone(), old_receiver_leftmost)?,
+            );
+            *separator = cell.key().to_vec();
+        }
+        (Node::Internal(donor), Node::Internal(receiver), BorrowSide::Right) => {
+            if donor.cells.is_empty() {
+                return Err(corruption("right internal donor is empty"));
+            }
+            let cell = donor.cells.remove(0);
+            receiver
+                .cells
+                .push(InternalCell::new(separator.clone(), donor.leftmost)?);
+            donor.leftmost = cell.right();
+            *separator = cell.key().to_vec();
+        }
+        _ => return Err(corruption("B+Tree siblings have different node types")),
+    }
+    Ok(())
+}
+
+fn merge_nodes(left: &Node, right: &Node, separator: Vec<u8>) -> Result<Node> {
+    match (left, right) {
+        (Node::Leaf(left), Node::Leaf(right)) => {
+            let mut cells = left.cells.clone();
+            cells.extend(right.cells.iter().cloned());
+            Ok(Node::Leaf(LeafNode {
+                cells,
+                right_sibling: right.right_sibling,
+            }))
+        }
+        (Node::Internal(left), Node::Internal(right)) => {
+            let mut cells = left.cells.clone();
+            cells.push(InternalCell::new(separator, right.leftmost)?);
+            cells.extend(right.cells.iter().cloned());
+            Ok(Node::Internal(InternalNode {
+                leftmost: left.leftmost,
+                cells,
+            }))
+        }
+        _ => Err(corruption("B+Tree siblings have different node types")),
+    }
+}
+
+fn clone_node(node: &Node) -> Node {
+    match node {
+        Node::Leaf(leaf) => Node::Leaf(LeafNode {
+            cells: leaf.cells.clone(),
+            right_sibling: leaf.right_sibling,
+        }),
+        Node::Internal(internal) => Node::Internal(InternalNode {
+            leftmost: internal.leftmost,
+            cells: internal.cells.clone(),
+        }),
+    }
+}
+
+fn node_cell_count(node: &Node) -> usize {
+    match node {
+        Node::Leaf(leaf) => leaf.cells.len(),
+        Node::Internal(internal) => internal.cells.len(),
+    }
+}
+
+fn node_is_underfull(page_len: usize, node: &Node) -> Result<bool> {
+    let (metadata_end, encoded) = encoded_node_cells(node)?;
+    let usable = page_len
+        .checked_sub(metadata_end)
+        .ok_or_else(|| corruption("B+Tree metadata exceeds page length"))?;
+    let used = encoded_bytes(&encoded)?;
+    Ok(used.checked_mul(4).is_none_or(|used| used < usable))
+}
+
+fn node_fits(page_len: usize, node: &Node) -> Result<bool> {
+    let (metadata_end, encoded) = encoded_node_cells(node)?;
+    encoded_cells_fit(page_len, metadata_end, &encoded)
+}
+
+fn encoded_node_cells(node: &Node) -> Result<(usize, Vec<Vec<u8>>)> {
+    match node {
+        Node::Leaf(leaf) => Ok((LEAF_METADATA_END, encode_leaf_cells(&leaf.cells)?)),
+        Node::Internal(internal) => Ok((
+            INTERNAL_METADATA_END,
+            encode_internal_cells(&internal.cells)?,
+        )),
+    }
+}
+
+fn rewrite_node(batch: &mut WriteBatch<'_>, reference: PageRef, node: &Node) -> Result<()> {
+    match node {
+        Node::Leaf(leaf) => rewrite_leaf(batch, reference, leaf.right_sibling, &leaf.cells),
+        Node::Internal(internal) => {
+            rewrite_internal(batch, reference, internal.leftmost, &internal.cells)
+        }
+    }
+}
+
+fn parent_child(parent: &InternalNode, child_index: usize) -> Result<PageRef> {
+    if child_index == 0 {
+        Ok(parent.leftmost)
+    } else {
+        parent
+            .cells
+            .get(child_index - 1)
+            .map(InternalCell::right)
+            .ok_or_else(|| corruption("B+Tree child index is outside its parent"))
+    }
+}
+
+fn node_minimum(batch: &mut WriteBatch<'_>, kind: super::TreeKind, node: &Node) -> Result<Vec<u8>> {
+    match node {
+        Node::Leaf(leaf) => leaf
+            .cells
+            .first()
+            .map(|cell| cell.key().to_vec())
+            .ok_or_else(|| corruption("non-root B+Tree leaf is empty")),
+        Node::Internal(internal) => subtree_minimum(batch, kind, internal.leftmost),
+    }
+}
+
+fn subtree_minimum(
+    source: &mut impl PageSource,
+    kind: super::TreeKind,
+    mut reference: PageRef,
+) -> Result<Vec<u8>> {
+    let max_hops = source.page_count()?;
+    let mut visited = HashSet::new();
+    loop {
+        if u64::try_from(visited.len()).map_or(true, |count| count >= max_hops)
+            || !visited.insert(reference)
+        {
+            return Err(corruption("B+Tree minimum descent has a cycle"));
+        }
+        match load_node(source, kind, reference)? {
+            Node::Leaf(leaf) => {
+                return leaf
+                    .cells
+                    .first()
+                    .map(|cell| cell.key().to_vec())
+                    .ok_or_else(|| corruption("non-root B+Tree leaf is empty"));
+            }
+            Node::Internal(internal) => reference = internal.leftmost,
+        }
+    }
+}
+
+fn propagate_minimum(
+    batch: &mut WriteBatch<'_>,
+    kind: super::TreeKind,
+    mut child_ref: PageRef,
+    minimum: Vec<u8>,
+    mut path: SearchPath,
+) -> Result<()> {
+    while let Some((parent_ref, child_index)) = path.pop() {
+        let mut parent = match load_node(batch, kind, parent_ref)? {
+            Node::Internal(parent) => parent,
+            Node::Leaf(_) => return Err(corruption("B+Tree path parent is a leaf page")),
+        };
+        if parent_child(&parent, child_index)? != child_ref {
+            return Err(corruption("B+Tree deletion path does not match its parent"));
+        }
+        if child_index == 0 {
+            child_ref = parent_ref;
+            continue;
+        }
+        parent.cells[child_index - 1] = InternalCell::new(minimum, child_ref)?;
+        rewrite_internal(batch, parent_ref, parent.leftmost, &parent.cells)?;
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn descend_with_path(
@@ -347,7 +790,8 @@ mod tests {
 
     use super::{
         super::{TreeKind, ValueStorage, search::BTree},
-        Node, PageSource, load_node, lower_bound,
+        InternalCell, LeafCell, Node, PageSource, load_node, lower_bound, rewrite_internal,
+        rewrite_leaf,
     };
     use crate::{
         ErrorCode, Result,
@@ -369,6 +813,325 @@ mod tests {
             tree.insert(&mut batch, b"k", b"v2").unwrap_err().code(),
             ErrorCode::Constraint
         );
+    }
+
+    #[test]
+    fn delete_returns_value_and_missing_key_is_noop() {
+        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let mut tree = {
+            let mut batch = pager.begin_write().unwrap();
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+            for i in 0..300u32 {
+                tree.insert(&mut batch, &i.to_be_bytes(), &[i as u8; 40])
+                    .unwrap();
+            }
+            batch.commit().unwrap();
+            tree
+        };
+        let page_count = pager.page_count();
+        let mut batch = pager.begin_write().unwrap();
+        assert_eq!(tree.delete(&mut batch, b"missing").unwrap(), None);
+        assert_eq!(batch.page_count().unwrap(), page_count);
+        assert_eq!(
+            tree.delete(&mut batch, &150u32.to_be_bytes()).unwrap(),
+            Some(vec![150u32 as u8; 40])
+        );
+        batch.commit().unwrap();
+        assert_eq!(tree.get(&mut pager, &150u32.to_be_bytes()).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_returns_overflow_value_and_releases_the_whole_chain() {
+        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let value = vec![0x5a; 9000];
+        let (mut tree, overflow_pages) = {
+            let mut batch = pager.begin_write().unwrap();
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+            tree.insert(&mut batch, b"large", &value).unwrap();
+            let Node::Leaf(leaf) = load_node(&mut batch, TreeKind::Table, tree.root()).unwrap()
+            else {
+                panic!("single large value must remain in a leaf root");
+            };
+            let ValueStorage::Overflow(first) = leaf.cells[0].storage() else {
+                panic!("large value must use overflow pages");
+            };
+            let pages =
+                overflow::collect_chain(&mut batch, *first, leaf.cells[0].total_value_len())
+                    .unwrap();
+            batch.commit().unwrap();
+            (tree, pages)
+        };
+
+        {
+            let mut batch = pager.begin_write().unwrap();
+            assert_eq!(tree.delete(&mut batch, b"large").unwrap(), Some(value));
+            batch.commit().unwrap();
+        }
+        let replacements = {
+            let mut batch = pager.begin_write().unwrap();
+            let pages = (0..overflow_pages.len())
+                .map(|_| batch.allocate(TreeKind::Table.leaf_page_type()).unwrap())
+                .collect::<Vec<_>>();
+            for page in &pages {
+                SlottedPage::open(
+                    batch.modify(*page).unwrap(),
+                    super::super::LEAF_METADATA_END,
+                )
+                .unwrap();
+            }
+            batch.commit().unwrap();
+            pages
+        };
+        assert_eq!(
+            replacements
+                .iter()
+                .map(|page| page.page_id())
+                .collect::<HashSet<_>>(),
+            overflow_pages
+                .iter()
+                .map(|page| page.page_id())
+                .collect::<HashSet<_>>()
+        );
+        for stale in overflow_pages {
+            assert_eq!(pager.read(stale).unwrap_err().code(), ErrorCode::Corruption);
+        }
+    }
+
+    #[test]
+    fn deleting_to_empty_shrinks_to_one_leaf_root() {
+        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+        for i in 0..600u32 {
+            tree.insert(&mut batch, &i.to_be_bytes(), &[i as u8; 40])
+                .unwrap();
+        }
+        for i in 0..600u32 {
+            tree.delete(&mut batch, &i.to_be_bytes()).unwrap();
+        }
+        let Node::Leaf(root) = load_node(&mut batch, TreeKind::Table, tree.root()).unwrap() else {
+            panic!("empty tree root must be a leaf");
+        };
+        assert!(root.cells.is_empty());
+        assert_eq!(root.right_sibling, None);
+    }
+
+    #[test]
+    fn leaf_borrows_from_left_then_right_at_every_page_size() {
+        for page_size in [4096, 8192, 16384] {
+            let (_temp, mut pager, mut tree, left_ref, right_ref) =
+                committed_two_leaf_tree(page_size, 5, 3).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            assert_eq!(
+                tree.delete(&mut batch, &small_key(5)).unwrap(),
+                Some(sized_value(5, leaf_test_value_len(page_size)))
+            );
+            assert_eq!(leaf_keys(&mut batch, left_ref), vec![0, 1, 2, 3]);
+            assert_eq!(leaf_keys(&mut batch, right_ref), vec![4, 6, 7]);
+            assert_eq!(
+                scan_small_keys(&mut batch, &tree).unwrap(),
+                vec![0, 1, 2, 3, 4, 6, 7]
+            );
+            assert_exact_separators(&mut batch, &tree).unwrap();
+            assert_eq!(leaf_right_sibling(&mut batch, left_ref), Some(right_ref));
+
+            let (_temp, mut pager, mut tree, left_ref, right_ref) =
+                committed_two_leaf_tree(page_size, 3, 5).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            assert_eq!(
+                tree.delete(&mut batch, &small_key(2)).unwrap(),
+                Some(sized_value(2, leaf_test_value_len(page_size)))
+            );
+            assert_eq!(leaf_keys(&mut batch, left_ref), vec![0, 1, 3]);
+            assert_eq!(leaf_keys(&mut batch, right_ref), vec![4, 5, 6, 7]);
+            assert_eq!(
+                scan_small_keys(&mut batch, &tree).unwrap(),
+                vec![0, 1, 3, 4, 5, 6, 7]
+            );
+            assert_exact_separators(&mut batch, &tree).unwrap();
+            assert_eq!(leaf_right_sibling(&mut batch, left_ref), Some(right_ref));
+        }
+    }
+
+    #[test]
+    fn equal_cost_borrow_and_merge_prefer_the_left_sibling() {
+        for page_size in [4096, 8192, 16384] {
+            let (_temp, mut pager, mut tree, left, middle, right) =
+                committed_three_leaf_tree(page_size, 5, 3, 5).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            tree.delete(&mut batch, &small_key(5)).unwrap();
+            assert_eq!(leaf_keys(&mut batch, left), vec![0, 1, 2, 3]);
+            assert_eq!(leaf_keys(&mut batch, middle), vec![4, 6, 7]);
+            assert_eq!(leaf_keys(&mut batch, right), vec![8, 9, 10, 11, 12]);
+            assert_exact_separators(&mut batch, &tree).unwrap();
+
+            let (_temp, mut pager, mut tree, left, _middle, right) =
+                committed_three_leaf_tree(page_size, 3, 3, 3).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            tree.delete(&mut batch, &small_key(3)).unwrap();
+            assert_eq!(leaf_keys(&mut batch, left), vec![0, 1, 2, 4, 5]);
+            assert_eq!(leaf_keys(&mut batch, right), vec![6, 7, 8]);
+            assert_eq!(leaf_right_sibling(&mut batch, left), Some(right));
+            assert_exact_separators(&mut batch, &tree).unwrap();
+        }
+    }
+
+    #[test]
+    fn leaf_merge_shrinks_root_and_delays_reuse_at_every_page_size() {
+        for page_size in [4096, 8192, 16384] {
+            let (_temp, mut pager, mut tree, left_ref, right_ref) =
+                committed_two_leaf_tree(page_size, 3, 3).unwrap();
+            let old_root = tree.root();
+            let appended = {
+                let mut batch = pager.begin_write().unwrap();
+                assert_eq!(
+                    tree.delete(&mut batch, &small_key(2)).unwrap(),
+                    Some(sized_value(2, leaf_test_value_len(page_size)))
+                );
+                assert_eq!(tree.root(), left_ref);
+                assert_eq!(leaf_right_sibling(&mut batch, left_ref), None);
+                assert_eq!(
+                    scan_small_keys(&mut batch, &tree).unwrap(),
+                    vec![0, 1, 3, 4, 5]
+                );
+                let appended = batch.allocate(TreeKind::Table.leaf_page_type()).unwrap();
+                assert_ne!(appended.page_id(), right_ref.page_id());
+                assert_ne!(appended.page_id(), old_root.page_id());
+                SlottedPage::open(
+                    batch.modify(appended).unwrap(),
+                    super::super::LEAF_METADATA_END,
+                )
+                .unwrap();
+                batch.commit().unwrap();
+                appended
+            };
+
+            let replacements = {
+                let mut batch = pager.begin_write().unwrap();
+                let replacements = (0..2)
+                    .map(|_| batch.allocate(TreeKind::Table.leaf_page_type()).unwrap())
+                    .collect::<Vec<_>>();
+                for replacement in &replacements {
+                    SlottedPage::open(
+                        batch.modify(*replacement).unwrap(),
+                        super::super::LEAF_METADATA_END,
+                    )
+                    .unwrap();
+                }
+                batch.commit().unwrap();
+                replacements
+            };
+            let replacement_ids = replacements
+                .iter()
+                .map(|page| page.page_id())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                replacement_ids,
+                HashSet::from([right_ref.page_id(), old_root.page_id()])
+            );
+            assert!(replacements.iter().all(|page| page.generation() == 2));
+            assert_eq!(
+                pager.read(right_ref).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+            assert_eq!(
+                pager.read(old_root).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+            pager.read(appended).unwrap();
+        }
+    }
+
+    #[test]
+    fn internal_nodes_borrow_from_both_sides_at_every_page_size() {
+        for page_size in [4096, 8192, 16384] {
+            let minimum_cells = minimum_large_internal_cells(page_size);
+            let (_temp, mut pager, mut tree, left_internal, right_internal, delete_key) =
+                committed_three_level_tree(page_size, minimum_cells + 2, minimum_cells).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            assert!(tree.delete(&mut batch, &delete_key).unwrap().is_some());
+            assert_eq!(
+                internal_cell_count(&mut batch, left_internal),
+                minimum_cells + 1
+            );
+            assert_eq!(
+                internal_cell_count(&mut batch, right_internal),
+                minimum_cells
+            );
+            assert_exact_separators(&mut batch, &tree).unwrap();
+
+            let (_temp, mut pager, mut tree, left_internal, right_internal, _) =
+                committed_three_level_tree(page_size, minimum_cells, minimum_cells + 2).unwrap();
+            let delete_key =
+                last_key_in_internal(&mut pager, TreeKind::Table, left_internal).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            assert!(tree.delete(&mut batch, &delete_key).unwrap().is_some());
+            assert_eq!(
+                internal_cell_count(&mut batch, left_internal),
+                minimum_cells
+            );
+            assert_eq!(
+                internal_cell_count(&mut batch, right_internal),
+                minimum_cells + 1
+            );
+            assert_exact_separators(&mut batch, &tree).unwrap();
+        }
+    }
+
+    #[test]
+    fn internal_merge_cascades_and_shrinks_root_at_every_page_size() {
+        for page_size in [4096, 8192, 16384] {
+            let minimum_cells = minimum_large_internal_cells(page_size);
+            let (_temp, mut pager, mut tree, left_internal, right_internal, delete_key) =
+                committed_three_level_tree(page_size, minimum_cells, minimum_cells).unwrap();
+            let old_root = tree.root();
+            let expected_key_count = 2 * (minimum_cells + 1) - 1;
+            {
+                let mut batch = pager.begin_write().unwrap();
+                assert!(tree.delete(&mut batch, &delete_key).unwrap().is_some());
+                assert_eq!(tree.root(), left_internal);
+                assert_eq!(
+                    internal_cell_count(&mut batch, left_internal),
+                    2 * minimum_cells
+                );
+                assert_eq!(
+                    scan_keys(&mut batch, &tree).unwrap().len(),
+                    expected_key_count
+                );
+                assert_exact_separators(&mut batch, &tree).unwrap();
+                batch.commit().unwrap();
+            }
+            assert_eq!(tree.get(&mut pager, &delete_key).unwrap(), None);
+            let replacements = {
+                let mut batch = pager.begin_write().unwrap();
+                let pages = (0..2)
+                    .map(|_| batch.allocate(TreeKind::Table.leaf_page_type()).unwrap())
+                    .collect::<Vec<_>>();
+                for page in &pages {
+                    SlottedPage::open(
+                        batch.modify(*page).unwrap(),
+                        super::super::LEAF_METADATA_END,
+                    )
+                    .unwrap();
+                }
+                batch.commit().unwrap();
+                pages
+            };
+            let ids = replacements
+                .iter()
+                .map(|page| page.page_id())
+                .collect::<HashSet<_>>();
+            assert!(ids.contains(&right_internal.page_id()));
+            assert!(ids.contains(&old_root.page_id()));
+            assert_eq!(
+                pager.read(right_internal).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+            assert_eq!(
+                pager.read(old_root).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+        }
     }
 
     #[test]
@@ -608,6 +1371,244 @@ mod tests {
                 Ok(minimum)
             }
         }
+    }
+
+    fn committed_two_leaf_tree(
+        page_size: u32,
+        left_count: u32,
+        right_count: u32,
+    ) -> Result<(TempDatabase, Pager, BTree, PageRef, PageRef)> {
+        let (temp, mut pager) = test_pager(page_size)?;
+        let mut batch = pager.begin_write()?;
+        let left_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
+        let right_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
+        let root = batch.allocate(TreeKind::Table.internal_page_type())?;
+        let value_len = leaf_test_value_len(page_size);
+        let left = (0..left_count)
+            .map(|index| LeafCell::inline(small_key(index), sized_value(index, value_len)))
+            .collect::<Result<Vec<_>>>()?;
+        let right = (left_count..left_count + right_count)
+            .map(|index| LeafCell::inline(small_key(index), sized_value(index, value_len)))
+            .collect::<Result<Vec<_>>>()?;
+        rewrite_leaf(&mut batch, left_ref, Some(right_ref), &left)?;
+        rewrite_leaf(&mut batch, right_ref, None, &right)?;
+        rewrite_internal(
+            &mut batch,
+            root,
+            left_ref,
+            &[InternalCell::new(right[0].key().to_vec(), right_ref)?],
+        )?;
+        batch.commit()?;
+        Ok((
+            temp,
+            pager,
+            BTree {
+                kind: TreeKind::Table,
+                root,
+            },
+            left_ref,
+            right_ref,
+        ))
+    }
+
+    fn committed_three_leaf_tree(
+        page_size: u32,
+        left_count: u32,
+        middle_count: u32,
+        right_count: u32,
+    ) -> Result<(TempDatabase, Pager, BTree, PageRef, PageRef, PageRef)> {
+        let (temp, mut pager) = test_pager(page_size)?;
+        let mut batch = pager.begin_write()?;
+        let left_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
+        let middle_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
+        let right_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
+        let root = batch.allocate(TreeKind::Table.internal_page_type())?;
+        let value_len = leaf_test_value_len(page_size);
+        let counts = [left_count, middle_count, right_count];
+        let references = [left_ref, middle_ref, right_ref];
+        let mut start = 0u32;
+        let mut first_keys = Vec::new();
+        for (index, count) in counts.into_iter().enumerate() {
+            let cells = (start..start + count)
+                .map(|value| LeafCell::inline(small_key(value), sized_value(value, value_len)))
+                .collect::<Result<Vec<_>>>()?;
+            first_keys.push(cells[0].key().to_vec());
+            rewrite_leaf(
+                &mut batch,
+                references[index],
+                references.get(index + 1).copied(),
+                &cells,
+            )?;
+            start += count;
+        }
+        rewrite_internal(
+            &mut batch,
+            root,
+            left_ref,
+            &[
+                InternalCell::new(first_keys[1].clone(), middle_ref)?,
+                InternalCell::new(first_keys[2].clone(), right_ref)?,
+            ],
+        )?;
+        batch.commit()?;
+        Ok((
+            temp,
+            pager,
+            BTree {
+                kind: TreeKind::Table,
+                root,
+            },
+            left_ref,
+            middle_ref,
+            right_ref,
+        ))
+    }
+
+    fn committed_three_level_tree(
+        page_size: u32,
+        left_cells: usize,
+        right_cells: usize,
+    ) -> Result<(TempDatabase, Pager, BTree, PageRef, PageRef, Vec<u8>)> {
+        let (temp, mut pager) = test_pager(page_size)?;
+        let mut batch = pager.begin_write()?;
+        let leaf_count = left_cells + right_cells + 2;
+        let leaf_refs = (0..leaf_count)
+            .map(|_| batch.allocate(TreeKind::Table.leaf_page_type()))
+            .collect::<Result<Vec<_>>>()?;
+        let value_len = usize::try_from(page_size)
+            .expect("supported page size fits usize")
+            .checked_sub(super::super::LEAF_METADATA_END)
+            .ok_or_else(|| super::corruption("test page is shorter than leaf metadata"))?
+            / 4;
+        for (index, reference) in leaf_refs.iter().copied().enumerate() {
+            let key = test_key(u32::try_from(index).unwrap());
+            let value = sized_value(u32::try_from(index).unwrap(), value_len);
+            let cell = LeafCell::inline(key, value)?;
+            rewrite_leaf(
+                &mut batch,
+                reference,
+                leaf_refs.get(index + 1).copied(),
+                &[cell],
+            )?;
+        }
+
+        let left_internal = batch.allocate(TreeKind::Table.internal_page_type())?;
+        let right_internal = batch.allocate(TreeKind::Table.internal_page_type())?;
+        let root = batch.allocate(TreeKind::Table.internal_page_type())?;
+        let left_internal_cells = (1..=left_cells)
+            .map(|index| {
+                InternalCell::new(test_key(u32::try_from(index).unwrap()), leaf_refs[index])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let right_start = left_cells + 1;
+        let right_internal_cells = (1..=right_cells)
+            .map(|offset| {
+                let index = right_start + offset;
+                InternalCell::new(test_key(u32::try_from(index).unwrap()), leaf_refs[index])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rewrite_internal(
+            &mut batch,
+            left_internal,
+            leaf_refs[0],
+            &left_internal_cells,
+        )?;
+        rewrite_internal(
+            &mut batch,
+            right_internal,
+            leaf_refs[right_start],
+            &right_internal_cells,
+        )?;
+        let delete_key = test_key(u32::try_from(right_start).unwrap());
+        rewrite_internal(
+            &mut batch,
+            root,
+            left_internal,
+            &[InternalCell::new(delete_key.clone(), right_internal)?],
+        )?;
+        batch.commit()?;
+        Ok((
+            temp,
+            pager,
+            BTree {
+                kind: TreeKind::Table,
+                root,
+            },
+            left_internal,
+            right_internal,
+            delete_key,
+        ))
+    }
+
+    fn leaf_test_value_len(page_size: u32) -> usize {
+        (usize::try_from(page_size).unwrap() - super::super::LEAF_METADATA_END) / 10 - 20
+    }
+
+    fn minimum_large_internal_cells(page_size: u32) -> usize {
+        let usable = usize::try_from(page_size).unwrap() - super::super::INTERNAL_METADATA_END;
+        let encoded_large_cell = 20 + 1024 + 4;
+        usable.div_ceil(4).div_ceil(encoded_large_cell)
+    }
+
+    fn small_key(value: u32) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    fn sized_value(value: u32, len: usize) -> Vec<u8> {
+        vec![value as u8; len]
+    }
+
+    fn leaf_keys(source: &mut impl PageSource, reference: PageRef) -> Vec<u32> {
+        let Node::Leaf(leaf) = load_node(source, TreeKind::Table, reference).unwrap() else {
+            panic!("expected leaf");
+        };
+        leaf.cells
+            .iter()
+            .map(|cell| u32::from_be_bytes(cell.key().try_into().unwrap()))
+            .collect()
+    }
+
+    fn leaf_right_sibling(source: &mut impl PageSource, reference: PageRef) -> Option<PageRef> {
+        let Node::Leaf(leaf) = load_node(source, TreeKind::Table, reference).unwrap() else {
+            panic!("expected leaf");
+        };
+        leaf.right_sibling
+    }
+
+    fn scan_small_keys(source: &mut impl PageSource, tree: &BTree) -> Result<Vec<u32>> {
+        scan_keys(source, tree)?
+            .into_iter()
+            .map(|key| {
+                key.as_slice()
+                    .try_into()
+                    .map(u32::from_be_bytes)
+                    .map_err(|_| super::corruption("small test key is not four bytes"))
+            })
+            .collect()
+    }
+
+    fn internal_cell_count(source: &mut impl PageSource, reference: PageRef) -> usize {
+        let Node::Internal(internal) = load_node(source, TreeKind::Table, reference).unwrap()
+        else {
+            panic!("expected internal node");
+        };
+        internal.cells.len()
+    }
+
+    fn last_key_in_internal(
+        source: &mut impl PageSource,
+        kind: TreeKind,
+        reference: PageRef,
+    ) -> Result<Vec<u8>> {
+        let Node::Internal(internal) = load_node(source, kind, reference)? else {
+            return Err(super::corruption("test expected internal node"));
+        };
+        let last_child = internal
+            .cells
+            .last()
+            .map(InternalCell::right)
+            .unwrap_or(internal.leftmost);
+        subtree_minimum(source, kind, last_child, &mut HashSet::new())
     }
 
     fn test_key(value: u32) -> Vec<u8> {

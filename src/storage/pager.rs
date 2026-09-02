@@ -391,6 +391,63 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
+    pub(super) fn release_btree_later(&mut self, reference: PageRef) -> Result<()> {
+        self.require_active()?;
+        let batch_allocation = self
+            .pending_generations
+            .get(&reference.page_id())
+            .is_some_and(|generation| *generation == reference.generation());
+        if self.pending_releases.contains_key(&reference.page_id()) {
+            return Err(corruption("page is already pending release in this batch"));
+        }
+        if reference.page_id().0 == 0 {
+            return Err(corruption("database header cannot enter the freelist"));
+        }
+        if reference.page_id() == self.current_header().catalog_root() {
+            return Err(corruption("active catalog root cannot enter the freelist"));
+        }
+        if self.committed_freelist.contains_trunk(reference.page_id()) && !batch_allocation {
+            return Err(corruption(
+                "freelist trunk cannot enter the freelist as a leaf",
+            ));
+        }
+        if self.committed_freelist.contains_leaf(reference.page_id()) && !batch_allocation {
+            return Err(corruption(
+                "page is already recorded in the committed freelist",
+            ));
+        }
+
+        if let Some(frame) = self.dirty.get(&reference.page_id()) {
+            if frame.header().generation() != reference.generation() {
+                return Err(corruption(
+                    "page frame generation does not match the requested page",
+                ));
+            }
+        } else {
+            self.read(reference)?;
+        }
+        if self.pending_generations.contains_key(&reference.page_id()) && !batch_allocation {
+            return Err(corruption(
+                "new page generation does not match the requested B+Tree page",
+            ));
+        }
+
+        if batch_allocation {
+            let mut tombstone = PageFrame::new_zeroed(
+                PageType::TableLeaf,
+                reference,
+                self.pager.header.page_size(),
+            )?;
+            SlottedPage::open(&mut tombstone, LEAF_METADATA_END)?;
+            self.dirty.insert(reference.page_id(), tombstone);
+        } else {
+            self.pager.read(reference)?;
+            self.dirty.remove(&reference.page_id());
+        }
+        self.pending_releases.insert(reference.page_id(), reference);
+        Ok(())
+    }
+
     fn validate_releasable(&mut self, reference: PageRef) -> Result<()> {
         if reference.page_id().0 == 0 {
             return Err(corruption("database header cannot enter the freelist"));
@@ -398,17 +455,30 @@ impl WriteBatch<'_> {
         if reference.page_id() == self.current_header().catalog_root() {
             return Err(corruption("active catalog root cannot enter the freelist"));
         }
-        if self.dirty.contains_key(&reference.page_id())
-            || self.new_pages.contains(&reference.page_id())
+        let staged_batch_allocation = self
+            .pending_releases
+            .get(&reference.page_id())
+            .is_some_and(|pending| *pending == reference)
+            && self
+                .pending_generations
+                .get(&reference.page_id())
+                .is_some_and(|generation| *generation == reference.generation())
+            && self
+                .dirty
+                .get(&reference.page_id())
+                .is_some_and(|frame| frame.header().generation() == reference.generation());
+        if (self.dirty.contains_key(&reference.page_id())
+            || self.new_pages.contains(&reference.page_id()))
+            && !staged_batch_allocation
         {
             return Err(corruption("dirty live page cannot enter the freelist"));
         }
-        if self.committed_freelist.contains_trunk(reference.page_id()) {
+        if self.committed_freelist.contains_trunk(reference.page_id()) && !staged_batch_allocation {
             return Err(corruption(
                 "freelist trunk cannot enter the freelist as a leaf",
             ));
         }
-        if self.committed_freelist.contains_leaf(reference.page_id()) {
+        if self.committed_freelist.contains_leaf(reference.page_id()) && !staged_batch_allocation {
             return Err(corruption(
                 "page is already recorded in the committed freelist",
             ));
@@ -557,7 +627,7 @@ impl WriteBatch<'_> {
 
     fn validate_freelist(&mut self) -> Result<()> {
         let root = self.current_header().freelist_root();
-        let page_count = self.pager.file.page_count();
+        let page_count = self.target_page_count()?;
         Freelist::walk(root, page_count, |page_id| self.read_frame_by_id(page_id)).map(|_| ())
     }
 
@@ -1278,6 +1348,112 @@ mod tests {
             .expect("append allocation");
 
         assert_ne!(allocated.page_id(), page.page_id());
+    }
+
+    #[test]
+    fn btree_release_discards_a_dirty_committed_image_until_later_reuse() {
+        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let page = {
+            let mut batch = pager.begin_write().expect("begin allocation batch");
+            let page = batch.allocate(PageType::TableLeaf).expect("allocate leaf");
+            SlottedPage::open(batch.modify(page).expect("initialize leaf"), 56).expect("open leaf");
+            batch.commit().expect("commit leaf");
+            page
+        };
+
+        {
+            let mut batch = pager.begin_write().expect("begin release batch");
+            batch.modify(page).expect("dirty committed leaf");
+            batch
+                .release_btree_later(page)
+                .expect("release dirty B+Tree page");
+            let appended = batch
+                .allocate(PageType::TableLeaf)
+                .expect("same batch must append");
+            assert_ne!(appended.page_id(), page.page_id());
+            SlottedPage::open(
+                batch.modify(appended).expect("initialize appended leaf"),
+                56,
+            )
+            .expect("open appended leaf");
+            batch.commit().expect("commit release");
+        }
+
+        let replacement = {
+            let mut batch = pager.begin_write().expect("begin reuse batch");
+            let replacement = batch
+                .allocate(PageType::TableLeaf)
+                .expect("reuse released page");
+            SlottedPage::open(
+                batch.modify(replacement).expect("initialize replacement"),
+                56,
+            )
+            .expect("open replacement leaf");
+            batch.commit().expect("commit replacement");
+            replacement
+        };
+        assert_eq!(replacement.page_id(), page.page_id());
+        assert_eq!(replacement.generation(), page.generation() + 1);
+        assert_eq!(
+            pager
+                .read(page)
+                .expect_err("old generation is stale")
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn btree_release_of_same_batch_page_is_checkpointed_and_reused_later() {
+        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let released = {
+            let mut batch = pager.begin_write().expect("begin allocation batch");
+            let page = batch.allocate(PageType::TableLeaf).expect("allocate leaf");
+            SlottedPage::open(batch.modify(page).expect("initialize leaf"), 56).expect("open leaf");
+            let checkpoint = batch.checkpoint_mutation().expect("checkpoint");
+            batch
+                .release_btree_later(page)
+                .expect("release new B+Tree page");
+            batch.restore_mutation(checkpoint);
+            batch.read(page).expect("checkpoint restored live page");
+            batch
+                .release_btree_later(page)
+                .expect("release restored new B+Tree page");
+            let appended = batch
+                .allocate(PageType::TableLeaf)
+                .expect("same batch must append");
+            assert_ne!(appended.page_id(), page.page_id());
+            SlottedPage::open(
+                batch.modify(appended).expect("initialize appended leaf"),
+                56,
+            )
+            .expect("open appended leaf");
+            batch.commit().expect("commit new-page release");
+            page
+        };
+
+        let replacement = {
+            let mut batch = pager.begin_write().expect("begin reuse batch");
+            let replacement = batch
+                .allocate(PageType::TableLeaf)
+                .expect("reuse released page");
+            SlottedPage::open(
+                batch.modify(replacement).expect("initialize replacement"),
+                56,
+            )
+            .expect("open replacement leaf");
+            batch.commit().expect("commit replacement");
+            replacement
+        };
+        assert_eq!(replacement.page_id(), released.page_id());
+        assert_eq!(replacement.generation(), released.generation() + 1);
+        assert_eq!(
+            pager
+                .read(released)
+                .expect_err("old generation is stale")
+                .code(),
+            ErrorCode::Corruption
+        );
     }
 
     #[test]
