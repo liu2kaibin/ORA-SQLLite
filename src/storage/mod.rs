@@ -1,7 +1,13 @@
 mod checksum;
 mod codec;
+mod file;
 mod header;
 mod page;
+
+#[cfg(test)]
+mod test_support;
+
+use file::OpenMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct PageId(pub(super) u64);
@@ -44,12 +50,6 @@ impl PageRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Lsn(pub(super) u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OpenMode {
-    ReadOnly,
-    ReadWrite,
-}
 
 #[test]
 fn page_ref_rejects_header_page_and_zero_generation() {
