@@ -5,6 +5,14 @@ use super::{
 };
 use crate::{DbError, ErrorCode, Result};
 
+mod search;
+
+#[allow(
+    unused_imports,
+    reason = "the B+Tree search facade is consumed by subsequent storage tasks"
+)]
+pub(super) use search::{BTree, BTreeCursor};
+
 pub(super) const LEAF_METADATA_END: usize = 56;
 pub(super) const INTERNAL_METADATA_END: usize = 64;
 const MAX_KEY_LEN: usize = 1024;
@@ -284,13 +292,40 @@ fn corruption(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use super::{
         InternalCell, LeafCell, TreeKind, decode_internal_leftmost, decode_leaf_right_sibling,
         encode_internal_leftmost, encode_leaf_right_sibling,
     };
     use crate::ErrorCode;
 
-    use super::super::{PageId, PageRef};
+    use super::{
+        super::{PageId, PageRef, page::PageType, test_support::test_pager},
+        search::BTree,
+    };
+
+    #[test]
+    fn empty_tree_is_one_leaf_and_scans_empty() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let tree = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let tree = BTree::create(&mut batch, TreeKind::Table).expect("create empty tree");
+            batch.commit().expect("commit empty tree");
+            tree
+        };
+
+        let root = pager.read(tree.root()).expect("read root page");
+        assert_eq!(root.borrow().header().page_type(), PageType::TableLeaf);
+
+        assert_eq!(
+            tree.scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+                .expect("scan empty tree")
+                .next()
+                .expect("read empty cursor"),
+            None
+        );
+    }
 
     #[test]
     fn cell_codecs_round_trip_and_enforce_key_limit() {

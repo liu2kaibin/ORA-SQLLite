@@ -1,4 +1,4 @@
-mod btree;
+pub(super) mod btree;
 mod cache;
 mod checksum;
 mod codec;
