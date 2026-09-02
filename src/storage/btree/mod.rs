@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{DbError, ErrorCode, Result};
 
+mod mutate;
 mod search;
 
 #[allow(

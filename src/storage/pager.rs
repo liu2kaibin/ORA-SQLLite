@@ -8,8 +8,8 @@ use std::{
 use super::{
     PageId, PageRef,
     btree::{
-        INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, LeafCell, decode_internal_leftmost,
-        decode_leaf_right_sibling,
+        INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, LeafCell, TreeKind,
+        decode_internal_leftmost, decode_leaf_right_sibling,
     },
     cache::{PageCache, PageHandle},
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
@@ -130,6 +130,7 @@ impl Pager {
             pending_releases: BTreeMap::new(),
             committed_freelist,
             candidate_header: None,
+            tracked_trees: Vec::new(),
             finished: false,
         })
     }
@@ -192,10 +193,73 @@ pub(super) struct WriteBatch<'a> {
     pending_releases: BTreeMap<PageId, PageRef>,
     committed_freelist: FreelistWalk,
     candidate_header: Option<DatabaseHeader>,
+    tracked_trees: Vec<(TreeKind, PageRef)>,
     finished: bool,
 }
 
+pub(super) struct WriteBatchCheckpoint {
+    dirty: BTreeMap<PageId, PageFrame>,
+    new_pages: BTreeSet<PageId>,
+    pending_generations: BTreeMap<PageId, u64>,
+    pending_releases: BTreeMap<PageId, PageRef>,
+    candidate_header: Option<DatabaseHeader>,
+    tracked_trees: Vec<(TreeKind, PageRef)>,
+}
+
 impl WriteBatch<'_> {
+    pub(super) fn checkpoint_mutation(&mut self) -> Result<WriteBatchCheckpoint> {
+        self.require_active()?;
+        let dirty = self
+            .dirty
+            .iter_mut()
+            .map(|(page_id, frame)| Ok((*page_id, private_frame(frame)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(WriteBatchCheckpoint {
+            dirty,
+            new_pages: self.new_pages.clone(),
+            pending_generations: self.pending_generations.clone(),
+            pending_releases: self.pending_releases.clone(),
+            candidate_header: self.candidate_header,
+            tracked_trees: self.tracked_trees.clone(),
+        })
+    }
+
+    pub(super) fn restore_mutation(&mut self, checkpoint: WriteBatchCheckpoint) {
+        self.dirty = checkpoint.dirty;
+        self.new_pages = checkpoint.new_pages;
+        self.pending_generations = checkpoint.pending_generations;
+        self.pending_releases = checkpoint.pending_releases;
+        self.candidate_header = checkpoint.candidate_header;
+        self.tracked_trees = checkpoint.tracked_trees;
+    }
+
+    pub(super) fn track_tree(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
+        self.require_active()?;
+        if self.pending_releases.contains_key(&root.page_id()) {
+            return Err(corruption(
+                "released page cannot remain a tracked tree root in the same batch",
+            ));
+        }
+        self.read(root)?;
+        if !self.tracked_trees.contains(&(kind, root)) {
+            self.tracked_trees.push((kind, root));
+        }
+        Ok(())
+    }
+
+    pub(super) fn refresh_tree(
+        &mut self,
+        kind: TreeKind,
+        previous_root: PageRef,
+        root: PageRef,
+    ) -> Result<()> {
+        if previous_root != root {
+            self.tracked_trees
+                .retain(|tracked| *tracked != (kind, previous_root));
+        }
+        self.track_tree(kind, root)
+    }
+
     pub(super) fn read(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.require_active()?;
 
@@ -566,6 +630,7 @@ impl WriteBatch<'_> {
         self.pending_releases.clear();
         self.committed_freelist = FreelistWalk::default();
         self.candidate_header = None;
+        self.tracked_trees.clear();
         self.finished = true;
     }
 }

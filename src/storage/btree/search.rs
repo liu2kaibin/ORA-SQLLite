@@ -12,21 +12,21 @@ use crate::storage::{
 use crate::{DbError, ErrorCode, Result};
 
 pub(in crate::storage) struct BTree {
-    kind: TreeKind,
-    root: PageRef,
+    pub(super) kind: TreeKind,
+    pub(super) root: PageRef,
 }
 
-struct InternalNode {
-    leftmost: PageRef,
-    cells: Vec<InternalCell>,
+pub(super) struct InternalNode {
+    pub(super) leftmost: PageRef,
+    pub(super) cells: Vec<InternalCell>,
 }
 
-struct LeafNode {
-    cells: Vec<LeafCell>,
-    right_sibling: Option<PageRef>,
+pub(super) struct LeafNode {
+    pub(super) cells: Vec<LeafCell>,
+    pub(super) right_sibling: Option<PageRef>,
 }
 
-enum Node {
+pub(super) enum Node {
     Leaf(LeafNode),
     Internal(InternalNode),
 }
@@ -149,7 +149,11 @@ fn descend_to_leaf_by(
     }
 }
 
-fn load_node(source: &mut impl PageSource, kind: TreeKind, reference: PageRef) -> Result<Node> {
+pub(super) fn load_node(
+    source: &mut impl PageSource,
+    kind: TreeKind,
+    reference: PageRef,
+) -> Result<Node> {
     let handle = source.read_page(reference)?;
     let mut frame = handle.borrow_mut();
     if frame.header().page_id() != reference.page_id()
@@ -235,7 +239,7 @@ fn reject_uninitialized_btree_layout(frame: &crate::storage::page::PageFrame) ->
     Ok(())
 }
 
-fn lower_bound(cells: &[LeafCell], key: &[u8]) -> usize {
+pub(super) fn lower_bound(cells: &[LeafCell], key: &[u8]) -> usize {
     let mut lower = 0usize;
     let mut upper = cells.len();
     while lower < upper {
