@@ -6,6 +6,11 @@ mod decimal;
 pub mod error;
 #[allow(
     dead_code,
+    reason = "fault boundaries are consumed by later storage tasks"
+)]
+mod fault;
+#[allow(
+    dead_code,
     reason = "phase 1 primitives are consumed by later storage tasks"
 )]
 mod storage;

@@ -15,7 +15,10 @@ The first release will not implement PL/SQL, packages, a network server, Oracle 
 
 ## Status
 
-Architecture and bootstrap planning are complete. Database implementation has not started.
+Phase 1 foundations are complete: validated Oracle-compatible values, stable errors,
+disk codecs, versioned disk headers, checksums, and internal fault-injection
+boundaries. The Pager, B+Tree, WAL, SQL, and public database API remain
+unimplemented.
 
 See:
 
