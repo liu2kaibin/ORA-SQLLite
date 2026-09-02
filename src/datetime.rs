@@ -134,13 +134,23 @@ mod tests {
     #[test]
     fn stores_all_date_and_timestamp_fields() {
         let date = OracleDate::new(2026, 9, 1, 12, 34, 56).expect("valid date");
-        let other_date = OracleDate::new(2026, 9, 2, 12, 34, 56).expect("valid date");
+        let other_year = OracleDate::new(2027, 9, 1, 12, 34, 56).expect("valid date");
+        let other_month = OracleDate::new(2026, 10, 1, 12, 34, 56).expect("valid date");
+        let other_day = OracleDate::new(2026, 9, 2, 12, 34, 56).expect("valid date");
+        let other_hour = OracleDate::new(2026, 9, 1, 13, 34, 56).expect("valid date");
+        let other_minute = OracleDate::new(2026, 9, 1, 12, 35, 56).expect("valid date");
+        let other_second = OracleDate::new(2026, 9, 1, 12, 34, 57).expect("valid date");
         let timestamp = OracleTimestamp::new(date, 123_456, Some(480)).expect("valid timestamp");
 
-        assert_ne!(date, other_date);
+        assert_ne!(date, other_year);
+        assert_ne!(date, other_month);
+        assert_ne!(date, other_day);
+        assert_ne!(date, other_hour);
+        assert_ne!(date, other_minute);
+        assert_ne!(date, other_second);
         assert_ne!(
             timestamp,
-            OracleTimestamp::new(other_date, 123_456, Some(480)).expect("valid timestamp")
+            OracleTimestamp::new(other_day, 123_456, Some(480)).expect("valid timestamp")
         );
         assert_ne!(
             timestamp,
