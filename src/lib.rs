@@ -4,6 +4,11 @@
 mod datetime;
 mod decimal;
 pub mod error;
+#[allow(
+    dead_code,
+    reason = "phase 1 primitives are consumed by later storage tasks"
+)]
+mod storage;
 mod value;
 
 pub use datetime::{OracleDate, OracleTimestamp};
