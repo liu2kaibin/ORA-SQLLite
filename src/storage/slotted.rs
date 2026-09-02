@@ -1,4 +1,7 @@
-use super::page::PageFrame;
+use super::{
+    btree::{INTERNAL_METADATA_END, LEAF_METADATA_END},
+    page::{PageFrame, PageType},
+};
 use crate::{DbError, ErrorCode, Result};
 
 const PAGE_HEADER_LEN: usize = 48;
@@ -17,6 +20,7 @@ pub(super) struct SlottedPage<'a> {
 
 impl<'a> SlottedPage<'a> {
     pub(super) fn open(frame: &'a mut PageFrame, metadata_end: usize) -> Result<Self> {
+        validate_btree_metadata_end(frame.header().page_type(), metadata_end)?;
         validate_metadata_end(frame, metadata_end)?;
 
         let initial_slot_end = usize::from(frame.header().slot_end());
@@ -385,6 +389,20 @@ fn validate_metadata_end(frame: &PageFrame, metadata_end: usize) -> Result<()> {
     Ok(())
 }
 
+fn validate_btree_metadata_end(page_type: PageType, metadata_end: usize) -> Result<()> {
+    let expected = match page_type {
+        PageType::TableLeaf | PageType::IndexLeaf => LEAF_METADATA_END,
+        PageType::TableInternal | PageType::IndexInternal => INTERNAL_METADATA_END,
+        _ => return Err(type_error("slotted pages require a B+Tree page type")),
+    };
+    if metadata_end != expected {
+        return Err(type_error(
+            "B+Tree page type has an incompatible metadata end",
+        ));
+    }
+    Ok(())
+}
+
 fn write_slot(slot_bytes: &mut [u8], offset: usize, len: u16) -> Result<()> {
     if slot_bytes.len() != SLOT_LEN {
         return Err(corruption("slot encoding has an invalid length"));
@@ -508,13 +526,41 @@ mod tests {
         assert_eq!(open_error(&mut frame).code(), ErrorCode::Corruption);
     }
 
+    #[test]
+    fn open_rejects_wrong_leaf_and_internal_metadata_offsets_without_mutating_frames() {
+        let mut leaf = leaf_frame(4096);
+        assert_eq!(rejected_open_error(&mut leaf, 64).code(), ErrorCode::Type);
+
+        let mut internal = internal_frame(4096);
+        assert_eq!(
+            rejected_open_error(&mut internal, 56).code(),
+            ErrorCode::Type
+        );
+    }
+
+    #[test]
+    fn open_rejects_non_btree_page_types_without_mutating_frames() {
+        for page_type in [PageType::Catalog, PageType::Overflow, PageType::Freelist] {
+            let mut frame = frame(page_type, 4096);
+            assert_eq!(rejected_open_error(&mut frame, 56).code(), ErrorCode::Type);
+        }
+    }
+
     fn leaf_frame(page_size: u32) -> PageFrame {
+        frame(PageType::TableLeaf, page_size)
+    }
+
+    fn internal_frame(page_size: u32) -> PageFrame {
+        frame(PageType::TableInternal, page_size)
+    }
+
+    fn frame(page_type: PageType, page_size: u32) -> PageFrame {
         PageFrame::new_zeroed(
-            PageType::TableLeaf,
+            page_type,
             PageRef::new(PageId(1), 1).expect("page reference"),
             page_size,
         )
-        .expect("zeroed leaf frame")
+        .expect("zeroed page frame")
     }
 
     fn open_error(frame: &mut PageFrame) -> crate::DbError {
@@ -522,6 +568,18 @@ mod tests {
             Ok(_) => panic!("malformed slotted page must be rejected"),
             Err(error) => error,
         }
+    }
+
+    fn rejected_open_error(frame: &mut PageFrame, metadata_end: usize) -> crate::DbError {
+        let bytes_before = frame.bytes().to_vec();
+        let header_before = *frame.header();
+        let error = match SlottedPage::open(frame, metadata_end) {
+            Ok(_) => panic!("unsupported slotted-page format must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(frame.bytes(), bytes_before);
+        assert_eq!(frame.header(), &header_before);
+        error
     }
 
     fn encoded_frame_with_slots(slots: &[(u16, u16)]) -> PageFrame {
