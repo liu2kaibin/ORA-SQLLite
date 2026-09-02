@@ -45,6 +45,14 @@ struct TreeWalk {
     seen_overflow_pages: BTreeSet<PageId>,
 }
 
+struct PendingInternal {
+    cells: Vec<InternalCell>,
+    children: Vec<PageRef>,
+    next_child: usize,
+    result: Subtree,
+    previous_maximum: Option<Vec<u8>>,
+}
+
 enum ValidationNode {
     Leaf {
         cells: Vec<LeafCell>,
@@ -72,10 +80,13 @@ pub(super) fn validate_tree(
         .borrow()
         .header()
         .page_type();
-    let kind = TreeKind::from_root_page_type(root_page_type)
-        .ok_or_else(|| corruption("B+Tree root page has an unexpected type"))?;
+    if TreeKind::from_root_page_type(root_page_type) != Some(tree.kind()) {
+        return Err(corruption(
+            "B+Tree root page type does not match its tree kind",
+        ));
+    }
     let mut walk = TreeWalk {
-        kind,
+        kind: tree.kind(),
         page_count,
         seen_tree_pages: BTreeSet::new(),
         seen_overflow_pages: BTreeSet::new(),
@@ -99,11 +110,62 @@ impl TreeWalk {
         depth: u64,
         is_root: bool,
     ) -> Result<Subtree> {
+        let mut stack = Vec::new();
+        let mut next = Some((reference, depth, is_root));
+        let mut completed = None;
+
+        loop {
+            if let Some((reference, depth, is_root)) = next.take() {
+                match self.open_subtree(source, reference, depth, is_root)? {
+                    Ok(leaf) => completed = Some(leaf),
+                    Err(internal) => {
+                        stack
+                            .try_reserve(1)
+                            .map_err(|_| corruption("B+Tree validation stack allocation failed"))?;
+                        let child = internal.children[0];
+                        stack.push(internal);
+                        next = Some((
+                            child,
+                            depth
+                                .checked_add(1)
+                                .ok_or_else(|| corruption("B+Tree depth overflow"))?,
+                            false,
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            let child = completed
+                .take()
+                .ok_or_else(|| corruption("B+Tree validation lost a subtree result"))?;
+            let Some(parent) = stack.last_mut() else {
+                return Ok(child);
+            };
+            parent.accept_child(child)?;
+            if parent.next_child < parent.children.len() {
+                next = Some((
+                    parent.children[parent.next_child],
+                    depth_for_stack(&stack)?,
+                    false,
+                ));
+            } else {
+                completed = stack.pop().map(|parent| parent.result);
+            }
+        }
+    }
+
+    fn open_subtree(
+        &mut self,
+        source: &mut impl PageSource,
+        reference: PageRef,
+        depth: u64,
+        is_root: bool,
+    ) -> Result<std::result::Result<Subtree, PendingInternal>> {
         validate_page_id(reference.page_id(), self.page_count, "B+Tree")?;
         if !self.seen_tree_pages.insert(reference.page_id()) {
             return Err(corruption("B+Tree has duplicate reachable page references"));
         }
-
         match load_validation_node(source, self.kind, reference)? {
             ValidationNode::Leaf {
                 cells,
@@ -137,70 +199,81 @@ impl TreeWalk {
                     result.minimum = Some(first.key().to_vec());
                     result.maximum = cells.last().map(|cell| cell.key().to_vec());
                 }
-                Ok(result)
+                Ok(Ok(result))
             }
             ValidationNode::Internal { leftmost, cells } => {
                 if cells.is_empty() {
                     return Err(corruption("B+Tree internal page has no separator cells"));
                 }
-                let mut children = Vec::with_capacity(cells.len() + 1);
+                let mut children = Vec::new();
+                children
+                    .try_reserve(cells.len() + 1)
+                    .map_err(|_| corruption("B+Tree child list allocation failed"))?;
                 children.push(leftmost);
                 children.extend(cells.iter().map(|cell| cell.right()));
-
                 let mut result = Subtree::default();
                 result.tree_pages.insert(reference.page_id());
-                let mut previous_maximum: Option<Vec<u8>> = None;
-                for (index, child) in children.into_iter().enumerate() {
-                    let child = self.walk_tree(
-                        source,
-                        child,
-                        depth
-                            .checked_add(1)
-                            .ok_or_else(|| corruption("B+Tree depth overflow"))?,
-                        false,
-                    )?;
-                    let child_minimum = child
-                        .minimum
-                        .as_ref()
-                        .ok_or_else(|| corruption("non-root B+Tree subtree is empty"))?;
-                    let child_maximum = child
-                        .maximum
-                        .as_ref()
-                        .ok_or_else(|| corruption("non-root B+Tree subtree is empty"))?;
-                    if let Some(previous) = &previous_maximum
-                        && previous >= child_minimum
-                    {
-                        return Err(corruption(
-                            "B+Tree child key ranges overlap or are unsorted",
-                        ));
-                    }
-                    if index > 0 && cells[index - 1].key() != child_minimum {
-                        return Err(corruption(
-                            "B+Tree parent separator is not its right child minimum",
-                        ));
-                    }
-                    let child_depth = child
-                        .leaf_depth
-                        .ok_or_else(|| corruption("B+Tree subtree has no leaf depth"))?;
-                    if let Some(expected_depth) = result.leaf_depth
-                        && expected_depth != child_depth
-                    {
-                        return Err(corruption("B+Tree leaves are at unequal depths"));
-                    }
-                    result.leaf_depth = Some(child_depth);
-                    if result.minimum.is_none() {
-                        result.minimum = Some(child_minimum.clone());
-                    }
-                    result.maximum = Some(child_maximum.clone());
-                    previous_maximum = Some(child_maximum.clone());
-                    result.leaves.extend(child.leaves);
-                    result.tree_pages.extend(child.tree_pages);
-                    result.overflow_pages.extend(child.overflow_pages);
-                }
-                Ok(result)
+                Ok(Err(PendingInternal {
+                    cells,
+                    children,
+                    next_child: 0,
+                    result,
+                    previous_maximum: None,
+                }))
             }
         }
     }
+}
+
+impl PendingInternal {
+    fn accept_child(&mut self, child: Subtree) -> Result<()> {
+        let child_minimum = child
+            .minimum
+            .as_ref()
+            .ok_or_else(|| corruption("non-root B+Tree subtree is empty"))?;
+        let child_maximum = child
+            .maximum
+            .as_ref()
+            .ok_or_else(|| corruption("non-root B+Tree subtree is empty"))?;
+        if let Some(previous) = &self.previous_maximum
+            && previous >= child_minimum
+        {
+            return Err(corruption(
+                "B+Tree child key ranges overlap or are unsorted",
+            ));
+        }
+        if self.next_child > 0 && self.cells[self.next_child - 1].key() != child_minimum {
+            return Err(corruption(
+                "B+Tree parent separator is not its right child minimum",
+            ));
+        }
+        let child_depth = child
+            .leaf_depth
+            .ok_or_else(|| corruption("B+Tree subtree has no leaf depth"))?;
+        if let Some(expected_depth) = self.result.leaf_depth
+            && expected_depth != child_depth
+        {
+            return Err(corruption("B+Tree leaves are at unequal depths"));
+        }
+        self.result.leaf_depth = Some(child_depth);
+        if self.result.minimum.is_none() {
+            self.result.minimum = Some(child_minimum.clone());
+        }
+        self.result.maximum = Some(child_maximum.clone());
+        self.previous_maximum = Some(child_maximum.clone());
+        self.result.leaves.extend(child.leaves);
+        self.result.tree_pages.extend(child.tree_pages);
+        self.result.overflow_pages.extend(child.overflow_pages);
+        self.next_child = self
+            .next_child
+            .checked_add(1)
+            .ok_or_else(|| corruption("B+Tree child index overflow"))?;
+        Ok(())
+    }
+}
+
+fn depth_for_stack(stack: &[PendingInternal]) -> Result<u64> {
+    u64::try_from(stack.len()).map_err(|_| corruption("B+Tree depth exceeds u64"))
 }
 
 fn load_validation_node(
@@ -528,6 +601,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tree_validator_rejects_a_supplied_kind_that_differs_from_its_root_page_type() {
+        let mut source = valid_source();
+        let table_root_as_index = BTree::from_root(TreeKind::Index, reference(1));
+
+        assert_eq!(
+            validate_tree(&mut source, &table_root_as_index)
+                .expect_err("table root cannot validate as an index tree")
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn tree_validator_rejects_a_deep_spine_without_recursing_on_the_process_stack() {
+        let mut source = deep_spine_source(512);
+        let tree = BTree::from_root(TreeKind::Table, reference(1));
+
+        assert_eq!(
+            validate_tree(&mut source, &tree)
+                .expect_err("deep malformed spine")
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
     fn valid_source() -> TestSource {
         let mut source = TestSource::new(11, PageId(9));
         source.put(internal_frame(
@@ -564,6 +663,36 @@ mod tests {
         source.put(overflow_frame(reference(8)));
         source.put(freelist_frame(reference(9), None, &[PageId(10)]));
         source.put(leaf_frame(reference(10), &[(b"x", inline(b"x"))], None));
+        source
+    }
+
+    fn deep_spine_source(depth: u64) -> TestSource {
+        let first_leaf = depth + 1;
+        let first_right_leaf = first_leaf + 1;
+        let mut source = TestSource::new(first_right_leaf + depth, PageId(0));
+        for offset in 0..depth {
+            let page_id = offset + 1;
+            let leftmost = if offset + 1 == depth {
+                reference(first_leaf)
+            } else {
+                reference(page_id + 1)
+            };
+            source.put(internal_frame(
+                reference(page_id),
+                leftmost,
+                &[(b"b", reference(first_right_leaf + offset))],
+            ));
+            source.put(leaf_frame(
+                reference(first_right_leaf + offset),
+                &[(b"b", inline(b"b"))],
+                None,
+            ));
+        }
+        source.put(leaf_frame(
+            reference(first_leaf),
+            &[(b"a", inline(b"a"))],
+            None,
+        ));
         source
     }
 

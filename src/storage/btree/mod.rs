@@ -52,6 +52,10 @@ impl BTree {
     pub(in crate::storage) const fn from_root(kind: TreeKind, root: PageRef) -> Self {
         Self { kind, root }
     }
+
+    pub(in crate::storage) const fn kind(&self) -> TreeKind {
+        self.kind
+    }
 }
 
 pub(super) fn encode_leaf_right_sibling(right_sibling: Option<PageRef>) -> [u8; 8] {
