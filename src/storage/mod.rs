@@ -5,6 +5,7 @@ mod codec;
 mod file;
 mod freelist;
 mod header;
+mod overflow;
 mod page;
 mod pager;
 mod slotted;

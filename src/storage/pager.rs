@@ -15,6 +15,7 @@ use super::{
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
     freelist::{Freelist, FreelistWalk},
     header::DatabaseHeader,
+    overflow,
     page::{PageFrame, PageType},
     slotted::SlottedPage,
 };
@@ -169,11 +170,17 @@ impl Pager {
 
 pub(super) trait PageSource {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle>;
+
+    fn page_count(&self) -> u64;
 }
 
 impl PageSource for Pager {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.read(reference)
+    }
+
+    fn page_count(&self) -> u64 {
+        self.page_count()
     }
 }
 
@@ -568,7 +575,8 @@ fn validate_page_body(frame: &mut PageFrame) -> Result<()> {
         PageType::TableLeaf | PageType::IndexLeaf => validate_leaf_page(frame),
         PageType::TableInternal | PageType::IndexInternal => validate_internal_page(frame),
         PageType::Freelist => Freelist::decode(frame).map(|_| ()),
-        PageType::Catalog | PageType::Overflow => Ok(()),
+        PageType::Overflow => overflow::validate_local(frame),
+        PageType::Catalog => Ok(()),
     }
 }
 
@@ -602,6 +610,10 @@ fn validate_internal_page(frame: &mut PageFrame) -> Result<()> {
 impl PageSource for WriteBatch<'_> {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.read(reference)
+    }
+
+    fn page_count(&self) -> u64 {
+        self.pager.page_count()
     }
 }
 
