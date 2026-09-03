@@ -22,6 +22,12 @@ use super::{
 };
 use crate::{DbError, ErrorCode, Result};
 
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+use crate::fault::FaultInjector;
+
 pub(super) struct PagerConfig {
     pub(super) page_size: u32,
     pub(super) uuid: [u8; 16],
@@ -158,6 +164,12 @@ impl Pager {
 
     pub(super) fn is_poisoned(&self) -> bool {
         self.state == PagerState::Poisoned
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_faults(mut self, faults: Arc<dyn FaultInjector>) -> Self {
+        self.file = self.file.with_faults(faults);
+        self
     }
 
     fn read_frame(&mut self, page_id: PageId) -> Result<PageFrame> {
@@ -321,6 +333,22 @@ impl WriteBatch<'_> {
         self.track_tree(kind, root)
     }
 
+    pub(super) fn replace_tree_root(
+        &mut self,
+        kind: TreeKind,
+        previous_root: PageRef,
+        root: PageRef,
+    ) -> Result<()> {
+        self.refresh_tree(kind, previous_root, root)?;
+        if self.current_header().catalog_root() == previous_root.page_id() {
+            validate_tree(self, &BTree::from_root(kind, root))?;
+            let mut header = self.current_header();
+            header.set_catalog_root(root.page_id());
+            self.candidate_header = Some(header);
+        }
+        Ok(())
+    }
+
     pub(super) fn read(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.require_active()?;
 
@@ -444,6 +472,10 @@ impl WriteBatch<'_> {
         }
         let tree = BTree::from_root(kind, root);
         validate_tree(self, &tree)?;
+
+        if self.current_header().catalog_root() == root.page_id() {
+            return Ok(());
+        }
 
         if let Some((committed_root, committed_pages)) = &self.committed_catalog
             && *committed_root != root

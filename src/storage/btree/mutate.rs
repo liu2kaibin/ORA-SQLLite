@@ -114,9 +114,10 @@ impl BTree {
         let old_root = self.root;
         let checkpoint = batch.checkpoint_mutation()?;
         let result = self.delete_inner(batch, key).and_then(|removed| {
-            batch
-                .refresh_tree(self.kind, old_root, self.root)
-                .map(|()| removed)
+            if removed.is_some() {
+                batch.refresh_tree(self.kind, old_root, self.root)?;
+            }
+            Ok(removed)
         });
         match result {
             Ok(removed) => Ok(removed),
@@ -177,6 +178,7 @@ fn repair_after_delete(
                     rewrite_leaf(batch, current_ref, leaf.right_sibling, &leaf.cells)?
                 }
                 Node::Internal(internal) if internal.cells.is_empty() => {
+                    batch.replace_tree_root(kind, current_ref, internal.leftmost)?;
                     *root = internal.leftmost;
                     batch.release_btree_later(current_ref)?;
                 }
@@ -264,6 +266,10 @@ fn repair_after_delete(
         }
         if let Some(candidate) = right_borrow {
             let (right_ref, _) = right.expect("right sibling exists");
+            if child_index > 0 {
+                let minimum = node_minimum(batch, kind, &candidate.receiver)?;
+                parent.cells[child_index - 1] = InternalCell::new(minimum, current_ref)?;
+            }
             rewrite_node(batch, right_ref, &candidate.donor)?;
             rewrite_node(batch, current_ref, &candidate.receiver)?;
             parent.cells[child_index] = InternalCell::new(candidate.separator, right_ref)?;
@@ -841,6 +847,71 @@ mod tests {
     }
 
     #[test]
+    fn missing_delete_preserves_an_unregistered_tree_and_existing_batch_state() {
+        let (_temp, mut pager) = test_pager(4096).expect("create pager");
+        let tree = {
+            let mut batch = pager.begin_write().expect("begin tree batch");
+            let tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            batch.commit().expect("commit unregistered tree");
+            tree
+        };
+        let root = tree.root();
+        let mut tree = tree;
+        let mut batch = pager
+            .begin_write()
+            .expect("begin batch with existing state");
+        let existing = batch
+            .allocate(TreeKind::Index.leaf_page_type())
+            .expect("allocate unrelated page");
+
+        assert_eq!(
+            tree.delete(&mut batch, b"missing").expect("missing delete"),
+            None
+        );
+        assert_eq!(
+            tree.root(),
+            root,
+            "missing delete must preserve the tree root"
+        );
+        assert_eq!(batch.page_count().expect("batch page count"), 3);
+        assert_eq!(
+            batch
+                .set_catalog_root(root)
+                .expect_err("missing delete must not register an untracked root")
+                .code(),
+            ErrorCode::Corruption
+        );
+        assert_eq!(
+            batch
+                .read(existing)
+                .expect("existing unrelated batch page")
+                .borrow()
+                .header()
+                .page_type(),
+            TreeKind::Index.leaf_page_type()
+        );
+        batch.rollback().expect("rollback existing state");
+    }
+
+    #[test]
+    fn equal_byte_balance_split_ties_choose_the_lower_leaf_and_internal_indexes() {
+        let leaf_cells = vec![vec![0x11; 10]; 5];
+        assert_eq!(
+            super::balanced_leaf_boundary(4096, &leaf_cells).expect("balance leaf split"),
+            2,
+            "equal two-versus-three and three-versus-two byte balances choose the lower split"
+        );
+
+        let internal_cells = vec![vec![0x22; 10]; 6];
+        assert_eq!(
+            super::balanced_internal_separator(4096, &internal_cells)
+                .expect("balance internal split"),
+            2,
+            "equal left and right internal byte balances choose the lower promoted cell"
+        );
+    }
+
+    #[test]
     fn delete_returns_overflow_value_and_releases_the_whole_chain() {
         for page_size in [4096, 8192, 16384] {
             let (_temp, mut pager) = test_pager(page_size).unwrap();
@@ -1034,6 +1105,23 @@ mod tests {
     }
 
     #[test]
+    fn right_borrow_into_an_empty_nonleftmost_leaf_refreshes_its_parent_separator() {
+        let (_temp, mut pager, mut tree, left, middle, right) =
+            committed_three_leaf_tree(4096, 3, 1, 7).expect("create three-leaf tree");
+        let mut batch = pager.begin_write().expect("begin delete batch");
+
+        assert_eq!(
+            tree.delete(&mut batch, &small_key(3))
+                .expect("delete only middle key"),
+            Some(sized_value(3, leaf_test_value_len(4096)))
+        );
+        assert_eq!(leaf_keys(&mut batch, left), vec![0, 1, 2]);
+        assert_eq!(leaf_keys(&mut batch, middle), vec![4, 5, 6]);
+        assert_eq!(leaf_keys(&mut batch, right), vec![7, 8, 9, 10]);
+        assert_exact_separators(&mut batch, &tree).expect("parent separators after right borrow");
+    }
+
+    #[test]
     fn equal_cost_borrow_and_merge_prefer_the_left_sibling() {
         for page_size in [4096, 8192, 16384] {
             let (_temp, mut pager, mut tree, left, middle, right) =
@@ -1120,6 +1208,48 @@ mod tests {
             );
             pager.read(appended).unwrap();
         }
+    }
+
+    #[test]
+    fn deleting_a_catalog_root_can_shrink_to_its_left_leaf() {
+        let (_temp, mut pager, mut tree, left_ref, _right_ref) =
+            committed_two_leaf_tree(4096, 3, 3).expect("create two-leaf tree");
+        let old_root = tree.root();
+        {
+            let mut batch = pager.begin_write().expect("begin catalog publish batch");
+            batch
+                .track_tree(TreeKind::Table, old_root)
+                .expect("register catalog tree");
+            batch
+                .set_catalog_root(old_root)
+                .expect("publish catalog root");
+            batch.commit().expect("commit catalog root");
+        }
+
+        {
+            let mut batch = pager
+                .begin_write()
+                .expect("begin catalog root shrink batch");
+            assert_eq!(
+                tree.delete(&mut batch, &small_key(2))
+                    .expect("delete from the catalog tree"),
+                Some(sized_value(2, leaf_test_value_len(4096)))
+            );
+            assert_eq!(tree.root(), left_ref);
+            batch
+                .set_catalog_root(tree.root())
+                .expect("publish the shrunken catalog root");
+            batch.commit().expect("commit catalog root shrink");
+        }
+
+        assert_eq!(
+            pager
+                .catalog_tree(TreeKind::Table)
+                .expect("read catalog root")
+                .expect("catalog root is present")
+                .root(),
+            left_ref
+        );
     }
 
     #[test]
