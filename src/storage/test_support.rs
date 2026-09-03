@@ -299,12 +299,14 @@ fn nth_fault_index(events: &[FaultPoint], point: FaultPoint, occurrence: usize) 
 
 const MODEL_OPERATIONS: usize = 10_000;
 const MODEL_VALIDATION_INTERVAL: usize = 100;
+const MODEL_PERSISTENCE_INTERVAL: usize = 1_000;
 const MODEL_SEED: u64 = 0x8d26_1a75_40ce_9b31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ModelProof {
     operations: usize,
     validations: usize,
+    commits: usize,
     reopens: usize,
 }
 
@@ -328,9 +330,20 @@ fn fixed_seed_reference_model_covers_every_page_size_and_tree_kind() {
             let proof = run_reference_model(page_size, kind).expect("fixed-seed reference model");
             assert_eq!(proof.operations, MODEL_OPERATIONS);
             assert_eq!(proof.validations, MODEL_OPERATIONS / 100);
-            assert_eq!(proof.reopens, MODEL_OPERATIONS / 1_000);
+            assert_eq!(proof.commits, MODEL_OPERATIONS / MODEL_PERSISTENCE_INTERVAL);
+            assert_eq!(proof.reopens, MODEL_OPERATIONS / MODEL_PERSISTENCE_INTERVAL);
         }
     }
+}
+
+#[test]
+fn reference_model_commits_once_per_persistence_window() {
+    let proof = run_reference_model_operations(4096, TreeKind::Table, 1_000)
+        .expect("reference-model persistence window");
+
+    assert_eq!(proof.validations, 10);
+    assert_eq!(proof.commits, 1, "1,000 operations must use one commit");
+    assert_eq!(proof.reopens, 1);
 }
 
 fn run_reference_model(page_size: u32, kind: TreeKind) -> Result<ModelProof> {
@@ -348,7 +361,7 @@ fn run_reference_model_operations(
         "model runs whole validation windows"
     );
     assert_eq!(
-        operations % 1_000,
+        operations % MODEL_PERSISTENCE_INTERVAL,
         0,
         "model commits whole persistence windows"
     );
@@ -359,100 +372,106 @@ fn run_reference_model_operations(
     let mut random = XorShift64(MODEL_SEED);
     let mut seen_key_lengths = [false; 65];
     let mut validations = 0;
+    let mut commits = 0;
     let mut reopens = 0;
 
-    for window in 0..(operations / MODEL_VALIDATION_INTERVAL) {
+    for persistence_window in 0..(operations / MODEL_PERSISTENCE_INTERVAL) {
         let mut batch = pager.begin_write()?;
-        for _ in 0..45 {
-            let key = workload_key(&mut random);
-            seen_key_lengths[key.len()] = true;
-            let value = workload_value(page_size, &mut random);
-            let expected = if model.contains_key(&key) {
-                Err(ErrorCode::Constraint)
-            } else {
-                Ok(())
-            };
-            let actual = tree
-                .insert(&mut batch, &key, &value)
-                .map_err(|error| error.code());
-            assert_eq!(
-                actual, expected,
-                "insert result must mirror the reference model"
-            );
-            if actual.is_ok() {
-                model.insert(key, value);
+        for checkpoint in 0..(MODEL_PERSISTENCE_INTERVAL / MODEL_VALIDATION_INTERVAL) {
+            let window = persistence_window
+                * (MODEL_PERSISTENCE_INTERVAL / MODEL_VALIDATION_INTERVAL)
+                + checkpoint;
+            for _ in 0..45 {
+                let key = workload_key(&mut random);
+                seen_key_lengths[key.len()] = true;
+                let value = workload_value(page_size, &mut random);
+                let expected = if model.contains_key(&key) {
+                    Err(ErrorCode::Constraint)
+                } else {
+                    Ok(())
+                };
+                let actual = tree
+                    .insert(&mut batch, &key, &value)
+                    .map_err(|error| error.code());
+                assert_eq!(
+                    actual, expected,
+                    "insert result must mirror the reference model"
+                );
+                if actual.is_ok() {
+                    model.insert(key, value);
+                }
             }
+            for delete_index in 0..25 {
+                let key = workload_key(&mut random);
+                seen_key_lengths[key.len()] = true;
+                let expected = model.remove(&key);
+                let actual = tree.delete(&mut batch, &key).map_err(|error| {
+                    DbError::new(
+                        error.code(),
+                        format!(
+                            "reference-model delete failed at page_size={page_size}, kind={kind:?}, window={window}, delete={delete_index}: {error}"
+                        ),
+                    )
+                })?;
+                assert_eq!(
+                    actual, expected,
+                    "delete result must mirror the reference model"
+                );
+            }
+
+            for _ in 0..20 {
+                let key = workload_key(&mut random);
+                seen_key_lengths[key.len()] = true;
+                assert_eq!(
+                    tree.get(&mut batch, &key)?,
+                    model.get(&key).cloned(),
+                    "point lookup must mirror the reference model"
+                );
+            }
+            for _ in 0..10 {
+                let first = workload_key(&mut random);
+                let second = workload_key(&mut random);
+                seen_key_lengths[first.len()] = true;
+                seen_key_lengths[second.len()] = true;
+                let (start, end) = if first <= second {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                assert_eq!(
+                    collect_range(&tree, &mut batch, &start, &end)?,
+                    model_range(&model, &start, &end),
+                    "range scan must mirror the reference model"
+                );
+            }
+
+            validate_tree(&mut batch, &tree)?;
+            validations += 1;
         }
-        for delete_index in 0..25 {
-            let key = workload_key(&mut random);
-            seen_key_lengths[key.len()] = true;
-            let expected = model.remove(&key);
-            let actual = tree.delete(&mut batch, &key).map_err(|error| {
-                DbError::new(
-                    error.code(),
-                    format!(
-                        "reference-model delete failed at page_size={page_size}, kind={kind:?}, window={window}, delete={delete_index}: {error}"
-                    ),
-                )
-            })?;
-            assert_eq!(
-                actual, expected,
-                "delete result must mirror the reference model"
-            );
-        }
+
         batch.track_tree(kind, tree.root())?;
         batch.set_catalog_root(tree.root())?;
         batch.commit()?;
+        commits += 1;
 
-        for _ in 0..20 {
-            let key = workload_key(&mut random);
-            seen_key_lengths[key.len()] = true;
-            assert_eq!(
-                tree.get(&mut pager, &key)?,
-                model.get(&key).cloned(),
-                "point lookup must mirror the reference model"
-            );
-        }
-        for _ in 0..10 {
-            let first = workload_key(&mut random);
-            let second = workload_key(&mut random);
-            seen_key_lengths[first.len()] = true;
-            seen_key_lengths[second.len()] = true;
-            let (start, end) = if first <= second {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            assert_eq!(
-                collect_range(&tree, &mut pager, &start, &end)?,
-                model_range(&model, &start, &end),
-                "range scan must mirror the reference model"
-            );
-        }
-
-        let completed = (window + 1) * MODEL_VALIDATION_INTERVAL;
-        validate_tree(&mut pager, &tree)?;
-        validations += 1;
-        if completed % 1_000 == 0 {
-            drop(pager);
-            pager = Pager::open(
-                temp.path(),
-                OpenMode::ReadWrite,
-                PagerConfig::test_default(page_size),
-            )?;
-            tree = pager.catalog_tree(kind)?.ok_or_else(|| {
-                DbError::new(ErrorCode::Corruption, "model catalog root is missing")
-            })?;
-            assert_eq!(
-                collect_all(&tree, &mut pager)?,
-                model
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<Vec<_>>(),
-                "full scan after reopen must mirror the reference model"
-            );
-            reopens += 1;
-        }
+        drop(pager);
+        pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(page_size),
+        )?;
+        tree = pager
+            .catalog_tree(kind)?
+            .ok_or_else(|| DbError::new(ErrorCode::Corruption, "model catalog root is missing"))?;
+        assert_eq!(
+            collect_all(&tree, &mut pager)?,
+            model
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>(),
+            "full scan after reopen must mirror the reference model"
+        );
+        reopens += 1;
     }
 
     assert!(
@@ -463,6 +482,7 @@ fn run_reference_model_operations(
     Ok(ModelProof {
         operations,
         validations,
+        commits,
         reopens,
     })
 }
@@ -501,8 +521,8 @@ fn workload_value(page_size: u32, random: &mut XorShift64) -> Vec<u8> {
     vec![random.next() as u8; len]
 }
 
-fn collect_all(tree: &BTree, pager: &mut Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut cursor = tree.scan(pager, Bound::Unbounded, Bound::Unbounded)?;
+fn collect_all(tree: &BTree, source: &mut impl PageSource) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut cursor = tree.scan(source, Bound::Unbounded, Bound::Unbounded)?;
     let mut entries = Vec::new();
     while let Some(entry) = cursor.next()? {
         entries.push(entry);
@@ -512,11 +532,11 @@ fn collect_all(tree: &BTree, pager: &mut Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)
 
 fn collect_range(
     tree: &BTree,
-    pager: &mut Pager,
+    source: &mut impl PageSource,
     start: &[u8],
     end: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut cursor = tree.scan(pager, Bound::Included(start), Bound::Excluded(end))?;
+    let mut cursor = tree.scan(source, Bound::Included(start), Bound::Excluded(end))?;
     let mut entries = Vec::new();
     while let Some(entry) = cursor.next()? {
         entries.push(entry);

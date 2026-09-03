@@ -6,7 +6,7 @@ use super::{
 };
 use crate::storage::{
     PageId, PageRef, overflow,
-    pager::{PageSource, Pager, WriteBatch},
+    pager::{PageSource, WriteBatch},
     slotted::SlottedPage,
 };
 use crate::{DbError, ErrorCode, Result};
@@ -63,45 +63,49 @@ impl BTree {
         self.root
     }
 
-    pub(in crate::storage) fn get(&self, pager: &mut Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(in crate::storage) fn get(
+        &self,
+        source: &mut impl PageSource,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
-        let (_, leaf) = descend_to_leaf(pager, self.kind, self.root, key)?;
+        let (_, leaf) = descend_to_leaf(source, self.kind, self.root, key)?;
         let index = lower_bound(&leaf.cells, key);
         let Some(cell) = leaf.cells.get(index).filter(|cell| cell.key() == key) else {
             return Ok(None);
         };
-        read_value(pager, cell).map(Some)
+        read_value(source, cell).map(Some)
     }
 
-    pub(in crate::storage) fn scan<'a>(
+    pub(in crate::storage) fn scan<'a, S: PageSource>(
         &self,
-        pager: &'a mut Pager,
+        source: &'a mut S,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
-    ) -> Result<BTreeCursor<'a>> {
+    ) -> Result<BTreeCursor<'a, S>> {
         validate_bound(&start)?;
         validate_bound(&end)?;
         let (current, _leaf, next_slot) = match start {
             Bound::Unbounded => {
-                let (reference, leaf) = descend_to_leftmost(pager, self.kind, self.root)?;
+                let (reference, leaf) = descend_to_leftmost(source, self.kind, self.root)?;
                 (reference, leaf, 0)
             }
             Bound::Included(key) => {
-                let (reference, leaf) = descend_to_leaf(pager, self.kind, self.root, key)?;
+                let (reference, leaf) = descend_to_leaf(source, self.kind, self.root, key)?;
                 let next_slot = lower_bound(&leaf.cells, key);
                 (reference, leaf, next_slot)
             }
             Bound::Excluded(key) => {
-                let (reference, leaf) = descend_to_leaf(pager, self.kind, self.root, key)?;
+                let (reference, leaf) = descend_to_leaf(source, self.kind, self.root, key)?;
                 let next_slot = upper_bound(&leaf.cells, key);
                 (reference, leaf, next_slot)
             }
         };
-        let max_leaf_hops = max_page_hops(pager)?;
+        let max_leaf_hops = max_page_hops(source)?;
         let mut visited = BTreeSet::new();
         visit_page(&mut visited, current, max_leaf_hops, "B+Tree leaf chain")?;
         Ok(BTreeCursor {
-            pager,
+            source,
             kind: self.kind,
             current: Some(current),
             next_slot,
@@ -274,11 +278,11 @@ fn validate_bound(bound: &Bound<&[u8]>) -> Result<()> {
     }
 }
 
-fn read_value(pager: &mut Pager, cell: &LeafCell) -> Result<Vec<u8>> {
+fn read_value(source: &mut impl PageSource, cell: &LeafCell) -> Result<Vec<u8>> {
     match cell.storage() {
         ValueStorage::Inline(value) => Ok(value.clone()),
         ValueStorage::Overflow(first) => {
-            overflow::read_value(pager, *first, cell.total_value_len())
+            overflow::read_value(source, *first, cell.total_value_len())
         }
     }
 }
@@ -315,8 +319,8 @@ fn visit_page(
     Ok(())
 }
 
-pub(in crate::storage) struct BTreeCursor<'a> {
-    pager: &'a mut Pager,
+pub(in crate::storage) struct BTreeCursor<'a, S: PageSource> {
+    source: &'a mut S,
     kind: TreeKind,
     current: Option<PageRef>,
     next_slot: usize,
@@ -326,13 +330,13 @@ pub(in crate::storage) struct BTreeCursor<'a> {
     previous_leaf_last_key: Option<Vec<u8>>,
 }
 
-impl BTreeCursor<'_> {
+impl<S: PageSource> BTreeCursor<'_, S> {
     pub(in crate::storage) fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
             let Some(reference) = self.current else {
                 return Ok(None);
             };
-            let leaf = load_leaf(self.pager, self.kind, reference)?;
+            let leaf = load_leaf(self.source, self.kind, reference)?;
             if let Some(previous) = self.previous_leaf_last_key.as_deref()
                 && leaf
                     .cells
@@ -353,7 +357,7 @@ impl BTreeCursor<'_> {
                     self.current = None;
                     return Ok(None);
                 }
-                return read_value(self.pager, cell)
+                return read_value(self.source, cell)
                     .map(|value| Some((cell.key().to_vec(), value)));
             }
 
@@ -457,6 +461,57 @@ mod tests {
             Some(b"two".to_vec())
         );
         assert_eq!(tree.get(&mut pager, b"cat").expect("missing key"), None);
+    }
+
+    #[test]
+    fn write_batch_overlay_is_visible_to_point_and_bounded_range_reads() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let mut batch = pager.begin_write().expect("begin uncommitted write");
+        let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+        tree.insert(&mut batch, b"ant", b"one")
+            .expect("insert ant into batch");
+        tree.insert(&mut batch, b"bee", b"two")
+            .expect("insert bee into batch");
+        tree.insert(&mut batch, b"cat", b"three")
+            .expect("insert cat into batch");
+
+        assert_eq!(
+            tree.get(&mut batch, b"bee")
+                .expect("point lookup from batch"),
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            collect_scan(
+                &tree,
+                &mut batch,
+                Bound::Included(b"bee"),
+                Bound::Excluded(b"cat"),
+            ),
+            vec![(b"bee".to_vec(), b"two".to_vec())]
+        );
+
+        assert_eq!(
+            tree.delete(&mut batch, b"bee")
+                .expect("delete bee from batch"),
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            tree.get(&mut batch, b"bee")
+                .expect("deleted point lookup from batch"),
+            None
+        );
+        assert_eq!(
+            collect_scan(
+                &tree,
+                &mut batch,
+                Bound::Included(b"ant"),
+                Bound::Included(b"cat"),
+            ),
+            vec![
+                (b"ant".to_vec(), b"one".to_vec()),
+                (b"cat".to_vec(), b"three".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -934,11 +989,11 @@ mod tests {
 
     fn collect_scan(
         tree: &BTree,
-        pager: &mut Pager,
+        source: &mut impl super::PageSource,
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut cursor = tree.scan(pager, start, end).expect("start scan");
+        let mut cursor = tree.scan(source, start, end).expect("start scan");
         let mut rows = Vec::new();
         while let Some(row) = cursor.next().expect("read scan row") {
             rows.push(row);
