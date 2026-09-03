@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Linux stable quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust with quality tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: rustup run stable cargo fmt --check
+      - name: Run Clippy
+        run: rustup run stable cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: rustup run stable cargo test --all-targets
+
+  msrv:
+    name: Linux Rust 1.85 MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Run tests on the minimum supported Rust version
+        run: rustup run 1.85.0 cargo test --all-targets
+
+  windows:
+    name: Windows stable
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run tests on Windows
+        run: rustup run stable cargo test --all-targets
