@@ -74,12 +74,16 @@ pub(super) fn validate_tree(
     }
 
     let root = tree.root();
-    let root_page_type = source
-        .read_page(root)
-        .map_err(as_corruption)?
-        .borrow()
-        .header()
-        .page_type();
+    let root_page_type = {
+        let root_handle = source.read_page(root).map_err(as_corruption)?;
+        let root_frame = root_handle.try_borrow().map_err(|_| {
+            DbError::new(
+                ErrorCode::Busy,
+                "B+Tree root is mutably borrowed by another cache handle",
+            )
+        })?;
+        root_frame.header().page_type()
+    };
     if TreeKind::from_root_page_type(root_page_type) != Some(tree.kind()) {
         return Err(corruption(
             "B+Tree root page type does not match its tree kind",
@@ -282,7 +286,20 @@ fn load_validation_node(
     reference: PageRef,
 ) -> Result<ValidationNode> {
     let handle = source.read_page(reference).map_err(as_corruption)?;
-    let mut frame = handle.borrow_mut();
+    let mut frame = {
+        let cached = handle.try_borrow().map_err(|_| {
+            DbError::new(
+                ErrorCode::Busy,
+                "B+Tree validation page is mutably borrowed by another cache handle",
+            )
+        })?;
+        super::page::PageFrame::decode(
+            cached.bytes().to_vec(),
+            reference.page_id(),
+            None,
+            Some(reference.generation()),
+        )?
+    };
     if frame.header().page_id() != reference.page_id()
         || frame.header().generation() != reference.generation()
     {
@@ -434,10 +451,9 @@ fn validate_page_id(page_id: PageId, page_count: u64, label: &str) -> Result<()>
 }
 
 fn as_corruption(error: DbError) -> DbError {
-    if error.code() == ErrorCode::Corruption {
-        error
-    } else {
-        corruption("storage structure cannot be proven valid")
+    match error.code() {
+        ErrorCode::Busy | ErrorCode::Io | ErrorCode::Corruption => error,
+        _ => corruption("storage structure cannot be proven valid"),
     }
 }
 
@@ -627,6 +643,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tree_validator_preserves_an_io_error_from_its_page_source() {
+        let mut source = IoSource;
+        let tree = BTree::from_root(TreeKind::Table, reference(1));
+
+        assert_eq!(
+            validate_tree(&mut source, &tree)
+                .expect_err("source I/O must remain distinguishable from corruption")
+                .code(),
+            ErrorCode::Io
+        );
+    }
+
     fn valid_source() -> TestSource {
         let mut source = TestSource::new(11, PageId(9));
         source.put(internal_frame(
@@ -794,6 +823,18 @@ mod tests {
         fn put(&mut self, frame: PageFrame) {
             self.pages
                 .insert(frame.header().page_id(), frame.bytes().to_vec());
+        }
+    }
+
+    struct IoSource;
+
+    impl PageSource for IoSource {
+        fn read_page(&mut self, _reference: PageRef) -> Result<PageHandle> {
+            Err(DbError::new(ErrorCode::Io, "injected page-source I/O"))
+        }
+
+        fn page_count(&self) -> Result<u64> {
+            Ok(2)
         }
     }
 

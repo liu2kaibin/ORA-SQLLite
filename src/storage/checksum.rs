@@ -5,19 +5,21 @@ const CHECKSUM_LEN: usize = 4;
 
 pub(super) fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
+    crc32c_update(&mut crc, bytes);
+    !crc
+}
 
+fn crc32c_update(crc: &mut u32, bytes: &[u8]) {
     for &byte in bytes {
-        crc ^= u32::from(byte);
+        *crc ^= u32::from(byte);
         for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ 0x82f6_3b78;
+            if *crc & 1 == 1 {
+                *crc = (*crc >> 1) ^ 0x82f6_3b78;
             } else {
-                crc >>= 1;
+                *crc >>= 1;
             }
         }
     }
-
-    !crc
 }
 
 pub(super) fn stamp_page_checksum(bytes: &mut [u8]) -> Result<u32> {
@@ -41,10 +43,11 @@ pub(super) fn verify_page_checksum(bytes: &[u8]) -> Result<()> {
 }
 
 fn checksum_with_zeroed_field(bytes: &[u8]) -> u32 {
-    let mut checksummed = bytes.to_vec();
-    let checksum_field = &mut checksummed[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_LEN];
-    checksum_field.fill(0);
-    crc32c(&checksummed)
+    let mut crc = !0u32;
+    crc32c_update(&mut crc, &bytes[..CHECKSUM_OFFSET]);
+    crc32c_update(&mut crc, &[0; CHECKSUM_LEN]);
+    crc32c_update(&mut crc, &bytes[CHECKSUM_OFFSET + CHECKSUM_LEN..]);
+    !crc
 }
 
 fn validate_page_size(page_len: usize) -> Result<()> {
@@ -76,4 +79,29 @@ fn whole_page_checksum_ignores_only_its_own_field() {
         verify_page_checksum(&page).unwrap_err().code(),
         crate::ErrorCode::Corruption
     );
+}
+
+#[test]
+fn segmented_page_checksum_matches_the_byte_identical_zeroed_field_contract() {
+    for page_size in [4096usize, 8192, 16384] {
+        let mut original = (0..page_size)
+            .map(|index| u8::try_from(index % 251).expect("test byte"))
+            .collect::<Vec<_>>();
+        original[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_LEN]
+            .copy_from_slice(&0xa5a5_5a5au32.to_le_bytes());
+
+        let mut expected = original.clone();
+        expected[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_LEN].fill(0);
+        let checksum = crc32c(&expected);
+        expected[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_LEN]
+            .copy_from_slice(&checksum.to_le_bytes());
+
+        let mut actual = original;
+        assert_eq!(
+            stamp_page_checksum(&mut actual).expect("stamp whole page"),
+            checksum
+        );
+        assert_eq!(actual, expected, "page size {page_size}");
+        verify_page_checksum(&actual).expect("verify byte-identical page");
+    }
 }

@@ -96,14 +96,36 @@ fn sanitized_label(label: &str) -> String {
 fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_file() {
     let label = "direct-collision";
     let sequence = NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed);
+    let first_sequence = sequence
+        .checked_add(1)
+        .expect("temporary database sequence must not overflow");
     let collision = std::env::temp_dir().join(format!(
-        "ora-sqllite-{}-{label}-{sequence}.db",
-        std::process::id()
+        "ora-sqllite-{}-{label}-{first_sequence}.db",
+        std::process::id(),
     ));
+    let first_candidate = std::env::temp_dir().join(format!(
+        "ora-sqllite-{}-{label}-{first_sequence}.db",
+        std::process::id(),
+    ));
+    assert_eq!(
+        collision, first_candidate,
+        "the collision fixture must occupy TempDatabase::new's first candidate"
+    );
     fs::write(&collision, b"pre-existing collision").expect("create collision file");
 
     let database = TempDatabase::new(label);
     let database_path = database.path().to_path_buf();
+    let retry_sequence = first_sequence
+        .checked_add(1)
+        .expect("temporary database retry sequence must not overflow");
+    assert_eq!(
+        database_path,
+        std::env::temp_dir().join(format!(
+            "ora-sqllite-{}-{label}-{retry_sequence}.db",
+            std::process::id()
+        )),
+        "TempDatabase::new must retry immediately after the occupied first candidate"
+    );
     let sentinel = database_path.with_extension("sentinel");
     assert_ne!(database_path, collision);
     fs::write(&database_path, b"owned database file").expect("create owned file");
@@ -301,6 +323,8 @@ const MODEL_OPERATIONS: usize = 10_000;
 const MODEL_VALIDATION_INTERVAL: usize = 100;
 const MODEL_PERSISTENCE_INTERVAL: usize = 1_000;
 const MODEL_SEED: u64 = 0x8d26_1a75_40ce_9b31;
+const MODEL_DUPLICATE_INSERTS_PER_WINDOW: usize = 9;
+const MODEL_MIN_DISTINCT_KEYS: usize = 3_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ModelProof {
@@ -308,6 +332,9 @@ struct ModelProof {
     validations: usize,
     commits: usize,
     reopens: usize,
+    distinct_keys: usize,
+    tree_height: u64,
+    duplicate_insert_attempts: usize,
 }
 
 struct XorShift64(u64);
@@ -325,14 +352,32 @@ impl XorShift64 {
 
 #[test]
 fn fixed_seed_reference_model_covers_every_page_size_and_tree_kind() {
+    let mut proofs = Vec::new();
     for page_size in [4096, 8192, 16384] {
         for kind in [TreeKind::Table, TreeKind::Index] {
             let proof = run_reference_model(page_size, kind).expect("fixed-seed reference model");
-            assert_eq!(proof.operations, MODEL_OPERATIONS);
-            assert_eq!(proof.validations, MODEL_OPERATIONS / 100);
-            assert_eq!(proof.commits, MODEL_OPERATIONS / MODEL_PERSISTENCE_INTERVAL);
-            assert_eq!(proof.reopens, MODEL_OPERATIONS / MODEL_PERSISTENCE_INTERVAL);
+            proofs.push((page_size, kind, proof));
         }
+    }
+
+    for (page_size, kind, proof) in proofs {
+        assert_eq!(proof.operations, MODEL_OPERATIONS);
+        assert_eq!(proof.validations, MODEL_OPERATIONS / 100);
+        assert_eq!(proof.commits, MODEL_OPERATIONS / MODEL_PERSISTENCE_INTERVAL);
+        assert_eq!(proof.reopens, MODEL_OPERATIONS / MODEL_PERSISTENCE_INTERVAL);
+        assert!(
+            proof.distinct_keys >= MODEL_MIN_DISTINCT_KEYS,
+            "page_size={page_size}, kind={kind:?} must exercise high-cardinality keys"
+        );
+        assert!(
+            proof.tree_height >= 2,
+            "page_size={page_size}, kind={kind:?} must form a nontrivial B+Tree shape"
+        );
+        assert_eq!(
+            proof.duplicate_insert_attempts,
+            (MODEL_OPERATIONS / MODEL_VALIDATION_INTERVAL) * MODEL_DUPLICATE_INSERTS_PER_WINDOW,
+            "page_size={page_size}, kind={kind:?} must deliberately exercise duplicate inserts"
+        );
     }
 }
 
@@ -370,10 +415,13 @@ fn run_reference_model_operations(
     let mut tree = create_catalog_tree(&mut pager, kind)?;
     let mut model = BTreeMap::new();
     let mut random = XorShift64(MODEL_SEED);
+    let mut fresh_key_sequence = 0u64;
+    let mut query_key_sequence = 0u64;
     let mut seen_key_lengths = [false; 65];
     let mut validations = 0;
     let mut commits = 0;
     let mut reopens = 0;
+    let mut duplicate_insert_attempts = 0;
 
     for persistence_window in 0..(operations / MODEL_PERSISTENCE_INTERVAL) {
         let mut batch = pager.begin_write()?;
@@ -381,11 +429,16 @@ fn run_reference_model_operations(
             let window = persistence_window
                 * (MODEL_PERSISTENCE_INTERVAL / MODEL_VALIDATION_INTERVAL)
                 + checkpoint;
-            for _ in 0..45 {
-                let key = workload_key(&mut random);
+            for insert_index in 0..45 {
+                let deliberate_duplicate = insert_index % 5 == 4;
+                let key = if deliberate_duplicate {
+                    known_model_key(&mut random, &model)
+                } else {
+                    fresh_workload_key(&mut random, &mut fresh_key_sequence, &model)
+                };
                 seen_key_lengths[key.len()] = true;
                 let value = workload_value(page_size, &mut random);
-                let expected = if model.contains_key(&key) {
+                let expected = if deliberate_duplicate {
                     Err(ErrorCode::Constraint)
                 } else {
                     Ok(())
@@ -397,12 +450,14 @@ fn run_reference_model_operations(
                     actual, expected,
                     "insert result must mirror the reference model"
                 );
-                if actual.is_ok() {
+                if deliberate_duplicate {
+                    duplicate_insert_attempts += 1;
+                } else {
                     model.insert(key, value);
                 }
             }
             for delete_index in 0..25 {
-                let key = workload_key(&mut random);
+                let key = query_workload_key(&mut random, &mut query_key_sequence, &model, 8);
                 seen_key_lengths[key.len()] = true;
                 let expected = model.remove(&key);
                 let actual = tree.delete(&mut batch, &key).map_err(|error| {
@@ -420,7 +475,7 @@ fn run_reference_model_operations(
             }
 
             for _ in 0..20 {
-                let key = workload_key(&mut random);
+                let key = query_workload_key(&mut random, &mut query_key_sequence, &model, 2);
                 seen_key_lengths[key.len()] = true;
                 assert_eq!(
                     tree.get(&mut batch, &key)?,
@@ -429,8 +484,8 @@ fn run_reference_model_operations(
                 );
             }
             for _ in 0..10 {
-                let first = workload_key(&mut random);
-                let second = workload_key(&mut random);
+                let first = query_workload_key(&mut random, &mut query_key_sequence, &model, 2);
+                let second = query_workload_key(&mut random, &mut query_key_sequence, &model, 2);
                 seen_key_lengths[first.len()] = true;
                 seen_key_lengths[second.len()] = true;
                 let (start, end) = if first <= second {
@@ -478,12 +533,16 @@ fn run_reference_model_operations(
         seen_key_lengths.into_iter().all(|seen| seen),
         "fixed-seed model must cover key lengths 0 through 64"
     );
+    let tree_height = tree_height(temp.path(), page_size, tree.root())?;
 
     Ok(ModelProof {
         operations,
         validations,
         commits,
         reopens,
+        distinct_keys: model.len(),
+        tree_height,
+        duplicate_insert_attempts,
     })
 }
 
@@ -496,14 +555,65 @@ fn create_catalog_tree(pager: &mut Pager, kind: TreeKind) -> Result<BTree> {
     Ok(tree)
 }
 
-fn workload_key(random: &mut XorShift64) -> Vec<u8> {
-    let id = u16::try_from(random.next() % 65).expect("model key id fits u16");
-    let key_len = usize::from(id % 65);
+fn fresh_workload_key(
+    random: &mut XorShift64,
+    next_sequence: &mut u64,
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Vec<u8> {
+    loop {
+        let sequence = next_workload_key_sequence(next_sequence);
+        let key = sequenced_workload_key(random, sequence);
+        if !model.contains_key(&key) {
+            return key;
+        }
+    }
+}
+
+fn query_workload_key(
+    random: &mut XorShift64,
+    next_sequence: &mut u64,
+    model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    existing_divisor: u64,
+) -> Vec<u8> {
+    assert_ne!(
+        existing_divisor, 0,
+        "query key selection divisor must be nonzero"
+    );
+    if !model.is_empty() && random.next() % existing_divisor == 0 {
+        known_model_key(random, model)
+    } else {
+        sequenced_workload_key(random, next_workload_key_sequence(next_sequence))
+    }
+}
+
+fn known_model_key(random: &mut XorShift64, model: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    let model_len = u64::try_from(model.len()).expect("model length fits u64");
+    let index = usize::try_from(random.next() % model_len).expect("model index fits usize");
+    model
+        .keys()
+        .nth(index)
+        .expect("nonempty model must contain the selected key")
+        .clone()
+}
+
+fn next_workload_key_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence
+        .checked_add(1)
+        .expect("fixed-seed key sequence must not overflow");
+    sequence
+}
+
+fn sequenced_workload_key(random: &mut XorShift64, sequence: u64) -> Vec<u8> {
+    let key_len = usize::try_from(sequence % 65).expect("model key length fits usize");
     let mut key = vec![0; key_len];
+    let entropy = random.next().to_le_bytes();
+    let sequence_bytes = sequence.to_le_bytes();
     for (index, byte) in key.iter_mut().enumerate() {
-        *byte = id
-            .wrapping_add(u16::try_from(index).expect("key index fits u16"))
-            .to_le_bytes()[index % 2];
+        let index_byte = u8::try_from(index).expect("key index fits u8");
+        *byte = entropy[index % entropy.len()]
+            ^ sequence_bytes[(index * 3) % sequence_bytes.len()]
+                .wrapping_add(index_byte.wrapping_mul(17));
     }
     key
 }
@@ -922,7 +1032,7 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
         rows,
         file_bytes,
         tree_height,
-        reused_pages: 0,
+        reused_pages: pager.reused_page_count(),
         elapsed: started.elapsed(),
     })
 }

@@ -85,7 +85,7 @@ impl BTree {
     ) -> Result<BTreeCursor<'a, S>> {
         validate_bound(&start)?;
         validate_bound(&end)?;
-        let (current, _leaf, next_slot) = match start {
+        let (current, leaf, next_slot) = match start {
             Bound::Unbounded => {
                 let (reference, leaf) = descend_to_leftmost(source, self.kind, self.root)?;
                 (reference, leaf, 0)
@@ -108,6 +108,7 @@ impl BTree {
             source,
             kind: self.kind,
             current: Some(current),
+            leaf: Some(leaf),
             next_slot,
             end: own_bound(end),
             visited,
@@ -159,7 +160,20 @@ pub(super) fn load_node(
     reference: PageRef,
 ) -> Result<Node> {
     let handle = source.read_page(reference)?;
-    let mut frame = handle.borrow_mut();
+    let mut frame = {
+        let cached = handle.try_borrow().map_err(|_| {
+            DbError::new(
+                ErrorCode::Busy,
+                "B+Tree node is mutably borrowed by another cache handle",
+            )
+        })?;
+        crate::storage::page::PageFrame::decode(
+            cached.bytes().to_vec(),
+            reference.page_id(),
+            None,
+            Some(reference.generation()),
+        )?
+    };
     if frame.header().page_id() != reference.page_id()
         || frame.header().generation() != reference.generation()
     {
@@ -323,6 +337,7 @@ pub(in crate::storage) struct BTreeCursor<'a, S: PageSource> {
     source: &'a mut S,
     kind: TreeKind,
     current: Option<PageRef>,
+    leaf: Option<LeafNode>,
     next_slot: usize,
     end: Bound<Vec<u8>>,
     visited: BTreeSet<PageId>,
@@ -333,38 +348,44 @@ pub(in crate::storage) struct BTreeCursor<'a, S: PageSource> {
 impl<S: PageSource> BTreeCursor<'_, S> {
     pub(in crate::storage) fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
-            let Some(reference) = self.current else {
+            if self.current.is_none() {
                 return Ok(None);
-            };
-            let leaf = load_leaf(self.source, self.kind, reference)?;
-            if let Some(previous) = self.previous_leaf_last_key.as_deref()
-                && leaf
-                    .cells
-                    .first()
-                    .is_some_and(|cell| cell.key() <= previous)
-            {
-                return Err(corruption(
-                    "B+Tree leaf chain keys are not strictly ordered",
-                ));
             }
-
-            if let Some(cell) = leaf.cells.get(self.next_slot) {
+            let cell = self
+                .leaf
+                .as_ref()
+                .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?
+                .cells
+                .get(self.next_slot)
+                .cloned();
+            if let Some(cell) = cell {
                 self.next_slot = self
                     .next_slot
                     .checked_add(1)
                     .ok_or_else(|| corruption("B+Tree cursor slot index overflows"))?;
                 if is_past_end(cell.key(), &self.end) {
                     self.current = None;
+                    self.leaf = None;
                     return Ok(None);
                 }
-                return read_value(self.source, cell)
+                return read_value(self.source, &cell)
                     .map(|value| Some((cell.key().to_vec(), value)));
             }
 
-            if let Some(last) = leaf.cells.last() {
-                self.previous_leaf_last_key = Some(last.key().to_vec());
+            let (last_key, right_sibling) = {
+                let leaf = self
+                    .leaf
+                    .as_ref()
+                    .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?;
+                (
+                    leaf.cells.last().map(|cell| cell.key().to_vec()),
+                    leaf.right_sibling,
+                )
+            };
+            if let Some(last_key) = last_key {
+                self.previous_leaf_last_key = Some(last_key);
             }
-            match leaf.right_sibling {
+            match right_sibling {
                 Some(right) => {
                     visit_page(
                         &mut self.visited,
@@ -372,11 +393,24 @@ impl<S: PageSource> BTreeCursor<'_, S> {
                         self.max_leaf_hops,
                         "B+Tree leaf chain",
                     )?;
+                    let leaf = load_leaf(self.source, self.kind, right)?;
+                    if let Some(previous) = self.previous_leaf_last_key.as_deref()
+                        && leaf
+                            .cells
+                            .first()
+                            .is_some_and(|cell| cell.key() <= previous)
+                    {
+                        return Err(corruption(
+                            "B+Tree leaf chain keys are not strictly ordered",
+                        ));
+                    }
                     self.current = Some(right);
+                    self.leaf = Some(leaf);
                     self.next_slot = 0;
                 }
                 None => {
                     self.current = None;
+                    self.leaf = None;
                     return Ok(None);
                 }
             }
@@ -413,19 +447,20 @@ fn corruption(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Bound;
+    use std::{collections::BTreeMap, ops::Bound};
 
     use super::InternalNode;
-    use crate::ErrorCode;
     use crate::storage::{
         PageId, PageRef,
         btree::{BTree, InternalCell, LeafCell, TreeKind, encode_leaf_right_sibling},
+        cache::PageHandle,
         overflow,
         page::PageType,
-        pager::{Pager, WriteBatch},
+        pager::{PageSource, Pager, WriteBatch},
         slotted::SlottedPage,
         test_support::test_pager,
     };
+    use crate::{DbError, ErrorCode, Result};
 
     #[test]
     fn internal_routing_uses_last_separator_not_greater_than_key() {
@@ -461,6 +496,48 @@ mod tests {
             Some(b"two".to_vec())
         );
         assert_eq!(tree.get(&mut pager, b"cat").expect("missing key"), None);
+    }
+
+    #[test]
+    fn held_clean_handle_allows_point_and_range_search_without_a_refcell_panic() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let tree = {
+            let mut batch = pager.begin_write().expect("begin tree batch");
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            tree.insert(&mut batch, b"ant", b"one").expect("insert ant");
+            tree.insert(&mut batch, b"bee", b"two").expect("insert bee");
+            tree.insert(&mut batch, b"cat", b"three")
+                .expect("insert cat");
+            batch.commit().expect("commit tree");
+            tree
+        };
+        let handle = pager.read(tree.root()).expect("hold clean root handle");
+        let held_frame = handle.borrow();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let point = tree.get(&mut pager, b"bee")?;
+            let mut cursor =
+                tree.scan(&mut pager, Bound::Included(b"ant"), Bound::Included(b"cat"))?;
+            let mut rows = Vec::new();
+            while let Some(row) = cursor.next()? {
+                rows.push(row);
+            }
+            Ok::<_, crate::DbError>((point, rows))
+        }));
+
+        assert_eq!(
+            result
+                .expect("search must not panic while a clean frame is immutably borrowed")
+                .expect("search must retain normal supported behavior"),
+            (
+                Some(b"two".to_vec()),
+                vec![
+                    (b"ant".to_vec(), b"one".to_vec()),
+                    (b"bee".to_vec(), b"two".to_vec()),
+                    (b"cat".to_vec(), b"three".to_vec()),
+                ],
+            )
+        );
+        drop(held_frame);
     }
 
     #[test]
@@ -564,6 +641,32 @@ mod tests {
                 (b"bee".to_vec(), b"two".to_vec()),
                 (b"cat".to_vec(), b"three".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn streaming_cursor_loads_each_visited_leaf_at_most_once() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let tree = three_leaf_tree(&mut pager);
+        let mut source = CountingSource::new(&mut pager);
+        let mut cursor = tree
+            .scan(&mut source, Bound::Unbounded, Bound::Unbounded)
+            .expect("start full streaming scan");
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next().expect("read streaming row") {
+            rows.push(row);
+        }
+        drop(cursor);
+
+        assert_eq!(rows.len(), 5);
+        assert!(
+            !source.leaf_loads.is_empty(),
+            "the scan must visit at least one leaf"
+        );
+        assert!(
+            source.leaf_loads.values().all(|loads| *loads <= 1),
+            "each visited leaf must decode exactly once: {:?}",
+            source.leaf_loads
         );
     }
 
@@ -999,5 +1102,38 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    struct CountingSource<'a> {
+        pager: &'a mut Pager,
+        leaf_loads: BTreeMap<PageId, usize>,
+    }
+
+    impl<'a> CountingSource<'a> {
+        fn new(pager: &'a mut Pager) -> Self {
+            Self {
+                pager,
+                leaf_loads: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl PageSource for CountingSource<'_> {
+        fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
+            let handle = self.pager.read(reference)?;
+            let page_type = handle
+                .try_borrow()
+                .map_err(|_| DbError::new(ErrorCode::Busy, "counted page is mutably borrowed"))?
+                .header()
+                .page_type();
+            if matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf) {
+                *self.leaf_loads.entry(reference.page_id()).or_default() += 1;
+            }
+            Ok(handle)
+        }
+
+        fn page_count(&self) -> Result<u64> {
+            Ok(self.pager.page_count())
+        }
     }
 }
