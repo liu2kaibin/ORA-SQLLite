@@ -239,12 +239,12 @@ impl PendingInternal {
             .maximum
             .as_ref()
             .ok_or_else(|| corruption("non-root B+Tree subtree is empty"))?;
-        if let Some(previous) = &self.previous_maximum
-            && previous >= child_minimum
-        {
-            return Err(corruption(
-                "B+Tree child key ranges overlap or are unsorted",
-            ));
+        if let Some(previous) = &self.previous_maximum {
+            if previous >= child_minimum {
+                return Err(corruption(
+                    "B+Tree child key ranges overlap or are unsorted",
+                ));
+            }
         }
         if self.next_child > 0 && self.cells[self.next_child - 1].key() != child_minimum {
             return Err(corruption(
@@ -254,10 +254,10 @@ impl PendingInternal {
         let child_depth = child
             .leaf_depth
             .ok_or_else(|| corruption("B+Tree subtree has no leaf depth"))?;
-        if let Some(expected_depth) = self.result.leaf_depth
-            && expected_depth != child_depth
-        {
-            return Err(corruption("B+Tree leaves are at unequal depths"));
+        if let Some(expected_depth) = self.result.leaf_depth {
+            if expected_depth != child_depth {
+                return Err(corruption("B+Tree leaves are at unequal depths"));
+            }
         }
         self.result.leaf_depth = Some(child_depth);
         if self.result.minimum.is_none() {

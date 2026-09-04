@@ -394,15 +394,16 @@ impl<S: PageSource> BTreeCursor<'_, S> {
                         "B+Tree leaf chain",
                     )?;
                     let leaf = load_leaf(self.source, self.kind, right)?;
-                    if let Some(previous) = self.previous_leaf_last_key.as_deref()
-                        && leaf
+                    if let Some(previous) = self.previous_leaf_last_key.as_deref() {
+                        if leaf
                             .cells
                             .first()
                             .is_some_and(|cell| cell.key() <= previous)
-                    {
-                        return Err(corruption(
-                            "B+Tree leaf chain keys are not strictly ordered",
-                        ));
+                        {
+                            return Err(corruption(
+                                "B+Tree leaf chain keys are not strictly ordered",
+                            ));
+                        }
                     }
                     self.current = Some(right);
                     self.leaf = Some(leaf);

@@ -507,13 +507,12 @@ impl WriteBatch<'_> {
             return Ok(());
         }
 
-        if let Some((committed_root, committed_pages)) = &self.committed_catalog
-            && *committed_root != root
-            && committed_pages.contains(&root.page_id())
-        {
-            return Err(corruption(
-                "reachable non-root catalog tree page cannot become the catalog root",
-            ));
+        if let Some((committed_root, committed_pages)) = &self.committed_catalog {
+            if *committed_root != root && committed_pages.contains(&root.page_id()) {
+                return Err(corruption(
+                    "reachable non-root catalog tree page cannot become the catalog root",
+                ));
+            }
         }
 
         let mut header = self.current_header();
@@ -686,12 +685,12 @@ impl WriteBatch<'_> {
                     "dirty page image key does not match its page header",
                 ));
             }
-            if let Some(generation) = self.pending_generations.get(page_id)
-                && frame.header().generation() != *generation
-            {
-                return Err(corruption(
-                    "new page image generation does not match its allocation",
-                ));
+            if let Some(generation) = self.pending_generations.get(page_id) {
+                if frame.header().generation() != *generation {
+                    return Err(corruption(
+                        "new page image generation does not match its allocation",
+                    ));
+                }
             }
             validate_page_body(frame)?;
             frame.prepare_for_write()?;
