@@ -108,7 +108,17 @@ impl Pager {
         self.require_ready()?;
 
         if let Some(handle) = self.cache.get(reference.page_id()) {
-            if handle.borrow().header().generation() == reference.generation() {
+            let generation = handle
+                .try_borrow()
+                .map_err(|_| {
+                    DbError::new(
+                        ErrorCode::Busy,
+                        "clean cache frame is mutably borrowed during page read",
+                    )
+                })?
+                .header()
+                .generation();
+            if generation == reference.generation() {
                 return Ok(handle);
             }
             self.cache.remove(reference.page_id());
@@ -1162,6 +1172,28 @@ mod tests {
         result
             .expect("batch modify must not panic while a clean frame is immutably borrowed")
             .expect("batch modify must retain normal supported behavior");
+        drop(held_frame);
+    }
+
+    #[test]
+    fn mutably_borrowed_clean_handle_returns_busy_without_a_refcell_panic() {
+        let (_temp, mut pager) = test_pager(4096).expect("create pager");
+        let page = {
+            let mut batch = pager.begin_write().expect("begin seed batch");
+            let page = batch
+                .allocate_append(PageType::TableLeaf)
+                .expect("allocate seed page");
+            batch.commit().expect("commit seed page");
+            page
+        };
+        let handle = pager.read(page).expect("hold clean cache handle");
+        let held_frame = handle.borrow_mut();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pager.read(page)));
+
+        let error = result
+            .expect("cache hit must not panic while its frame is mutably borrowed")
+            .expect_err("mutable cache borrow must report busy");
+        assert_eq!(error.code(), ErrorCode::Busy);
         drop(held_frame);
     }
 

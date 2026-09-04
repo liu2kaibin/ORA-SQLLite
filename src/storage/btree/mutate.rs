@@ -8,6 +8,7 @@ use super::{
 };
 use crate::storage::{
     PageRef, overflow,
+    page::PageFrame,
     pager::{PageSource, WriteBatch},
     slotted::SlottedPage,
 };
@@ -594,7 +595,20 @@ fn cell_fits_target(
     encoded_len: usize,
 ) -> Result<bool> {
     let handle = batch.read(reference)?;
-    let mut frame = handle.borrow_mut();
+    let mut frame = {
+        let cached = handle.try_borrow().map_err(|_| {
+            DbError::new(
+                ErrorCode::Busy,
+                "B+Tree target page is mutably borrowed by another cache handle",
+            )
+        })?;
+        PageFrame::decode(
+            cached.bytes().to_vec(),
+            reference.page_id(),
+            None,
+            Some(reference.generation()),
+        )?
+    };
     let free = SlottedPage::open(&mut frame, metadata_end)?.compacted_free()?;
     Ok(encoded_len
         .checked_add(SLOT_LEN)
@@ -819,6 +833,31 @@ mod tests {
             tree.insert(&mut batch, b"k", b"v2").unwrap_err().code(),
             ErrorCode::Constraint
         );
+    }
+
+    #[test]
+    fn held_clean_handle_allows_insert_without_a_refcell_panic() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let mut tree = {
+            let mut batch = pager.begin_write().expect("begin seed write");
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            tree.insert(&mut batch, b"a", b"one")
+                .expect("insert seed row");
+            batch.commit().expect("commit seed row");
+            tree
+        };
+        let handle = pager.read(tree.root()).expect("hold clean root handle");
+        let held_frame = handle.borrow();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut batch = pager.begin_write()?;
+            tree.insert(&mut batch, b"b", b"two")?;
+            batch.rollback()
+        }));
+
+        result
+            .expect("insert must not panic while a clean frame is immutably borrowed")
+            .expect("insert must retain normal supported behavior");
+        drop(held_frame);
     }
 
     #[test]

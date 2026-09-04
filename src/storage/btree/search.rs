@@ -645,6 +645,25 @@ mod tests {
     }
 
     #[test]
+    fn range_scan_excludes_an_existing_start_key() {
+        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let tree = three_leaf_tree(&mut pager);
+
+        assert_eq!(
+            collect_scan(
+                &tree,
+                &mut pager,
+                Bound::Excluded(b"bee"),
+                Bound::Included(b"dog"),
+            ),
+            vec![
+                (b"cat".to_vec(), b"three".to_vec()),
+                (b"dog".to_vec(), b"four".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
     fn streaming_cursor_loads_each_visited_leaf_at_most_once() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_leaf_tree(&mut pager);
