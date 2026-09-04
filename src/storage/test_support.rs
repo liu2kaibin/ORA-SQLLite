@@ -34,11 +34,15 @@ pub(super) struct TempDatabase {
 
 impl TempDatabase {
     pub(super) fn new(label: &str) -> Self {
+        Self::new_with_sequence(label, || NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn new_with_sequence(label: &str, mut next_sequence: impl FnMut() -> u64) -> Self {
         let process_id = std::process::id();
         let label = sanitized_label(label);
 
         loop {
-            let sequence = NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed);
+            let sequence = next_sequence();
             let path = std::env::temp_dir()
                 .join(format!("ora-sqllite-{process_id}-{label}-{sequence}.db"));
             if !path.exists() {
@@ -95,29 +99,23 @@ fn sanitized_label(label: &str) -> String {
 #[test]
 fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_file() {
     let label = "direct-collision";
-    let sequence = NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed);
-    let first_sequence = sequence
+    let first_sequence = NEXT_TEMP_DATABASE.fetch_add(2, Ordering::Relaxed);
+    let retry_sequence = first_sequence
         .checked_add(1)
-        .expect("temporary database sequence must not overflow");
+        .expect("temporary database retry sequence must not overflow");
     let collision = std::env::temp_dir().join(format!(
         "ora-sqllite-{}-{label}-{first_sequence}.db",
         std::process::id(),
     ));
-    let first_candidate = std::env::temp_dir().join(format!(
-        "ora-sqllite-{}-{label}-{first_sequence}.db",
-        std::process::id(),
-    ));
-    assert_eq!(
-        collision, first_candidate,
-        "the collision fixture must occupy TempDatabase::new's first candidate"
-    );
     fs::write(&collision, b"pre-existing collision").expect("create collision file");
 
-    let database = TempDatabase::new(label);
+    let mut sequences = [first_sequence, retry_sequence].into_iter();
+    let database = TempDatabase::new_with_sequence(label, || {
+        sequences
+            .next()
+            .expect("collision retry must consume exactly two candidates")
+    });
     let database_path = database.path().to_path_buf();
-    let retry_sequence = first_sequence
-        .checked_add(1)
-        .expect("temporary database retry sequence must not overflow");
     assert_eq!(
         database_path,
         std::env::temp_dir().join(format!(
@@ -351,6 +349,7 @@ impl XorShift64 {
 }
 
 #[test]
+#[ignore = "exhaustive six-configuration storage model; run in dedicated CI"]
 fn fixed_seed_reference_model_covers_every_page_size_and_tree_kind() {
     let mut proofs = Vec::new();
     for page_size in [4096, 8192, 16384] {
