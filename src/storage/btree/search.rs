@@ -160,20 +160,12 @@ pub(super) fn load_node(
     reference: PageRef,
 ) -> Result<Node> {
     let handle = source.read_page(reference)?;
-    let mut frame = {
-        let cached = handle.try_borrow().map_err(|_| {
-            DbError::new(
-                ErrorCode::Busy,
-                "B+Tree node is mutably borrowed by another cache handle",
-            )
-        })?;
-        crate::storage::page::PageFrame::decode(
-            cached.bytes().to_vec(),
-            reference.page_id(),
-            None,
-            Some(reference.generation()),
-        )?
-    };
+    let mut frame = crate::storage::page::PageFrame::decode(
+        handle.bytes().to_vec(),
+        reference.page_id(),
+        None,
+        Some(reference.generation()),
+    )?;
     if frame.header().page_id() != reference.page_id()
         || frame.header().generation() != reference.generation()
     {
@@ -461,7 +453,7 @@ mod tests {
         slotted::SlottedPage,
         test_support::test_pager,
     };
-    use crate::{DbError, ErrorCode, Result};
+    use crate::{ErrorCode, Result};
 
     #[test]
     fn internal_routing_uses_last_separator_not_greater_than_key() {
@@ -513,7 +505,7 @@ mod tests {
             tree
         };
         let handle = pager.read(tree.root()).expect("hold clean root handle");
-        let held_frame = handle.borrow();
+        let _held_frame = handle.as_ref();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let point = tree.get(&mut pager, b"bee")?;
             let mut cursor =
@@ -538,7 +530,6 @@ mod tests {
                 ],
             )
         );
-        drop(held_frame);
     }
 
     #[test]
@@ -1141,11 +1132,7 @@ mod tests {
     impl PageSource for CountingSource<'_> {
         fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
             let handle = self.pager.read(reference)?;
-            let page_type = handle
-                .try_borrow()
-                .map_err(|_| DbError::new(ErrorCode::Busy, "counted page is mutably borrowed"))?
-                .header()
-                .page_type();
+            let page_type = handle.header().page_type();
             if matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf) {
                 *self.leaf_loads.entry(reference.page_id()).or_default() += 1;
             }

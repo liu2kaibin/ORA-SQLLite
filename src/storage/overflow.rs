@@ -149,7 +149,7 @@ fn walk_chain(
         }
 
         let handle = source.read_page(current)?;
-        let frame = handle.borrow();
+        let frame = handle.as_ref();
         if frame.header().page_id() != current.page_id()
             || frame.header().generation() != current.generation()
         {
@@ -157,8 +157,8 @@ fn walk_chain(
                 "overflow page reference does not match the loaded page",
             ));
         }
-        let body = OverflowBody::decode(&frame)?;
-        let chunk = body.chunk(&frame)?;
+        let body = OverflowBody::decode(frame)?;
+        let chunk = body.chunk(frame)?;
         value_len = value_len
             .checked_add(
                 u64::try_from(chunk.len())
@@ -305,7 +305,7 @@ fn corruption(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+    use std::{collections::BTreeMap, sync::Arc};
 
     use super::{collect_chain, read_value, release_chain, write_value};
     use crate::{ErrorCode, Result};
@@ -638,7 +638,7 @@ mod tests {
                 None,
                 Some(reference.generation()),
             )?;
-            Ok(Rc::new(RefCell::new(frame)))
+            Ok(Arc::new(frame))
         }
 
         fn page_count(&self) -> Result<u64> {

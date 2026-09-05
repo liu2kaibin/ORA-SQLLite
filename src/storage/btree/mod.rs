@@ -335,7 +335,7 @@ mod tests {
         };
 
         let root = pager.read(tree.root()).expect("read root page");
-        assert_eq!(root.borrow().header().page_type(), PageType::TableLeaf);
+        assert_eq!(root.header().page_type(), PageType::TableLeaf);
 
         assert_eq!(
             tree.scan(&mut pager, Bound::Unbounded, Bound::Unbounded)

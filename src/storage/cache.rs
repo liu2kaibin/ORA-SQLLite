@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
     PageId, PageRef,
@@ -7,7 +7,18 @@ use super::{
 
 use crate::{DbError, ErrorCode, Result};
 
-pub(super) type PageHandle = Rc<RefCell<PageFrame>>;
+pub(super) type PageHandle = Arc<PageFrame>;
+
+#[test]
+fn page_handles_are_shareable_immutable_arcs() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PageHandle>();
+
+    let page = handle(1);
+    let clone = page.clone();
+    assert!(Arc::ptr_eq(&page, &clone));
+    assert_eq!(page.header().page_id(), PageId(1));
+}
 
 #[derive(Debug)]
 struct CacheEntry {
@@ -46,7 +57,7 @@ impl PageCache {
     }
 
     pub(super) fn insert_clean(&mut self, handle: PageHandle) -> Result<()> {
-        let page_id = handle.borrow().header().page_id();
+        let page_id = handle.header().page_id();
         let last_used = self.next_access();
 
         if let Some(entry) = self.entries.get_mut(&page_id) {
@@ -59,7 +70,7 @@ impl PageCache {
             let evicted_page_id = self
                 .entries
                 .iter()
-                .filter(|(_, entry)| Rc::strong_count(&entry.handle) == 1)
+                .filter(|(_, entry)| Arc::strong_count(&entry.handle) == 1)
                 .min_by_key(|(page_id, entry)| (entry.last_used, **page_id))
                 .map(|(page_id, _)| *page_id)
                 .ok_or_else(|| DbError::new(ErrorCode::Busy, "all cached pages are pinned"))?;
@@ -188,7 +199,7 @@ fn remove_returns_the_entry_and_updates_length() {
     assert_eq!(cache.len(), 1);
 
     let removed = cache.remove(PageId(1)).expect("removed page");
-    assert_eq!(removed.borrow().header().page_id(), PageId(1));
+    assert_eq!(removed.header().page_id(), PageId(1));
     assert_eq!(cache.len(), 0);
     assert!(cache.remove(PageId(1)).is_none());
 }
@@ -216,12 +227,12 @@ fn access_clock_overflow_preserves_lru_eviction_order() {
 }
 
 fn handle(id: u64) -> PageHandle {
-    Rc::new(RefCell::new(
+    Arc::new(
         PageFrame::new_zeroed(
             PageType::TableLeaf,
             PageRef::new(PageId(id), 1).expect("page reference"),
             4096,
         )
         .expect("page frame"),
-    ))
+    )
 }

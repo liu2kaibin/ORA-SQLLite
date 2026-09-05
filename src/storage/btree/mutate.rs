@@ -190,7 +190,7 @@ fn repair_after_delete(
             return Ok(());
         }
 
-        let page_len = batch.read(current_ref)?.borrow().bytes().len();
+        let page_len = batch.read(current_ref)?.bytes().len();
         if !node_is_underfull(page_len, &current)? {
             rewrite_node(batch, current_ref, &current)?;
             let minimum = node_minimum(batch, kind, &current)?;
@@ -595,20 +595,12 @@ fn cell_fits_target(
     encoded_len: usize,
 ) -> Result<bool> {
     let handle = batch.read(reference)?;
-    let mut frame = {
-        let cached = handle.try_borrow().map_err(|_| {
-            DbError::new(
-                ErrorCode::Busy,
-                "B+Tree target page is mutably borrowed by another cache handle",
-            )
-        })?;
-        PageFrame::decode(
-            cached.bytes().to_vec(),
-            reference.page_id(),
-            None,
-            Some(reference.generation()),
-        )?
-    };
+    let mut frame = PageFrame::decode(
+        handle.bytes().to_vec(),
+        reference.page_id(),
+        None,
+        Some(reference.generation()),
+    )?;
     let free = SlottedPage::open(&mut frame, metadata_end)?.compacted_free()?;
     Ok(encoded_len
         .checked_add(SLOT_LEN)
@@ -622,7 +614,7 @@ fn write_or_split_leaf(
     leaf: LeafNode,
 ) -> Result<Option<Split>> {
     let encoded = encode_leaf_cells(&leaf.cells)?;
-    let page_len = batch.read(left_ref)?.borrow().bytes().len();
+    let page_len = batch.read(left_ref)?.bytes().len();
     if encoded_cells_fit(page_len, LEAF_METADATA_END, &encoded)? {
         rewrite_leaf(batch, left_ref, leaf.right_sibling, &leaf.cells)?;
         return Ok(None);
@@ -651,7 +643,7 @@ fn write_or_split_internal(
     node: InternalNode,
 ) -> Result<Option<Split>> {
     let encoded = encode_internal_cells(&node.cells)?;
-    let page_len = batch.read(left_ref)?.borrow().bytes().len();
+    let page_len = batch.read(left_ref)?.bytes().len();
     if encoded_cells_fit(page_len, INTERNAL_METADATA_END, &encoded)? {
         rewrite_internal(batch, left_ref, node.leftmost, &node.cells)?;
         return Ok(None);
@@ -847,7 +839,7 @@ mod tests {
             tree
         };
         let handle = pager.read(tree.root()).expect("hold clean root handle");
-        let held_frame = handle.borrow();
+        let _held_frame = handle.as_ref();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut batch = pager.begin_write()?;
             tree.insert(&mut batch, b"b", b"two")?;
@@ -857,7 +849,6 @@ mod tests {
         result
             .expect("insert must not panic while a clean frame is immutably borrowed")
             .expect("insert must retain normal supported behavior");
-        drop(held_frame);
     }
 
     #[test]
@@ -924,7 +915,6 @@ mod tests {
             batch
                 .read(existing)
                 .expect("existing unrelated batch page")
-                .borrow()
                 .header()
                 .page_type(),
             TreeKind::Index.leaf_page_type()

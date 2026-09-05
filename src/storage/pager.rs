@@ -1,8 +1,7 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    rc::Rc,
+    sync::Arc,
 };
 
 use super::{
@@ -21,9 +20,6 @@ use super::{
     validate::{validate_freelist, validate_tree},
 };
 use crate::{DbError, ErrorCode, Result};
-
-#[cfg(test)]
-use std::sync::Arc;
 
 #[cfg(test)]
 use crate::fault::FaultInjector;
@@ -108,16 +104,7 @@ impl Pager {
         self.require_ready()?;
 
         if let Some(handle) = self.cache.get(reference.page_id()) {
-            let generation = handle
-                .try_borrow()
-                .map_err(|_| {
-                    DbError::new(
-                        ErrorCode::Busy,
-                        "clean cache frame is mutably borrowed during page read",
-                    )
-                })?
-                .header()
-                .generation();
+            let generation = handle.header().generation();
             if generation == reference.generation() {
                 return Ok(handle);
             }
@@ -130,7 +117,7 @@ impl Pager {
             None,
             Some(reference.generation()),
         )?;
-        let handle = Rc::new(RefCell::new(frame));
+        let handle = Arc::new(frame);
         self.cache.insert_clean(handle.clone())?;
         Ok(handle)
     }
@@ -270,7 +257,7 @@ impl PageSource for Pager {
 
     fn read_page_by_id(&mut self, page_id: PageId) -> Result<PageHandle> {
         let frame = self.read_frame(page_id)?;
-        Ok(Rc::new(RefCell::new(frame)))
+        Ok(Arc::new(frame))
     }
 
     fn page_count(&self) -> Result<u64> {
@@ -398,14 +385,8 @@ impl WriteBatch<'_> {
         }
         if !self.dirty.contains_key(&reference.page_id()) {
             let handle = self.pager.read(reference)?;
-            let source = handle.try_borrow().map_err(|_| {
-                DbError::new(
-                    ErrorCode::Busy,
-                    "clean cache frame is mutably borrowed during write-batch copy",
-                )
-            })?;
             self.dirty
-                .insert(reference.page_id(), copy_clean_frame(&source)?);
+                .insert(reference.page_id(), copy_clean_frame(handle.as_ref())?);
         }
         let frame = self
             .dirty
@@ -492,7 +473,7 @@ impl WriteBatch<'_> {
                 "released page cannot become the catalog root in the same batch",
             ));
         }
-        let page_type = self.read(root)?.borrow().header().page_type();
+        let page_type = self.read(root)?.header().page_type();
         let kind = TreeKind::from_root_page_type(page_type)
             .ok_or_else(|| corruption("catalog root must reference a B+Tree page"))?;
         if !self.tracked_trees.contains(&(kind, root)) {
@@ -554,7 +535,7 @@ impl WriteBatch<'_> {
             }
             frame.header().page_type()
         } else {
-            self.read(reference)?.borrow().header().page_type()
+            self.read(reference)?.header().page_type()
         };
         if !matches!(
             page_type,
@@ -868,7 +849,7 @@ impl WriteBatch<'_> {
     fn replace_cache_images(&mut self) {
         for (page_id, frame) in std::mem::take(&mut self.dirty) {
             self.pager.cache.remove(page_id);
-            let handle = Rc::new(RefCell::new(frame));
+            let handle = Arc::new(frame);
             let _ = self.pager.cache.insert_clean(handle);
         }
     }
@@ -941,7 +922,7 @@ impl PageSource for WriteBatch<'_> {
     fn read_page_by_id(&mut self, page_id: PageId) -> Result<PageHandle> {
         self.require_active()?;
         let frame = self.read_frame_by_id(page_id)?;
-        Ok(Rc::new(RefCell::new(frame)))
+        Ok(Arc::new(frame))
     }
 
     fn page_count(&self) -> Result<u64> {
@@ -959,7 +940,7 @@ impl PageSource for WriteBatch<'_> {
 }
 
 fn private_handle(frame: &mut PageFrame) -> Result<PageHandle> {
-    Ok(Rc::new(RefCell::new(private_frame(frame)?)))
+    Ok(Arc::new(private_frame(frame)?))
 }
 
 fn private_frame(frame: &mut PageFrame) -> Result<PageFrame> {
@@ -989,11 +970,10 @@ fn corruption(message: impl Into<String>) -> DbError {
 mod tests {
     use std::{
         ops::Bound,
-        rc::Rc,
         sync::{Arc, Mutex},
     };
 
-    use super::{PageSource, Pager, PagerConfig};
+    use super::{PageSource, Pager, PagerConfig, copy_clean_frame};
     use crate::{
         DbError, ErrorCode, Result,
         fault::{FaultInjector, FaultPoint},
@@ -1085,11 +1065,7 @@ mod tests {
             .bytes_mut()[100] = 0x7b;
 
         assert_eq!(
-            batch
-                .read(page)
-                .expect("batch overlay read")
-                .borrow()
-                .bytes()[100],
+            batch.read(page).expect("batch overlay read").bytes()[100],
             0x7b
         );
         batch.rollback().expect("rollback");
@@ -1114,9 +1090,9 @@ mod tests {
         assert_eq!(pager.page_count(), 2);
         assert_eq!(pager.cache.len(), 1);
         let first = pager.read(page).expect("read committed page");
-        assert_eq!(first.borrow().bytes()[100], 0x2a);
+        assert_eq!(first.bytes()[100], 0x2a);
         let second = pager.read(page).expect("read cached page");
-        assert!(Rc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
@@ -1137,16 +1113,16 @@ mod tests {
             let mut batch = pager.begin_write().expect("begin second write");
             batch.modify(page).expect("copy committed page").bytes_mut()[100] = 0x22;
             assert_eq!(
-                batch.read(page).expect("read dirty copy").borrow().bytes()[100],
+                batch.read(page).expect("read dirty copy").bytes()[100],
                 0x22
             );
             batch.commit().expect("commit dirty copy");
         }
 
-        assert_eq!(clean_handle.borrow().bytes()[100], 0x11);
+        assert_eq!(clean_handle.bytes()[100], 0x11);
         let current_handle = pager.read(page).expect("read replacement image");
-        assert_eq!(current_handle.borrow().bytes()[100], 0x22);
-        assert!(!Rc::ptr_eq(&clean_handle, &current_handle));
+        assert_eq!(current_handle.bytes()[100], 0x22);
+        assert!(!Arc::ptr_eq(&clean_handle, &current_handle));
     }
 
     #[test]
@@ -1161,7 +1137,7 @@ mod tests {
             page
         };
         let handle = pager.read(page).expect("hold clean cache handle");
-        let held_frame = handle.borrow();
+        let _held_frame = handle.as_ref();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut batch = pager.begin_write()?;
             batch.modify(page)?;
@@ -1171,29 +1147,32 @@ mod tests {
         result
             .expect("batch modify must not panic while a clean frame is immutably borrowed")
             .expect("batch modify must retain normal supported behavior");
-        drop(held_frame);
     }
 
     #[test]
-    fn mutably_borrowed_clean_handle_returns_busy_without_a_refcell_panic() {
+    fn held_immutable_handle_does_not_block_reads_or_writes() {
         let (_temp, mut pager) = test_pager(4096).expect("create pager");
         let page = {
             let mut batch = pager.begin_write().expect("begin seed batch");
             let page = batch
                 .allocate_append(PageType::TableLeaf)
                 .expect("allocate seed page");
+            batch.modify(page).expect("modify seed page").bytes_mut()[100] = 0x11;
             batch.commit().expect("commit seed page");
             page
         };
-        let handle = pager.read(page).expect("hold clean cache handle");
-        let held_frame = handle.borrow_mut();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pager.read(page)));
+        let held_handle = pager.read(page).expect("hold clean cache handle");
 
-        let error = result
-            .expect("cache hit must not panic while its frame is mutably borrowed")
-            .expect_err("mutable cache borrow must report busy");
-        assert_eq!(error.code(), ErrorCode::Busy);
-        drop(held_frame);
+        let mut batch = pager.begin_write().expect("begin replacement write");
+        batch
+            .modify(page)
+            .expect("modify replacement image")
+            .bytes_mut()[100] = 0x22;
+        batch.commit().expect("commit replacement image");
+
+        assert_eq!(held_handle.bytes()[100], 0x11);
+        let current_handle = pager.read(page).expect("read replacement image");
+        assert_eq!(current_handle.bytes()[100], 0x22);
     }
 
     #[test]
@@ -1220,11 +1199,7 @@ mod tests {
         .expect("open read only");
 
         assert_eq!(
-            read_only
-                .read(page)
-                .expect("read committed page")
-                .borrow()
-                .bytes()[100],
+            read_only.read(page).expect("read committed page").bytes()[100],
             0x33
         );
         let error = match read_only.begin_write() {
@@ -1458,7 +1433,7 @@ mod tests {
             tree
         };
         let handle = pager.read(tree.root()).expect("hold clean root handle");
-        let held_frame = handle.borrow();
+        let _held_frame = handle.as_ref();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             validate_tree(&mut pager, &tree)
         }));
@@ -1466,7 +1441,6 @@ mod tests {
         result
             .expect("validation must not panic while a clean frame is immutably borrowed")
             .expect("validation must retain normal supported behavior");
-        drop(held_frame);
     }
 
     #[test]
@@ -1494,10 +1468,9 @@ mod tests {
                 .track_tree(TreeKind::Table, tree.root())
                 .expect("register current root");
             let rightmost = {
-                let root = batch.read(tree.root()).expect("read root");
-                let mut root = root.borrow_mut();
+                let root = batch.modify(tree.root()).expect("read root");
                 let cell_count = usize::from(root.header().cell_count());
-                let slots = SlottedPage::open(&mut root, INTERNAL_METADATA_END).expect("open root");
+                let slots = SlottedPage::open(root, INTERNAL_METADATA_END).expect("open root");
                 InternalCell::decode(
                     &slots
                         .cell(cell_count - 1)
@@ -2157,7 +2130,6 @@ mod tests {
                 batch
                     .read(catalog)
                     .expect("catalog remains readable")
-                    .borrow()
                     .header()
                     .page_type(),
                 PageType::Catalog
@@ -2185,7 +2157,6 @@ mod tests {
                 batch
                     .read(freelist)
                     .expect("freelist remains readable")
-                    .borrow()
                     .header()
                     .page_type(),
                 PageType::Freelist
@@ -2318,8 +2289,8 @@ mod tests {
             };
 
             let persisted = pager.read(released).expect("read persisted tombstone");
-            assert_eq!(persisted.borrow().header().page_type(), PageType::TableLeaf);
-            assert_eq!(persisted.borrow().header().cell_count(), 0);
+            assert_eq!(persisted.header().page_type(), PageType::TableLeaf);
+            assert_eq!(persisted.header().cell_count(), 0);
 
             let replacement = {
                 let mut batch = pager.begin_write().expect("begin reuse batch");
@@ -2405,7 +2376,6 @@ mod tests {
         source
             .read_page(reference)
             .expect("read page source")
-            .borrow()
             .bytes()[100]
     }
 
@@ -2712,19 +2682,18 @@ mod tests {
 
     fn root_has_internal_child(source: &mut impl PageSource, root: PageRef) -> Result<bool> {
         let root = source.read_page(root)?;
-        let root = root.borrow();
+        let root = root.as_ref();
         if root.header().page_type() != PageType::TableInternal {
             return Ok(false);
         }
         let leftmost = decode_internal_leftmost(&root.bytes()[48..INTERNAL_METADATA_END])?;
-        drop(root);
         let child = source.read_page(leftmost)?;
-        Ok(child.borrow().header().page_type() == PageType::TableInternal)
+        Ok(child.header().page_type() == PageType::TableInternal)
     }
 
     fn rightmost_child(source: &mut impl PageSource, root: PageRef) -> PageRef {
         let root = source.read_page(root).expect("read internal root");
-        let mut root = root.borrow_mut();
+        let mut root = copy_clean_frame(root.as_ref()).expect("copy internal root");
         let cell_count = usize::from(root.header().cell_count());
         let slots = SlottedPage::open(&mut root, INTERNAL_METADATA_END).expect("open root slots");
         InternalCell::decode(
