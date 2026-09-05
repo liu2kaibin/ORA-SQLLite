@@ -54,3 +54,17 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Run tests on Windows
         run: rustup run stable cargo test --all-targets
+
+  exhaustive-model:
+    name: Linux exhaustive storage model
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run the six-configuration storage model
+        run: >-
+          rustup run stable cargo test
+          fixed_seed_reference_model_covers_every_page_size_and_tree_kind
+          -- --ignored --nocapture

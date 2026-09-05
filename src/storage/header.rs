@@ -1,7 +1,7 @@
 use super::{
-    Lsn, PageId,
+    Lsn, OpenMode, PageId,
+    checksum::crc32c,
     codec::{Decoder, Encoder},
-    crc32c,
 };
 use crate::{DbError, ErrorCode, Result};
 
@@ -10,6 +10,7 @@ const DATABASE_HEADER_PREFIX_LEN: usize = 124;
 const DATABASE_MAGIC: &[u8; 16] = b"ORA-SQLLITE\0\0\0\0\0";
 const FORMAT_MAJOR: u16 = 1;
 const FORMAT_MINOR: u16 = 0;
+const KNOWN_FEATURES: u64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DatabaseHeader {
@@ -66,6 +67,48 @@ impl DatabaseHeader {
             .expect("database header encoding has a fixed length")
     }
 
+    pub(super) const fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    pub(super) const fn uuid(&self) -> [u8; 16] {
+        self.uuid
+    }
+
+    pub(super) const fn minor(&self) -> u16 {
+        self.minor
+    }
+
+    pub(super) const fn features(&self) -> u64 {
+        self.features
+    }
+
+    pub(super) const fn catalog_root(&self) -> PageId {
+        self.catalog_root
+    }
+
+    pub(super) const fn freelist_root(&self) -> PageId {
+        self.freelist_root
+    }
+
+    pub(super) fn set_catalog_root(&mut self, root: PageId) {
+        self.catalog_root = root;
+    }
+
+    pub(super) fn set_freelist_root(&mut self, root: PageId) {
+        self.freelist_root = root;
+    }
+
+    pub(super) fn validate_open(&self, mode: OpenMode) -> Result<()> {
+        if self.minor > FORMAT_MINOR && mode == OpenMode::ReadWrite {
+            return Err(DbError::new(
+                ErrorCode::Unsupported,
+                "database format minor version requires read-only access",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != DATABASE_HEADER_LEN {
             return Err(corruption("database header must be exactly 128 bytes"));
@@ -97,7 +140,7 @@ impl DatabaseHeader {
         if !is_valid_page_size(page_size) {
             return Err(corruption("invalid database page size"));
         }
-        if features != 0 {
+        if features & !KNOWN_FEATURES != 0 {
             return Err(corruption("database header has unknown feature bits"));
         }
         if reserved.iter().any(|&byte| byte != 0) {
@@ -170,7 +213,7 @@ fn database_header_uses_fixed_little_endian_offsets() {
     assert_eq!(&bytes[72..124], &[0; 52]);
     assert_eq!(
         u32::from_le_bytes(bytes[124..128].try_into().expect("checksum bytes")),
-        super::crc32c(&bytes[..124])
+        super::checksum::crc32c(&bytes[..124])
     );
 }
 
@@ -222,7 +265,39 @@ fn database_header_decode_requires_exact_layout_size() {
     );
 }
 
+#[test]
+fn future_minor_is_read_only_when_features_are_known() {
+    let mut bytes = DatabaseHeader::new(4096, [9; 16]).unwrap().encode();
+    bytes[18..20].copy_from_slice(&1u16.to_le_bytes());
+    refresh_database_crc(&mut bytes);
+    let header = DatabaseHeader::decode(&bytes).expect("structurally valid");
+    header
+        .validate_open(super::OpenMode::ReadOnly)
+        .expect("safe read-only open");
+    assert_eq!(
+        header
+            .validate_open(super::OpenMode::ReadWrite)
+            .unwrap_err()
+            .code(),
+        crate::ErrorCode::Unsupported
+    );
+}
+
+#[test]
+fn database_header_accessors_expose_values_and_only_roots_change() {
+    let mut header = DatabaseHeader::new(8192, [0xa5; 16]).expect("header");
+    header.set_catalog_root(PageId(7));
+    header.set_freelist_root(PageId(8));
+
+    assert_eq!(header.page_size(), 8192);
+    assert_eq!(header.uuid(), [0xa5; 16]);
+    assert_eq!(header.minor(), 0);
+    assert_eq!(header.features(), 0);
+    assert_eq!(header.catalog_root(), PageId(7));
+    assert_eq!(header.freelist_root(), PageId(8));
+}
+
 fn refresh_database_crc(bytes: &mut [u8; 128]) {
-    let checksum = super::crc32c(&bytes[..124]).to_le_bytes();
+    let checksum = super::checksum::crc32c(&bytes[..124]).to_le_bytes();
     bytes[124..128].copy_from_slice(&checksum);
 }

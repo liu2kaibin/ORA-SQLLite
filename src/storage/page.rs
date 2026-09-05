@@ -1,5 +1,6 @@
 use super::{
-    PageId,
+    PageId, PageRef,
+    checksum::{stamp_page_checksum, verify_page_checksum},
     codec::{Decoder, Encoder},
 };
 use crate::{DbError, ErrorCode, Result};
@@ -44,6 +45,7 @@ pub(super) struct PageHeader {
     payload_start: u16,
     right_sibling: Option<PageId>,
     checksum: u32,
+    page_size: u32,
 }
 
 impl PageHeader {
@@ -67,7 +69,77 @@ impl PageHeader {
             payload_start: page_size as u16,
             right_sibling: None,
             checksum: 0,
+            page_size,
         })
+    }
+
+    pub(super) const fn page_type(&self) -> PageType {
+        self.page_type
+    }
+
+    pub(super) const fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    pub(super) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) const fn cell_count(&self) -> u16 {
+        self.cell_count
+    }
+
+    pub(super) const fn slot_end(&self) -> u16 {
+        self.slot_end
+    }
+
+    pub(super) const fn payload_start(&self) -> u16 {
+        self.payload_start
+    }
+
+    pub(super) const fn right_sibling(&self) -> Option<PageId> {
+        self.right_sibling
+    }
+
+    pub(super) const fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    pub(super) fn set_checksum(&mut self, checksum: u32) {
+        self.checksum = checksum;
+    }
+
+    pub(super) fn set_generation(&mut self, generation: u64) -> Result<()> {
+        if generation == 0 {
+            return Err(corruption("page generation must be nonzero"));
+        }
+        self.generation = generation;
+        Ok(())
+    }
+
+    pub(super) fn set_right_sibling(&mut self, right_sibling: Option<PageId>) -> Result<()> {
+        if right_sibling.is_some_and(|page_id| page_id.0 == 0) {
+            return Err(corruption("right sibling page id must be nonzero"));
+        }
+        self.right_sibling = right_sibling;
+        Ok(())
+    }
+
+    pub(super) fn set_layout(
+        &mut self,
+        cell_count: u16,
+        slot_end: u16,
+        payload_start: u16,
+    ) -> Result<()> {
+        validate_layout(slot_end, payload_start, self.page_size)?;
+        self.cell_count = cell_count;
+        self.slot_end = slot_end;
+        self.payload_start = payload_start;
+        Ok(())
     }
 
     pub(super) fn encode(&self) -> [u8; PAGE_HEADER_LEN] {
@@ -118,15 +190,7 @@ impl PageHeader {
         if reserved_1 != 0 || reserved_2 != 0 || reserved_3.iter().any(|&byte| byte != 0) {
             return Err(corruption("page header reserved bytes are nonzero"));
         }
-        if usize::from(slot_end) < PAGE_HEADER_LEN {
-            return Err(corruption("page slot directory overlaps the header"));
-        }
-        if u32::from(payload_start) > page_size {
-            return Err(corruption("page payload starts beyond the page boundary"));
-        }
-        if slot_end > payload_start {
-            return Err(corruption("page free-space boundaries cross"));
-        }
+        validate_layout(slot_end, payload_start, page_size)?;
 
         Ok(Self {
             page_type,
@@ -138,8 +202,22 @@ impl PageHeader {
             payload_start,
             right_sibling,
             checksum,
+            page_size,
         })
     }
+}
+
+fn validate_layout(slot_end: u16, payload_start: u16, page_size: u32) -> Result<()> {
+    if usize::from(slot_end) < PAGE_HEADER_LEN {
+        return Err(corruption("page slot directory overlaps the header"));
+    }
+    if u32::from(payload_start) > page_size {
+        return Err(corruption("page payload starts beyond the page boundary"));
+    }
+    if slot_end > payload_start {
+        return Err(corruption("page free-space boundaries cross"));
+    }
+    Ok(())
 }
 
 const fn is_valid_page_size(page_size: u32) -> bool {
@@ -148,6 +226,97 @@ const fn is_valid_page_size(page_size: u32) -> bool {
 
 fn corruption(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
+}
+
+#[derive(Debug)]
+pub(super) struct PageFrame {
+    bytes: Vec<u8>,
+    header: PageHeader,
+}
+
+impl PageFrame {
+    pub(super) fn new_zeroed(
+        page_type: PageType,
+        page_ref: PageRef,
+        page_size: u32,
+    ) -> Result<Self> {
+        let header = PageHeader::new(
+            page_type,
+            page_ref.page_id(),
+            page_ref.generation(),
+            page_size,
+        )?;
+        Ok(Self {
+            bytes: vec![0; page_size as usize],
+            header,
+        })
+    }
+
+    pub(super) fn decode(
+        bytes: Vec<u8>,
+        expected_page_id: PageId,
+        expected_page_type: Option<PageType>,
+        expected_generation: Option<u64>,
+    ) -> Result<Self> {
+        verify_page_checksum(&bytes)?;
+        let page_size = u32::try_from(bytes.len())
+            .map_err(|_| corruption("page frame exceeds supported size"))?;
+        let header = PageHeader::decode(&bytes[..PAGE_HEADER_LEN], page_size)?;
+
+        if header.page_id() != expected_page_id {
+            return Err(corruption(
+                "page frame id does not match the requested page",
+            ));
+        }
+        if expected_page_type.is_some_and(|page_type| header.page_type() != page_type) {
+            return Err(corruption(
+                "page frame type does not match the requested page",
+            ));
+        }
+        if expected_generation.is_some_and(|generation| header.generation() != generation) {
+            return Err(corruption(
+                "page frame generation does not match the requested page",
+            ));
+        }
+
+        Ok(Self { bytes, header })
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    pub(super) const fn header(&self) -> &PageHeader {
+        &self.header
+    }
+
+    pub(super) fn set_layout(
+        &mut self,
+        cell_count: u16,
+        slot_end: u16,
+        payload_start: u16,
+    ) -> Result<()> {
+        self.header.set_layout(cell_count, slot_end, payload_start)
+    }
+
+    pub(super) fn set_right_sibling(&mut self, right_sibling: Option<PageId>) -> Result<()> {
+        self.header.set_right_sibling(right_sibling)
+    }
+
+    pub(super) fn prepare_for_write(&mut self) -> Result<()> {
+        self.header.set_checksum(0);
+        self.bytes[..PAGE_HEADER_LEN].copy_from_slice(&self.header.encode());
+        let page_size = u32::try_from(self.bytes.len())
+            .map_err(|_| corruption("page frame exceeds supported size"))?;
+        self.header = PageHeader::decode(&self.bytes[..PAGE_HEADER_LEN], page_size)?;
+        let checksum = stamp_page_checksum(&mut self.bytes)?;
+        self.header.set_checksum(checksum);
+        Ok(())
+    }
 }
 
 #[test]
@@ -292,4 +461,153 @@ fn page_header_decode_requires_exact_layout_size() {
             .code(),
         crate::ErrorCode::Corruption
     );
+}
+
+#[test]
+fn page_header_mutators_preserve_bounds() {
+    let mut header = PageHeader::new(PageType::TableLeaf, PageId(1), 1, 4096).unwrap();
+    header.set_layout(2, 56, 4000).expect("valid layout");
+    assert_eq!(header.cell_count(), 2);
+    assert_eq!(
+        header.set_layout(2, 4001, 4000).unwrap_err().code(),
+        crate::ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn frame_layout_mutator_updates_the_authoritative_header() {
+    let reference = PageRef::new(PageId(1), 1).expect("page reference");
+    let mut frame =
+        PageFrame::new_zeroed(PageType::TableLeaf, reference, 4096).expect("zeroed page frame");
+
+    frame.set_layout(2, 56, 4000).expect("valid frame layout");
+    frame.prepare_for_write().expect("prepared page frame");
+
+    let decoded = PageFrame::decode(
+        frame.bytes().to_vec(),
+        PageId(1),
+        Some(PageType::TableLeaf),
+        Some(1),
+    )
+    .expect("decoded page frame");
+    assert_eq!(decoded.header().cell_count(), 2);
+    assert_eq!(decoded.header().slot_end(), 56);
+    assert_eq!(decoded.header().payload_start(), 4000);
+}
+
+#[test]
+fn frame_right_sibling_mutator_updates_the_authoritative_header() {
+    let reference = PageRef::new(PageId(1), 1).expect("page reference");
+    let mut frame =
+        PageFrame::new_zeroed(PageType::TableLeaf, reference, 4096).expect("zeroed page frame");
+
+    frame
+        .set_right_sibling(Some(PageId(2)))
+        .expect("valid right sibling");
+    frame.prepare_for_write().expect("prepared page frame");
+
+    let decoded = PageFrame::decode(
+        frame.bytes().to_vec(),
+        PageId(1),
+        Some(PageType::TableLeaf),
+        Some(1),
+    )
+    .expect("decoded page frame");
+    assert_eq!(decoded.header().right_sibling(), Some(PageId(2)));
+}
+
+#[test]
+fn page_header_accessors_and_setters_round_trip() {
+    let mut header = PageHeader::new(PageType::TableLeaf, PageId(7), 1, 8192).unwrap();
+    header.set_generation(2).expect("generation");
+    header
+        .set_right_sibling(Some(PageId(8)))
+        .expect("right sibling");
+    header.set_checksum(0xa1b2_c3d4);
+
+    assert_eq!(header.page_type(), PageType::TableLeaf);
+    assert_eq!(header.flags(), 0);
+    assert_eq!(header.page_id(), PageId(7));
+    assert_eq!(header.generation(), 2);
+    assert_eq!(header.cell_count(), 0);
+    assert_eq!(header.slot_end(), 48);
+    assert_eq!(header.payload_start(), 8192);
+    assert_eq!(header.right_sibling(), Some(PageId(8)));
+    assert_eq!(header.checksum(), 0xa1b2_c3d4);
+}
+
+#[test]
+fn frame_decode_checks_crc_id_type_and_generation() {
+    let expected = PageRef::new(PageId(5), 2).expect("page reference");
+    let mut frame =
+        PageFrame::new_zeroed(PageType::TableLeaf, expected, 4096).expect("zeroed page frame");
+    frame.prepare_for_write().expect("prepare page frame");
+
+    PageFrame::decode(
+        frame.bytes().to_vec(),
+        PageId(5),
+        Some(PageType::TableLeaf),
+        Some(2),
+    )
+    .expect("matching frame");
+    assert_eq!(
+        PageFrame::decode(frame.bytes().to_vec(), PageId(6), None, None)
+            .expect_err("wrong page id")
+            .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn frame_decode_rejects_checksum_corruption() {
+    let mut bytes = encoded_frame(PageType::TableLeaf, 5, 2);
+    bytes[100] ^= 1;
+
+    assert_eq!(
+        PageFrame::decode(bytes, PageId(5), Some(PageType::TableLeaf), Some(2))
+            .expect_err("checksum corruption")
+            .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn frame_decode_rejects_mismatched_page_type() {
+    assert_eq!(
+        PageFrame::decode(
+            encoded_frame(PageType::TableLeaf, 5, 2),
+            PageId(5),
+            Some(PageType::Catalog),
+            Some(2),
+        )
+        .expect_err("mismatched page type")
+        .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn frame_decode_rejects_mismatched_generation() {
+    assert_eq!(
+        PageFrame::decode(
+            encoded_frame(PageType::TableLeaf, 5, 2),
+            PageId(5),
+            Some(PageType::TableLeaf),
+            Some(3),
+        )
+        .expect_err("mismatched generation")
+        .code(),
+        ErrorCode::Corruption
+    );
+}
+
+fn encoded_frame(page_type: PageType, page_id: u64, generation: u64) -> Vec<u8> {
+    let mut frame = PageFrame::new_zeroed(
+        page_type,
+        PageRef::new(PageId(page_id), generation).expect("page reference"),
+        4096,
+    )
+    .expect("page frame");
+    frame.prepare_for_write().expect("prepared page frame");
+    frame.bytes().to_vec()
 }

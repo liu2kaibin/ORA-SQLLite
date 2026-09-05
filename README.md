@@ -17,8 +17,15 @@ The first release will not implement PL/SQL, packages, a network server, Oracle 
 
 Phase 1 foundations are complete: validated Oracle-compatible values, stable errors,
 disk codecs, versioned disk headers, checksums, and internal fault-injection
-boundaries. The Pager, B+Tree, WAL, SQL, and public database API remain
-unimplemented.
+boundaries.
+
+Phase 2 implements an internal single-file Pager and full-mutation B+Tree with a
+bounded cache, checksums, generations, overflow storage, freelist reuse, validation,
+and normal-close persistence.
+
+Phase 2 has no WAL. A process or machine failure during a multi-page commit can leave a partially updated file; only successful commit followed by normal close/reopen is guaranteed.
+
+WAL, SQL, and the public database CRUD API remain unimplemented.
 
 See:
 
