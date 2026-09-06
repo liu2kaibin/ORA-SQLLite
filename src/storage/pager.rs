@@ -11,7 +11,7 @@ use super::{
         decode_internal_leftmost, decode_leaf_right_sibling,
     },
     cache::{PageCache, PageHandle},
-    file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
+    file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
     freelist::{Freelist, FreelistWalk},
     header::DatabaseHeader,
     overflow,
@@ -412,17 +412,14 @@ impl WriteBatch<'_> {
             .checked_add(allocated)
             .ok_or_else(|| corruption("page id overflow while allocating"))?;
         let reference = PageRef::new(PageId(page_id), 1)?;
-        let next_page_count = page_id
+        page_id
             .checked_add(1)
             .ok_or_else(|| corruption("page count overflow while allocating"))?;
-        let bytes = next_page_count
-            .checked_mul(u64::from(self.pager.header.page_size()))
-            .ok_or_else(|| corruption("database length overflow while allocating"))?;
-        if bytes > self.pager.max_database_bytes {
-            return Err(corruption(
-                "allocation exceeds the configured maximum database size",
-            ));
-        }
+        checked_page_offset(
+            reference.page_id(),
+            self.pager.header.page_size(),
+            self.pager.max_database_bytes,
+        )?;
         let frame = PageFrame::new_zeroed(page_type, reference, self.pager.header.page_size())?;
         self.dirty.insert(reference.page_id(), frame);
         self.new_pages.insert(reference.page_id());
@@ -632,15 +629,21 @@ impl WriteBatch<'_> {
         }
 
         let target_page_count = self.target_page_count()?;
+        let roots = self.candidate_header.unwrap_or(self.pager.header);
+        let header = self.pager.header.with_checkpoint(
+            self.pager.header.checkpoint_lsn(),
+            target_page_count,
+            roots.catalog_root(),
+            roots.freelist_root(),
+            self.pager.header.wal_generation(),
+        )?;
         self.pager.state = PagerState::Poisoned;
         self.pager.file.extend_to_pages(target_page_count)?;
         for (page_id, frame) in &self.dirty {
             self.pager.file.write_page(*page_id, frame.bytes())?;
         }
         self.pager.file.sync_all()?;
-        let header = self.candidate_header.unwrap_or(self.pager.header);
-        self.pager.file.write_header(header)?;
-        self.pager.file.sync_all()?;
+        self.pager.file.publish_superblock(header)?;
 
         self.pager.header = header;
         self.replace_cache_images();
@@ -651,13 +654,18 @@ impl WriteBatch<'_> {
 
     fn validate_for_commit(&mut self) -> Result<()> {
         let target_page_count = self.target_page_count()?;
-        let bytes = target_page_count
-            .checked_mul(u64::from(self.pager.header.page_size()))
-            .ok_or_else(|| corruption("database length overflow while committing"))?;
-        if bytes > self.pager.max_database_bytes {
-            return Err(corruption(
-                "commit exceeds the configured maximum database size",
-            ));
+        if target_page_count == 1 {
+            if super::header::SUPERBLOCK_AREA_LEN > self.pager.max_database_bytes {
+                return Err(corruption(
+                    "commit exceeds the configured maximum database size",
+                ));
+            }
+        } else {
+            checked_page_offset(
+                PageId(target_page_count - 1),
+                self.pager.header.page_size(),
+                self.pager.max_database_bytes,
+            )?;
         }
 
         for (page_id, frame) in &mut self.dirty {
@@ -1665,11 +1673,20 @@ mod tests {
         }
         assert_ne!(pager.header.catalog_root(), second_free.page_id());
         pager.header.set_catalog_root(second_free.page_id());
+        let header = pager
+            .header
+            .with_checkpoint(
+                pager.header.checkpoint_lsn(),
+                pager.page_count(),
+                pager.header.catalog_root(),
+                pager.header.freelist_root(),
+                pager.header.wal_generation(),
+            )
+            .expect("build corrupt catalog superblock");
         pager
             .file
-            .write_header(pager.header)
+            .publish_superblock(header)
             .expect("inject corrupt catalog header");
-        pager.file.sync_all().expect("sync corrupt catalog header");
         drop(pager);
 
         let mut reopened = Pager::open(
@@ -2383,7 +2400,7 @@ mod tests {
     fn append_rejects_pages_beyond_the_configured_limit_before_file_changes() {
         let temp = TempDatabase::new("pager-limit");
         let mut config = PagerConfig::test_default(4096);
-        config.max_database_bytes = 4096;
+        config.max_database_bytes = 8192;
         let mut pager = Pager::create(temp.path(), config).expect("create limited pager");
         let initial_len = std::fs::metadata(temp.path())
             .expect("database metadata")
@@ -2425,6 +2442,18 @@ mod tests {
         file.write_page(PageId(1), &[0; 4096])
             .expect("write invalid page bytes");
         file.sync_all().expect("sync invalid page bytes");
+        let header = file
+            .header()
+            .with_checkpoint(
+                file.header().checkpoint_lsn(),
+                2,
+                PageId(0),
+                PageId(0),
+                file.header().wal_generation(),
+            )
+            .expect("build page-count superblock");
+        file.publish_superblock(header)
+            .expect("publish page-count superblock");
         drop(file);
 
         let mut pager = Pager::open(
@@ -2761,8 +2790,17 @@ mod tests {
 
         let mut header = file.header();
         header.set_freelist_root(PageId(1));
-        file.write_header(header).expect("publish freelist root");
-        file.sync_all().expect("sync database header");
+        let header = header
+            .with_checkpoint(
+                header.checkpoint_lsn(),
+                page_count,
+                header.catalog_root(),
+                header.freelist_root(),
+                header.wal_generation(),
+            )
+            .expect("build freelist superblock");
+        file.publish_superblock(header)
+            .expect("publish freelist root");
         drop(file);
 
         Pager::open(
@@ -2858,8 +2896,15 @@ mod tests {
         const FIRST_LEAF_OFFSET: usize = 72;
 
         let mut bytes = std::fs::read(temp.path()).expect("read persisted database");
-        let page_start =
-            usize::try_from(root.page_id().0).expect("freelist root id fits usize") * 4096;
+        let page_start = usize::try_from(
+            super::super::file::checked_page_offset(
+                root.page_id(),
+                4096,
+                DEFAULT_MAX_DATABASE_BYTES,
+            )
+            .expect("freelist root offset"),
+        )
+        .expect("freelist root offset fits usize");
         let page = &mut bytes[page_start..page_start + 4096];
         page[LEAF_COUNT_OFFSET..LEAF_COUNT_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
         page[FIRST_LEAF_OFFSET..FIRST_LEAF_OFFSET + 8]

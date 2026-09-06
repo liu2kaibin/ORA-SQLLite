@@ -20,7 +20,8 @@ use super::{
     PageId, PageRef,
     btree::{BTree, TreeKind},
     checksum::stamp_page_checksum,
-    file::OpenMode,
+    file::{OpenMode, checked_page_offset},
+    header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
     pager::{PageSource, Pager, PagerConfig},
     validate::validate_tree,
@@ -719,7 +720,14 @@ fn truncation_and_restamped_field_corruption_return_controlled_errors() {
     }
 
     let fixture = corruption_fixture(4096).expect("create header corruption fixture");
-    flip_header_byte(fixture.temp.path(), 0).expect("corrupt header");
+    flip_header_byte(fixture.temp.path(), SuperblockSlot::A, 0).expect("corrupt first superblock");
+    Pager::open(
+        fixture.temp.path(),
+        OpenMode::ReadOnly,
+        PagerConfig::test_default(4096),
+    )
+    .expect("one valid superblock remains usable");
+    flip_header_byte(fixture.temp.path(), SuperblockSlot::B, 0).expect("corrupt second superblock");
     assert_controlled_corruption(|| {
         Pager::open(
             fixture.temp.path(),
@@ -870,12 +878,17 @@ fn fixture_pages(path: &Path, page_size: u32) -> Result<Vec<(PageRef, PageType)>
         DbError::new(ErrorCode::Io, format!("read corruption fixture: {error}"))
     })?;
     let page_len = usize::try_from(page_size).expect("page size fits usize");
+    let ordinary_bytes = bytes
+        .len()
+        .checked_sub(usize::try_from(SUPERBLOCK_AREA_LEN).expect("prefix length fits usize"))
+        .ok_or_else(|| DbError::new(ErrorCode::Corruption, "fixture omits superblocks"))?;
     let mut pages = Vec::new();
-    for page_id in 1..bytes.len() / page_len {
-        let offset = page_id * page_len;
+    for page_id in 1..=ordinary_bytes / page_len {
+        let page_id = PageId(u64::try_from(page_id).expect("page id fits u64"));
+        let offset = fixture_page_offset(page_id, page_size)?;
         let frame = PageFrame::decode(
             bytes[offset..offset + page_len].to_vec(),
-            PageId(u64::try_from(page_id).expect("page id fits u64")),
+            page_id,
             None,
             None,
         )?;
@@ -888,7 +901,8 @@ fn fixture_pages(path: &Path, page_size: u32) -> Result<Vec<(PageRef, PageType)>
 fn page_bytes(fixture: &CorruptionFixture, reference: PageRef) -> Vec<u8> {
     let bytes = fs::read(fixture.temp.path()).expect("read fixture bytes");
     let page_len = usize::try_from(fixture.page_size).expect("page size fits usize");
-    let offset = usize::try_from(reference.page_id().0).expect("page id fits usize") * page_len;
+    let offset =
+        fixture_page_offset(reference.page_id(), fixture.page_size).expect("fixture page offset");
     bytes[offset..offset + page_len].to_vec()
 }
 
@@ -901,8 +915,7 @@ fn patch_page(
     let mut bytes = fs::read(fixture.temp.path())
         .map_err(|error| DbError::new(ErrorCode::Io, format!("read fixture for patch: {error}")))?;
     let page_len = usize::try_from(fixture.page_size).expect("page size fits usize");
-    let page_offset =
-        usize::try_from(reference.page_id().0).expect("page id fits usize") * page_len;
+    let page_offset = fixture_page_offset(reference.page_id(), fixture.page_size)?;
     let page = &mut bytes[page_offset..page_offset + page_len];
     page[offset..offset + replacement.len()].copy_from_slice(replacement);
     stamp_page_checksum(page)?;
@@ -917,9 +930,7 @@ fn flip_page_byte(path: &Path, page_size: u32, reference: PageRef, offset: usize
             format!("read fixture for checksum flip: {error}"),
         )
     })?;
-    let page_len = usize::try_from(page_size).expect("page size fits usize");
-    let page_offset =
-        usize::try_from(reference.page_id().0).expect("page id fits usize") * page_len;
+    let page_offset = fixture_page_offset(reference.page_id(), page_size)?;
     bytes[page_offset + offset] ^= 1;
     fs::write(path, bytes).map_err(|error| {
         DbError::new(
@@ -929,12 +940,27 @@ fn flip_page_byte(path: &Path, page_size: u32, reference: PageRef, offset: usize
     })
 }
 
-fn flip_header_byte(path: &Path, offset: usize) -> Result<()> {
+fn flip_header_byte(path: &Path, slot: SuperblockSlot, offset: usize) -> Result<()> {
+    if offset >= SUPERBLOCK_SLOT_LEN {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            "superblock corruption offset is outside the selected slot",
+        ));
+    }
     let mut bytes = fs::read(path)
         .map_err(|error| DbError::new(ErrorCode::Io, format!("read header fixture: {error}")))?;
-    bytes[offset] ^= 1;
+    let slot_start = match slot {
+        SuperblockSlot::A => 0,
+        SuperblockSlot::B => SUPERBLOCK_SLOT_LEN,
+    };
+    bytes[slot_start + offset] ^= 1;
     fs::write(path, bytes)
         .map_err(|error| DbError::new(ErrorCode::Io, format!("write header fixture: {error}")))
+}
+
+fn fixture_page_offset(page_id: PageId, page_size: u32) -> Result<usize> {
+    usize::try_from(checked_page_offset(page_id, page_size, u64::MAX)?)
+        .map_err(|_| DbError::new(ErrorCode::Corruption, "fixture page offset exceeds usize"))
 }
 
 fn truncate_file(path: &Path, len: u64) -> Result<()> {
@@ -1042,7 +1068,7 @@ fn tree_height(path: &Path, page_size: u32, mut current: PageRef) -> Result<u64>
     let page_len = usize::try_from(page_size).expect("page size fits usize");
     let mut height = 0u64;
     loop {
-        let offset = usize::try_from(current.page_id().0).expect("page id fits usize") * page_len;
+        let offset = fixture_page_offset(current.page_id(), page_size)?;
         let frame = PageFrame::decode(
             bytes[offset..offset + page_len].to_vec(),
             current.page_id(),

@@ -5,12 +5,20 @@ use super::{
 };
 use crate::{DbError, ErrorCode, Result};
 
-const DATABASE_HEADER_LEN: usize = 128;
-const DATABASE_HEADER_PREFIX_LEN: usize = 124;
-const DATABASE_MAGIC: &[u8; 16] = b"ORA-SQLLITE\0\0\0\0\0";
-const FORMAT_MAJOR: u16 = 1;
+pub(super) const SUPERBLOCK_SLOT_LEN: usize = 4096;
+pub(super) const SUPERBLOCK_AREA_LEN: u64 = 8192;
+
+const SUPERBLOCK_PREFIX_LEN: usize = SUPERBLOCK_SLOT_LEN - 4;
+const DATABASE_MAGIC: &[u8; 16] = b"ORA-SQLLITE-SB\0\0";
+const FORMAT_MAJOR: u16 = 2;
 const FORMAT_MINOR: u16 = 0;
 const KNOWN_FEATURES: u64 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SuperblockSlot {
+    A,
+    B,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DatabaseHeader {
@@ -18,9 +26,12 @@ pub(super) struct DatabaseHeader {
     minor: u16,
     page_size: u32,
     uuid: [u8; 16],
+    publish_sequence: u64,
+    checkpoint_lsn: Lsn,
+    page_count: u64,
     catalog_root: PageId,
     freelist_root: PageId,
-    checkpoint_lsn: Lsn,
+    wal_generation: u64,
     features: u64,
 }
 
@@ -38,33 +49,39 @@ impl DatabaseHeader {
             minor: FORMAT_MINOR,
             page_size,
             uuid,
+            publish_sequence: 1,
+            checkpoint_lsn: Lsn(0),
+            page_count: 1,
             catalog_root: PageId(0),
             freelist_root: PageId(0),
-            checkpoint_lsn: Lsn(0),
+            wal_generation: 1,
             features: 0,
         })
     }
 
-    pub(super) fn encode(&self) -> [u8; DATABASE_HEADER_LEN] {
+    pub(super) fn encode_slot(&self) -> [u8; SUPERBLOCK_SLOT_LEN] {
         let mut encoder = Encoder::new();
         encoder.put_bytes(DATABASE_MAGIC);
         encoder.put_u16(self.major);
         encoder.put_u16(self.minor);
         encoder.put_u32(self.page_size);
         encoder.put_bytes(&self.uuid);
+        encoder.put_u64(self.publish_sequence);
+        encoder.put_u64(self.checkpoint_lsn.0);
+        encoder.put_u64(self.page_count);
         encoder.put_u64(self.catalog_root.0);
         encoder.put_u64(self.freelist_root.0);
-        encoder.put_u64(self.checkpoint_lsn.0);
+        encoder.put_u64(self.wal_generation);
         encoder.put_u64(self.features);
-        encoder.put_bytes(&[0; 52]);
+        encoder.put_bytes(&[0; SUPERBLOCK_PREFIX_LEN - 96]);
 
         let mut bytes = encoder.into_bytes();
-        debug_assert_eq!(bytes.len(), DATABASE_HEADER_PREFIX_LEN);
+        debug_assert_eq!(bytes.len(), SUPERBLOCK_PREFIX_LEN);
         let checksum = crc32c(&bytes);
         bytes.extend_from_slice(&checksum.to_le_bytes());
         bytes
             .try_into()
-            .expect("database header encoding has a fixed length")
+            .expect("superblock slot encoding has a fixed length")
     }
 
     pub(super) const fn page_size(&self) -> u32 {
@@ -73,6 +90,22 @@ impl DatabaseHeader {
 
     pub(super) const fn uuid(&self) -> [u8; 16] {
         self.uuid
+    }
+
+    pub(super) const fn publish_sequence(&self) -> u64 {
+        self.publish_sequence
+    }
+
+    pub(super) const fn checkpoint_lsn(&self) -> Lsn {
+        self.checkpoint_lsn
+    }
+
+    pub(super) const fn page_count(&self) -> u64 {
+        self.page_count
+    }
+
+    pub(super) const fn wal_generation(&self) -> u64 {
+        self.wal_generation
     }
 
     pub(super) const fn minor(&self) -> u16 {
@@ -99,6 +132,34 @@ impl DatabaseHeader {
         self.freelist_root = root;
     }
 
+    pub(super) fn with_checkpoint(
+        self,
+        checkpoint_lsn: Lsn,
+        page_count: u64,
+        catalog_root: PageId,
+        freelist_root: PageId,
+        wal_generation: u64,
+    ) -> Result<Self> {
+        if checkpoint_lsn.0 < self.checkpoint_lsn.0 {
+            return Err(corruption("database checkpoint LSN cannot move backwards"));
+        }
+        let publish_sequence = self
+            .publish_sequence
+            .checked_add(1)
+            .ok_or_else(|| corruption("database publish sequence overflow"))?;
+        let candidate = Self {
+            publish_sequence,
+            checkpoint_lsn,
+            page_count,
+            catalog_root,
+            freelist_root,
+            wal_generation,
+            ..self
+        };
+        candidate.validate_fields()?;
+        Ok(candidate)
+    }
+
     pub(super) fn validate_open(&self, mode: OpenMode) -> Result<()> {
         if self.minor > FORMAT_MINOR && mode == OpenMode::ReadWrite {
             return Err(DbError::new(
@@ -109,9 +170,11 @@ impl DatabaseHeader {
         Ok(())
     }
 
-    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != DATABASE_HEADER_LEN {
-            return Err(corruption("database header must be exactly 128 bytes"));
+    pub(super) fn decode_slot(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != SUPERBLOCK_SLOT_LEN {
+            return Err(corruption(
+                "database superblock slot must be exactly 4096 bytes",
+            ));
         }
 
         let mut decoder = Decoder::new(bytes);
@@ -121,42 +184,95 @@ impl DatabaseHeader {
         let page_size = decoder.get_u32()?;
         let mut uuid = [0; 16];
         uuid.copy_from_slice(decoder.get_bytes(16)?);
+        let publish_sequence = decoder.get_u64()?;
+        let checkpoint_lsn = Lsn(decoder.get_u64()?);
+        let page_count = decoder.get_u64()?;
         let catalog_root = PageId(decoder.get_u64()?);
         let freelist_root = PageId(decoder.get_u64()?);
-        let checkpoint_lsn = Lsn(decoder.get_u64()?);
+        let wal_generation = decoder.get_u64()?;
         let features = decoder.get_u64()?;
-        let reserved = decoder.get_bytes(52)?;
+        let reserved = decoder.get_bytes(SUPERBLOCK_PREFIX_LEN - 96)?;
         let stored_checksum = decoder.get_u32()?;
 
         if magic != DATABASE_MAGIC {
-            return Err(corruption("invalid database header magic"));
+            return Err(corruption("invalid database superblock magic"));
         }
-        if stored_checksum != crc32c(&bytes[..DATABASE_HEADER_PREFIX_LEN]) {
-            return Err(corruption("invalid database header checksum"));
+        if stored_checksum != crc32c(&bytes[..SUPERBLOCK_PREFIX_LEN]) {
+            return Err(corruption("invalid database superblock checksum"));
         }
         if major != FORMAT_MAJOR {
             return Err(corruption("unsupported database format major version"));
         }
-        if !is_valid_page_size(page_size) {
-            return Err(corruption("invalid database page size"));
-        }
-        if features & !KNOWN_FEATURES != 0 {
-            return Err(corruption("database header has unknown feature bits"));
-        }
         if reserved.iter().any(|&byte| byte != 0) {
-            return Err(corruption("database header reserved bytes are nonzero"));
+            return Err(corruption("database superblock reserved bytes are nonzero"));
         }
 
-        Ok(Self {
+        let header = Self {
             major,
             minor,
             page_size,
             uuid,
+            publish_sequence,
+            checkpoint_lsn,
+            page_count,
             catalog_root,
             freelist_root,
-            checkpoint_lsn,
+            wal_generation,
             features,
-        })
+        };
+        header.validate_fields()?;
+        Ok(header)
+    }
+
+    pub(super) fn select(slot_a: &[u8], slot_b: &[u8]) -> Result<(Self, SuperblockSlot)> {
+        let decoded_a = Self::decode_slot(slot_a).ok();
+        let decoded_b = Self::decode_slot(slot_b).ok();
+        match (decoded_a, decoded_b) {
+            (None, None) => Err(corruption("both database superblock slots are invalid")),
+            (Some(header), None) => Ok((header, SuperblockSlot::A)),
+            (None, Some(header)) => Ok((header, SuperblockSlot::B)),
+            (Some(a), Some(b)) => {
+                if a.uuid != b.uuid || a.page_size != b.page_size {
+                    return Err(corruption(
+                        "database superblock slots disagree on database identity",
+                    ));
+                }
+                if a.publish_sequence == b.publish_sequence {
+                    if a != b {
+                        return Err(corruption(
+                            "database superblock slots reuse a sequence for different state",
+                        ));
+                    }
+                    return Ok((a, SuperblockSlot::A));
+                }
+                if a.publish_sequence > b.publish_sequence {
+                    Ok((a, SuperblockSlot::A))
+                } else {
+                    Ok((b, SuperblockSlot::B))
+                }
+            }
+        }
+    }
+
+    fn validate_fields(&self) -> Result<()> {
+        if !is_valid_page_size(self.page_size) {
+            return Err(corruption("invalid database page size"));
+        }
+        if self.publish_sequence == 0 {
+            return Err(corruption("database publish sequence must be nonzero"));
+        }
+        if self.page_count == 0 {
+            return Err(corruption("database page count must be nonzero"));
+        }
+        validate_root_page("catalog root", self.catalog_root, self.page_count)?;
+        validate_root_page("freelist root", self.freelist_root, self.page_count)?;
+        if self.wal_generation == 0 {
+            return Err(corruption("database WAL generation must be nonzero"));
+        }
+        if self.features & !KNOWN_FEATURES != 0 {
+            return Err(corruption("database header has unknown feature bits"));
+        }
+        Ok(())
     }
 }
 
@@ -168,52 +284,110 @@ fn corruption(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
 }
 
+fn validate_root_page(name: &'static str, root: PageId, page_count: u64) -> Result<()> {
+    if root.0 != 0 && root.0 >= page_count {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            format!("database {name} is outside the database"),
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 fn database_header_round_trips() {
     let header = DatabaseHeader::new(4096, [7; 16]).expect("valid header");
-    let bytes = header.encode();
-    assert_eq!(&bytes[..16], b"ORA-SQLLITE\0\0\0\0\0");
-    assert_eq!(DatabaseHeader::decode(&bytes).expect("decode"), header);
+    let bytes = header.encode_slot();
+    assert_eq!(&bytes[..16], b"ORA-SQLLITE-SB\0\0");
+    assert_eq!(DatabaseHeader::decode_slot(&bytes).expect("decode"), header);
 }
 
 #[test]
 fn database_header_rejects_corruption_and_page_size() {
     assert!(DatabaseHeader::new(2048, [1; 16]).is_err());
-    let mut bytes = DatabaseHeader::new(8192, [1; 16]).expect("header").encode();
+    let mut bytes = DatabaseHeader::new(8192, [1; 16])
+        .expect("header")
+        .encode_slot();
     bytes[32] ^= 1;
     assert_eq!(
-        DatabaseHeader::decode(&bytes).expect_err("checksum").code(),
+        DatabaseHeader::decode_slot(&bytes)
+            .expect_err("checksum")
+            .code(),
         crate::ErrorCode::Corruption
     );
 }
 
 #[test]
-fn database_header_uses_fixed_little_endian_offsets() {
-    let mut header = DatabaseHeader::new(4096, [0x5a; 16]).expect("header");
-    header.catalog_root = PageId(0x0102_0304_0506_0708);
-    header.freelist_root = PageId(0x1112_1314_1516_1718);
-    header.checkpoint_lsn = Lsn(0x2122_2324_2526_2728);
-
-    let bytes = header.encode();
-
-    assert_eq!(bytes.len(), 128);
-    assert_eq!(&bytes[16..20], &[1, 0, 0, 0]);
-    assert_eq!(&bytes[20..24], &[0, 0x10, 0, 0]);
+fn superblock_slot_uses_fixed_format_2_offsets_and_crc() {
+    let header = DatabaseHeader::new(4096, [0x5a; 16]).unwrap();
+    let bytes = header.encode_slot();
+    assert_eq!(bytes.len(), 4096);
+    assert_eq!(&bytes[..16], b"ORA-SQLLITE-SB\0\0");
+    assert_eq!(&bytes[16..20], &[2, 0, 0, 0]);
+    assert_eq!(&bytes[20..24], &4096u32.to_le_bytes());
     assert_eq!(&bytes[24..40], &[0x5a; 16]);
-    assert_eq!(&bytes[40..48], &[8, 7, 6, 5, 4, 3, 2, 1]);
+    assert!(bytes[96..4092].iter().all(|byte| *byte == 0));
     assert_eq!(
-        &bytes[48..56],
-        &[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]
+        u32::from_le_bytes(bytes[4092..].try_into().unwrap()),
+        crc32c(&bytes[..4092])
+    );
+}
+
+#[test]
+fn select_uses_the_highest_valid_publish_sequence() {
+    let mut a = DatabaseHeader::new(4096, [1; 16]).unwrap();
+    let mut b = a;
+    a.publish_sequence = 7;
+    b.publish_sequence = 8;
+    let (selected, slot) = DatabaseHeader::select(&a.encode_slot(), &b.encode_slot()).unwrap();
+    assert_eq!(selected.publish_sequence(), 8);
+    assert_eq!(slot, SuperblockSlot::B);
+}
+
+#[test]
+fn equal_sequences_with_different_state_are_corruption() {
+    let mut a = DatabaseHeader::new(4096, [1; 16]).unwrap();
+    let mut b = a;
+    a.publish_sequence = 9;
+    b.publish_sequence = 9;
+    b.page_count = 2;
+    b.catalog_root = PageId(1);
+    assert_eq!(
+        DatabaseHeader::select(&a.encode_slot(), &b.encode_slot())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn select_accepts_one_valid_slot_and_rejects_two_invalid_slots() {
+    let header = DatabaseHeader::new(4096, [2; 16]).unwrap();
+    let valid = header.encode_slot();
+    let mut corrupt = valid;
+    corrupt[95] ^= 1;
+
+    assert_eq!(
+        DatabaseHeader::select(&corrupt, &valid).unwrap(),
+        (header, SuperblockSlot::B)
     );
     assert_eq!(
-        &bytes[56..64],
-        &[0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21]
+        DatabaseHeader::select(&corrupt, &corrupt)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
     );
-    assert_eq!(&bytes[64..72], &[0; 8]);
-    assert_eq!(&bytes[72..124], &[0; 52]);
+}
+
+#[test]
+fn select_rejects_mismatched_database_identity() {
+    let a = DatabaseHeader::new(4096, [1; 16]).unwrap();
+    let b = DatabaseHeader::new(4096, [2; 16]).unwrap();
     assert_eq!(
-        u32::from_le_bytes(bytes[124..128].try_into().expect("checksum bytes")),
-        super::checksum::crc32c(&bytes[..124])
+        DatabaseHeader::select(&a.encode_slot(), &b.encode_slot())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
     );
 }
 
@@ -227,29 +401,38 @@ fn database_header_uses_type_for_constructor_page_size_errors() {
 
 #[test]
 fn database_header_decode_rejects_invalid_disk_fields_as_corruption() {
-    let valid = DatabaseHeader::new(4096, [3; 16]).expect("header").encode();
+    let valid = DatabaseHeader::new(4096, [3; 16])
+        .expect("header")
+        .encode_slot();
 
     for mutate in [
-        |bytes: &mut [u8; 128]| bytes[0] ^= 1,
-        |bytes: &mut [u8; 128]| bytes[16..18].copy_from_slice(&2u16.to_le_bytes()),
-        |bytes: &mut [u8; 128]| bytes[20..24].copy_from_slice(&2048u32.to_le_bytes()),
-        |bytes: &mut [u8; 128]| bytes[64] = 1,
-        |bytes: &mut [u8; 128]| bytes[72] = 1,
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[0] ^= 1,
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[16..18].copy_from_slice(&1u16.to_le_bytes()),
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| {
+            bytes[20..24].copy_from_slice(&2048u32.to_le_bytes())
+        },
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[40..48].copy_from_slice(&0u64.to_le_bytes()),
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[56..64].copy_from_slice(&0u64.to_le_bytes()),
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[80..88].copy_from_slice(&0u64.to_le_bytes()),
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[88] = 1,
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[96] = 1,
     ] {
         let mut bytes = valid;
         mutate(&mut bytes);
         refresh_database_crc(&mut bytes);
-        let error = DatabaseHeader::decode(&bytes).expect_err("invalid disk field");
+        let error = DatabaseHeader::decode_slot(&bytes).expect_err("invalid disk field");
         assert_eq!(error.code(), crate::ErrorCode::Corruption);
     }
 }
 
 #[test]
 fn database_header_decode_requires_exact_layout_size() {
-    let bytes = DatabaseHeader::new(4096, [4; 16]).expect("header").encode();
+    let bytes = DatabaseHeader::new(4096, [4; 16])
+        .expect("header")
+        .encode_slot();
 
     assert_eq!(
-        DatabaseHeader::decode(&bytes[..127])
+        DatabaseHeader::decode_slot(&bytes[..SUPERBLOCK_SLOT_LEN - 1])
             .expect_err("truncated header")
             .code(),
         crate::ErrorCode::Corruption
@@ -258,7 +441,7 @@ fn database_header_decode_requires_exact_layout_size() {
     let mut extended = bytes.to_vec();
     extended.push(0);
     assert_eq!(
-        DatabaseHeader::decode(&extended)
+        DatabaseHeader::decode_slot(&extended)
             .expect_err("extended header")
             .code(),
         crate::ErrorCode::Corruption
@@ -267,10 +450,10 @@ fn database_header_decode_requires_exact_layout_size() {
 
 #[test]
 fn future_minor_is_read_only_when_features_are_known() {
-    let mut bytes = DatabaseHeader::new(4096, [9; 16]).unwrap().encode();
+    let mut bytes = DatabaseHeader::new(4096, [9; 16]).unwrap().encode_slot();
     bytes[18..20].copy_from_slice(&1u16.to_le_bytes());
     refresh_database_crc(&mut bytes);
-    let header = DatabaseHeader::decode(&bytes).expect("structurally valid");
+    let header = DatabaseHeader::decode_slot(&bytes).expect("structurally valid");
     header
         .validate_open(super::OpenMode::ReadOnly)
         .expect("safe read-only open");
@@ -284,10 +467,14 @@ fn future_minor_is_read_only_when_features_are_known() {
 }
 
 #[test]
-fn database_header_accessors_expose_values_and_only_roots_change() {
+fn with_checkpoint_builds_a_validated_new_publication() {
     let mut header = DatabaseHeader::new(8192, [0xa5; 16]).expect("header");
     header.set_catalog_root(PageId(7));
     header.set_freelist_root(PageId(8));
+    header.page_count = 9;
+    let candidate = header
+        .with_checkpoint(Lsn(12), 10, PageId(7), PageId(8), 3)
+        .expect("valid checkpoint state");
 
     assert_eq!(header.page_size(), 8192);
     assert_eq!(header.uuid(), [0xa5; 16]);
@@ -295,9 +482,36 @@ fn database_header_accessors_expose_values_and_only_roots_change() {
     assert_eq!(header.features(), 0);
     assert_eq!(header.catalog_root(), PageId(7));
     assert_eq!(header.freelist_root(), PageId(8));
+    assert_eq!(header.publish_sequence(), 1);
+    assert_eq!(header.checkpoint_lsn(), Lsn(0));
+    assert_eq!(header.page_count(), 9);
+    assert_eq!(header.wal_generation(), 1);
+
+    assert_eq!(candidate.publish_sequence(), 2);
+    assert_eq!(candidate.checkpoint_lsn(), Lsn(12));
+    assert_eq!(candidate.page_count(), 10);
+    assert_eq!(candidate.catalog_root(), PageId(7));
+    assert_eq!(candidate.freelist_root(), PageId(8));
+    assert_eq!(candidate.wal_generation(), 3);
+
+    assert_eq!(
+        header
+            .with_checkpoint(Lsn(1), 1, PageId(1), PageId(0), 1)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+    header.publish_sequence = u64::MAX;
+    assert_eq!(
+        header
+            .with_checkpoint(Lsn(1), 9, PageId(7), PageId(8), 1)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
 }
 
-fn refresh_database_crc(bytes: &mut [u8; 128]) {
-    let checksum = super::checksum::crc32c(&bytes[..124]).to_le_bytes();
-    bytes[124..128].copy_from_slice(&checksum);
+fn refresh_database_crc(bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]) {
+    let checksum = super::checksum::crc32c(&bytes[..SUPERBLOCK_SLOT_LEN - 4]).to_le_bytes();
+    bytes[SUPERBLOCK_SLOT_LEN - 4..].copy_from_slice(&checksum);
 }
