@@ -10,6 +10,7 @@ mod page;
 mod pager;
 mod slotted;
 mod validate;
+mod wal;
 
 #[cfg(test)]
 mod test_support;
