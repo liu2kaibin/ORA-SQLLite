@@ -7,3 +7,4 @@ description = "A lightweight embedded database with an Oracle-compatible CRUD di
 repository = "https://github.com/liu2kaibin/ORA-SQLLite"
 
 [dependencies]
+fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }

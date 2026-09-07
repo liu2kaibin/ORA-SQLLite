@@ -25,6 +25,7 @@ use super::{
     page::{PageFrame, PageType},
     pager::{PageSource, Pager, PagerConfig},
     validate::validate_tree,
+    wal::wal_path,
 };
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -71,9 +72,11 @@ pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
 
 impl Drop for TempDatabase {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path) {
-            if error.kind() != ErrorKind::NotFound {
-                // Test cleanup is best effort; a later test must never remove a different path.
+        for path in [&self.path, &wal_path(&self.path)] {
+            if let Err(error) = fs::remove_file(path) {
+                if error.kind() != ErrorKind::NotFound {
+                    // Test cleanup is best effort; a later test must never remove a different path.
+                }
             }
         }
     }
@@ -126,8 +129,10 @@ fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_f
         "TempDatabase::new must retry immediately after the occupied first candidate"
     );
     let sentinel = database_path.with_extension("sentinel");
+    let wal = wal_path(&database_path);
     assert_ne!(database_path, collision);
     fs::write(&database_path, b"owned database file").expect("create owned file");
+    fs::write(&wal, b"owned WAL file").expect("create owned WAL file");
     fs::write(&sentinel, b"unrelated sentinel").expect("create sentinel file");
     drop(database);
 
@@ -138,6 +143,10 @@ fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_f
     assert!(
         !database_path.exists(),
         "Drop must remove its exact generated filename"
+    );
+    assert!(
+        !wal.exists(),
+        "Drop must remove the WAL paired with its exact generated filename"
     );
     assert!(
         sentinel.exists(),
@@ -533,7 +542,7 @@ fn run_reference_model_operations(
         seen_key_lengths.into_iter().all(|seen| seen),
         "fixed-seed model must cover key lengths 0 through 64"
     );
-    let tree_height = tree_height(temp.path(), page_size, tree.root())?;
+    let tree_height = tree_height(&mut pager, tree.root())?;
 
     Ok(ModelProof {
         operations,
@@ -1048,10 +1057,16 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
         batch.set_catalog_root(tree.root())?;
         batch.commit()?;
     }
-    let file_bytes = fs::metadata(temp.path())
-        .map_err(|error| DbError::new(ErrorCode::Io, format!("read scale file metadata: {error}")))?
-        .len();
-    let tree_height = tree_height(temp.path(), page_size, tree.root())?;
+    let file_bytes = SUPERBLOCK_AREA_LEN
+        .checked_add(
+            pager
+                .page_count()
+                .checked_sub(1)
+                .and_then(|ordinary_pages| ordinary_pages.checked_mul(u64::from(page_size)))
+                .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale file length overflow"))?,
+        )
+        .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale file length overflow"))?;
+    let tree_height = tree_height(&mut pager, tree.root())?;
 
     Ok(ScaleMetrics {
         rows,
@@ -1062,19 +1077,10 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
     })
 }
 
-fn tree_height(path: &Path, page_size: u32, mut current: PageRef) -> Result<u64> {
-    let bytes = fs::read(path)
-        .map_err(|error| DbError::new(ErrorCode::Io, format!("read scale tree: {error}")))?;
-    let page_len = usize::try_from(page_size).expect("page size fits usize");
+fn tree_height(pager: &mut Pager, mut current: PageRef) -> Result<u64> {
     let mut height = 0u64;
     loop {
-        let offset = fixture_page_offset(current.page_id(), page_size)?;
-        let frame = PageFrame::decode(
-            bytes[offset..offset + page_len].to_vec(),
-            current.page_id(),
-            None,
-            Some(current.generation()),
-        )?;
+        let frame = pager.read(current)?;
         height = height
             .checked_add(1)
             .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale tree height overflow"))?;

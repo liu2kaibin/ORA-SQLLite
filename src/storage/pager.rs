@@ -993,7 +993,7 @@ mod tests {
             BTree, INTERNAL_METADATA_END, InternalCell, TreeKind, decode_internal_leftmost,
             encode_internal_leftmost,
         },
-        file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
+        file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
         freelist::Freelist,
         page::{PageFrame, PageType},
         slotted::SlottedPage,
@@ -1344,14 +1344,14 @@ mod tests {
             drop(cursor);
             drop(reopened);
 
-            let _second_open = Pager::open(
+            let mut second_open = Pager::open(
                 temp.path(),
                 OpenMode::ReadOnly,
                 PagerConfig::test_default(page_size),
             )
             .expect("second read-only open");
             assert_eq!(
-                std::fs::read(temp.path()).expect("read after second open"),
+                database_bytes(&mut second_open),
                 before_second_open,
                 "read-only reopen must not write at page size {page_size}",
             );
@@ -1363,7 +1363,7 @@ mod tests {
         let temp = TempDatabase::new("pager-tree-preflight");
         let mut pager =
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        let before = std::fs::read(temp.path()).expect("read pristine database");
+        let before = database_bytes(&mut pager);
         let error = {
             let mut batch = pager.begin_write().expect("begin write");
             let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
@@ -1389,7 +1389,7 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert!(!pager.is_poisoned());
     }
 
@@ -1468,7 +1468,7 @@ mod tests {
             batch.commit().expect("commit tree");
             tree
         };
-        let before = std::fs::read(temp.path()).expect("read committed bytes");
+        let before = database_bytes(&mut pager);
 
         let error = {
             let mut batch = pager.begin_write().expect("begin replacement batch");
@@ -1493,7 +1493,7 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert_eq!(pager.header.catalog_root(), tree.root().page_id());
     }
 
@@ -1513,7 +1513,7 @@ mod tests {
             batch.commit().expect("commit tree");
             tree
         };
-        let before = std::fs::read(temp.path()).expect("read committed bytes");
+        let before = database_bytes(&mut pager);
         let error = {
             let mut batch = pager.begin_write().expect("begin replacement batch");
             let descendant = rightmost_child(&mut batch, tree.root());
@@ -1531,7 +1531,7 @@ mod tests {
                 .to_string()
                 .contains("reachable non-root catalog tree page cannot become the catalog root")
         );
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
     }
 
     #[test]
@@ -1729,7 +1729,7 @@ mod tests {
             };
 
             assert_eq!(error.code(), ErrorCode::Corruption, "{live_target:?}");
-            assert_file_is_unchanged(&temp, &before);
+            assert_file_is_unchanged(&mut pager, &before);
         }
     }
 
@@ -1770,7 +1770,7 @@ mod tests {
             };
 
             assert_eq!(error.code(), ErrorCode::Corruption, "{live_target:?}");
-            assert_file_is_unchanged(&temp, &before);
+            assert_file_is_unchanged(&mut pager, &before);
         }
     }
 
@@ -1876,7 +1876,7 @@ mod tests {
             batch.commit().expect("commit page");
             page
         };
-        let before = std::fs::read(temp.path()).expect("read database before rejected overlap");
+        let before = database_bytes(&mut pager);
 
         {
             let mut batch = pager.begin_write().expect("begin overlap batch");
@@ -1891,7 +1891,7 @@ mod tests {
             batch.rollback().expect("rollback rejected overlap batch");
         }
 
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         pager
             .read(page)
             .expect("original live page remains readable");
@@ -1910,7 +1910,7 @@ mod tests {
             batch.commit().expect("commit page");
             page
         };
-        let before = std::fs::read(temp.path()).expect("read database before rejected overlap");
+        let before = database_bytes(&mut pager);
 
         {
             let mut batch = pager.begin_write().expect("begin overlap batch");
@@ -1925,7 +1925,7 @@ mod tests {
             batch.rollback().expect("rollback rejected overlap batch");
         }
 
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert_eq!(pager.header.catalog_root(), PageId(0));
     }
 
@@ -1933,7 +1933,7 @@ mod tests {
     fn leaf_generation_overflow_preserves_the_batch_freelist_state() {
         let temp = TempDatabase::new("pager-freelist-leaf-generation-overflow");
         let mut pager = pager_with_freelist(&temp, 1, &[u64::MAX]);
-        let before = std::fs::read(temp.path()).expect("read database before rejected reuse");
+        let before = database_bytes(&mut pager);
         let mut batch = pager.begin_write().expect("begin overflow batch");
 
         for _ in 0..2 {
@@ -1947,7 +1947,7 @@ mod tests {
         }
         batch.rollback().expect("rollback overflow batch");
 
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert_eq!(pager.header.freelist_root(), PageId(1));
     }
 
@@ -1955,7 +1955,7 @@ mod tests {
     fn empty_root_generation_overflow_preserves_the_staged_root() {
         let temp = TempDatabase::new("pager-freelist-root-generation-overflow");
         let mut pager = pager_with_freelist(&temp, u64::MAX, &[]);
-        let before = std::fs::read(temp.path()).expect("read database before rejected reuse");
+        let before = database_bytes(&mut pager);
         let mut batch = pager.begin_write().expect("begin overflow batch");
 
         for _ in 0..2 {
@@ -1969,7 +1969,7 @@ mod tests {
         }
         batch.rollback().expect("rollback overflow batch");
 
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert_eq!(pager.header.freelist_root(), PageId(1));
     }
 
@@ -2350,7 +2350,7 @@ mod tests {
             batch.release_later(page).expect("release page");
             batch.commit().expect("commit release");
         }
-        let before = std::fs::read(temp.path()).expect("read database before malformed commit");
+        let before = database_bytes(&mut pager);
         let error = {
             let mut batch = pager.begin_write().expect("begin invalid freelist batch");
             batch
@@ -2365,7 +2365,7 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert!(!pager.is_poisoned());
     }
 
@@ -2529,7 +2529,7 @@ mod tests {
             let temp = TempDatabase::new("pager-invalid-leaf-metadata");
             let mut pager =
                 Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-            let before = std::fs::read(temp.path()).expect("read database before commit");
+            let before = database_bytes(&mut pager);
             let error = {
                 let mut batch = pager.begin_write().expect("begin write");
                 let page = batch.allocate_append(page_type).expect("allocate page");
@@ -2542,7 +2542,7 @@ mod tests {
             };
 
             assert_eq!(error.code(), ErrorCode::Corruption);
-            assert_file_is_unchanged(&temp, &before);
+            assert_file_is_unchanged(&mut pager, &before);
             assert!(!pager.is_poisoned());
         }
     }
@@ -2552,7 +2552,7 @@ mod tests {
         let temp = TempDatabase::new("pager-invalid-leaf-layout");
         let mut pager =
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        let before = std::fs::read(temp.path()).expect("read database before commit");
+        let before = database_bytes(&mut pager);
         let error = {
             let mut batch = pager.begin_write().expect("begin write");
             let page = batch
@@ -2568,7 +2568,7 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert!(!pager.is_poisoned());
     }
 
@@ -2577,7 +2577,7 @@ mod tests {
         let temp = TempDatabase::new("pager-invalid-leaf-cell");
         let mut pager =
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        let before = std::fs::read(temp.path()).expect("read database before commit");
+        let before = database_bytes(&mut pager);
         let error = {
             let mut batch = pager.begin_write().expect("begin write");
             let page = batch
@@ -2595,7 +2595,7 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert!(!pager.is_poisoned());
     }
 
@@ -2605,7 +2605,7 @@ mod tests {
             let temp = TempDatabase::new("pager-invalid-internal-metadata");
             let mut pager =
                 Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-            let before = std::fs::read(temp.path()).expect("read database before commit");
+            let before = database_bytes(&mut pager);
             let error = {
                 let mut batch = pager.begin_write().expect("begin write");
                 batch.allocate_append(page_type).expect("allocate page");
@@ -2616,7 +2616,7 @@ mod tests {
             };
 
             assert_eq!(error.code(), ErrorCode::Corruption);
-            assert_file_is_unchanged(&temp, &before);
+            assert_file_is_unchanged(&mut pager, &before);
             assert!(!pager.is_poisoned());
         }
     }
@@ -2626,7 +2626,7 @@ mod tests {
         let temp = TempDatabase::new("pager-invalid-internal-cell");
         let mut pager =
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        let before = std::fs::read(temp.path()).expect("read database before commit");
+        let before = database_bytes(&mut pager);
         let error = {
             let mut batch = pager.begin_write().expect("begin write");
             let page = batch
@@ -2647,7 +2647,7 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert!(!pager.is_poisoned());
     }
 
@@ -2674,7 +2674,7 @@ mod tests {
         let temp = TempDatabase::new("pager-drop-batch");
         let mut pager =
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        let before = std::fs::read(temp.path()).expect("read database before batch");
+        let before = database_bytes(&mut pager);
         let page;
         {
             let mut batch = pager.begin_write().expect("begin write");
@@ -2687,7 +2687,7 @@ mod tests {
                 .bytes_mut()[100] = 0x5c;
         }
 
-        assert_file_is_unchanged(&temp, &before);
+        assert_file_is_unchanged(&mut pager, &before);
         assert_eq!(
             pager
                 .read(page)
@@ -2698,15 +2698,14 @@ mod tests {
         assert!(!pager.is_poisoned());
     }
 
-    fn assert_file_is_unchanged(temp: &TempDatabase, before: &[u8]) {
-        let after = std::fs::read(temp.path()).expect("read database after rejected commit");
+    fn database_bytes(pager: &mut Pager) -> Vec<u8> {
+        read_all_for_test(&mut pager.file).expect("read database through owning handle")
+    }
+
+    fn assert_file_is_unchanged(pager: &mut Pager, before: &[u8]) {
+        let after = database_bytes(pager);
         assert_eq!(after, before);
-        assert_eq!(
-            std::fs::metadata(temp.path())
-                .expect("database metadata after rejected commit")
-                .len(),
-            u64::try_from(before.len()).expect("test database length fits u64")
-        );
+        assert_eq!(after.len(), before.len());
     }
 
     fn root_has_internal_child(source: &mut impl PageSource, root: PageRef) -> Result<bool> {
@@ -2741,13 +2740,9 @@ mod tests {
     }
 
     fn pager_with_faults(temp: &TempDatabase, faults: Arc<dyn FaultInjector>) -> Pager {
-        let mut pager =
-            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        pager.file =
-            DatabaseFile::open(temp.path(), OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)
-                .expect("reopen file for faults")
-                .with_faults(faults);
-        pager
+        Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .expect("create pager")
+            .with_faults(faults)
     }
 
     fn pager_with_freelist(

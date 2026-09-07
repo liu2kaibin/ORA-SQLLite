@@ -6,6 +6,8 @@ use std::{
     sync::Arc,
 };
 
+use fs4::{FileExt, TryLockError};
+
 use super::{
     PageId,
     header::{DatabaseHeader, SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
@@ -60,6 +62,7 @@ impl DatabaseFile {
             .write(true)
             .open(path)
             .map_err(|error| io_error("create database", error))?;
+        lock_database(&file)?;
 
         let mut database = Self {
             file,
@@ -94,6 +97,7 @@ impl DatabaseFile {
         let mut file = options
             .open(path)
             .map_err(|error| io_error("open database", error))?;
+        lock_database(&file)?;
 
         let mut magic = [0; 16];
         file.read_exact(&mut magic)
@@ -352,8 +356,40 @@ fn io_error(operation: &str, error: io::Error) -> DbError {
     DbError::new(ErrorCode::Io, format!("{operation}: {error}"))
 }
 
+fn lock_database(file: &File) -> Result<()> {
+    match FileExt::try_lock(file) {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(DbError::new(
+            ErrorCode::Busy,
+            "database file is locked by another process",
+        )),
+        Err(TryLockError::Error(error)) => Err(io_error("lock database", error)),
+    }
+}
+
 fn corruption(message: impl Into<String>) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
+}
+
+#[cfg(test)]
+pub(super) fn read_all_for_test(database: &mut DatabaseFile) -> Result<Vec<u8>> {
+    let len = database
+        .file
+        .metadata()
+        .map_err(|error| io_error("read database test length", error))?
+        .len();
+    let len =
+        usize::try_from(len).map_err(|_| corruption("database test length does not fit memory"))?;
+    let mut bytes = vec![0; len];
+    database
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| io_error("seek database test bytes", error))?;
+    database
+        .file
+        .read_exact(&mut bytes)
+        .map_err(|error| read_error("read database test bytes", error))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -364,6 +400,7 @@ fn create_is_exclusive_and_writes_two_synced_superblocks() {
     let temp = TempDatabase::new("create");
     let db = DatabaseFile::create(temp.path(), 4096, [4; 16], 10 * 1024 * 1024).unwrap();
     assert_eq!(db.page_count(), 1);
+    drop(db);
     let bytes = std::fs::read(temp.path()).unwrap();
     assert_eq!(bytes.len(), 8192);
     let slot_a = DatabaseHeader::decode_slot(&bytes[..4096]).unwrap();
@@ -378,7 +415,6 @@ fn create_is_exclusive_and_writes_two_synced_superblocks() {
             .code(),
         ErrorCode::Io
     );
-    drop(db);
 }
 
 #[test]

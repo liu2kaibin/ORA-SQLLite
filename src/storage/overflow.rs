@@ -313,9 +313,10 @@ mod tests {
     use super::super::{
         PageId, PageRef,
         cache::PageHandle,
+        file::OpenMode,
         page::{PageFrame, PageType},
-        pager::PageSource,
-        test_support::test_pager,
+        pager::{PageSource, Pager, PagerConfig},
+        test_support::{TempDatabase, test_pager},
     };
 
     const CHUNK_OFFSET: usize = 72;
@@ -587,8 +588,17 @@ mod tests {
 
     #[test]
     fn malformed_dirty_overflow_body_rejects_commit_before_file_io() {
-        let (temp, mut pager) = test_pager(4096).expect("create test pager");
+        let temp = TempDatabase::new("overflow-invalid-body");
+        let pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create test pager");
+        drop(pager);
         let before = std::fs::read(temp.path()).expect("read database before invalid commit");
+        let mut pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .expect("reopen test pager");
         let error = {
             let mut batch = pager.begin_write().expect("begin overflow write");
             let first = write_value(&mut batch, b"x")
@@ -605,11 +615,12 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
+        assert!(!pager.is_poisoned());
+        drop(pager);
         assert_eq!(
             std::fs::read(temp.path()).expect("read database after invalid commit"),
             before
         );
-        assert!(!pager.is_poisoned());
     }
 
     fn read_from_source(
