@@ -105,9 +105,8 @@ fn internal(message: &'static str) -> DbError {
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::{Arc, mpsc},
+        sync::TryLockError,
         thread,
-        time::Duration,
     };
 
     use super::{SnapshotLease, SnapshotRegistry};
@@ -121,13 +120,43 @@ mod tests {
         let first_three = registry.register(Lsn(3)).expect("first LSN 3");
         let second_three = registry.register(Lsn(3)).expect("second LSN 3");
         let eight = registry.register(Lsn(8)).expect("LSN 8");
+        {
+            let counts = registry.counts.lock().expect("snapshot counts");
+            assert_eq!(counts.by_lsn.get(&Lsn(3)), Some(&2));
+            assert_eq!(counts.by_lsn.get(&Lsn(8)), Some(&1));
+        }
         assert_eq!(registry.oldest().expect("oldest"), Some(Lsn(3)));
 
         drop(first_three);
+        assert_eq!(
+            registry
+                .counts
+                .lock()
+                .expect("snapshot counts")
+                .by_lsn
+                .get(&Lsn(3)),
+            Some(&1)
+        );
         assert_eq!(registry.oldest().expect("duplicate remains"), Some(Lsn(3)));
         drop(eight);
+        assert!(
+            !registry
+                .counts
+                .lock()
+                .expect("snapshot counts")
+                .by_lsn
+                .contains_key(&Lsn(8))
+        );
         assert_eq!(registry.oldest().expect("older remains"), Some(Lsn(3)));
         drop(second_three);
+        assert!(
+            !registry
+                .counts
+                .lock()
+                .expect("snapshot counts")
+                .by_lsn
+                .contains_key(&Lsn(3))
+        );
         assert_eq!(registry.oldest().expect("no oldest"), None);
         assert!(registry.is_empty().expect("all leases dropped"));
     }
@@ -155,29 +184,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_guard_blocks_registration_until_it_is_released() {
-        let registry = Arc::new(SnapshotRegistry::default());
+    fn empty_guard_holds_the_registration_mutex_until_release() {
+        let registry = SnapshotRegistry::default();
         let guard = registry.lock_empty().expect("empty registry guard");
-        let registering = registry.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (sent, received) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            started_tx.send(()).expect("signal registration attempt");
-            let lease = registering.register(Lsn(9)).expect("register after guard");
-            sent.send(lease).expect("send lease");
-        });
 
-        started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("registration worker started");
-        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(matches!(
+            registry.counts.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
         drop(guard);
-        let lease = received
-            .recv_timeout(Duration::from_secs(2))
-            .expect("registration proceeds after guard release");
+
+        let lease = registry.register(Lsn(9)).expect("register after guard");
         assert_eq!(registry.oldest().expect("registered LSN"), Some(Lsn(9)));
         drop(lease);
-        worker.join().expect("registration worker");
     }
 
     #[test]
