@@ -56,7 +56,7 @@ impl PageRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Lsn(pub(super) u64);
 
 #[test]

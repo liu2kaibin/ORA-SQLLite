@@ -1,4 +1,6 @@
 pub(super) mod format;
+pub(crate) mod index;
+pub(crate) mod recovery;
 
 use std::{
     fmt,
@@ -224,6 +226,14 @@ impl Wal {
 
     pub(super) const fn len(&self) -> u64 {
         self.end_offset
+    }
+
+    pub(super) fn recover(
+        &mut self,
+        database_header: &DatabaseHeader,
+        mode: OpenMode,
+    ) -> Result<recovery::RecoveryResult> {
+        recovery::recover(self, database_header, mode)
     }
 
     /// `AfterWalTruncate` can report an applied-but-unacknowledged truncate; its boundary is retained.

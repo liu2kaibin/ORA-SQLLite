@@ -82,6 +82,11 @@ impl Drop for TempDatabase {
     }
 }
 
+pub(super) fn write_wal_fixture(database_path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(wal_path(database_path), bytes)
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("write WAL fixture: {error}")))
+}
+
 fn sanitized_label(label: &str) -> String {
     let label: String = label
         .chars()

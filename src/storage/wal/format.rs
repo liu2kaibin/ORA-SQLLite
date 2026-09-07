@@ -289,11 +289,11 @@ impl RecordHeader {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CommitState {
-    pub(super) page_count: u64,
-    pub(super) catalog_root: PageId,
-    pub(super) freelist_root: PageId,
-    pub(super) feature_bits: u64,
+pub(crate) struct CommitState {
+    pub(crate) page_count: u64,
+    pub(crate) catalog_root: PageId,
+    pub(crate) freelist_root: PageId,
+    pub(crate) feature_bits: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
