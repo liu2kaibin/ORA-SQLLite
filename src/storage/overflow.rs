@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn overflow_round_trips_and_releases_multiple_pages() {
         let value = vec![0x6d; 9000];
-        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
         let first = {
             let mut batch = pager.begin_write().expect("begin overflow write");
             let first = write_value(&mut batch, &value)
@@ -334,11 +334,12 @@ mod tests {
             first
         };
 
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         assert_eq!(
-            read_value(&mut pager, first, value.len() as u64).expect("read overflow value"),
+            read_value(&mut snapshot, first, value.len() as u64).expect("read overflow value"),
             value
         );
-        let chain = collect_chain(&mut pager, first, 9000).expect("collect overflow chain");
+        let chain = collect_chain(&mut snapshot, first, 9000).expect("collect overflow chain");
         assert_eq!(chain.len(), 3);
 
         {
@@ -365,7 +366,7 @@ mod tests {
     #[test]
     fn overflow_round_trips_one_page_boundaries() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager) = test_pager(page_size).expect("create test pager");
+            let (_temp, pager) = test_pager(page_size).expect("create test pager");
             let before = pager.page_count();
             let empty = {
                 let mut batch = pager.begin_write().expect("begin empty value write");
@@ -380,7 +381,7 @@ mod tests {
                 usize::try_from(page_size).expect("test page size fits usize") - CHUNK_OFFSET;
             for len in [1, capacity, capacity + 1] {
                 let value = vec![0x3a; len];
-                let (_temp, mut pager) = test_pager(page_size).expect("create test pager");
+                let (_temp, pager) = test_pager(page_size).expect("create test pager");
                 let first = {
                     let mut batch = pager.begin_write().expect("begin overflow write");
                     let first = write_value(&mut batch, &value)
@@ -390,12 +391,13 @@ mod tests {
                     first
                 };
 
+                let mut snapshot = pager.begin_read().expect("begin read snapshot");
                 assert_eq!(
-                    read_value(&mut pager, first, len as u64).expect("read overflow value"),
+                    read_value(&mut snapshot, first, len as u64).expect("read overflow value"),
                     value
                 );
                 assert_eq!(
-                    collect_chain(&mut pager, first, len as u64)
+                    collect_chain(&mut snapshot, first, len as u64)
                         .expect("collect overflow chain")
                         .len(),
                     if len <= capacity { 1 } else { 2 }
@@ -407,7 +409,7 @@ mod tests {
     #[test]
     fn batch_overlay_reads_a_multi_page_overflow_chain_before_commit() {
         let value = vec![0x27; 9000];
-        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
         let mut batch = pager.begin_write().expect("begin overflow write");
         let first = write_value(&mut batch, &value)
             .expect("write overflow value")
@@ -593,7 +595,7 @@ mod tests {
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create test pager");
         drop(pager);
         let before = std::fs::read(temp.path()).expect("read database before invalid commit");
-        let mut pager = Pager::open(
+        let pager = Pager::open(
             temp.path(),
             OpenMode::ReadWrite,
             PagerConfig::test_default(4096),

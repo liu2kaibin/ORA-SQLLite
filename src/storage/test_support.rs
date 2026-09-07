@@ -20,12 +20,12 @@ use super::{
     PageId, PageRef,
     btree::{BTree, TreeKind},
     checksum::stamp_page_checksum,
-    file::{OpenMode, checked_page_offset},
+    file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
     pager::{PageSource, Pager, PagerConfig},
     validate::validate_tree,
-    wal::wal_path,
+    wal::{Wal, wal_path},
 };
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -201,8 +201,8 @@ impl FaultInjector for RecordingFaults {
 #[test]
 fn test_fault_injector_is_used_after_pager_creation() {
     let temp = TempDatabase::new("test-fault-injector");
-    let faults = Arc::new(RecordingFaults::at(FaultPoint::BeforeFileWrite, 1));
-    let mut pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+    let faults = Arc::new(RecordingFaults::at(FaultPoint::BeforeWalWrite, 1));
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
         .expect("create pager")
         .with_faults(faults.clone());
     let page = {
@@ -220,38 +220,43 @@ fn test_fault_injector_is_used_after_pager_creation() {
         page
     };
 
-    assert_eq!(faults.observed(), vec![FaultPoint::BeforeFileWrite]);
+    assert_eq!(faults.observed(), vec![FaultPoint::BeforeWalWrite]);
     assert!(pager.is_poisoned());
     assert_eq!(
-        pager.read(page).expect_err("poisoned read").code(),
-        ErrorCode::Io
+        pager
+            .read(page)
+            .expect_err("unpublished page remains invisible")
+            .code(),
+        ErrorCode::Corruption
     );
 }
 
 #[test]
-fn every_multi_page_write_and_sync_fault_poisons_the_pager_until_reopen() {
+fn every_wal_commit_fault_requires_recovery_after_a_multi_page_transaction() {
     let baseline_faults = Arc::new(RecordingFaults::never());
     let baseline = commit_multi_page_tree(baseline_faults.clone()).expect("baseline commit");
-    assert!(
-        baseline
-            .iter()
-            .filter(|&&point| point == FaultPoint::BeforeFileWrite)
-            .count()
-            > 2,
-        "fixture must make a multi-page commit"
+    assert_eq!(
+        baseline,
+        vec![
+            FaultPoint::BeforeWalWrite,
+            FaultPoint::AfterWalWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+        ],
+        "a multi-page transaction must append and sync through the WAL once"
     );
 
     for point in [
-        FaultPoint::BeforeFileWrite,
-        FaultPoint::AfterFileWrite,
-        FaultPoint::BeforeFileSync,
-        FaultPoint::AfterFileSync,
+        FaultPoint::BeforeWalWrite,
+        FaultPoint::AfterWalWrite,
+        FaultPoint::BeforeWalSync,
+        FaultPoint::AfterWalSync,
     ] {
         let occurrences = baseline.iter().filter(|&&seen| seen == point).count();
         for occurrence in 1..=occurrences {
             let faults = Arc::new(RecordingFaults::at(point, occurrence));
             let temp = TempDatabase::new(&format!("multi-page-fault-{point:?}-{occurrence}"));
-            let mut pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+            let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
                 .expect("create fault pager")
                 .with_faults(faults.clone());
             let root = {
@@ -278,14 +283,17 @@ fn every_multi_page_write_and_sync_fault_poisons_the_pager_until_reopen() {
             assert_eq!(faults.observed(), baseline[..=stop]);
             assert!(pager.is_poisoned());
             assert_eq!(
-                pager.read(root).expect_err("poisoned pager read").code(),
-                ErrorCode::Io
+                pager
+                    .read(root)
+                    .expect_err("unpublished root remains invisible")
+                    .code(),
+                ErrorCode::Corruption
             );
             let write_error = match pager.begin_write() {
                 Ok(_) => panic!("poisoned pager must reject write batches"),
                 Err(error) => error,
             };
-            assert_eq!(write_error.code(), ErrorCode::Io);
+            assert_eq!(write_error.code(), ErrorCode::Transaction);
 
             drop(pager);
             if let Ok(reopened) = Pager::open(
@@ -301,7 +309,7 @@ fn every_multi_page_write_and_sync_fault_poisons_the_pager_until_reopen() {
 
 fn commit_multi_page_tree(faults: Arc<RecordingFaults>) -> Result<Vec<FaultPoint>> {
     let temp = TempDatabase::new("multi-page-fault-baseline");
-    let mut pager =
+    let pager =
         Pager::create(temp.path(), PagerConfig::test_default(4096))?.with_faults(faults.clone());
     let mut batch = pager.begin_write()?;
     let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
@@ -532,8 +540,9 @@ fn run_reference_model_operations(
         tree = pager
             .catalog_tree(kind)?
             .ok_or_else(|| DbError::new(ErrorCode::Corruption, "model catalog root is missing"))?;
+        let mut snapshot = pager.begin_read()?;
         assert_eq!(
-            collect_all(&tree, &mut pager)?,
+            collect_all(&tree, &mut snapshot)?,
             model
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -547,7 +556,8 @@ fn run_reference_model_operations(
         seen_key_lengths.into_iter().all(|seen| seen),
         "fixed-seed model must cover key lengths 0 through 64"
     );
-    let tree_height = tree_height(&mut pager, tree.root())?;
+    let mut snapshot = pager.begin_read()?;
+    let tree_height = tree_height(&mut snapshot, tree.root())?;
 
     Ok(ModelProof {
         operations,
@@ -700,17 +710,18 @@ fn checksum_corruption_is_rejected_for_every_page_type_at_every_page_size() {
                 page_size as usize - 1,
             )
             .expect("corrupt whole-page checksum");
-            let mut pager = Pager::open(
+            let error = match Pager::open(
                 fixture.temp.path(),
                 OpenMode::ReadOnly,
                 PagerConfig::test_default(page_size),
-            )
-            .expect("open checksum-corrupted fixture");
-            assert_eq!(
-                pager
+            ) {
+                Ok(pager) => pager
                     .read(*reference)
-                    .expect_err("checksum-corrupted page must reject reads")
-                    .code(),
+                    .expect_err("checksum-corrupted page must reject reads"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code(),
                 ErrorCode::Corruption,
                 "checksum corruption must reject {page_type:?} at page size {page_size}"
             );
@@ -801,7 +812,7 @@ fn truncation_and_restamped_field_corruption_return_controlled_errors() {
     patch_page(&fixture, freelist, 68, &1u32.to_le_bytes())
         .expect("restamp freelist reserved field");
     assert_controlled_corruption(|| {
-        let mut pager = Pager::open(
+        let pager = Pager::open(
             fixture.temp.path(),
             OpenMode::ReadWrite,
             PagerConfig::test_default(4096),
@@ -821,7 +832,7 @@ impl CorruptionFixture {
 
 fn corruption_fixture(page_size: u32) -> Result<CorruptionFixture> {
     let temp = TempDatabase::new(&format!("corruption-{page_size}"));
-    let mut pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
     let (mut table, index) = {
         let mut batch = pager.begin_write()?;
         let mut table = BTree::create(&mut batch, TreeKind::Table)?;
@@ -855,9 +866,7 @@ fn corruption_fixture(page_size: u32) -> Result<CorruptionFixture> {
         batch.set_catalog_root(table.root())?;
         batch.commit()?;
     }
-    drop(pager);
-
-    let pages = fixture_pages(temp.path(), page_size)?;
+    let pages = materialize_wal_fixture_to_checkpoint(&temp, pager, table.root().page_id())?;
     for page_type in [
         PageType::Catalog,
         PageType::TableInternal,
@@ -879,6 +888,64 @@ fn corruption_fixture(page_size: u32) -> Result<CorruptionFixture> {
         index,
         pages,
     })
+}
+
+fn materialize_wal_fixture_to_checkpoint(
+    temp: &TempDatabase,
+    pager: Pager,
+    catalog_root: PageId,
+) -> Result<Vec<(PageRef, PageType)>> {
+    let latest_lsn = pager.latest_lsn()?;
+    let mut snapshot = pager.begin_read()?;
+    let page_count = snapshot.page_count()?;
+    let freelist_root = snapshot.freelist_root()?;
+    let mut images = Vec::new();
+    let mut pages = Vec::new();
+    for page_id in 1..page_count {
+        let page_id = PageId(page_id);
+        let frame = snapshot.read_page_by_id(page_id)?;
+        let reference = PageRef::new(frame.header().page_id(), frame.header().generation())?;
+        images.push((page_id, frame.bytes().to_vec()));
+        pages.push((reference, frame.header().page_type()));
+    }
+    drop(snapshot);
+    drop(pager);
+
+    let mut main =
+        DatabaseFile::open(temp.path(), OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)?;
+    main.extend_to_pages(page_count)?;
+    for (page_id, bytes) in images {
+        main.write_page(page_id, &bytes)?;
+    }
+    main.sync_all()?;
+    let base = main.header();
+    let checkpoint = base.with_checkpoint(
+        latest_lsn,
+        page_count,
+        catalog_root,
+        freelist_root,
+        base.wal_generation(),
+    )?;
+    main.publish_superblock(checkpoint)?;
+    let fallback_checkpoint = main.header().with_checkpoint(
+        latest_lsn,
+        page_count,
+        catalog_root,
+        freelist_root,
+        main.header().wal_generation(),
+    )?;
+    main.publish_superblock(fallback_checkpoint)?;
+    drop(main);
+
+    fs::remove_file(wal_path(temp.path())).map_err(|error| {
+        DbError::new(
+            ErrorCode::Io,
+            format!("remove fixture WAL before rebasing: {error}"),
+        )
+    })?;
+    let wal = Wal::create(temp.path(), &fallback_checkpoint)?;
+    drop(wal);
+    Ok(pages)
 }
 
 fn fixture_key(prefix: u8, number: u8) -> Vec<u8> {
@@ -987,7 +1054,7 @@ fn truncate_file(path: &Path, len: u64) -> Result<()> {
 }
 
 fn read_page_from_fixture(fixture: &CorruptionFixture, reference: PageRef) -> Result<()> {
-    let mut pager = Pager::open(
+    let pager = Pager::open(
         fixture.temp.path(),
         OpenMode::ReadOnly,
         PagerConfig::test_default(fixture.page_size),
@@ -996,7 +1063,7 @@ fn read_page_from_fixture(fixture: &CorruptionFixture, reference: PageRef) -> Re
 }
 
 fn validate_fixture_tree(fixture: &CorruptionFixture, kind: TreeKind) -> Result<()> {
-    let mut pager = Pager::open(
+    let pager = Pager::open(
         fixture.temp.path(),
         OpenMode::ReadOnly,
         PagerConfig::test_default(fixture.page_size),
@@ -1005,7 +1072,8 @@ fn validate_fixture_tree(fixture: &CorruptionFixture, kind: TreeKind) -> Result<
         TreeKind::Table => &fixture.table,
         TreeKind::Index => &fixture.index,
     };
-    validate_tree(&mut pager, tree).map(|_| ())
+    let mut snapshot = pager.begin_read()?;
+    validate_tree(&mut snapshot, tree).map(|_| ())
 }
 
 fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
@@ -1071,7 +1139,8 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
                 .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale file length overflow"))?,
         )
         .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale file length overflow"))?;
-    let tree_height = tree_height(&mut pager, tree.root())?;
+    let mut snapshot = pager.begin_read()?;
+    let tree_height = tree_height(&mut snapshot, tree.root())?;
 
     Ok(ScaleMetrics {
         rows,
@@ -1082,10 +1151,10 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
     })
 }
 
-fn tree_height(pager: &mut Pager, mut current: PageRef) -> Result<u64> {
+fn tree_height(source: &mut impl PageSource, mut current: PageRef) -> Result<u64> {
     let mut height = 0u64;
     loop {
-        let frame = pager.read(current)?;
+        let frame = source.read_page(current)?;
         height = height
             .checked_add(1)
             .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale tree height overflow"))?;

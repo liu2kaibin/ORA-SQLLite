@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn empty_tree_is_one_leaf_and_scans_empty() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let tree = {
             let mut batch = pager.begin_write().expect("begin write");
             let tree = BTree::create(&mut batch, TreeKind::Table).expect("create empty tree");
@@ -337,8 +337,9 @@ mod tests {
         let root = pager.read(tree.root()).expect("read root page");
         assert_eq!(root.header().page_type(), PageType::TableLeaf);
 
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         assert_eq!(
-            tree.scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            tree.scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
                 .expect("scan empty tree")
                 .next()
                 .expect("read empty cursor"),

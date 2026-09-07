@@ -14,13 +14,19 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::{Lsn, file::OpenMode, header::DatabaseHeader};
+use super::{Lsn, PageId, checksum::Crc32c, file::OpenMode, header::DatabaseHeader};
 use crate::{
     DbError, ErrorCode, Result,
     fault::{FaultInjector, FaultPoint, NoFaults},
 };
 
-use self::format::{WAL_HEADER_SLOT_LEN, WalHeader};
+use self::{
+    format::{
+        CommitPayload, CommitState, RecordHeader, RecordType, WAL_HEADER_SLOT_LEN, WalHeader,
+        record_end, zero_padding_len,
+    },
+    index::WalVersion,
+};
 
 const WAL_HEADER_AREA_LEN: u64 = (WAL_HEADER_SLOT_LEN as u64) * 2;
 
@@ -195,6 +201,136 @@ impl Wal {
         self.end_offset = end;
         self.after_write()?;
         Ok(start)
+    }
+
+    /// Builds a complete, prevalidated transaction before performing its one append operation.
+    pub(crate) fn append_transaction(
+        &mut self,
+        transaction_lsn: Lsn,
+        previous_lsn: Lsn,
+        state: CommitState,
+        frames: &[(PageId, u64, Vec<u8>)],
+    ) -> Result<Vec<(PageId, u64, u64)>> {
+        self.require_ready()?;
+        if frames.is_empty() {
+            return Err(corruption(
+                "WAL transactions require at least one page frame",
+            ));
+        }
+        if transaction_lsn.0 == 0
+            || previous_lsn
+                .0
+                .checked_add(1)
+                .is_none_or(|next| next != transaction_lsn.0)
+        {
+            return Err(corruption("WAL transaction LSN is not consecutive"));
+        }
+
+        let frame_count = u32::try_from(frames.len())
+            .map_err(|_| corruption("WAL transaction has too many page frames"))?;
+        let mut transaction = Vec::new();
+        let mut transaction_crc = Crc32c::new();
+        let mut versions = Vec::new();
+        versions
+            .try_reserve_exact(frames.len())
+            .map_err(|_| corruption("WAL version allocation failed"))?;
+        let mut next_offset = self.end_offset;
+        let mut previous_page_id = None;
+
+        for (ordinal, (page_id, generation, payload)) in frames.iter().enumerate() {
+            if previous_page_id.is_some_and(|previous| *page_id <= previous) {
+                return Err(corruption("WAL page frames are not strictly page ordered"));
+            }
+            previous_page_id = Some(*page_id);
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| corruption("WAL transaction has too many page frames"))?;
+            let record = RecordHeader::page_frame(
+                transaction_lsn,
+                ordinal,
+                *page_id,
+                *generation,
+                self.header.wal_generation,
+                payload,
+            )?;
+            let encoded_header = record.encode(self.header.page_size)?;
+            let end = record_end(next_offset, record.payload_len)?;
+            transaction_crc.update(&encoded_header);
+            transaction_crc.update(payload);
+            transaction.extend_from_slice(&encoded_header);
+            transaction.extend_from_slice(payload);
+            transaction.extend(std::iter::repeat_n(0, zero_padding_len(record.payload_len)));
+            versions.push((*page_id, next_offset, *generation));
+            next_offset = end;
+        }
+
+        let commit_payload = CommitPayload {
+            previous_lsn,
+            state,
+            frame_count,
+            transaction_crc32c: transaction_crc.finish(),
+        }
+        .encode()?;
+        let commit = RecordHeader::commit(
+            transaction_lsn,
+            frame_count,
+            self.header.wal_generation,
+            &commit_payload,
+        )?;
+        let encoded_header = commit.encode(self.header.page_size)?;
+        let _transaction_end = record_end(next_offset, commit.payload_len)?;
+        transaction.extend_from_slice(&encoded_header);
+        transaction.extend_from_slice(&commit_payload);
+        transaction.extend(std::iter::repeat_n(0, zero_padding_len(commit.payload_len)));
+        self.append_record(&transaction)?;
+        Ok(versions)
+    }
+
+    /// Revalidates an indexed page-frame record before exposing its immutable decoded image.
+    pub(crate) fn read_page_frame(
+        &mut self,
+        page_id: PageId,
+        version: WalVersion,
+        page_size: u32,
+    ) -> Result<super::page::PageFrame> {
+        self.require_ready()?;
+        let mut header_bytes = [0; 64];
+        self.read_exact_at(version.offset, &mut header_bytes)?;
+        let header = RecordHeader::decode(&header_bytes, page_size, self.header.wal_generation)?;
+        if header.record_type != RecordType::PageFrame
+            || header.transaction_lsn != version.lsn
+            || header.page_id != page_id
+            || header.generation != version.generation
+        {
+            return Err(corruption(
+                "WAL index points to a different page-frame record",
+            ));
+        }
+        let end = record_end(version.offset, header.payload_len)?;
+        if end > self.end_offset {
+            return Err(corruption(
+                "WAL page-frame record exceeds the file boundary",
+            ));
+        }
+        let payload_len = usize::try_from(header.payload_len)
+            .map_err(|_| corruption("WAL page-frame length does not fit memory"))?;
+        let mut payload = vec![0; payload_len];
+        let payload_offset = version
+            .offset
+            .checked_add(64)
+            .ok_or_else(|| corruption("WAL page-frame payload offset overflow"))?;
+        self.read_exact_at(payload_offset, &mut payload)?;
+        let padding_len = zero_padding_len(header.payload_len);
+        let mut padding = [0; 7];
+        if padding_len != 0 {
+            self.read_exact_at(
+                payload_offset
+                    .checked_add(u64::from(header.payload_len))
+                    .ok_or_else(|| corruption("WAL page-frame padding offset overflow"))?,
+                &mut padding[..padding_len],
+            )?;
+        }
+        header.validate_payload(&payload, &padding[..padding_len])?;
+        super::page::PageFrame::decode(payload, page_id, None, Some(version.generation))
     }
 
     pub(super) fn read_exact_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<()> {
