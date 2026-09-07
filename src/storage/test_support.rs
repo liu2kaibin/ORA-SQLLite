@@ -537,10 +537,10 @@ fn run_reference_model_operations(
             OpenMode::ReadWrite,
             PagerConfig::test_default(page_size),
         )?;
-        tree = pager
+        let mut snapshot = pager.begin_read()?;
+        tree = snapshot
             .catalog_tree(kind)?
             .ok_or_else(|| DbError::new(ErrorCode::Corruption, "model catalog root is missing"))?;
-        let mut snapshot = pager.begin_read()?;
         assert_eq!(
             collect_all(&tree, &mut snapshot)?,
             model

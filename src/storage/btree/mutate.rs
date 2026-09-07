@@ -1276,8 +1276,9 @@ mod tests {
             batch.commit().expect("commit catalog root shrink");
         }
 
+        let mut snapshot = pager.begin_read().expect("begin catalog snapshot");
         assert_eq!(
-            pager
+            snapshot
                 .catalog_tree(TreeKind::Table)
                 .expect("read catalog root")
                 .expect("catalog root is present")

@@ -150,6 +150,11 @@ impl Pager {
                 "recovered WAL LSN predates the database checkpoint",
             ));
         }
+        validate_recovered_page_count(
+            latest.page_count,
+            checkpoint.page_size(),
+            max_database_bytes,
+        )?;
         Ok(Self {
             inner: Arc::new(PagerInner {
                 main: Mutex::new(file),
@@ -411,28 +416,6 @@ impl Pager {
         Ok(handle)
     }
 
-    pub(super) fn catalog_tree(&self, kind: TreeKind) -> Result<Option<BTree>> {
-        let mut snapshot = self.begin_read()?;
-        let page_id = snapshot.state.catalog_root;
-        if page_id.0 == 0 {
-            return Ok(None);
-        }
-        if page_id.0 >= snapshot.state.page_count {
-            return Err(corruption("catalog root is outside the database"));
-        }
-        let frame = snapshot.read_page_by_id(page_id)?;
-        let root = PageRef::new(page_id, frame.header().generation())?;
-        if TreeKind::from_root_page_type(frame.header().page_type()) != Some(kind) {
-            return Err(corruption(
-                "catalog root page type does not match the requested tree kind",
-            ));
-        }
-        let tree = BTree::from_root(kind, root);
-        let report = validate_tree(&mut snapshot, &tree)?;
-        validate_freelist(&mut snapshot, &report.all_live_pages())?;
-        Ok(Some(tree))
-    }
-
     fn main_lock(&self) -> Result<MutexGuard<'_, DatabaseFile>> {
         self.inner
             .main
@@ -494,6 +477,27 @@ impl ReadSnapshot {
         self.pager
             .read_at(self.lsn, self.state, self.checkpoint, reference)
     }
+
+    pub(super) fn catalog_tree(&mut self, kind: TreeKind) -> Result<Option<BTree>> {
+        let page_id = self.state.catalog_root;
+        if page_id.0 == 0 {
+            return Ok(None);
+        }
+        if page_id.0 >= self.state.page_count {
+            return Err(corruption("catalog root is outside the database"));
+        }
+        let frame = self.read_page_by_id(page_id)?;
+        let root = PageRef::new(page_id, frame.header().generation())?;
+        if TreeKind::from_root_page_type(frame.header().page_type()) != Some(kind) {
+            return Err(corruption(
+                "catalog root page type does not match the requested tree kind",
+            ));
+        }
+        let tree = BTree::from_root(kind, root);
+        let report = validate_tree(self, &tree)?;
+        validate_freelist(self, &report.all_live_pages())?;
+        Ok(Some(tree))
+    }
 }
 
 impl PageSource for ReadSnapshot {
@@ -522,6 +526,25 @@ fn checkpoint_state(header: &DatabaseHeader) -> CommitState {
         freelist_root: header.freelist_root(),
         feature_bits: header.features(),
     }
+}
+
+fn validate_recovered_page_count(
+    page_count: u64,
+    page_size: u32,
+    max_database_bytes: u64,
+) -> Result<()> {
+    let last_page_id = page_count
+        .checked_sub(1)
+        .ok_or_else(|| corruption("recovered WAL page count must be nonzero"))?;
+    if last_page_id == 0 {
+        if super::header::SUPERBLOCK_AREA_LEN > max_database_bytes {
+            return Err(corruption(
+                "recovered WAL database exceeds the configured maximum size",
+            ));
+        }
+        return Ok(());
+    }
+    checked_page_offset(PageId(last_page_id), page_size, max_database_bytes).map(|_| ())
 }
 
 fn walk_freelist(
@@ -1453,16 +1476,68 @@ mod tests {
         )
         .expect("reopen pager from WAL");
         assert_eq!(reopened.latest_lsn().expect("read latest LSN"), Lsn(1));
-        let tree = reopened
+        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
+        let tree = snapshot
             .catalog_tree(TreeKind::Table)
             .expect("recover catalog tree")
             .expect("catalog root is present");
         assert_eq!(tree.root(), root);
-        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
         assert_eq!(
             tree.get(&mut snapshot, b"wal-key")
                 .expect("read recovered catalog value"),
             Some(b"wal-value".to_vec())
+        );
+    }
+
+    #[test]
+    fn snapshot_catalog_tree_keeps_its_root_across_a_later_split() {
+        let temp = TempDatabase::new("pager-snapshot-catalog-root");
+        let pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let mut tree = {
+            let mut batch = pager.begin_write().expect("begin initial batch");
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            for index in 0..4u8 {
+                let key = format!("k{index:03}").into_bytes();
+                tree.insert(&mut batch, &key, &[index; 700])
+                    .expect("insert initial value");
+            }
+            batch
+                .set_catalog_root(tree.root())
+                .expect("publish initial root");
+            batch.commit().expect("commit initial root");
+            tree
+        };
+
+        let mut old_snapshot = pager.begin_read().expect("begin LSN-1 snapshot");
+        let old_catalog = old_snapshot
+            .catalog_tree(TreeKind::Table)
+            .expect("resolve catalog through old snapshot")
+            .expect("catalog root exists");
+
+        {
+            let mut batch = pager.begin_write().expect("begin split batch");
+            for index in 4..30u8 {
+                let key = format!("k{index:03}").into_bytes();
+                tree.insert(&mut batch, &key, &[index; 700])
+                    .expect("grow catalog tree");
+            }
+            assert_ne!(
+                tree.root(),
+                old_catalog.root(),
+                "fixture must split the root"
+            );
+            batch
+                .set_catalog_root(tree.root())
+                .expect("publish split root");
+            batch.commit().expect("commit split root");
+        }
+
+        assert_eq!(
+            old_catalog
+                .get(&mut old_snapshot, b"k003")
+                .expect("read old tree through old snapshot"),
+            Some(vec![3; 700])
         );
     }
 
@@ -1560,6 +1635,55 @@ mod tests {
     }
 
     #[test]
+    fn cold_snapshot_reads_published_wal_page_after_os_append_failure() {
+        let temp = TempDatabase::new("pager-wal-os-append-failure");
+        let pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        let page = {
+            let mut batch = pager.begin_write().expect("begin initial write");
+            let page = batch
+                .allocate_append(PageType::TableLeaf)
+                .expect("allocate initial page");
+            batch.modify(page).expect("modify initial page").bytes_mut()[100] = 0x33;
+            batch.commit().expect("commit initial page");
+            page
+        };
+        let mut old_snapshot = pager.begin_read().expect("begin old snapshot");
+
+        let checkpoint = pager
+            .published_read()
+            .expect("read checkpoint header")
+            .checkpoint;
+        let read_only_wal =
+            Wal::open(temp.path(), &checkpoint, OpenMode::ReadOnly).expect("open read-only WAL");
+        *pager.wal_lock().expect("lock WAL") = read_only_wal;
+
+        let error = {
+            let mut batch = pager.begin_write().expect("begin failing write");
+            batch
+                .modify(page)
+                .expect("modify replacement page")
+                .bytes_mut()[100] = 0x44;
+            batch
+                .commit()
+                .expect_err("read-only WAL append must fail through write_all")
+        };
+        assert_eq!(error.code(), ErrorCode::Io);
+        pager
+            .cache_lock()
+            .expect("lock page cache")
+            .remove_page_versions(page.page_id());
+
+        assert_eq!(
+            old_snapshot
+                .read(page)
+                .expect("published WAL prefix remains readable after failed append")
+                .bytes()[100],
+            0x33
+        );
+    }
+
+    #[test]
     fn lsn_overflow_rejects_before_wal_io() {
         let temp = TempDatabase::new("pager-lsn-overflow");
         let mut database =
@@ -1620,6 +1744,29 @@ mod tests {
             fs::read(wal_path(temp.path())).expect("read WAL after overflow attempt"),
             before
         );
+    }
+
+    #[test]
+    fn reopen_rejects_wal_recovered_pages_above_the_configured_database_limit() {
+        let temp = TempDatabase::new("pager-recovered-size-limit");
+        let pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
+        {
+            let mut batch = pager.begin_write().expect("begin write");
+            batch
+                .allocate_append(PageType::TableLeaf)
+                .expect("allocate WAL-only page");
+            batch.commit().expect("commit WAL-only page");
+        }
+        drop(pager);
+
+        let mut limited = PagerConfig::test_default(4096);
+        limited.max_database_bytes = 8192;
+        let error = match Pager::open(temp.path(), OpenMode::ReadOnly, limited) {
+            Ok(_) => panic!("recovery must reject a logical page beyond the configured limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Corruption);
     }
 
     #[test]
@@ -1878,8 +2025,9 @@ mod tests {
             PagerConfig::test_default(4096),
         )
         .expect("reopen pager");
+        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
         assert_eq!(
-            reopened
+            snapshot
                 .catalog_tree(TreeKind::Table)
                 .expect("recover catalog tree")
                 .expect("catalog root exists")
@@ -1943,12 +2091,12 @@ mod tests {
                 PagerConfig::test_default(page_size),
             )
             .expect("open persisted pager");
-            let tree = reopened
+            let mut snapshot = reopened.begin_read().expect("begin read snapshot");
+            let tree = snapshot
                 .catalog_tree(TreeKind::Table)
                 .expect("recover catalog tree")
                 .expect("catalog tree exists");
             assert_eq!(tree.root(), root);
-            let mut snapshot = reopened.begin_read().expect("begin read snapshot");
             assert!(
                 root_has_internal_child(&mut snapshot, tree.root())
                     .expect("recovered tree has three levels"),
@@ -2211,11 +2359,11 @@ mod tests {
             PagerConfig::test_default(4096),
         )
         .expect("reopen split tree");
-        let recovered = reopened
+        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
+        let recovered = snapshot
             .catalog_tree(TreeKind::Table)
             .expect("recover split tree")
             .expect("catalog root exists");
-        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
         let mut cursor = recovered
             .scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
             .expect("scan recovered split tree");
@@ -2258,8 +2406,9 @@ mod tests {
             PagerConfig::test_default(4096),
         )
         .expect("reopen unchanged root");
+        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
         assert_eq!(
-            reopened
+            snapshot
                 .catalog_tree(TreeKind::Table)
                 .expect("recover unchanged root")
                 .expect("catalog root exists")
@@ -2338,8 +2487,9 @@ mod tests {
             PagerConfig::test_default(4096),
         )
         .expect("open corrupt catalog header read only");
+        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
         assert_eq!(
-            reopened
+            snapshot
                 .catalog_tree(TreeKind::Table)
                 .expect("recover committed catalog")
                 .expect("committed catalog exists")

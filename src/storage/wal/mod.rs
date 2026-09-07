@@ -187,7 +187,7 @@ impl Wal {
 
     /// `AfterWalWrite` can report an applied-but-unacknowledged append; its boundary is retained.
     pub(super) fn append_record(&mut self, bytes: &[u8]) -> Result<u64> {
-        self.require_ready()?;
+        self.require_writable()?;
         if bytes.is_empty() {
             return Err(corruption("cannot append an empty WAL record"));
         }
@@ -211,7 +211,7 @@ impl Wal {
         state: CommitState,
         frames: &[(PageId, u64, Vec<u8>)],
     ) -> Result<Vec<(PageId, u64, u64)>> {
-        self.require_ready()?;
+        self.require_writable()?;
         if frames.is_empty() {
             return Err(corruption(
                 "WAL transactions require at least one page frame",
@@ -292,7 +292,6 @@ impl Wal {
         version: WalVersion,
         page_size: u32,
     ) -> Result<super::page::PageFrame> {
-        self.require_ready()?;
         let mut header_bytes = [0; 64];
         self.read_exact_at(version.offset, &mut header_bytes)?;
         let header = RecordHeader::decode(&header_bytes, page_size, self.header.wal_generation)?;
@@ -334,7 +333,6 @@ impl Wal {
     }
 
     pub(super) fn read_exact_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<()> {
-        self.require_ready()?;
         let byte_count = u64::try_from(bytes.len())
             .map_err(|_| corruption("WAL read length does not fit u64"))?;
         let end = offset
@@ -352,7 +350,7 @@ impl Wal {
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
-        self.require_ready()?;
+        self.require_writable()?;
         self.faults.check(FaultPoint::BeforeWalSync)?;
         self.file
             .sync_all()
@@ -374,7 +372,7 @@ impl Wal {
 
     /// `AfterWalTruncate` can report an applied-but-unacknowledged truncate; its boundary is retained.
     pub(super) fn truncate(&mut self, len: u64) -> Result<()> {
-        self.require_ready()?;
+        self.require_writable()?;
         if !(WAL_HEADER_AREA_LEN..=self.end_offset).contains(&len) {
             return Err(corruption(
                 "WAL truncate length is outside the file boundary",
@@ -401,7 +399,7 @@ impl Wal {
     }
 
     fn write_at(&mut self, offset: u64, operation: &str, bytes: &[u8]) -> Result<()> {
-        self.require_ready()?;
+        self.require_writable()?;
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|error| io_error(operation, error))?;
@@ -416,11 +414,11 @@ impl Wal {
         self.faults.check(FaultPoint::AfterWalWrite)
     }
 
-    fn require_ready(&self) -> Result<()> {
+    fn require_writable(&self) -> Result<()> {
         if self.poisoned {
             return Err(DbError::new(
                 ErrorCode::Io,
-                "WAL is unusable after a failed mutating I/O operation",
+                "WAL is unusable for further mutating I/O after a failed write",
             ));
         }
         Ok(())
@@ -719,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_os_write_poisoned_wal_rejects_further_io() {
+    fn failed_os_write_poisoned_wal_rejects_mutations_but_reads_the_existing_prefix() {
         let temp = TempDatabase::new("wal-poisoned-write");
         let header = DatabaseHeader::new(4096, [12; 16]).unwrap();
         let wal = Wal::create(temp.path(), &header).unwrap();
@@ -731,10 +729,10 @@ mod tests {
             ErrorCode::Io
         );
         assert_eq!(wal.sync_all().unwrap_err().code(), ErrorCode::Io);
-        assert_eq!(
-            wal.read_exact_at(0, &mut [0; 1]).unwrap_err().code(),
-            ErrorCode::Io
-        );
+        let mut header_magic = [0; 16];
+        wal.read_exact_at(0, &mut header_magic)
+            .expect("the valid WAL prefix remains readable");
+        assert_eq!(&header_magic, b"ORA-SQLLITE-WAL\0");
     }
 
     #[test]
