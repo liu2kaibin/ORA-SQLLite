@@ -38,11 +38,10 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
     let wal_header = wal.header();
     let mut offset = WAL_HEADER_AREA_LEN;
     let mut committed_end = WAL_HEADER_AREA_LEN;
-    let mut previous_lsn = wal_header.base_checkpoint_lsn;
     let mut latest_lsn = database_header.checkpoint_lsn();
     let mut latest_state = checkpoint_state(database_header);
     let mut index = WalIndex::default();
-    let mut pending = None;
+    let mut transactions = TransactionScanner::new(Some(wal_header.base_checkpoint_lsn));
 
     loop {
         let header_bytes = match read_header(wal, offset)? {
@@ -52,7 +51,7 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                     latest_state,
                     index,
                     committed_end,
-                    truncate_to: pending.map(|transaction: PendingTransaction| transaction.start),
+                    truncate_to: transactions.pending_start(),
                 });
             }
             HeaderRead::Incomplete => {
@@ -61,23 +60,25 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                     latest_state,
                     index,
                     committed_end,
-                    truncate_to: Some(pending.map_or(offset, |transaction| transaction.start)),
+                    truncate_to: Some(transactions.pending_start().unwrap_or(offset)),
                 });
             }
             HeaderRead::Complete(bytes) => bytes,
         };
 
-        if offset == WAL_HEADER_AREA_LEN
-            && is_previous_generation(&header_bytes, wal_header.wal_generation)
-        {
-            verify_old_generation_suffix(wal, database_header, wal_header.wal_generation - 1)?;
-            return Ok(RecoveryResult {
-                latest_lsn,
-                latest_state,
-                index,
-                committed_end,
-                truncate_to: Some(WAL_HEADER_AREA_LEN),
-            });
+        if offset == WAL_HEADER_AREA_LEN {
+            if let Some(old_generation) =
+                previous_generation(&header_bytes, wal_header.wal_generation)
+            {
+                verify_old_generation_suffix(wal, database_header, old_generation)?;
+                return Ok(RecoveryResult {
+                    latest_lsn,
+                    latest_state,
+                    index,
+                    committed_end,
+                    truncate_to: Some(WAL_HEADER_AREA_LEN),
+                });
+            }
         }
 
         let record = read_record(
@@ -93,10 +94,78 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                 latest_state,
                 index,
                 committed_end,
-                truncate_to: Some(pending.map_or(offset, |transaction| transaction.start)),
+                truncate_to: Some(transactions.pending_start().unwrap_or(offset)),
             });
         };
-        if record.header.transaction_lsn <= wal_header.base_checkpoint_lsn {
+        let end = record.end;
+        if let Some(transaction) = transactions.consume(record, offset)? {
+            committed_end = end;
+            if transaction.lsn > database_header.checkpoint_lsn() {
+                index.publish(
+                    transaction.lsn,
+                    Some(transaction.state),
+                    &transaction.frames,
+                )?;
+                latest_lsn = transaction.lsn;
+                latest_state = transaction.state;
+            }
+        }
+        offset = end;
+    }
+}
+
+struct PendingTransaction {
+    start: u64,
+    lsn: Lsn,
+    frames: Vec<(PageId, u64, u64)>,
+    last_page_id: Option<PageId>,
+    transaction_crc: Crc32c,
+}
+
+impl PendingTransaction {
+    fn new(start: u64, lsn: Lsn) -> Self {
+        Self {
+            start,
+            lsn,
+            frames: Vec::new(),
+            last_page_id: None,
+            transaction_crc: Crc32c::new(),
+        }
+    }
+}
+
+struct ValidatedTransaction {
+    lsn: Lsn,
+    state: CommitState,
+    frames: Vec<(PageId, u64, u64)>,
+}
+
+struct TransactionScanner {
+    previous_lsn: Option<Lsn>,
+    pending: Option<PendingTransaction>,
+}
+
+impl TransactionScanner {
+    fn new(previous_lsn: Option<Lsn>) -> Self {
+        Self {
+            previous_lsn,
+            pending: None,
+        }
+    }
+
+    fn pending_start(&self) -> Option<u64> {
+        self.pending.as_ref().map(|transaction| transaction.start)
+    }
+
+    fn consume(
+        &mut self,
+        record: DecodedRecord,
+        offset: u64,
+    ) -> Result<Option<ValidatedTransaction>> {
+        if self
+            .previous_lsn
+            .is_some_and(|base_lsn| record.header.transaction_lsn <= base_lsn)
+        {
             return Err(corruption(
                 "WAL record LSN does not follow the base checkpoint",
             ));
@@ -104,7 +173,7 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
 
         match record.header.record_type {
             RecordType::PageFrame => {
-                let transaction = match pending.as_mut() {
+                let transaction = match self.pending.as_mut() {
                     Some(transaction) => {
                         if record.header.transaction_lsn != transaction.lsn {
                             return Err(corruption("WAL page frame changes LSN before commit"));
@@ -112,10 +181,12 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                         transaction
                     }
                     None => {
-                        if record.header.transaction_lsn != next_lsn(previous_lsn)? {
-                            return Err(corruption("WAL transaction LSN is not consecutive"));
+                        if let Some(previous_lsn) = self.previous_lsn {
+                            if record.header.transaction_lsn != next_lsn(previous_lsn)? {
+                                return Err(corruption("WAL transaction LSN is not consecutive"));
+                            }
                         }
-                        pending.insert(PendingTransaction::new(
+                        self.pending.insert(PendingTransaction::new(
                             offset,
                             record.header.transaction_lsn,
                         ))
@@ -144,9 +215,10 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                     .frames
                     .push((record.header.page_id, offset, record.header.generation));
                 transaction.last_page_id = Some(record.header.page_id);
+                Ok(None)
             }
             RecordType::Commit => {
-                let transaction = pending.take().ok_or_else(|| {
+                let transaction = self.pending.take().ok_or_else(|| {
                     corruption("WAL commit record has no preceding page-frame records")
                 })?;
                 if record.header.transaction_lsn != transaction.lsn {
@@ -160,8 +232,14 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                     ));
                 }
                 let commit = CommitPayload::decode(&record.payload)?;
-                if commit.previous_lsn != previous_lsn {
+                if self
+                    .previous_lsn
+                    .is_some_and(|previous_lsn| commit.previous_lsn != previous_lsn)
+                {
                     return Err(corruption("WAL commit previous LSN is not consecutive"));
+                }
+                if transaction.lsn != next_lsn(commit.previous_lsn)? {
+                    return Err(corruption("WAL transaction LSN is not consecutive"));
                 }
                 if commit.frame_count != frame_count {
                     return Err(corruption(
@@ -173,43 +251,14 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                         "WAL transaction checksum does not match its page frames",
                     ));
                 }
-                if record.header.transaction_lsn != next_lsn(previous_lsn)? {
-                    return Err(corruption("WAL transaction LSN is not consecutive"));
-                }
 
-                previous_lsn = record.header.transaction_lsn;
-                committed_end = record.end;
-                if record.header.transaction_lsn > database_header.checkpoint_lsn() {
-                    index.publish(
-                        record.header.transaction_lsn,
-                        Some(commit.state),
-                        &transaction.frames,
-                    )?;
-                    latest_lsn = record.header.transaction_lsn;
-                    latest_state = commit.state;
-                }
+                self.previous_lsn = Some(transaction.lsn);
+                Ok(Some(ValidatedTransaction {
+                    lsn: transaction.lsn,
+                    state: commit.state,
+                    frames: transaction.frames,
+                }))
             }
-        }
-        offset = record.end;
-    }
-}
-
-struct PendingTransaction {
-    start: u64,
-    lsn: Lsn,
-    frames: Vec<(PageId, u64, u64)>,
-    last_page_id: Option<PageId>,
-    transaction_crc: Crc32c,
-}
-
-impl PendingTransaction {
-    fn new(start: u64, lsn: Lsn) -> Self {
-        Self {
-            start,
-            lsn,
-            frames: Vec::new(),
-            last_page_id: None,
-            transaction_crc: Crc32c::new(),
         }
     }
 }
@@ -296,9 +345,17 @@ fn verify_old_generation_suffix(
     old_generation: u64,
 ) -> Result<()> {
     let mut offset = WAL_HEADER_AREA_LEN;
+    let mut transactions = TransactionScanner::new(None);
     loop {
         let header_bytes = match read_header(wal, offset)? {
-            HeaderRead::End => return Ok(()),
+            HeaderRead::End => {
+                if transactions.pending_start().is_some() {
+                    return Err(corruption(
+                        "old-generation WAL suffix ends without a commit",
+                    ));
+                }
+                return Ok(());
+            }
             HeaderRead::Incomplete => {
                 return Err(corruption(
                     "old-generation WAL suffix ends inside a record header",
@@ -319,27 +376,16 @@ fn verify_old_generation_suffix(
             old_generation,
         )?
         .ok_or_else(|| corruption("old-generation WAL suffix ends inside a record"))?;
-        match record.header.record_type {
-            RecordType::PageFrame => {
-                PageFrame::decode(
-                    record.payload,
-                    record.header.page_id,
-                    None,
-                    Some(record.header.generation),
-                )?;
-            }
-            RecordType::Commit => {
-                CommitPayload::decode(&record.payload)?;
-            }
-        }
-        offset = record.end;
+        let end = record.end;
+        let _ = transactions.consume(record, offset)?;
+        offset = end;
     }
 }
 
-fn is_previous_generation(header_bytes: &[u8; 64], current_generation: u64) -> bool {
+fn previous_generation(header_bytes: &[u8; 64], current_generation: u64) -> Option<u64> {
     current_generation
         .checked_sub(1)
-        .is_some_and(|previous_generation| raw_wal_generation(header_bytes) == previous_generation)
+        .filter(|&previous_generation| raw_wal_generation(header_bytes) == previous_generation)
 }
 
 fn raw_wal_generation(header_bytes: &[u8; 64]) -> u64 {
@@ -414,6 +460,7 @@ mod tests {
             WAL_GENERATION,
             database.checkpoint_lsn(),
             &records,
+            OpenMode::ReadWrite,
         );
         let result = wal
             .recover(&database, OpenMode::ReadWrite)
@@ -460,6 +507,7 @@ mod tests {
             WAL_GENERATION,
             database.checkpoint_lsn(),
             &records,
+            OpenMode::ReadWrite,
         );
         let observed = Arc::new(RecordingFaults::default());
         let mut wal = wal.with_faults(observed.clone());
@@ -524,6 +572,7 @@ mod tests {
                 WAL_GENERATION,
                 database.checkpoint_lsn(),
                 &records,
+                OpenMode::ReadOnly,
             );
             let before = fs::metadata(wal.path()).unwrap().len();
             let result = wal.recover(&database, OpenMode::ReadOnly).expect(name);
@@ -579,6 +628,7 @@ mod tests {
                 WAL_GENERATION,
                 database.checkpoint_lsn(),
                 &records,
+                OpenMode::ReadWrite,
             );
             let before = fs::metadata(wal.path()).unwrap().len();
             assert_eq!(
@@ -602,7 +652,7 @@ mod tests {
             .expect("reset superblock");
         let old_records =
             encoded_transaction_for_generation(1, 0, &[(PageId(1), 5)], commit_state(2, 1, 0), 1);
-        let (temp, mut wal) = fixture_wal(&database, 2, Lsn(1), &old_records);
+        let (temp, mut wal) = fixture_wal(&database, 2, Lsn(1), &old_records, OpenMode::ReadWrite);
 
         let result = wal
             .recover(&database, OpenMode::ReadWrite)
@@ -632,7 +682,7 @@ mod tests {
             commit_state(2, 1, 0),
             2,
         ));
-        let (temp, mut wal) = fixture_wal(&database, 2, Lsn(1), &records);
+        let (temp, mut wal) = fixture_wal(&database, 2, Lsn(1), &records, OpenMode::ReadWrite);
         let before = fs::metadata(wal.path()).unwrap().len();
 
         assert_eq!(
@@ -646,11 +696,44 @@ mod tests {
         drop(temp);
     }
 
+    #[test]
+    fn recovery_rejects_corrupt_old_generation_suffix_without_truncating_in_any_mode() {
+        let database = DatabaseHeader::new(PAGE_SIZE, [0x37; 16])
+            .expect("database header")
+            .with_checkpoint(Lsn(1), 2, PageId(1), PageId(0), 2)
+            .expect("reset superblock");
+        let mut old_records =
+            encoded_transaction_for_generation(1, 0, &[(PageId(1), 5)], commit_state(2, 1, 0), 1);
+        let commit = old_records.len() - COMMIT_RECORD_LEN;
+        old_records[commit + 64 + 36] ^= 1;
+        restamp_record(&mut old_records, commit);
+
+        for mode in [OpenMode::ReadWrite, OpenMode::ReadOnly] {
+            let (temp, mut wal) = fixture_wal(&database, 2, Lsn(1), &old_records, mode);
+            let before = fs::metadata(wal.path()).expect("fixture length").len();
+
+            assert_eq!(
+                wal.recover(&database, mode)
+                    .expect_err("corrupt old transaction must be rejected")
+                    .code(),
+                ErrorCode::Corruption,
+                "{mode:?}"
+            );
+            assert_eq!(
+                fs::metadata(wal.path()).expect("fixture length").len(),
+                before
+            );
+            drop(wal);
+            drop(temp);
+        }
+    }
+
     fn fixture_wal(
         database: &DatabaseHeader,
         wal_generation: u64,
         base_checkpoint_lsn: Lsn,
         records: &[u8],
+        open_mode: OpenMode,
     ) -> (TempDatabase, Wal) {
         let temp = TempDatabase::new("wal-recovery");
         let first = WalHeader {
@@ -669,7 +752,7 @@ mod tests {
         bytes.extend_from_slice(&second.encode().expect("second WAL header"));
         bytes.extend_from_slice(records);
         write_wal_fixture(temp.path(), &bytes).expect("write WAL fixture");
-        let wal = Wal::open(temp.path(), database, OpenMode::ReadWrite).expect("open WAL fixture");
+        let wal = Wal::open(temp.path(), database, open_mode).expect("open WAL fixture");
         (temp, wal)
     }
 
