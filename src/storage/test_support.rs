@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    PageId, PageRef,
+    Lsn, PageId, PageRef,
     btree::{BTree, TreeKind},
     checksum::stamp_page_checksum,
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
@@ -159,6 +159,322 @@ fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_f
     );
     fs::remove_file(collision).expect("remove collision fixture");
     fs::remove_file(sentinel).expect("remove sentinel fixture");
+}
+
+#[test]
+fn multi_reader_single_writer_matches_reference_model() {
+    use std::{
+        sync::{Barrier, mpsc},
+        thread,
+    };
+
+    const FIRST_COMMIT: u64 = 1;
+    const FINAL_COMMIT: u64 = 20;
+
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Pager>();
+    assert_send::<super::pager::ReadSnapshot>();
+    assert_send_sync::<super::cache::PageHandle>();
+
+    let temp = TempDatabase::new("multi-reader-single-writer");
+    let pager = Arc::new(
+        Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .expect("create concurrent pager"),
+    );
+    let root = create_concurrency_table(&pager).expect("commit LSN-1 fixture");
+    assert_eq!(
+        pager.latest_lsn().expect("read fixture LSN"),
+        Lsn(FIRST_COMMIT)
+    );
+
+    let mut old_snapshot = pager.begin_read().expect("open LSN-1 snapshot");
+    assert_eq!(old_snapshot.lsn(), Lsn(FIRST_COMMIT));
+    let initial_model = BTreeMap::from([
+        (b"counter".to_vec(), vec![1]),
+        (b"stable".to_vec(), b"unchanged".to_vec()),
+    ]);
+    let start = Arc::new(Barrier::new(3));
+    let (old_commit_tx, old_commit_rx) = mpsc::sync_channel(0);
+    let (old_done_tx, old_done_rx) = mpsc::sync_channel(0);
+    let (fresh_commit_tx, fresh_commit_rx) = mpsc::sync_channel(0);
+    let (fresh_done_tx, fresh_done_rx) = mpsc::sync_channel(0);
+    let writer_initial_model = initial_model.clone();
+
+    let (final_model, old_observations, fresh_observations) = thread::scope(|scope| {
+        let writer_pager = Arc::clone(&pager);
+        let writer_start = Arc::clone(&start);
+        let writer = scope.spawn(move || -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+            let mut tree = BTree::from_root(TreeKind::Table, root);
+            let mut model = writer_initial_model;
+            writer_start.wait();
+            for commit in (FIRST_COMMIT + 1)..=FINAL_COMMIT {
+                let mut batch = writer_pager.begin_write()?;
+                let removed = tree.delete(&mut batch, b"counter")?;
+                assert_eq!(removed, model.remove(b"counter".as_slice()));
+                let value = vec![u8::try_from(commit).expect("test commit fits u8")];
+                tree.insert(&mut batch, b"counter", &value)?;
+                batch.track_tree(TreeKind::Table, tree.root())?;
+                batch.set_catalog_root(tree.root())?;
+                batch.commit()?;
+                model.insert(b"counter".to_vec(), value);
+
+                old_commit_tx
+                    .send(())
+                    .expect("old reader remains available");
+                fresh_commit_tx
+                    .send((Lsn(commit), model.clone()))
+                    .expect("fresh reader remains available");
+                old_done_rx.recv().expect("old reader completed commit");
+                fresh_done_rx.recv().expect("fresh reader completed commit");
+            }
+            Ok(model)
+        });
+
+        let old_start = Arc::clone(&start);
+        let old_reader = scope.spawn(move || -> Result<Vec<BTreeMap<Vec<u8>, Vec<u8>>>> {
+            let tree = BTree::from_root(TreeKind::Table, root);
+            let mut observations = Vec::new();
+            old_start.wait();
+            while old_commit_rx.recv().is_ok() {
+                let observed = collect_all(&tree, &mut old_snapshot)?.into_iter().collect();
+                observations.push(observed);
+                old_done_tx.send(()).expect("writer remains available");
+            }
+            Ok(observations)
+        });
+
+        let fresh_pager = Arc::clone(&pager);
+        let fresh_start = Arc::clone(&start);
+        let fresh_reader = scope.spawn(move || -> Result<Vec<_>> {
+            let tree = BTree::from_root(TreeKind::Table, root);
+            let mut observations = Vec::new();
+            fresh_start.wait();
+            while let Ok((expected_lsn, expected_model)) = fresh_commit_rx.recv() {
+                let mut snapshot = fresh_pager.begin_read()?;
+                let actual_lsn = snapshot.lsn();
+                let actual_model: BTreeMap<_, _> =
+                    collect_all(&tree, &mut snapshot)?.into_iter().collect();
+                observations.push((expected_lsn, actual_lsn, expected_model, actual_model));
+                fresh_done_tx.send(()).expect("writer remains available");
+            }
+            Ok(observations)
+        });
+
+        (
+            writer
+                .join()
+                .expect("writer thread must not panic")
+                .expect("writer commits"),
+            old_reader
+                .join()
+                .expect("old-reader thread must not panic")
+                .expect("old-reader observations"),
+            fresh_reader
+                .join()
+                .expect("fresh-reader thread must not panic")
+                .expect("fresh-reader observations"),
+        )
+    });
+
+    assert_eq!(old_observations.len(), 19);
+    for observed in old_observations {
+        assert_eq!(observed, initial_model, "LSN-1 snapshot must stay fixed");
+    }
+    assert_eq!(fresh_observations.len(), 19);
+    let mut previous_lsn = Lsn(FIRST_COMMIT);
+    for (expected_lsn, actual_lsn, expected_model, actual_model) in fresh_observations {
+        assert!(actual_lsn >= previous_lsn, "fresh snapshot LSN regressed");
+        assert_eq!(
+            actual_lsn, expected_lsn,
+            "reader must see the released commit"
+        );
+        assert_eq!(
+            actual_model, expected_model,
+            "fresh snapshot diverged from model"
+        );
+        previous_lsn = actual_lsn;
+    }
+
+    let tree = BTree::from_root(TreeKind::Table, root);
+    let mut final_snapshot = pager.begin_read().expect("open final snapshot");
+    assert_eq!(final_snapshot.lsn(), Lsn(FINAL_COMMIT));
+    let final_actual: BTreeMap<_, _> = collect_all(&tree, &mut final_snapshot)
+        .expect("scan final snapshot")
+        .into_iter()
+        .collect();
+    assert_eq!(final_actual, final_model);
+}
+
+#[test]
+fn unfinished_writer_is_busy_readers_progress_and_checkpoint_waits_for_rollback() {
+    use std::{sync::mpsc, thread};
+
+    let temp = TempDatabase::new("writer-checkpoint-contention");
+    let pager = Arc::new(
+        Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .expect("create contention pager"),
+    );
+    let root = create_concurrency_table(&pager).expect("commit contention fixture");
+    let (writer_ready_tx, writer_ready_rx) = mpsc::sync_channel(0);
+    let (release_writer_tx, release_writer_rx) = mpsc::sync_channel(0);
+    let (checkpoint_go_tx, checkpoint_go_rx) = mpsc::sync_channel(0);
+    let (checkpoint_started_tx, checkpoint_started_rx) = mpsc::sync_channel(0);
+    let (checkpoint_done_tx, checkpoint_done_rx) = mpsc::sync_channel(0);
+
+    thread::scope(|scope| {
+        let writer_pager = Arc::clone(&pager);
+        let writer = scope.spawn(move || -> Result<()> {
+            let mut tree = BTree::from_root(TreeKind::Table, root);
+            let mut batch = writer_pager.begin_write()?;
+            assert_eq!(tree.delete(&mut batch, b"counter")?, Some(vec![1]));
+            tree.insert(&mut batch, b"counter", b"uncommitted")?;
+            writer_ready_tx
+                .send(())
+                .expect("contention driver remains available");
+            release_writer_rx
+                .recv()
+                .expect("contention driver releases writer");
+            drop(batch);
+            Ok(())
+        });
+
+        let checkpoint_pager = Arc::clone(&pager);
+        let checkpoint = scope.spawn(move || {
+            checkpoint_go_rx.recv().expect("checkpoint is started");
+            checkpoint_started_tx
+                .send(())
+                .expect("contention driver remains available");
+            checkpoint_done_tx
+                .send(checkpoint_pager.checkpoint())
+                .expect("contention driver receives checkpoint result");
+        });
+
+        writer_ready_rx
+            .recv()
+            .expect("unfinished writer acquired guard");
+        let busy = match pager.try_begin_write() {
+            Ok(_) => panic!("second writer must not acquire the active writer guard"),
+            Err(error) => error,
+        };
+        assert_eq!(busy.code(), ErrorCode::Busy);
+
+        let tree = BTree::from_root(TreeKind::Table, root);
+        let mut reader = pager
+            .begin_read()
+            .expect("reader opens beside unfinished writer");
+        assert_eq!(reader.lsn(), Lsn(1));
+        assert_eq!(
+            tree.get(&mut reader, b"counter").expect("reader lookup"),
+            Some(vec![1])
+        );
+        drop(reader);
+
+        checkpoint_go_tx.send(()).expect("start checkpoint attempt");
+        checkpoint_started_rx
+            .recv()
+            .expect("checkpoint announced its writer-lock attempt");
+        assert!(
+            matches!(
+                checkpoint_done_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ),
+            "checkpoint must remain serialized behind the active writer"
+        );
+        release_writer_tx
+            .send(())
+            .expect("roll back unfinished writer");
+        writer
+            .join()
+            .expect("writer thread must not panic")
+            .expect("writer rollback");
+        let result = checkpoint_done_rx
+            .recv()
+            .expect("checkpoint completes after writer rollback")
+            .expect("checkpoint succeeds");
+        assert_eq!(result.to_lsn, Lsn(1));
+        checkpoint.join().expect("checkpoint thread must not panic");
+    });
+}
+
+#[test]
+#[ignore = "spawned by database_lock_is_process_wide_and_releases_windows_paths"]
+fn database_lock_child() {
+    let path = std::env::var_os("ORA_SQLLITE_LOCK_CHILD_PATH")
+        .expect("lock child database path is provided");
+    let expected =
+        std::env::var("ORA_SQLLITE_LOCK_CHILD_EXPECT").expect("lock child expectation is provided");
+    let opened = Pager::open(
+        Path::new(&path),
+        OpenMode::ReadWrite,
+        PagerConfig::test_default(4096),
+    );
+    match expected.as_str() {
+        "busy" => match opened {
+            Ok(_) => panic!("child unexpectedly acquired its parent's database lock"),
+            Err(error) => assert_eq!(error.code(), ErrorCode::Busy),
+        },
+        "open" => drop(opened.expect("child opens database after parent Pager drop")),
+        other => panic!("unknown lock child expectation: {other}"),
+    }
+}
+
+#[test]
+fn database_lock_is_process_wide_and_releases_windows_paths() {
+    use std::process::Command;
+
+    let temp = TempDatabase::new("database-lock-process");
+    let database_path = temp.path().to_path_buf();
+    let wal = wal_path(&database_path);
+    let pager =
+        Pager::create(&database_path, PagerConfig::test_default(4096)).expect("create lock owner");
+    let executable = std::env::current_exe().expect("locate current test executable");
+
+    let busy = Command::new(&executable)
+        .args([
+            "--exact",
+            "storage::test_support::database_lock_child",
+            "--ignored",
+        ])
+        .env("ORA_SQLLITE_LOCK_CHILD_PATH", &database_path)
+        .env("ORA_SQLLITE_LOCK_CHILD_EXPECT", "busy")
+        .status()
+        .expect("run lock-contention child");
+    assert_eq!(
+        busy.code(),
+        Some(0),
+        "active owner must map child open to Busy"
+    );
+
+    drop(pager);
+    let opened = Command::new(executable)
+        .args([
+            "--exact",
+            "storage::test_support::database_lock_child",
+            "--ignored",
+        ])
+        .env("ORA_SQLLITE_LOCK_CHILD_PATH", &database_path)
+        .env("ORA_SQLLITE_LOCK_CHILD_EXPECT", "open")
+        .status()
+        .expect("run post-drop child");
+    assert_eq!(opened.code(), Some(0), "drop must release the process lock");
+
+    fs::remove_file(&wal).expect("remove exact WAL path after child exit");
+    fs::remove_file(&database_path).expect("remove exact database path after child exit");
+    assert!(!database_path.exists());
+    assert!(!wal.exists());
+}
+
+fn create_concurrency_table(pager: &Pager) -> Result<PageRef> {
+    let mut batch = pager.begin_write()?;
+    let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
+    tree.insert(&mut batch, b"counter", &[1])?;
+    tree.insert(&mut batch, b"stable", b"unchanged")?;
+    batch.track_tree(TreeKind::Table, tree.root())?;
+    batch.set_catalog_root(tree.root())?;
+    let root = tree.root();
+    batch.commit()?;
+    Ok(root)
 }
 
 struct RecordingFaults {
