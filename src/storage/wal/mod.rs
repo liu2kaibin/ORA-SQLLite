@@ -28,7 +28,7 @@ use self::{
     index::WalVersion,
 };
 
-const WAL_HEADER_AREA_LEN: u64 = (WAL_HEADER_SLOT_LEN as u64) * 2;
+pub(super) const WAL_HEADER_AREA_LEN: u64 = (WAL_HEADER_SLOT_LEN as u64) * 2;
 
 static NEXT_WAL_SALT: AtomicU64 = AtomicU64::new(1);
 
@@ -36,9 +36,21 @@ pub(super) struct Wal {
     file: File,
     path: PathBuf,
     header: WalHeader,
+    active_slot: usize,
     end_offset: u64,
     faults: Arc<dyn FaultInjector>,
     poisoned: bool,
+}
+
+pub(super) struct GenerationReset {
+    header: WalHeader,
+    slot: usize,
+}
+
+impl GenerationReset {
+    pub(super) fn generation(&self) -> u64 {
+        self.header.wal_generation
+    }
 }
 
 struct WalCreateRollback {
@@ -106,6 +118,7 @@ impl Wal {
             file,
             path,
             header: first_header,
+            active_slot: 0,
             end_offset: 0,
             faults,
             poisoned: false,
@@ -123,6 +136,7 @@ impl Wal {
         )?;
         wal.sync_all()?;
         wal.header = second_header;
+        wal.active_slot = 1;
         wal.end_offset = WAL_HEADER_AREA_LEN;
         rollback.disarm();
         Ok(wal)
@@ -167,10 +181,19 @@ impl Wal {
             &slots[WAL_HEADER_SLOT_LEN..],
             database_header,
         )?;
+        let active_slot =
+            if WalHeader::decode(&slots[..WAL_HEADER_SLOT_LEN], database_header.uuid()).ok()
+                == Some(header)
+            {
+                0
+            } else {
+                1
+            };
         Ok(Self {
             file,
             path,
             header,
+            active_slot,
             end_offset,
             faults: Arc::new(NoFaults),
             poisoned: false,
@@ -362,6 +385,57 @@ impl Wal {
         self.end_offset
     }
 
+    /// Persist only the inactive slot. The main superblock remains the recovery authority.
+    pub(super) fn begin_generation_reset(&mut self, checkpoint: Lsn) -> Result<GenerationReset> {
+        self.require_writable()?;
+        if checkpoint < self.header.base_checkpoint_lsn {
+            return Err(corruption("WAL reset checkpoint regresses"));
+        }
+        let header = WalHeader {
+            wal_generation: self
+                .header
+                .wal_generation
+                .checked_add(1)
+                .ok_or_else(|| corruption("WAL generation overflow"))?,
+            header_sequence: self
+                .header
+                .header_sequence
+                .checked_add(1)
+                .ok_or_else(|| corruption("WAL header sequence overflow"))?,
+            base_checkpoint_lsn: checkpoint,
+            salt: new_salt(),
+            ..self.header
+        };
+        let slot = 1 - self.active_slot;
+        let offset = u64::try_from(slot)
+            .map_err(|_| corruption("WAL slot offset overflow"))?
+            .checked_mul(WAL_HEADER_SLOT_LEN as u64)
+            .ok_or_else(|| corruption("WAL slot offset overflow"))?;
+        self.write_header(offset, header)?;
+        self.sync_all()?;
+        Ok(GenerationReset { header, slot })
+    }
+
+    /// Called only after the matching main superblock has been durably published.
+    pub(super) fn finish_generation_reset(
+        &mut self,
+        reset: GenerationReset,
+        database: &DatabaseHeader,
+    ) -> Result<()> {
+        if database.wal_generation() != reset.header.wal_generation
+            || database.checkpoint_lsn() != reset.header.base_checkpoint_lsn
+            || database.uuid() != reset.header.database_uuid
+            || database.page_size() != reset.header.page_size
+        {
+            return Err(corruption("WAL reset has no matching main superblock"));
+        }
+        self.truncate(WAL_HEADER_AREA_LEN)?;
+        self.sync_all()?;
+        self.header = reset.header;
+        self.active_slot = reset.slot;
+        Ok(())
+    }
+
     pub(super) fn recover(
         &mut self,
         database_header: &DatabaseHeader,
@@ -531,6 +605,52 @@ mod tests {
         let wal = Wal::create(temp.path(), &header).unwrap();
         assert_eq!(fs::metadata(wal.path()).unwrap().len(), 8192);
         assert_eq!(wal.header().header_sequence, 2);
+    }
+
+    #[test]
+    fn generation_reset_rejects_overflow_or_regression_before_header_io() {
+        for (generation, sequence, base, target) in
+            [(u64::MAX, 2, 0, 1), (1, u64::MAX, 0, 1), (1, 2, 2, 1)]
+        {
+            let temp = TempDatabase::new("wal-reset-arithmetic");
+            let database = DatabaseHeader::new(4096, [7; 16]).unwrap();
+            let mut wal = Wal::create(temp.path(), &database).unwrap();
+            wal.header.wal_generation = generation;
+            wal.header.header_sequence = sequence;
+            wal.header.base_checkpoint_lsn = Lsn(base);
+            let before = fs::read(wal.path()).unwrap();
+            let error = match wal.begin_generation_reset(Lsn(target)) {
+                Ok(_) => panic!("invalid reset accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert_eq!(fs::read(wal.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn generation_reset_preserves_old_header_until_matching_main_publication() {
+        let temp = TempDatabase::new("wal-reset-publication");
+        let database = DatabaseHeader::new(4096, [7; 16]).unwrap();
+        let mut wal = Wal::create(temp.path(), &database).unwrap();
+        let reset = wal.begin_generation_reset(Lsn(1)).unwrap();
+        let before = fs::read(wal.path()).unwrap();
+        assert_eq!(
+            wal.finish_generation_reset(reset, &database)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        assert_eq!(fs::read(wal.path()).unwrap(), before);
+        drop(wal);
+        let old = Wal::open(temp.path(), &database, OpenMode::ReadWrite).unwrap();
+        assert_eq!(old.header().wal_generation, 1);
+        let new_main = database
+            .with_checkpoint(Lsn(1), 1, PageId(0), PageId(0), 2)
+            .unwrap();
+        let new = Wal::open(temp.path(), &new_main, OpenMode::ReadWrite).unwrap();
+        assert_eq!(new.header().wal_generation, 2);
+        assert_eq!(new.header().base_checkpoint_lsn, Lsn(1));
     }
 
     #[test]

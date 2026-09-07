@@ -31,6 +31,8 @@ pub(super) struct PagerConfig {
     pub(super) uuid: [u8; 16],
     pub(super) max_database_bytes: u64,
     pub(super) cache_pages: usize,
+    pub(super) checkpoint_wal_bytes: u64,
+    pub(super) max_wal_bytes: u64,
 }
 
 impl PagerConfig {
@@ -41,41 +43,50 @@ impl PagerConfig {
             uuid,
             max_database_bytes: DEFAULT_MAX_DATABASE_BYTES,
             cache_pages: 1024,
+            checkpoint_wal_bytes: 64 * 1024 * 1024,
+            max_wal_bytes: 1024 * 1024 * 1024,
         })
     }
-}
 
-const MAX_WAL_BYTES: u64 = 1024 * 1024 * 1024;
+    fn validate_wal_limits(&self) -> Result<()> {
+        if self.checkpoint_wal_bytes == 0 || self.max_wal_bytes == 0 {
+            return Err(DbError::new(ErrorCode::Type, "WAL limits must be positive"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Pager {
     inner: Arc<PagerInner>,
 }
 
-struct PagerInner {
-    main: Mutex<DatabaseFile>,
-    wal: Mutex<Wal>,
-    published: RwLock<PublishedState>,
-    snapshots: SnapshotRegistry,
-    cache: Mutex<PageCache>,
+pub(super) struct PagerInner {
+    pub(super) main: Mutex<DatabaseFile>,
+    pub(super) wal: Mutex<Wal>,
+    pub(super) published: RwLock<PublishedState>,
+    pub(super) snapshots: SnapshotRegistry,
+    pub(super) cache: Mutex<PageCache>,
+    pub(super) cache_pages: usize,
     writer: Mutex<()>,
     mode: OpenMode,
     max_database_bytes: u64,
     max_wal_bytes: u64,
+    checkpoint_wal_bytes: u64,
     #[cfg(test)]
     reused_page_count: Mutex<u64>,
 }
 
-struct PublishedState {
-    checkpoint: DatabaseHeader,
-    latest_lsn: Lsn,
+pub(super) struct PublishedState {
+    pub(super) checkpoint: DatabaseHeader,
+    pub(super) latest_lsn: Lsn,
     latest: CommitState,
-    wal_index: WalIndex,
-    write_state: WriteState,
+    pub(super) wal_index: WalIndex,
+    pub(super) write_state: WriteState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WriteState {
+pub(super) enum WriteState {
     Ready,
     NeedsRecovery,
 }
@@ -89,7 +100,23 @@ pub(super) struct ReadSnapshot {
 }
 
 impl Pager {
+    pub(super) fn checkpoint(&self) -> Result<super::checkpoint::CheckpointResult> {
+        if self.inner.mode == OpenMode::ReadOnly {
+            return Err(DbError::new(
+                ErrorCode::Unsupported,
+                "read-only pager cannot checkpoint",
+            ));
+        }
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| internal("pager writer mutex is poisoned"))?;
+        super::checkpoint::run(&self.inner)
+    }
+
     pub(super) fn create(path: &Path, config: PagerConfig) -> Result<Self> {
+        config.validate_wal_limits()?;
         let cache = PageCache::new(config.cache_pages)?;
         let file = DatabaseFile::create(
             path,
@@ -104,7 +131,7 @@ impl Pager {
             wal,
             cache,
             OpenMode::ReadWrite,
-            config.max_database_bytes,
+            &config,
             header,
             header.checkpoint_lsn(),
             checkpoint_state(&header),
@@ -113,17 +140,19 @@ impl Pager {
     }
 
     pub(super) fn open(path: &Path, mode: OpenMode, config: PagerConfig) -> Result<Self> {
-        let file = DatabaseFile::open(path, mode, config.max_database_bytes)?;
+        config.validate_wal_limits()?;
+        let file = DatabaseFile::open_for_recovery(path, mode, config.max_database_bytes)?;
         let header = file.header();
         let cache = PageCache::new(config.cache_pages)?;
         let mut wal = Wal::open(path, &header, mode)?;
         let recovered = wal.recover(&header, mode)?;
+        file.validate_recovered_tail(recovered.latest_state.page_count)?;
         let pager = Self::from_recovered(
             file,
             wal,
             cache,
             mode,
-            config.max_database_bytes,
+            &config,
             header,
             recovered.latest_lsn,
             recovered.latest_state,
@@ -139,7 +168,7 @@ impl Pager {
         wal: Wal,
         cache: PageCache,
         mode: OpenMode,
-        max_database_bytes: u64,
+        config: &PagerConfig,
         checkpoint: DatabaseHeader,
         latest_lsn: Lsn,
         latest: CommitState,
@@ -153,7 +182,7 @@ impl Pager {
         validate_recovered_page_count(
             latest.page_count,
             checkpoint.page_size(),
-            max_database_bytes,
+            config.max_database_bytes,
         )?;
         Ok(Self {
             inner: Arc::new(PagerInner {
@@ -168,10 +197,12 @@ impl Pager {
                 }),
                 snapshots: SnapshotRegistry::default(),
                 cache: Mutex::new(cache),
+                cache_pages: config.cache_pages,
                 writer: Mutex::new(()),
                 mode,
-                max_database_bytes,
-                max_wal_bytes: MAX_WAL_BYTES,
+                max_database_bytes: config.max_database_bytes,
+                max_wal_bytes: config.max_wal_bytes,
+                checkpoint_wal_bytes: config.checkpoint_wal_bytes,
                 #[cfg(test)]
                 reused_page_count: Mutex::new(0),
             }),
@@ -232,6 +263,10 @@ impl Pager {
     }
 
     fn begin_write_with_guard<'a>(&'a self, writer: MutexGuard<'a, ()>) -> Result<WriteBatch<'a>> {
+        let wal_len = self.wal_lock()?.len();
+        if wal_len >= self.inner.checkpoint_wal_bytes {
+            super::checkpoint::run(&self.inner)?;
+        }
         let (base_lsn, committed_state, checkpoint) = {
             let published = self.published_read()?;
             if published.write_state == WriteState::NeedsRecovery {
@@ -340,10 +375,12 @@ impl Pager {
                 published: inner.published,
                 snapshots: inner.snapshots,
                 cache: inner.cache,
+                cache_pages: inner.cache_pages,
                 writer: inner.writer,
                 mode: inner.mode,
                 max_database_bytes: inner.max_database_bytes,
                 max_wal_bytes: inner.max_wal_bytes,
+                checkpoint_wal_bytes: inner.checkpoint_wal_bytes,
                 reused_page_count: inner.reused_page_count,
             }),
         }
@@ -378,18 +415,21 @@ impl Pager {
         &self,
         snapshot: Lsn,
         state: CommitState,
-        checkpoint: DatabaseHeader,
+        _checkpoint: DatabaseHeader,
         page_id: PageId,
     ) -> Result<PageHandle> {
         if page_id.0 == 0 || page_id.0 >= state.page_count {
             return Err(corruption("page id is outside the visible database"));
         }
-        let version = {
+        let (version, checkpoint) = {
             let published = self.published_read()?;
             if snapshot < published.checkpoint.checkpoint_lsn() {
                 return Err(corruption("snapshot predates the database checkpoint"));
             }
-            published.wal_index.visible_version(page_id, snapshot)
+            (
+                published.wal_index.visible_version(page_id, snapshot),
+                published.checkpoint,
+            )
         };
         let key = CacheKey {
             page_id,
@@ -1029,16 +1069,36 @@ impl WriteBatch<'_> {
             .checked_mul(frame_count)
             .and_then(|bytes| bytes.checked_add(128))
             .ok_or_else(|| corruption("WAL transaction length overflow"))?;
-        let wal_len = self.pager.wal_lock()?.len();
-        if transaction_bytes > self.pager.inner.max_wal_bytes
-            || wal_len
-                .checked_add(transaction_bytes)
-                .is_none_or(|total| total > self.pager.inner.max_wal_bytes)
+        let limit = self.pager.inner.max_wal_bytes;
+        if super::wal::WAL_HEADER_AREA_LEN
+            .checked_add(transaction_bytes)
+            .is_none_or(|total| total > limit)
         {
             return Err(DbError::new(
                 ErrorCode::Transaction,
-                "WAL hard limit would be exceeded before checkpoint",
+                "transaction cannot fit in an empty WAL within the hard limit",
             ));
+        }
+        let exceeds = |wal_len: u64| {
+            wal_len
+                .checked_add(transaction_bytes)
+                .is_none_or(|total| total > limit)
+        };
+        let wal_len = self.pager.wal_lock()?.len();
+        if exceeds(wal_len) {
+            // The batch already owns the writer mutex; checkpoint only committed pages.
+            super::checkpoint::run(&self.pager.inner)?;
+            let wal_len = self.pager.wal_lock()?.len();
+            if exceeds(wal_len) {
+                let message = match self.pager.inner.snapshots.oldest()? {
+                    Some(oldest) => {
+                        format!("WAL hard limit blocked by oldest snapshot LSN {}", oldest.0)
+                    }
+                    None => "WAL hard limit requires a checkpoint retry after snapshot release"
+                        .to_owned(),
+                };
+                return Err(DbError::new(ErrorCode::Busy, message));
+            }
         }
         Ok(())
     }
@@ -1446,6 +1506,112 @@ mod tests {
                 .len()
                 > 8192
         );
+    }
+
+    #[test]
+    fn checkpoint_registration_races_obey_published_then_registry_lock_order() {
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc,
+            },
+            time::Duration,
+        };
+
+        struct PauseAt {
+            point: FaultPoint,
+            armed: AtomicBool,
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FaultInjector for PauseAt {
+            fn check(&self, point: FaultPoint) -> Result<()> {
+                if point == self.point && self.armed.swap(false, Ordering::SeqCst) {
+                    self.entered.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| {
+                            DbError::new(ErrorCode::Internal, "checkpoint pause timed out")
+                        })?;
+                }
+                Ok(())
+            }
+        }
+
+        for pause_point in [FaultPoint::BeforeFileSync, FaultPoint::BeforeWalWrite] {
+            let temp = TempDatabase::new("checkpoint-registration-race");
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let faults = Arc::new(PauseAt {
+                point: pause_point,
+                armed: AtomicBool::new(false),
+                entered: entered_tx,
+                resume: Mutex::new(resume_rx),
+            });
+            let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+                .unwrap()
+                .with_faults(faults.clone());
+            let page = {
+                let mut batch = pager.begin_write().unwrap();
+                let page = batch.allocate_append(PageType::Catalog).unwrap();
+                batch.modify(page).unwrap().bytes_mut()[100] = 77;
+                batch.commit().unwrap();
+                page
+            };
+            faults.armed.store(true, Ordering::SeqCst);
+            let worker = pager.clone();
+            let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+            let checkpoint_thread =
+                std::thread::spawn(move || checkpoint_tx.send(worker.checkpoint()).unwrap());
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("checkpoint reached exact persistence boundary");
+            if pause_point == FaultPoint::BeforeFileSync {
+                // This registration wins the race while materialization holds no state lock.
+                let mut snapshot = pager.begin_read().unwrap();
+                resume_tx.send(()).unwrap();
+                let result = checkpoint_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("no lock inversion")
+                    .unwrap();
+                assert!(!result.wal_reset);
+                assert_eq!(snapshot.read(page).unwrap().bytes()[100], 77);
+                assert!(std::fs::metadata(wal_path(temp.path())).unwrap().len() > 8192);
+                drop(snapshot);
+            } else {
+                // The reset has the published write lock before taking EmptySnapshotGuard.
+                assert!(matches!(
+                    pager.inner.published.try_read(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                let reader = pager.clone();
+                let (attempt_tx, attempt_rx) = mpsc::channel();
+                let (read_tx, read_rx) = mpsc::channel();
+                let reader_thread = std::thread::spawn(move || {
+                    attempt_tx.send(()).unwrap();
+                    read_tx.send(reader.begin_read()).unwrap();
+                });
+                attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(read_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                resume_tx.send(()).unwrap();
+                let result = checkpoint_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("reset cannot deadlock with registration")
+                    .unwrap();
+                assert!(result.wal_reset);
+                let mut snapshot = read_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("registration resumes after reset")
+                    .unwrap();
+                assert_eq!(snapshot.lsn(), Lsn(1));
+                assert_eq!(snapshot.read(page).unwrap().bytes()[100], 77);
+                reader_thread.join().unwrap();
+            }
+            checkpoint_thread.join().unwrap();
+            assert_eq!(pager.read(page).unwrap().bytes()[100], 77);
+        }
     }
 
     #[test]

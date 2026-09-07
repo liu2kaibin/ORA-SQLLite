@@ -124,6 +124,20 @@ impl WalIndex {
         });
         self.states.retain(|lsn, _| *lsn > checkpoint);
     }
+
+    pub(crate) fn checkpoint_versions(&self, from: Lsn, target: Lsn) -> Vec<(PageId, WalVersion)> {
+        self.pages
+            .iter()
+            .filter_map(|(&page_id, versions)| {
+                versions
+                    .iter()
+                    .rev()
+                    .find(|version| version.lsn <= target)
+                    .filter(|version| version.lsn > from)
+                    .map(|version| (page_id, *version))
+            })
+            .collect()
+    }
 }
 
 fn corruption(message: &'static str) -> DbError {

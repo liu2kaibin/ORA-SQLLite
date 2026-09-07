@@ -1,5 +1,6 @@
 pub(super) mod btree;
 mod cache;
+mod checkpoint;
 mod checksum;
 mod codec;
 mod file;

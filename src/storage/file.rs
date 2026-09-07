@@ -89,6 +89,21 @@ impl DatabaseFile {
     }
 
     pub(super) fn open(path: &Path, mode: OpenMode, max_bytes: u64) -> Result<Self> {
+        Self::open_with_checkpoint_tail(path, mode, max_bytes, false)
+    }
+
+    /// A checkpoint may persist complete data pages before publishing its superblock.
+    /// Pager must subsequently prove the tail against the recovered committed page count.
+    pub(super) fn open_for_recovery(path: &Path, mode: OpenMode, max_bytes: u64) -> Result<Self> {
+        Self::open_with_checkpoint_tail(path, mode, max_bytes, true)
+    }
+
+    fn open_with_checkpoint_tail(
+        path: &Path,
+        mode: OpenMode,
+        max_bytes: u64,
+        allow_tail: bool,
+    ) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true);
         if mode == OpenMode::ReadWrite {
@@ -126,7 +141,10 @@ impl DatabaseFile {
         }
         let page_count = header.page_count();
         let expected_len = checked_database_len(page_count, header.page_size(), max_bytes)?;
-        if len != expected_len {
+        if len < expected_len
+            || (!allow_tail && len != expected_len)
+            || (len - SUPERBLOCK_AREA_LEN) % u64::from(header.page_size()) != 0
+        {
             return Err(corruption(
                 "database file length does not match the published page count",
             ));
@@ -140,6 +158,22 @@ impl DatabaseFile {
             max_bytes,
             faults: Arc::new(NoFaults),
         })
+    }
+
+    pub(super) fn validate_recovered_tail(&self, recovered_pages: u64) -> Result<()> {
+        let len = self
+            .file
+            .metadata()
+            .map_err(|error| io_error("read recovered database length", error))?
+            .len();
+        let recovered_len =
+            checked_database_len(recovered_pages, self.page_size(), self.max_bytes)?;
+        if len > recovered_len {
+            return Err(corruption(
+                "database checkpoint tail exceeds the recovered committed page count",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) const fn page_size(&self) -> u32 {
