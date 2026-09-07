@@ -2,7 +2,7 @@ pub(super) mod format;
 
 use std::{
     fmt,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -30,6 +30,30 @@ pub(super) struct Wal {
     header: WalHeader,
     end_offset: u64,
     faults: Arc<dyn FaultInjector>,
+    poisoned: bool,
+}
+
+struct WalCreateRollback {
+    path: PathBuf,
+    active: bool,
+}
+
+impl WalCreateRollback {
+    fn new(path: PathBuf) -> Self {
+        Self { path, active: true }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for WalCreateRollback {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl fmt::Debug for Wal {
@@ -39,12 +63,21 @@ impl fmt::Debug for Wal {
             .field("path", &self.path)
             .field("header", &self.header)
             .field("end_offset", &self.end_offset)
+            .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
 }
 
 impl Wal {
     pub(super) fn create(database_path: &Path, database_header: &DatabaseHeader) -> Result<Self> {
+        Self::create_with_faults(database_path, database_header, Arc::new(NoFaults))
+    }
+
+    fn create_with_faults(
+        database_path: &Path,
+        database_header: &DatabaseHeader,
+        faults: Arc<dyn FaultInjector>,
+    ) -> Result<Self> {
         let path = wal_path(database_path);
         let file = OpenOptions::new()
             .create_new(true)
@@ -52,6 +85,7 @@ impl Wal {
             .write(true)
             .open(&path)
             .map_err(|error| io_error("create WAL", error))?;
+        let mut rollback = WalCreateRollback::new(path.clone());
         let first_header = WalHeader {
             page_size: database_header.page_size(),
             database_uuid: database_header.uuid(),
@@ -65,7 +99,8 @@ impl Wal {
             path,
             header: first_header,
             end_offset: 0,
-            faults: Arc::new(NoFaults),
+            faults,
+            poisoned: false,
         };
         wal.write_header(0, first_header)?;
         wal.sync_all()?;
@@ -81,6 +116,7 @@ impl Wal {
         wal.sync_all()?;
         wal.header = second_header;
         wal.end_offset = WAL_HEADER_AREA_LEN;
+        rollback.disarm();
         Ok(wal)
     }
 
@@ -129,6 +165,7 @@ impl Wal {
             header,
             end_offset,
             faults: Arc::new(NoFaults),
+            poisoned: false,
         })
     }
 
@@ -140,7 +177,9 @@ impl Wal {
         self.header
     }
 
+    /// `AfterWalWrite` can report an applied-but-unacknowledged append; its boundary is retained.
     pub(super) fn append_record(&mut self, bytes: &[u8]) -> Result<u64> {
+        self.require_ready()?;
         if bytes.is_empty() {
             return Err(corruption("cannot append an empty WAL record"));
         }
@@ -152,10 +191,12 @@ impl Wal {
             .ok_or_else(|| corruption("WAL record end overflow"))?;
         self.write_at(start, "append WAL record", bytes)?;
         self.end_offset = end;
+        self.after_write()?;
         Ok(start)
     }
 
     pub(super) fn read_exact_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        self.require_ready()?;
         let byte_count = u64::try_from(bytes.len())
             .map_err(|_| corruption("WAL read length does not fit u64"))?;
         let end = offset
@@ -173,6 +214,7 @@ impl Wal {
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
+        self.require_ready()?;
         self.faults.check(FaultPoint::BeforeWalSync)?;
         self.file
             .sync_all()
@@ -184,18 +226,20 @@ impl Wal {
         self.end_offset
     }
 
+    /// `AfterWalTruncate` can report an applied-but-unacknowledged truncate; its boundary is retained.
     pub(super) fn truncate(&mut self, len: u64) -> Result<()> {
+        self.require_ready()?;
         if !(WAL_HEADER_AREA_LEN..=self.end_offset).contains(&len) {
             return Err(corruption(
                 "WAL truncate length is outside the file boundary",
             ));
         }
         self.faults.check(FaultPoint::BeforeWalTruncate)?;
-        self.file
-            .set_len(len)
-            .map_err(|error| io_error("truncate WAL", error))?;
-        self.faults.check(FaultPoint::AfterWalTruncate)?;
+        if let Err(error) = self.file.set_len(len) {
+            return Err(self.poison_after_mutating_io("truncate WAL", error));
+        }
         self.end_offset = len;
+        self.faults.check(FaultPoint::AfterWalTruncate)?;
         Ok(())
     }
 
@@ -206,18 +250,42 @@ impl Wal {
     }
 
     fn write_header(&mut self, offset: u64, header: WalHeader) -> Result<()> {
-        self.write_at(offset, "write WAL header", &header.encode()?)
+        self.write_at(offset, "write WAL header", &header.encode()?)?;
+        self.after_write()
     }
 
     fn write_at(&mut self, offset: u64, operation: &str, bytes: &[u8]) -> Result<()> {
+        self.require_ready()?;
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|error| io_error(operation, error))?;
         self.faults.check(FaultPoint::BeforeWalWrite)?;
-        self.file
-            .write_all(bytes)
-            .map_err(|error| io_error(operation, error))?;
+        if let Err(error) = self.file.write_all(bytes) {
+            return Err(self.poison_after_mutating_io(operation, error));
+        }
+        Ok(())
+    }
+
+    fn after_write(&self) -> Result<()> {
         self.faults.check(FaultPoint::AfterWalWrite)
+    }
+
+    fn require_ready(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(DbError::new(
+                ErrorCode::Io,
+                "WAL is unusable after a failed mutating I/O operation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn poison_after_mutating_io(&mut self, operation: &str, error: io::Error) -> DbError {
+        self.poisoned = true;
+        if let Ok(metadata) = self.file.metadata() {
+            self.end_offset = metadata.len();
+        }
+        io_error(operation, error)
     }
 }
 
@@ -297,7 +365,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use super::{Wal, wal_path};
@@ -431,6 +499,99 @@ mod tests {
     }
 
     #[test]
+    fn after_write_failure_keeps_the_wal_boundary_at_the_persisted_record_end() {
+        let temp = TempDatabase::new("wal-after-write");
+        let header = DatabaseHeader::new(4096, [9; 16]).unwrap();
+        let mut wal = Wal::create(temp.path(), &header)
+            .unwrap()
+            .with_faults(Arc::new(FailOnceAt::new(FaultPoint::AfterWalWrite)));
+        let path = wal.path().to_path_buf();
+
+        assert_eq!(
+            wal.append_record(&[0xa1]).unwrap_err().code(),
+            ErrorCode::Io
+        );
+        assert_eq!(wal.len(), 8193);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 8193);
+        assert_eq!(wal.append_record(&[0xb2]).unwrap(), 8193);
+        let mut bytes = [0; 2];
+        wal.read_exact_at(8192, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa1, 0xb2]);
+    }
+
+    #[test]
+    fn after_truncate_failure_keeps_the_wal_boundary_at_the_persisted_length() {
+        let temp = TempDatabase::new("wal-after-truncate");
+        let header = DatabaseHeader::new(4096, [10; 16]).unwrap();
+        let wal = Wal::create(temp.path(), &header).unwrap();
+        let mut wal = wal.with_faults(Arc::new(FailOnceAt::new(FaultPoint::AfterWalTruncate)));
+        let path = wal.path().to_path_buf();
+        wal.append_record(&[0xa1, 0xb2]).unwrap();
+
+        assert_eq!(wal.truncate(8192).unwrap_err().code(), ErrorCode::Io);
+        assert_eq!(wal.len(), 8192);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 8192);
+        assert_eq!(wal.append_record(&[0xc3]).unwrap(), 8192);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 8193);
+    }
+
+    #[test]
+    fn every_failed_wal_create_stage_removes_only_its_exact_wal_path() {
+        for (point, occurrence) in [
+            (FaultPoint::BeforeWalWrite, 1),
+            (FaultPoint::AfterWalWrite, 1),
+            (FaultPoint::BeforeWalSync, 1),
+            (FaultPoint::AfterWalSync, 1),
+            (FaultPoint::BeforeWalWrite, 2),
+            (FaultPoint::AfterWalWrite, 2),
+            (FaultPoint::BeforeWalSync, 2),
+            (FaultPoint::AfterWalSync, 2),
+        ] {
+            let temp = TempDatabase::new("wal-create-rollback");
+            let header = DatabaseHeader::new(4096, [11; 16]).unwrap();
+            let path = wal_path(temp.path());
+            let mut neighbor = path.as_os_str().to_os_string();
+            neighbor.push("-neighbor");
+            let neighbor = PathBuf::from(neighbor);
+            fs::write(&neighbor, b"retain adjacent file").unwrap();
+
+            let error = Wal::create_with_faults(
+                temp.path(),
+                &header,
+                Arc::new(FailAtOccurrence::new(point, occurrence)),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code(),
+                ErrorCode::Io,
+                "{point:?} occurrence {occurrence}"
+            );
+            assert!(!path.exists(), "{point:?} occurrence {occurrence}");
+            assert!(neighbor.exists(), "{point:?} occurrence {occurrence}");
+            fs::remove_file(neighbor).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_os_write_poisoned_wal_rejects_further_io() {
+        let temp = TempDatabase::new("wal-poisoned-write");
+        let header = DatabaseHeader::new(4096, [12; 16]).unwrap();
+        let wal = Wal::create(temp.path(), &header).unwrap();
+        drop(wal);
+        let mut wal = Wal::open(temp.path(), &header, OpenMode::ReadOnly).unwrap();
+
+        assert_eq!(
+            wal.append_record(&[0xa1]).unwrap_err().code(),
+            ErrorCode::Io
+        );
+        assert_eq!(wal.sync_all().unwrap_err().code(), ErrorCode::Io);
+        assert_eq!(
+            wal.read_exact_at(0, &mut [0; 1]).unwrap_err().code(),
+            ErrorCode::Io
+        );
+    }
+
+    #[test]
     fn missing_wal_rejects_an_existing_database() {
         let temp = TempDatabase::new("missing-wal-existing");
         let mut database =
@@ -487,6 +648,60 @@ mod tests {
         fn check(&self, point: FaultPoint) -> Result<()> {
             if point == self.0 {
                 return Err(DbError::new(ErrorCode::Io, "injected WAL I/O fault"));
+            }
+            Ok(())
+        }
+    }
+
+    struct FailOnceAt {
+        point: FaultPoint,
+        fired: Mutex<bool>,
+    }
+
+    impl FailOnceAt {
+        fn new(point: FaultPoint) -> Self {
+            Self {
+                point,
+                fired: Mutex::new(false),
+            }
+        }
+    }
+
+    impl FaultInjector for FailOnceAt {
+        fn check(&self, point: FaultPoint) -> Result<()> {
+            let mut fired = self.fired.lock().unwrap();
+            if point == self.point && !*fired {
+                *fired = true;
+                return Err(DbError::new(ErrorCode::Io, "injected WAL I/O fault"));
+            }
+            Ok(())
+        }
+    }
+
+    struct FailAtOccurrence {
+        point: FaultPoint,
+        occurrence: usize,
+        seen: Mutex<usize>,
+    }
+
+    impl FailAtOccurrence {
+        fn new(point: FaultPoint, occurrence: usize) -> Self {
+            Self {
+                point,
+                occurrence,
+                seen: Mutex::new(0),
+            }
+        }
+    }
+
+    impl FaultInjector for FailAtOccurrence {
+        fn check(&self, point: FaultPoint) -> Result<()> {
+            if point == self.point {
+                let mut seen = self.seen.lock().unwrap();
+                *seen += 1;
+                if *seen == self.occurrence {
+                    return Err(DbError::new(ErrorCode::Io, "injected WAL I/O fault"));
+                }
             }
             Ok(())
         }
