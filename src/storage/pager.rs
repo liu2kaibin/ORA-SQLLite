@@ -5,12 +5,12 @@ use std::{
 };
 
 use super::{
-    PageId, PageRef,
+    Lsn, PageId, PageRef,
     btree::{
         BTree, INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, LeafCell, TreeKind,
         decode_internal_leftmost, decode_leaf_right_sibling,
     },
-    cache::{PageCache, PageHandle},
+    cache::{CacheKey, PageCache, PageHandle},
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
     freelist::{Freelist, FreelistWalk},
     header::DatabaseHeader,
@@ -102,13 +102,17 @@ impl Pager {
 
     pub(super) fn read(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.require_ready()?;
+        let cache_key = CacheKey {
+            page_id: reference.page_id(),
+            source_lsn: Lsn(0),
+        };
 
-        if let Some(handle) = self.cache.get(reference.page_id()) {
+        if let Some(handle) = self.cache.get(cache_key) {
             let generation = handle.header().generation();
             if generation == reference.generation() {
                 return Ok(handle);
             }
-            self.cache.remove(reference.page_id());
+            self.cache.remove(cache_key);
         }
 
         let frame = PageFrame::decode(
@@ -118,7 +122,7 @@ impl Pager {
             Some(reference.generation()),
         )?;
         let handle = Arc::new(frame);
-        self.cache.insert_clean(handle.clone())?;
+        self.cache.insert_clean(cache_key, handle.clone())?;
         Ok(handle)
     }
 
@@ -856,9 +860,15 @@ impl WriteBatch<'_> {
 
     fn replace_cache_images(&mut self) {
         for (page_id, frame) in std::mem::take(&mut self.dirty) {
-            self.pager.cache.remove(page_id);
+            self.pager.cache.remove_page_versions(page_id);
             let handle = Arc::new(frame);
-            let _ = self.pager.cache.insert_clean(handle);
+            let _ = self.pager.cache.insert_clean(
+                CacheKey {
+                    page_id,
+                    source_lsn: Lsn(0),
+                },
+                handle,
+            );
         }
     }
 

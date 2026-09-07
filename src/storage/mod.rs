@@ -9,6 +9,7 @@ mod overflow;
 mod page;
 mod pager;
 mod slotted;
+mod snapshot;
 mod validate;
 mod wal;
 
@@ -56,7 +57,7 @@ impl PageRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Lsn(pub(super) u64);
 
 #[test]
