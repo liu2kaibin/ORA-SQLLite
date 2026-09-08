@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -319,7 +319,7 @@ fn unfinished_writer_is_busy_readers_progress_and_checkpoint_waits_for_rollback(
     let (writer_ready_tx, writer_ready_rx) = mpsc::sync_channel(0);
     let (release_writer_tx, release_writer_rx) = mpsc::sync_channel(0);
     let (checkpoint_go_tx, checkpoint_go_rx) = mpsc::sync_channel(0);
-    let (checkpoint_started_tx, checkpoint_started_rx) = mpsc::sync_channel(0);
+    let (checkpoint_contended_tx, checkpoint_contended_rx) = mpsc::sync_channel(0);
     let (checkpoint_done_tx, checkpoint_done_rx) = mpsc::sync_channel(0);
 
     thread::scope(|scope| {
@@ -342,11 +342,14 @@ fn unfinished_writer_is_busy_readers_progress_and_checkpoint_waits_for_rollback(
         let checkpoint_pager = Arc::clone(&pager);
         let checkpoint = scope.spawn(move || {
             checkpoint_go_rx.recv().expect("checkpoint is started");
-            checkpoint_started_tx
-                .send(())
-                .expect("contention driver remains available");
+            let result =
+                super::pager::checkpoint_after_writer_contention(&checkpoint_pager, || {
+                    checkpoint_contended_tx
+                        .send(())
+                        .expect("contention driver remains available");
+                });
             checkpoint_done_tx
-                .send(checkpoint_pager.checkpoint())
+                .send(result)
                 .expect("contention driver receives checkpoint result");
         });
 
@@ -371,16 +374,9 @@ fn unfinished_writer_is_busy_readers_progress_and_checkpoint_waits_for_rollback(
         drop(reader);
 
         checkpoint_go_tx.send(()).expect("start checkpoint attempt");
-        checkpoint_started_rx
+        checkpoint_contended_rx
             .recv()
-            .expect("checkpoint announced its writer-lock attempt");
-        assert!(
-            matches!(
-                checkpoint_done_rx.try_recv(),
-                Err(mpsc::TryRecvError::Empty)
-            ),
-            "checkpoint must remain serialized behind the active writer"
-        );
+            .expect("checkpoint observed the active writer before blocking");
         release_writer_tx
             .send(())
             .expect("roll back unfinished writer");
@@ -404,6 +400,10 @@ fn database_lock_child() {
         .expect("lock child database path is provided");
     let expected =
         std::env::var("ORA_SQLLITE_LOCK_CHILD_EXPECT").expect("lock child expectation is provided");
+    let marker_path = std::env::var_os("ORA_SQLLITE_LOCK_CHILD_MARKER_PATH")
+        .expect("lock child marker path is provided");
+    let nonce =
+        std::env::var("ORA_SQLLITE_LOCK_CHILD_NONCE").expect("lock child nonce is provided");
     let opened = Pager::open(
         Path::new(&path),
         OpenMode::ReadWrite,
@@ -417,6 +417,15 @@ fn database_lock_child() {
         "open" => drop(opened.expect("child opens database after parent Pager drop")),
         other => panic!("unknown lock child expectation: {other}"),
     }
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker_path)
+        .expect("create unique lock child marker");
+    marker
+        .write_all(format!("{expected}:{nonce}").as_bytes())
+        .expect("write lock child marker");
+    marker.sync_all().expect("sync lock child marker");
 }
 
 #[test]
@@ -429,6 +438,12 @@ fn database_lock_is_process_wide_and_releases_windows_paths() {
     let pager =
         Pager::create(&database_path, PagerConfig::test_default(4096)).expect("create lock owner");
     let executable = std::env::current_exe().expect("locate current test executable");
+    let busy_nonce = format!(
+        "{}-{}-busy",
+        std::process::id(),
+        NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed)
+    );
+    let busy_marker = database_path.with_extension(format!("{busy_nonce}.marker"));
 
     let busy = Command::new(&executable)
         .args([
@@ -438,6 +453,8 @@ fn database_lock_is_process_wide_and_releases_windows_paths() {
         ])
         .env("ORA_SQLLITE_LOCK_CHILD_PATH", &database_path)
         .env("ORA_SQLLITE_LOCK_CHILD_EXPECT", "busy")
+        .env("ORA_SQLLITE_LOCK_CHILD_MARKER_PATH", &busy_marker)
+        .env("ORA_SQLLITE_LOCK_CHILD_NONCE", &busy_nonce)
         .status()
         .expect("run lock-contention child");
     assert_eq!(
@@ -445,8 +462,15 @@ fn database_lock_is_process_wide_and_releases_windows_paths() {
         Some(0),
         "active owner must map child open to Busy"
     );
+    verify_and_remove_lock_child_marker(&busy_marker, "busy", &busy_nonce);
 
     drop(pager);
+    let open_nonce = format!(
+        "{}-{}-open",
+        std::process::id(),
+        NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed)
+    );
+    let open_marker = database_path.with_extension(format!("{open_nonce}.marker"));
     let opened = Command::new(executable)
         .args([
             "--exact",
@@ -455,14 +479,26 @@ fn database_lock_is_process_wide_and_releases_windows_paths() {
         ])
         .env("ORA_SQLLITE_LOCK_CHILD_PATH", &database_path)
         .env("ORA_SQLLITE_LOCK_CHILD_EXPECT", "open")
+        .env("ORA_SQLLITE_LOCK_CHILD_MARKER_PATH", &open_marker)
+        .env("ORA_SQLLITE_LOCK_CHILD_NONCE", &open_nonce)
         .status()
         .expect("run post-drop child");
     assert_eq!(opened.code(), Some(0), "drop must release the process lock");
+    verify_and_remove_lock_child_marker(&open_marker, "open", &open_nonce);
 
     fs::remove_file(&wal).expect("remove exact WAL path after child exit");
     fs::remove_file(&database_path).expect("remove exact database path after child exit");
     assert!(!database_path.exists());
     assert!(!wal.exists());
+    assert!(!busy_marker.exists());
+    assert!(!open_marker.exists());
+}
+
+fn verify_and_remove_lock_child_marker(marker: &Path, mode: &str, nonce: &str) {
+    let contents = fs::read_to_string(marker)
+        .expect("lock child marker is missing; the exact helper may not have run");
+    fs::remove_file(marker).expect("remove exact lock child marker");
+    assert_eq!(contents, format!("{mode}:{nonce}"));
 }
 
 fn create_concurrency_table(pager: &Pager) -> Result<PageRef> {

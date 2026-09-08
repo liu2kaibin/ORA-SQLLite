@@ -492,6 +492,36 @@ impl Pager {
     }
 }
 
+#[cfg(test)]
+pub(super) fn checkpoint_after_writer_contention(
+    pager: &Pager,
+    on_contention: impl FnOnce(),
+) -> Result<super::checkpoint::CheckpointResult> {
+    if pager.inner.mode == OpenMode::ReadOnly {
+        return Err(DbError::new(
+            ErrorCode::Unsupported,
+            "read-only pager cannot checkpoint",
+        ));
+    }
+    match pager.inner.writer.try_lock() {
+        Ok(_writer) => {
+            return Err(internal(
+                "checkpoint contention test requires an active writer",
+            ));
+        }
+        Err(TryLockError::WouldBlock) => on_contention(),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err(internal("pager writer mutex is poisoned"));
+        }
+    }
+    let _writer = pager
+        .inner
+        .writer
+        .lock()
+        .map_err(|_| internal("pager writer mutex is poisoned"))?;
+    super::checkpoint::run(&pager.inner)
+}
+
 pub(super) trait PageSource {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle>;
 
