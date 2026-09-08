@@ -23,7 +23,6 @@ use super::{
 };
 use crate::{DbError, ErrorCode, Result};
 
-#[cfg(test)]
 use crate::fault::FaultInjector;
 
 pub(super) struct PagerConfig {
@@ -44,7 +43,7 @@ impl PagerConfig {
             max_database_bytes: DEFAULT_MAX_DATABASE_BYTES,
             cache_pages: 1024,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
-            max_wal_bytes: 1024 * 1024 * 1024,
+            max_wal_bytes: super::wal::DEFAULT_MAX_WAL_BYTES,
         })
     }
 
@@ -116,16 +115,27 @@ impl Pager {
     }
 
     pub(super) fn create(path: &Path, config: PagerConfig) -> Result<Self> {
+        Self::create_with_faults(path, config, Arc::new(crate::fault::NoFaults))
+    }
+
+    fn create_with_faults(
+        path: &Path,
+        config: PagerConfig,
+        faults: Arc<dyn FaultInjector>,
+    ) -> Result<Self> {
         config.validate_wal_limits()?;
         let cache = PageCache::new(config.cache_pages)?;
-        let file = DatabaseFile::create(
+        let mut file = DatabaseFile::create_with_faults(
             path,
             config.page_size,
             config.uuid,
             config.max_database_bytes,
+            faults.clone(),
         )?;
         let header = file.header();
-        let wal = Wal::create(path, &header)?;
+        let wal = Wal::create_with_faults(path, &header, faults)?;
+        file.finish_wal_initialization()?;
+        let header = file.header();
         Self::from_recovered(
             file,
             wal,
@@ -144,7 +154,13 @@ impl Pager {
         let file = DatabaseFile::open_for_recovery(path, mode, config.max_database_bytes)?;
         let header = file.header();
         let cache = PageCache::new(config.cache_pages)?;
-        let mut wal = Wal::open(path, &header, mode)?;
+        let mut wal = Wal::open_with_limit(
+            path,
+            &header,
+            mode,
+            config.max_wal_bytes,
+            file.can_recreate_wal(),
+        )?;
         let recovered = wal.recover(&header, mode)?;
         file.validate_recovered_tail(recovered.latest_state.page_count)?;
         let pager = Self::from_recovered(
@@ -159,6 +175,23 @@ impl Pager {
             recovered.index,
         )?;
         pager.validate_recovered()?;
+        if mode == OpenMode::ReadWrite {
+            let mut file = pager.main_lock()?;
+            if file.header().publish_sequence() <= 2 {
+                pager.wal_lock()?.sync_all()?;
+                pager.wal_lock()?.sync_directory()?;
+                super::file::sync_parent_directory(
+                    path,
+                    &crate::fault::NoFaults,
+                    crate::fault::FaultPoint::BeforeMainDirectorySync,
+                    crate::fault::FaultPoint::AfterMainDirectorySync,
+                )?;
+            }
+            file.finish_wal_initialization()?;
+            let header = file.header();
+            drop(file);
+            pager.published_write()?.checkpoint = header;
+        }
         Ok(pager)
     }
 
@@ -1051,31 +1084,39 @@ impl WriteBatch<'_> {
             })
             .collect::<Vec<_>>();
         self.preflight_wal_limit(&frames)?;
-        let versions = match self.pager.wal_lock()?.append_transaction(
-            transaction_lsn,
-            self.base_lsn,
-            candidate_state,
-            &frames,
-        ) {
-            Ok(versions) => versions,
+        let publication_observer = self.pager.wal_lock()?.publication_observer();
+        let versions = self.pager.wal_lock()?.projected_versions(&frames)?;
+        // The writer guard excludes both another commit and checkpoint. Prepare
+        // all validation, allocation and map changes before touching the WAL.
+        let mut candidate_index = self.pager.published_read()?.wal_index.clone();
+        candidate_index.publish(transaction_lsn, Some(candidate_state), &versions)?;
+        // Verify write-lock health before durable I/O. Only this writer can
+        // acquire a write guard until publication (read-guard panic cannot poison).
+        drop(self.pager.published_write()?);
+        let mut wal = self.pager.wal_lock()?;
+        match wal.append_transaction(transaction_lsn, self.base_lsn, candidate_state, &frames) {
+            Ok(_) => (),
             Err(error) => return self.fail_wal_commit(error),
         };
-        if let Err(error) = self.pager.wal_lock()?.sync_all() {
+        if let Err(error) = wal.sync_all() {
             return self.fail_wal_commit(error);
         }
-        {
-            let mut published = self.pager.published_write()?;
-            if let Err(error) =
-                published
-                    .wal_index
-                    .publish(transaction_lsn, Some(candidate_state), &versions)
-            {
-                published.write_state = WriteState::NeedsRecovery;
-                return Err(error);
-            }
+        drop(wal);
+        publication_observer.observe_publication(crate::fault::FaultPoint::BeforeWalPublish);
+        let retired_index = {
+            let mut published = self
+                .pager
+                .inner
+                .published
+                .write()
+                .expect("exclusive writer prechecked published lock before WAL I/O");
+            let retired = std::mem::replace(&mut published.wal_index, candidate_index);
             published.latest_lsn = transaction_lsn;
             published.latest = candidate_state;
-        }
+            retired
+        };
+        publication_observer.observe_publication(crate::fault::FaultPoint::AfterWalPublish);
+        drop(retired_index); // recursive map destruction is outside the publication lock
         self.replace_cache_images(transaction_lsn);
         self.finish();
         Ok(())
@@ -1348,15 +1389,15 @@ impl WriteBatch<'_> {
     fn replace_cache_images(&mut self, source_lsn: Lsn) {
         for (page_id, frame) in std::mem::take(&mut self.dirty) {
             let handle = Arc::new(frame);
-            let _ = self.pager.cache_lock().and_then(|mut cache| {
-                cache.insert_clean(
+            if let Ok(mut cache) = self.pager.inner.cache.try_lock() {
+                let _ = cache.insert_clean(
                     CacheKey {
                         page_id,
                         source_lsn,
                     },
                     handle,
-                )
-            });
+                );
+            }
         }
     }
 
@@ -1512,6 +1553,136 @@ mod tests {
     };
 
     #[test]
+    fn final_c1_initialized_database_never_recreates_a_missing_wal() {
+        for committed in [true, false] {
+            for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                let temp = TempDatabase::new("final-c1-initialized");
+                let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+                if committed {
+                    let mut batch = pager.begin_write().unwrap();
+                    batch.allocate_append(PageType::TableLeaf).unwrap();
+                    batch.commit().unwrap();
+                }
+                drop(pager);
+                let before = fs::read(temp.path()).unwrap();
+                fs::remove_file(wal_path(temp.path())).unwrap();
+                let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                    Ok(_) => panic!(
+                        "initialized database recreated missing WAL: committed={committed}, mode={mode:?}"
+                    ),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code(), ErrorCode::Io);
+                assert_eq!(fs::read(temp.path()).unwrap(), before);
+                assert!(!wal_path(temp.path()).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn final_c2_create_faults_cover_main_wal_names_and_marker_in_order() {
+        let temp = TempDatabase::new("final-c2-create-trace");
+        let trace = Arc::new(RecordingFaults::never());
+        let pager =
+            Pager::create_with_faults(temp.path(), PagerConfig::test_default(4096), trace.clone())
+                .unwrap();
+        drop(pager);
+        let points = trace.recorded();
+        assert_eq!(
+            points,
+            vec![
+                FaultPoint::BeforeSuperblockWrite,
+                FaultPoint::AfterSuperblockWrite,
+                FaultPoint::BeforeMainSync,
+                FaultPoint::AfterMainSync,
+                FaultPoint::BeforeSuperblockWrite,
+                FaultPoint::AfterSuperblockWrite,
+                FaultPoint::BeforeMainSync,
+                FaultPoint::AfterMainSync,
+                FaultPoint::BeforeMainDirectorySync,
+                FaultPoint::AfterMainDirectorySync,
+                FaultPoint::BeforeWalHeaderWrite,
+                FaultPoint::AfterWalHeaderWrite,
+                FaultPoint::BeforeWalSync,
+                FaultPoint::AfterWalSync,
+                FaultPoint::BeforeWalHeaderWrite,
+                FaultPoint::AfterWalHeaderWrite,
+                FaultPoint::BeforeWalSync,
+                FaultPoint::AfterWalSync,
+                FaultPoint::BeforeWalDirectorySync,
+                FaultPoint::AfterWalDirectorySync,
+                FaultPoint::BeforeSuperblockWrite,
+                FaultPoint::AfterSuperblockWrite,
+                FaultPoint::BeforeMainSync,
+                FaultPoint::AfterMainSync,
+            ]
+        );
+        for occurrence in 1..=points.len() {
+            let temp = TempDatabase::new("final-c2-create-failure");
+            let faults = Arc::new(RecordingFaults::at(occurrence));
+            let error = match Pager::create_with_faults(
+                temp.path(),
+                PagerConfig::test_default(4096),
+                faults.clone(),
+            ) {
+                Ok(_) => panic!("create acknowledged failed durability boundary {occurrence}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Io);
+            assert_eq!(faults.recorded(), points[..occurrence]);
+            // Error paths may leave an incomplete pair; they never report success.
+            // If the main initial pair exists and WAL was rolled back, RW open
+            // can safely finish creation and durably mark it before returning.
+            if occurrence >= 9 {
+                let recovered = Pager::open(
+                    temp.path(),
+                    OpenMode::ReadWrite,
+                    PagerConfig::test_default(4096),
+                )
+                .unwrap();
+                assert_eq!(recovered.latest_lsn().unwrap(), Lsn(0));
+                drop(recovered);
+            }
+        }
+    }
+
+    #[test]
+    fn final_c1_read_write_open_finishes_initialization_marker() {
+        let temp = TempDatabase::new("final-c1-unmarked");
+        let file = DatabaseFile::create(temp.path(), 4096, [0x5a; 16], DEFAULT_MAX_DATABASE_BYTES)
+            .unwrap();
+        let wal = Wal::create(temp.path(), &file.header()).unwrap();
+        drop(wal);
+        drop(file);
+        let initial = fs::read(temp.path()).unwrap();
+        let reader = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        drop(reader);
+        assert_eq!(fs::read(temp.path()).unwrap(), initial);
+        let writer = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        drop(writer);
+        fs::remove_file(wal_path(temp.path())).unwrap();
+        assert!(
+            Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096)
+            )
+            .is_err(),
+            "successful open must finish initialization before returning"
+        );
+    }
+
+    #[test]
     fn commit_changes_only_the_wal_until_checkpoint() {
         let temp = TempDatabase::new("pager-wal-only-commit");
         let pager =
@@ -1536,6 +1707,118 @@ mod tests {
                 .len()
                 > 8192
         );
+    }
+
+    #[test]
+    fn final_i3_commit_trace_observes_each_real_record_and_partial_prefix() {
+        let temp = TempDatabase::new("final-i3-trace");
+        let faults = Arc::new(RecordingFaults::never());
+        let pager = pager_with_faults(&temp, faults.clone());
+        let mut batch = pager.begin_write().unwrap();
+        for _ in 0..3 {
+            batch.allocate_append(PageType::TableLeaf).unwrap();
+        }
+        batch.commit().unwrap();
+        let trace = faults
+            .recorded()
+            .iter()
+            .map(|point| format!("{point:?}"))
+            .collect::<Vec<_>>();
+        for point in [
+            "BeforeWalRecordWrite",
+            "AfterWalRecordHeaderPrefixWrite",
+            "AfterWalRecordPayloadPrefixWrite",
+            "AfterWalRecordWrite",
+        ] {
+            assert_eq!(
+                trace.iter().filter(|name| *name == point).count(),
+                4,
+                "three PageFrames and one Commit must each reach {point}"
+            );
+        }
+        assert_eq!(
+            &trace[trace.len() - 4..],
+            &[
+                "BeforeWalSync",
+                "AfterWalSync",
+                "BeforeWalPublish",
+                "AfterWalPublish"
+            ]
+        );
+    }
+
+    #[test]
+    fn final_i4_invalid_index_candidate_fails_before_any_wal_io() {
+        let temp = TempDatabase::new("final-i4-preflight");
+        let faults = Arc::new(RecordingFaults::never());
+        let pager = pager_with_faults(&temp, faults.clone());
+        let state = CommitState {
+            page_count: 2,
+            catalog_root: PageId(0),
+            freelist_root: PageId(0),
+            feature_bits: 0,
+        };
+        pager
+            .published_write()
+            .unwrap()
+            .wal_index
+            .publish(Lsn(1), Some(state), &[(PageId(1), 8192, 1)])
+            .unwrap();
+        let before = fs::read(wal_path(temp.path())).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        batch.allocate_append(PageType::TableLeaf).unwrap();
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Corruption);
+        assert!(
+            faults.recorded().is_empty(),
+            "invalid index candidate reached WAL I/O: {:?}",
+            faults.recorded()
+        );
+        assert_eq!(fs::read(wal_path(temp.path())).unwrap(), before);
+        assert_eq!(pager.latest_lsn().unwrap(), Lsn(0));
+    }
+
+    #[test]
+    fn final_i4_durable_commit_does_not_wait_for_cache_lock() {
+        use std::{sync::mpsc, time::Duration};
+        struct SyncGate {
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FaultInjector for SyncGate {
+            fn check(&self, point: FaultPoint) -> Result<()> {
+                if point == FaultPoint::AfterWalSync {
+                    self.entered.send(()).unwrap();
+                    self.resume.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        let temp = TempDatabase::new("final-i4-cache-gate");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .unwrap()
+            .with_faults(Arc::new(SyncGate {
+                entered: entered_tx,
+                resume: Mutex::new(resume_rx),
+            }));
+        let worker = pager.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut batch = worker.begin_write().unwrap();
+            batch.allocate_append(PageType::TableLeaf).unwrap();
+            done_tx.send(batch.commit()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let cache = pager.cache_lock().unwrap();
+        resume_tx.send(()).unwrap();
+        let committed = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(cache); // always release before joining, including the regression failure
+        writer.join().unwrap();
+        committed
+            .expect("durable commit blocked on best-effort cache publication")
+            .unwrap();
+        assert_eq!(pager.latest_lsn().unwrap(), Lsn(1));
     }
 
     #[test]
@@ -1793,7 +2076,7 @@ mod tests {
             batch.commit().expect("commit initial page");
             page
         };
-        let faults = Arc::new(RecordingFaults::at(3));
+        let faults = Arc::new(RecordingFaults::at(9));
         let pager = pager.with_faults(faults.clone());
         let mut old_snapshot = pager.begin_read().expect("begin old snapshot");
 
@@ -1806,14 +2089,7 @@ mod tests {
             batch.commit().expect_err("WAL sync fault must fail commit")
         };
         assert_eq!(error.code(), ErrorCode::Io);
-        assert_eq!(
-            faults.recorded(),
-            vec![
-                FaultPoint::BeforeWalRecordWrite,
-                FaultPoint::AfterWalRecordWrite,
-                FaultPoint::BeforeWalSync,
-            ]
-        );
+        assert_eq!(faults.recorded(), commit_fault_points()[..9]);
         assert_eq!(pager.latest_lsn().expect("read latest LSN"), Lsn(1));
         assert_eq!(
             old_snapshot
@@ -1963,6 +2239,42 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code(), ErrorCode::Corruption);
+    }
+
+    #[test]
+    fn final_i2_open_checks_wal_limit_before_scanning_or_truncating() {
+        for corrupt_record in [false, true] {
+            for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                let temp = TempDatabase::new("final-i2-wal-limit");
+                let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+                let mut batch = pager.begin_write().unwrap();
+                batch.allocate_append(PageType::TableLeaf).unwrap();
+                batch.commit().unwrap();
+                drop(pager);
+                let path = wal_path(temp.path());
+                let mut bytes = fs::read(&path).unwrap();
+                if corrupt_record {
+                    bytes[8192] ^= 1;
+                }
+                bytes.push(0); // a scanner would truncate this tail in RW mode
+                fs::write(&path, &bytes).unwrap();
+                let main = fs::read(temp.path()).unwrap();
+                let mut config = PagerConfig::test_default(4096);
+                config.max_wal_bytes = 8192;
+                let error = match Pager::open(temp.path(), mode, config) {
+                    Ok(_) => panic!("WAL above the configured limit was scanned"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("WAL file exceeds configured maximum size"),
+                    "must reject size before parsing the corrupt record: {error}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(fs::read(temp.path()).unwrap(), main);
+            }
+        }
     }
 
     #[test]
@@ -2614,11 +2926,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_recovery_ignores_a_stale_main_header_pointing_at_a_freelist_leaf() {
+    fn catalog_recovery_rejects_a_tampered_checkpoint_that_regresses_wal_page_count() {
         let temp = TempDatabase::new("pager-catalog-freelist-overlap");
         let pager =
             Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager");
-        let catalog = {
+        {
             let mut batch = pager.begin_write().expect("begin catalog batch");
             let tree = BTree::create(&mut batch, TreeKind::Table).expect("create catalog tree");
             batch
@@ -2628,8 +2940,7 @@ mod tests {
                 .set_catalog_root(tree.root())
                 .expect("publish catalog tree");
             batch.commit().expect("commit catalog tree");
-            tree
-        };
+        }
         let (first_free, second_free) = {
             let mut batch = pager.begin_write().expect("begin free-tree batch");
             let first = BTree::create(&mut batch, TreeKind::Table).expect("create first free tree");
@@ -2656,8 +2967,8 @@ mod tests {
                 .catalog_root,
             second_free.page_id()
         );
-        // The main file remains at the checkpoint while the WAL is authoritative. A stale or
-        // tampered main superblock therefore cannot replace the recovered committed catalog.
+        // Tampering the checkpoint-0 page count to a future count would require
+        // shrinking at WAL commit 1. Recovery must reject that inconsistent state.
         let recovered_page_count = pager.page_count();
         let mut main = pager.main_lock().expect("lock main database");
         main.extend_to_pages(recovered_page_count)
@@ -2677,21 +2988,22 @@ mod tests {
         drop(main);
         drop(pager);
 
-        let reopened = Pager::open(
-            temp.path(),
-            OpenMode::ReadOnly,
-            PagerConfig::test_default(4096),
-        )
-        .expect("open corrupt catalog header read only");
-        let mut snapshot = reopened.begin_read().expect("begin read snapshot");
-        assert_eq!(
-            snapshot
-                .catalog_tree(TreeKind::Table)
-                .expect("recover committed catalog")
-                .expect("committed catalog exists")
-                .root(),
-            catalog.root()
-        );
+        let main = fs::read(temp.path()).unwrap();
+        let wal = fs::read(wal_path(temp.path())).unwrap();
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                Ok(_) => panic!("tampered checkpoint accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert!(
+                error
+                    .to_string()
+                    .contains("shrinks the checkpoint page count")
+            );
+            assert_eq!(fs::read(temp.path()).unwrap(), main);
+            assert_eq!(fs::read(wal_path(temp.path())).unwrap(), wal);
+        }
     }
 
     #[test]
@@ -3514,7 +3826,9 @@ mod tests {
 
         batch.commit().expect("commit");
 
-        assert_eq!(faults.recorded(), commit_fault_points());
+        let mut expected = commit_fault_points();
+        expected.extend([FaultPoint::BeforeWalPublish, FaultPoint::AfterWalPublish]);
+        assert_eq!(faults.recorded(), expected);
     }
 
     #[test]
@@ -3970,6 +4284,12 @@ mod tests {
     fn commit_fault_points() -> Vec<FaultPoint> {
         vec![
             FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordHeaderPrefixWrite,
+            FaultPoint::AfterWalRecordPayloadPrefixWrite,
+            FaultPoint::AfterWalRecordWrite,
+            FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordHeaderPrefixWrite,
+            FaultPoint::AfterWalRecordPayloadPrefixWrite,
             FaultPoint::AfterWalRecordWrite,
             FaultPoint::BeforeWalSync,
             FaultPoint::AfterWalSync,

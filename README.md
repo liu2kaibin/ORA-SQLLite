@@ -5,7 +5,7 @@ ORA-SQLLite is a planned lightweight embedded database written in pure Rust. It 
 ## Selected boundaries
 
 - In-process Rust library with a CLI added alongside the library.
-- One main database file plus a temporary write-ahead log.
+- One main database file plus a persistent write-ahead log sidecar.
 - Fixed-size pages, a pager, B+Tree tables and indexes.
 - ACID transactions, crash recovery, multiple readers and one writer.
 - Common Oracle data types, functions, sequences, pagination and NULL semantics.
@@ -28,6 +28,19 @@ transaction-level read snapshots, multiple readers with one writer, checkpointin
 and single-process file ownership. Successful commits remain recoverable after a
 normal close or process or machine termination, while uncommitted transactions
 remain invisible.
+
+Creation synchronizes the main/WAL files and their parent directory entries before
+publishing the format-2 initialization marker. Unix uses a directory file sync;
+Windows uses a writable directory handle with `FILE_FLAG_BACKUP_SEMANTICS` and
+`sync_all`. Filesystems or permissions that reject these operations cause creation
+to fail; no weaker fallback is used. Durability depends on the OS, filesystem and
+storage device honoring successful flushes. An initialized database never recreates
+a missing WAL, even before its first checkpoint.
+
+Recovery checks the configured WAL hard limit (1 GiB by default) before scanning.
+Index publication is a constant-size state swap after WAL synchronization; preparing
+that swap currently copies the total in-memory index before each commit. This is an
+explicit Phase 3 performance/memory tradeoff, not a persistent-index implementation.
 
 SQL, the system catalog schema, and the public database CRUD API remain unimplemented.
 Phase 3 supports multiple readers and one writer only within one process; a second

@@ -99,8 +99,18 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
         };
         let end = record.end;
         if let Some(transaction) = transactions.consume(record, offset)? {
+            if transaction.lsn == database_header.checkpoint_lsn()
+                && transaction.state != checkpoint_state(database_header)
+            {
+                return Err(corruption(
+                    "WAL commit disagrees with the matching checkpoint state",
+                ));
+            }
             committed_end = end;
             if transaction.lsn > database_header.checkpoint_lsn() {
+                if transaction.state.page_count < latest_state.page_count {
+                    return Err(corruption("WAL commit shrinks the checkpoint page count"));
+                }
                 index.publish(
                     transaction.lsn,
                     Some(transaction.state),
@@ -142,6 +152,7 @@ struct ValidatedTransaction {
 
 struct TransactionScanner {
     previous_lsn: Option<Lsn>,
+    previous_state: Option<CommitState>,
     pending: Option<PendingTransaction>,
 }
 
@@ -149,6 +160,7 @@ impl TransactionScanner {
     fn new(previous_lsn: Option<Lsn>) -> Self {
         Self {
             previous_lsn,
+            previous_state: None,
             pending: None,
         }
     }
@@ -252,7 +264,26 @@ impl TransactionScanner {
                     ));
                 }
 
+                if transaction
+                    .frames
+                    .iter()
+                    .any(|(page_id, _, _)| page_id.0 >= commit.state.page_count)
+                {
+                    return Err(corruption(
+                        "WAL page frame lies outside the commit page count",
+                    ));
+                }
+                if self.previous_state.is_some_and(|previous| {
+                    commit.state.page_count < previous.page_count
+                        || commit.state.feature_bits != previous.feature_bits
+                }) {
+                    return Err(corruption(
+                        "WAL commit regresses the logical database state",
+                    ));
+                }
+
                 self.previous_lsn = Some(transaction.lsn);
+                self.previous_state = Some(commit.state);
                 Ok(Some(ValidatedTransaction {
                     lsn: transaction.lsn,
                     state: commit.state,
@@ -354,6 +385,19 @@ fn verify_old_generation_suffix(
                         "old-generation WAL suffix ends without a commit",
                     ));
                 }
+                if transactions
+                    .previous_lsn
+                    .is_some_and(|lsn| lsn > database_header.checkpoint_lsn())
+                    || transactions.previous_state.is_some_and(|state| {
+                        state.page_count > database_header.page_count()
+                            || (transactions.previous_lsn == Some(database_header.checkpoint_lsn())
+                                && state != checkpoint_state(database_header))
+                    })
+                {
+                    return Err(corruption(
+                        "old-generation WAL state exceeds or disagrees with the checkpoint",
+                    ));
+                }
                 return Ok(());
             }
             HeaderRead::Incomplete => {
@@ -444,6 +488,103 @@ mod tests {
     const RECORD_AREA_START: u64 = 8192;
     const PAGE_RECORD_LEN: usize = 64 + PAGE_SIZE as usize;
     const COMMIT_RECORD_LEN: usize = 128;
+
+    #[test]
+    #[ignore = "exhaustive real-file truncation of every page-frame/commit byte"]
+    fn phase_3_every_record_byte_truncation_matrix() {
+        let database = DatabaseHeader::new(PAGE_SIZE, [0x39; 16]).unwrap();
+        let first = encoded_transaction(1, 0, &[(PageId(1), 1)], commit_state(2, 0, 0));
+        let second = encoded_transaction(2, 1, &[(PageId(1), 2)], commit_state(2, 0, 0));
+        assert_eq!(second.len(), 4288); // 64+4096 PageFrame, 64+64 Commit, zero padding
+        let (temp, wal) = fixture_wal(&database, 1, Lsn(0), &first, OpenMode::ReadWrite);
+        let path = wal.path().to_owned();
+        drop(wal);
+        let prefix = fs::read(&path).unwrap();
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            for cut in 0..=4288 {
+                let bytes = [&prefix[..], &second[..cut]].concat();
+                fs::write(&path, &bytes).unwrap();
+                let mut wal = Wal::open(temp.path(), &database, mode).unwrap();
+                let result = wal.recover(&database, mode).unwrap();
+                assert_eq!(
+                    result.latest_lsn,
+                    Lsn(if cut == 4288 { 2 } else { 1 }),
+                    "{mode:?}/{cut}"
+                );
+                let after = fs::read(&path).unwrap();
+                assert_eq!(
+                    after,
+                    if mode == OpenMode::ReadWrite && cut < 4288 {
+                        prefix.clone()
+                    } else {
+                        bytes
+                    },
+                    "{mode:?}/{cut}"
+                );
+            }
+        }
+        eprintln!(
+            "8578 real-file recovery cases (4289 byte boundaries x RO/RW), all passed; legal padding length is zero"
+        );
+    }
+
+    #[test]
+    fn final_i1_full_crc_out_of_range_frames_and_shrink_reject_without_mutation() {
+        use crate::storage::pager::{Pager, PagerConfig};
+        for case in ["out-of-range", "shrink", "checkpoint-shrink"] {
+            for old_generation in [false, true] {
+                if case == "checkpoint-shrink" && !old_generation {
+                    continue;
+                }
+                for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                    let mut records = encoded_transaction(
+                        1,
+                        0,
+                        &[(PageId(1), 1)],
+                        commit_state(if case == "out-of-range" { 1 } else { 3 }, 0, 0),
+                    );
+                    if case == "shrink" {
+                        records.extend(encoded_transaction(
+                            2,
+                            1,
+                            &[(PageId(1), 2)],
+                            commit_state(2, 0, 0),
+                        ));
+                    }
+                    let checkpoint = if old_generation { 2 } else { 0 };
+                    let generation = if old_generation { 2 } else { 1 };
+                    let database = DatabaseHeader::new(PAGE_SIZE, [0x31; 16])
+                        .unwrap()
+                        .with_checkpoint(Lsn(checkpoint), 1, PageId(0), PageId(0), generation)
+                        .unwrap()
+                        .with_checkpoint(Lsn(checkpoint), 1, PageId(0), PageId(0), generation)
+                        .unwrap();
+                    let (temp, wal) =
+                        fixture_wal(&database, generation, Lsn(checkpoint), &records, mode);
+                    let wal_path = wal.path().to_owned();
+                    drop(wal);
+                    let main = [database.encode_slot(), database.encode_slot()].concat();
+                    fs::write(temp.path(), &main).unwrap();
+                    let before_wal = fs::read(&wal_path).unwrap();
+                    let error = match Pager::open(
+                        temp.path(),
+                        mode,
+                        PagerConfig::test_default(PAGE_SIZE),
+                    ) {
+                        Ok(_) => panic!("accepted {case}, old={old_generation}, mode={mode:?}"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(
+                        error.code(),
+                        ErrorCode::Corruption,
+                        "{case}, old={old_generation}, mode={mode:?}"
+                    );
+                    assert_eq!(fs::read(temp.path()).unwrap(), main);
+                    assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+                }
+            }
+        }
+    }
 
     #[test]
     fn recovery_publishes_two_valid_consecutive_commits_at_hand_derived_offsets() {

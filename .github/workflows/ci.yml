@@ -82,3 +82,8 @@ jobs:
           rustup run stable cargo test
           storage::test_support::phase_3_crash_recovery_matrix
           -- --exact --ignored --nocapture
+      - name: Run every-byte WAL truncation matrix
+        run: >-
+          rustup run stable cargo test
+          phase_3_every_record_byte_truncation_matrix
+          -- --ignored --nocapture

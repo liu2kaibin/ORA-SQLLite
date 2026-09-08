@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+thread_local! {
+    static ORDER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use super::{
     WAL_HEADER_AREA_LEN,
     format::{CommitState, RECORD_HEADER_LEN},
@@ -16,7 +21,7 @@ pub(crate) struct WalVersion {
     pub(crate) generation: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct WalIndex {
     pages: BTreeMap<PageId, Vec<WalVersion>>,
     states: BTreeMap<Lsn, CommitState>,
@@ -50,11 +55,12 @@ impl WalIndex {
             {
                 return Err(corruption("WAL version offset is outside the record area"));
             }
-            if pending
-                .iter()
-                .any(|(pending_page, _)| *pending_page == page_id)
-            {
-                return Err(corruption("WAL transaction repeats a page version"));
+            if pending.last().is_some_and(|(pending_page, _)| {
+                #[cfg(test)]
+                ORDER_COMPARISONS.with(|count| count.set(count.get() + 1));
+                *pending_page >= page_id
+            }) {
+                return Err(corruption("WAL transaction pages are not strictly ordered"));
             }
             if self
                 .pages
@@ -151,6 +157,36 @@ mod tests {
         ErrorCode,
         storage::{Lsn, PageId, header::DatabaseHeader, wal::format::CommitState},
     };
+
+    #[test]
+    fn final_i4_frame_order_validation_is_linear_at_scale() {
+        for count in [512usize, 2048] {
+            let mut index = WalIndex::default();
+            let state = CommitState {
+                page_count: count as u64 + 1,
+                catalog_root: PageId(0),
+                freelist_root: PageId(0),
+                feature_bits: 0,
+            };
+            let frames = (1..=count as u64)
+                .map(|id| (PageId(id), 8192 + id * 4160, 1))
+                .collect::<Vec<_>>();
+            super::ORDER_COMPARISONS.with(|value| value.set(0));
+            index.publish(Lsn(1), Some(state), &frames).unwrap();
+            let comparisons = super::ORDER_COMPARISONS.with(|value| value.get());
+            assert!(
+                comparisons <= count,
+                "{count} frames performed {comparisons} ordering comparisons"
+            );
+            assert_eq!(
+                index
+                    .visible_version(PageId(count as u64), Lsn(1))
+                    .unwrap()
+                    .generation,
+                1
+            );
+        }
+    }
 
     #[test]
     fn visible_version_selects_the_newest_committed_version_at_or_before_the_snapshot() {

@@ -144,6 +144,8 @@ Phase 3 将内部磁盘格式主版本从 1 升至 2。格式 1 是未公开的 
 
 数据库创建必须先写 Slot A 并同步，再写 Slot B 并再次同步。两个初始 Slot 状态相同，发布序号分别为 1 和 2。
 
+序号 1/2 仅表示创建尚未完成。主文件名称与 WAL 名称都完成父目录同步、双 WAL Header 完成同步后，再通过现有 alternate Superblock 发布一次无逻辑变化的状态（checked sequence 加 1，通常为 3），持久化 `WAL initialized` 标记，之后创建才可以返回成功。不增加新磁盘字段或新格式。读取中若 marker Slot 损坏而回退到序号 2，不能据此推断未初始化：补建 WAL 还必须由同一持锁主文件句柄读出的两个完整有效初始副本（A=1、B=2，状态为创建初始值）共同证明。
+
 ## 5. WAL 文件格式 1.0
 
 WAL 路径为主数据库路径追加 `-wal`。例如 `app.db` 对应 `app.db-wal`。
@@ -173,7 +175,9 @@ WAL 同样保留固定 8192 字节 Header 区，记录从偏移 8192 开始：
 
 两个 Slot 独立校验。正常打开必须选择 `wal_generation` 与已发布 Superblock 相同的有效 Slot；同 generation 有两个有效 Slot 时选择 `header_sequence` 较高者。相同 sequence 但内容不同是 `Corruption`。
 
-数据库创建必须在返回成功前创建 WAL，并依次同步两个与当前 Superblock 匹配的空 Header Slot；初始 Slot 的 sequence 分别为 1 和 2。之后 WAL 即使为空也必须保留。打开已有数据库时 WAL 缺失返回 `Io`，不能假定主文件已经包含最新提交。唯一修复例外是数据库仍处于可证明的初始空状态：`checkpoint_lsn=0`、`page_count=1` 且两个根均为 0；读写打开可以补建空 WAL，只读打开仍不修改文件。
+数据库创建必须在返回成功前创建 WAL，并依次同步两个与当前 Superblock 匹配的空 Header Slot；初始 Slot 的 sequence 分别为 1 和 2。之后 WAL 即使为空也必须保留。打开已标记初始化的数据库时 WAL 缺失返回 `Io`，即使主文件仍有 `checkpoint_lsn=0`、`page_count=1` 和空根，也不能假定不存在 WAL-only 提交。唯一补建例外是 4.2 节中两个初始副本证明的未完成创建；仅读写打开可补建。读写打开未标记但已有合法 WAL 的数据库，先完成恢复校验、同步 WAL 和父目录，再发布初始化标记后返回；只读打开不补建、不发布标记、不修改文件。
+
+新主文件及 WAL 名称必须执行父目录耐久同步。Unix 使用目录句柄的 `sync_all`；Windows 使用标准库 `OpenOptionsExt` 的写权限目录句柄（`FILE_FLAG_BACKUP_SEMANTICS`）再 `sync_all`。不支持该操作的文件系统、权限或平台必须返回错误，不能退化为空操作。失败创建的文件删除仅是 best-effort 清理，不宣称删除已耐久；调用方从未收到创建成功。所有耐久保证均以操作系统/文件系统/设备兑现成功 flush 为前提。
 
 有效 WAL Header 必须满足 `base_checkpoint_lsn <= Superblock.checkpoint_lsn`。小于当前 checkpoint 表示 WAL 仍保留已经写回主文件的旧提交；恢复器继续验证这些记录，但不把 `lsn <= checkpoint_lsn` 的页面加入活动索引。
 
@@ -243,14 +247,17 @@ Commit Record 自身的 Header CRC 和 Payload CRC 之外，再用 `transaction_
 1. 完成 freelist 准备和现有全树、页面、溢出链及空闲链校验。
 2. 计算候选逻辑页数和候选根状态，并执行资源上限检查。
 3. 为事务分配 `latest_lsn + 1`，但此时不发布。
+   在 WAL I/O 前投影记录偏移，复制现有索引并构造完整候选索引；页面相邻升序/重复检查为线性，全部索引验证和分配在同步前完成。
 4. 将脏页按 `PageId` 升序编码为 PageFrame 记录。
 5. 追加 Commit Record。
 6. 对 WAL 调用 `sync_all`。
-7. 在一次短临界区内把全部帧加入 `WalIndex`，更新最新状态和 `latest_lsn`。
-8. 用不可变页面替换相应最新版本缓存项。
+7. 在一次常数大小临界区内通过 `mem::replace` 发布已经构造完成的候选 `WalIndex`，更新最新状态和 `latest_lsn`；旧索引移出锁后释放。不在此锁内验证、逐帧插入、分配或销毁旧索引。
+8. 用不可变页面尽力更新最新版本缓存；缓存竞争不应阻塞已耐久提交的返回，未缓存页面可以从 WAL 读取。
 9. 释放写锁并返回成功。
 
 在第 6 步成功前，读事务不能看到新事务。第 6 步完成后到第 7 步之间如果进程终止，重启恢复必须发布该事务；调用方没有收到成功返回，但数据库状态仍以耐久 Commit Record 为准。
+
+本 Phase 明确接受每次提交在同步前复制总索引的 O(total index) 时间/内存代价，避免扩大为持久化/分段索引重构。writer guard 排除其他提交和 Checkpoint；同步前检查提交状态写锁健康，直到发布没有其他写锁持有者可以将其污染。普通读锁 panic 不会污染写锁。内存发布观察点只能记录或终止进程，不产生已同步提交的可恢复错误返回。
 
 WAL 追加或同步失败时：
 
@@ -265,10 +272,10 @@ WAL 追加或同步失败时：
 
 1. 获取主文件跨进程独占锁。
 2. 解码并选择有效 Superblock。
-3. 打开 WAL；验证 UUID、页大小、版本、generation 和 base checkpoint。
+3. 打开 WAL，首先以文件元数据检查配置硬上限（默认 1 GiB），超限在扫描/恢复索引分配及任何截断或写入前返回 `Corruption`；然后验证 UUID、页大小、版本、generation 和 base checkpoint。只读打开使用同一上限。
 4. 从偏移 8192 顺序、有限地扫描记录。
 5. 以事务为单位暂存 PageFrame 元数据，不在看到 Commit 前发布。
-6. 验证连续 LSN、连续 ordinal、页面升序、全部 CRC、事务摘要和候选状态。
+6. 验证连续 LSN、连续 ordinal、页面升序、全部 CRC、事务摘要和候选状态。每个待提交 PageId 必须小于 Commit.page_count；相邻 Commit 不得缩小 page_count 或改变不支持的 feature 状态。当前代及旧代后缀扫描均执行这些规则，活动提交也不得缩小主文件 checkpoint 的 page_count。
 7. Commit 完整有效后，原子加入恢复中的 `WalIndex` 并更新最新状态。
 8. 扫描结束后校验恢复出的目录树和 freelist 可达性。
 
@@ -328,7 +335,7 @@ WAL 追加或同步失败时：
 4. 快照登记锁。
 5. 页面缓存锁。
 
-任何代码不得逆序获取锁。WAL 或主文件 `sync_all` 期间可以持有 writer 锁，但不能持有提交状态或缓存锁。唯一例外是最终 WAL 重置：确认活跃快照数为零后，可以持有空的快照登记锁完成 Header generation 切换和截断，从而阻止新快照在重置中途登记；此时不得同时持有提交状态或缓存锁。
+任何代码不得逆序获取锁。通常 WAL 或主文件 `sync_all` 期间可以持有 writer 锁，但不能持有提交状态或缓存锁。唯一例外是最终 WAL generation 重置：按 writer → 提交状态写锁 → 空快照登记锁的顺序确认没有读快照后，可以在 generation 切换及截断同步 I/O 期间同时持有提交状态写锁和空快照登记锁，阻止新快照在重置中途登记；始终不持有缓存锁。普通提交及 checkpoint 数据页物化不适用此例外。
 
 写事务在创建时取得 writer 锁并持有到提交、回滚或 Drop。Drop 未完成的写事务只清理内存私有状态，不写 WAL。
 
@@ -446,6 +453,7 @@ Checkpoint 与写事务共用同一 writer 锁，因此不会与提交并行；�
 
 - 每个 PageFrame 写入前后。
 - Commit Record 写入前后。
+- 每条记录实际写入 32 字节 Header 前缀后、完整 Header 加半个 Payload 后；不是仅枚举名称。
 - WAL 同步前后。
 - 内存发布前后。
 - 每个主文件页面写回前后。
@@ -454,6 +462,8 @@ Checkpoint 与写事务共用同一 writer 锁，因此不会与提交并行；�
 - WAL 截断、Header 重写和同步前后。
 
 每个场景必须只得到旧的完整提交状态或新的完整提交状态，不能出现结构不一致、静默丢失已报告成功的提交或 panic。
+
+成功 trace 必须与真实 WAL 记录数量对应，子进程逐事件验证 trace 前缀并证明指定 occurrence 确实触发。另一个真实文件矩阵对代表性的 4096 字节 PageFrame + 64 字节 Commit Payload 事务执行全部 4289 个截断边界（RO/RW 共 8578 次）。当前合法固定长度 Payload 全部按 8 字节对齐，padding 长度为零；无不可触发的合法 padding 半写窗口。
 
 ### 13.4 快照与并发模型
 

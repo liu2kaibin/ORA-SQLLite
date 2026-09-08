@@ -14,7 +14,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::{Lsn, PageId, checksum::Crc32c, file::OpenMode, header::DatabaseHeader};
+use super::{
+    Lsn, PageId,
+    checksum::Crc32c,
+    file::{OpenMode, sync_parent_directory},
+    header::DatabaseHeader,
+};
 use crate::{
     DbError, ErrorCode, Result,
     fault::{FaultInjector, FaultPoint, NoFaults},
@@ -29,6 +34,7 @@ use self::{
 };
 
 pub(super) const WAL_HEADER_AREA_LEN: u64 = (WAL_HEADER_SLOT_LEN as u64) * 2;
+pub(super) const DEFAULT_MAX_WAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 static NEXT_WAL_SALT: AtomicU64 = AtomicU64::new(1);
 
@@ -71,6 +77,8 @@ impl WalCreateRollback {
 impl Drop for WalCreateRollback {
     fn drop(&mut self) {
         if self.active {
+            // Best-effort cleanup only: the failed create never acknowledges
+            // durability, and this removal is not a durable rollback promise.
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -93,7 +101,7 @@ impl Wal {
         Self::create_with_faults(database_path, database_header, Arc::new(NoFaults))
     }
 
-    fn create_with_faults(
+    pub(super) fn create_with_faults(
         database_path: &Path,
         database_header: &DatabaseHeader,
         faults: Arc<dyn FaultInjector>,
@@ -138,6 +146,7 @@ impl Wal {
         wal.header = second_header;
         wal.active_slot = 1;
         wal.end_offset = WAL_HEADER_AREA_LEN;
+        wal.sync_directory()?;
         rollback.disarm();
         Ok(wal)
     }
@@ -147,6 +156,25 @@ impl Wal {
         database_header: &DatabaseHeader,
         mode: OpenMode,
     ) -> Result<Self> {
+        Self::open_with_limit(
+            database_path,
+            database_header,
+            mode,
+            DEFAULT_MAX_WAL_BYTES,
+            false,
+        )
+    }
+
+    pub(super) fn open_with_limit(
+        database_path: &Path,
+        database_header: &DatabaseHeader,
+        mode: OpenMode,
+        max_bytes: u64,
+        allow_missing_initial: bool,
+    ) -> Result<Self> {
+        if max_bytes < WAL_HEADER_AREA_LEN {
+            return Err(corruption("WAL file exceeds configured maximum size"));
+        }
         let path = wal_path(database_path);
         let mut options = OpenOptions::new();
         options.read(true);
@@ -158,7 +186,7 @@ impl Wal {
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && initial_empty(database_header) =>
             {
-                if mode == OpenMode::ReadWrite {
+                if mode == OpenMode::ReadWrite && allow_missing_initial {
                     return Self::create(database_path, database_header);
                 }
                 return Err(io_error("open WAL", error));
@@ -169,6 +197,9 @@ impl Wal {
             .metadata()
             .map_err(|error| io_error("read WAL length", error))?
             .len();
+        if end_offset > max_bytes {
+            return Err(corruption("WAL file exceeds configured maximum size"));
+        }
         if end_offset < WAL_HEADER_AREA_LEN {
             return Err(corruption("WAL file is shorter than its header area"));
         }
@@ -204,6 +235,38 @@ impl Wal {
         &self.path
     }
 
+    pub(super) fn sync_directory(&self) -> Result<()> {
+        sync_parent_directory(
+            &self.path,
+            &*self.faults,
+            FaultPoint::BeforeWalDirectorySync,
+            FaultPoint::AfterWalDirectorySync,
+        )
+    }
+
+    pub(super) fn publication_observer(&self) -> Arc<dyn FaultInjector> {
+        self.faults.clone()
+    }
+
+    pub(super) fn projected_versions(
+        &self,
+        frames: &[(PageId, u64, Vec<u8>)],
+    ) -> Result<Vec<(PageId, u64, u64)>> {
+        let mut versions = Vec::new();
+        versions
+            .try_reserve_exact(frames.len())
+            .map_err(|_| corruption("WAL version allocation failed"))?;
+        let mut offset = self.end_offset;
+        for (page, generation, payload) in frames {
+            versions.push((*page, offset, *generation));
+            let len = u32::try_from(payload.len())
+                .map_err(|_| corruption("WAL payload length exceeds u32"))?;
+            offset = record_end(offset, len)?;
+        }
+        record_end(offset, 64)?;
+        Ok(versions)
+    }
+
     pub(in crate::storage::wal) const fn header(&self) -> WalHeader {
         self.header
     }
@@ -231,7 +294,7 @@ impl Wal {
         Ok(start)
     }
 
-    /// Builds a complete, prevalidated transaction before performing its one append operation.
+    /// Prevalidates the whole transaction, then writes each actual record separately.
     pub(crate) fn append_transaction(
         &mut self,
         transaction_lsn: Lsn,
@@ -305,12 +368,55 @@ impl Wal {
             &commit_payload,
         )?;
         let encoded_header = commit.encode(self.header.page_size)?;
-        let _transaction_end = record_end(next_offset, commit.payload_len)?;
+        let transaction_end = record_end(next_offset, commit.payload_len)?;
         transaction.extend_from_slice(&encoded_header);
         transaction.extend_from_slice(&commit_payload);
         transaction.extend(std::iter::repeat_n(0, zero_padding_len(commit.payload_len)));
-        self.append_record(&transaction)?;
+        let record_ends = versions
+            .iter()
+            .skip(1)
+            .map(|(_, offset, _)| *offset)
+            .chain(std::iter::once(next_offset))
+            .chain(std::iter::once(transaction_end))
+            .map(|end| {
+                usize::try_from(end - self.end_offset)
+                    .map_err(|_| corruption("WAL transaction record offset exceeds memory"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut start = 0;
+        for end in record_ends {
+            self.append_transaction_record(&transaction[start..end])?;
+            start = end;
+        }
         Ok(versions)
+    }
+
+    fn append_transaction_record(&mut self, bytes: &[u8]) -> Result<()> {
+        let start = self.end_offset;
+        self.file
+            .seek(SeekFrom::Start(start))
+            .map_err(|error| io_error("seek WAL record", error))?;
+        self.faults.check(FaultPoint::BeforeWalRecordWrite)?;
+        // Both prefixes are physically written before the observer runs. Valid
+        // format-1 page/commit payload lengths are aligned, so padding is empty.
+        let payload_middle = 64 + (bytes.len() - 64) / 2;
+        let mut from = 0;
+        for (to, point) in [
+            (32, FaultPoint::AfterWalRecordHeaderPrefixWrite),
+            (payload_middle, FaultPoint::AfterWalRecordPayloadPrefixWrite),
+            (bytes.len(), FaultPoint::AfterWalRecordWrite),
+        ] {
+            if let Err(error) = self.file.write_all(&bytes[from..to]) {
+                return Err(self.poison_after_mutating_io("append WAL record", error));
+            }
+            self.end_offset = start + to as u64; // transaction end was checked before I/O
+            if let Err(error) = self.faults.check(point) {
+                self.poisoned = true;
+                return Err(error);
+            }
+            from = to;
+        }
+        Ok(())
     }
 
     /// Revalidates an indexed page-frame record before exposing its immutable decoded image.
@@ -552,7 +658,9 @@ fn matching_header(bytes: &[u8], database_header: &DatabaseHeader) -> Option<Wal
 }
 
 fn initial_empty(header: &DatabaseHeader) -> bool {
-    header.checkpoint_lsn() == Lsn(0)
+    header.publish_sequence() <= 2
+        && header.wal_generation() == 1
+        && header.checkpoint_lsn() == Lsn(0)
         && header.page_count() == 1
         && header.catalog_root().0 == 0
         && header.freelist_root().0 == 0
@@ -617,6 +725,28 @@ mod tests {
         let wal = Wal::create(temp.path(), &header).unwrap();
         assert_eq!(fs::metadata(wal.path()).unwrap().len(), 8192);
         assert_eq!(wal.header().header_sequence, 2);
+    }
+
+    #[test]
+    fn final_c2_wal_creation_syncs_the_parent_after_both_header_syncs() {
+        #[derive(Default)]
+        struct Trace(Mutex<Vec<String>>);
+        impl FaultInjector for Trace {
+            fn check(&self, point: FaultPoint) -> Result<()> {
+                self.0.lock().unwrap().push(format!("{point:?}"));
+                Ok(())
+            }
+        }
+        let temp = TempDatabase::new("final-c2-dir-sync");
+        let trace = Arc::new(Trace::default());
+        let header = DatabaseHeader::new(4096, [7; 16]).unwrap();
+        let wal = Wal::create_with_faults(temp.path(), &header, trace.clone()).unwrap();
+        assert_eq!(wal.len(), 8192);
+        let trace = trace.0.lock().unwrap();
+        assert_eq!(
+            &trace[trace.len() - 2..],
+            &["BeforeWalDirectorySync", "AfterWalDirectorySync"]
+        );
     }
 
     #[test]
@@ -822,6 +952,8 @@ mod tests {
             (FaultPoint::AfterWalHeaderWrite, 2),
             (FaultPoint::BeforeWalSync, 2),
             (FaultPoint::AfterWalSync, 2),
+            (FaultPoint::BeforeWalDirectorySync, 1),
+            (FaultPoint::AfterWalDirectorySync, 1),
         ] {
             let temp = TempDatabase::new("wal-create-rollback");
             let header = DatabaseHeader::new(4096, [11; 16]).unwrap();
@@ -901,7 +1033,14 @@ mod tests {
         let database =
             DatabaseFile::open(temp.path(), OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)
                 .unwrap();
-        let wal = Wal::open(temp.path(), &database.header(), OpenMode::ReadWrite).unwrap();
+        let wal = Wal::open_with_limit(
+            temp.path(),
+            &database.header(),
+            OpenMode::ReadWrite,
+            super::DEFAULT_MAX_WAL_BYTES,
+            database.can_recreate_wal(),
+        )
+        .unwrap();
         assert_eq!(wal.header().base_checkpoint_lsn, Lsn(0));
         drop(wal);
         drop(database);

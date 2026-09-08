@@ -587,19 +587,12 @@ fn test_fault_injector_is_used_after_pager_creation() {
 fn every_wal_commit_fault_requires_recovery_after_a_multi_page_transaction() {
     let baseline_faults = Arc::new(RecordingFaults::never());
     let baseline = commit_multi_page_tree(baseline_faults.clone()).expect("baseline commit");
-    assert_eq!(
-        baseline,
-        vec![
-            FaultPoint::BeforeWalRecordWrite,
-            FaultPoint::AfterWalRecordWrite,
-            FaultPoint::BeforeWalSync,
-            FaultPoint::AfterWalSync,
-        ],
-        "a multi-page transaction must append and sync through the WAL once"
-    );
+    assert_commit_trace(&baseline);
 
     for point in [
         FaultPoint::BeforeWalRecordWrite,
+        FaultPoint::AfterWalRecordHeaderPrefixWrite,
+        FaultPoint::AfterWalRecordPayloadPrefixWrite,
         FaultPoint::AfterWalRecordWrite,
         FaultPoint::BeforeWalSync,
         FaultPoint::AfterWalSync,
@@ -1440,7 +1433,7 @@ fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
 }
 
 const CRASH_CHILD_TEST: &str = "storage::test_support::phase_3_crash_child";
-const CRASH_POINTS: [FaultPoint; 16] = [
+const CRASH_POINTS: [FaultPoint; 20] = [
     FaultPoint::BeforeWalRecordWrite,
     FaultPoint::AfterWalRecordWrite,
     FaultPoint::BeforeWalSync,
@@ -1457,6 +1450,10 @@ const CRASH_POINTS: [FaultPoint; 16] = [
     FaultPoint::AfterWalHeaderWrite,
     FaultPoint::BeforeWalTruncate,
     FaultPoint::AfterWalTruncate,
+    FaultPoint::AfterWalRecordHeaderPrefixWrite,
+    FaultPoint::AfterWalRecordPayloadPrefixWrite,
+    FaultPoint::BeforeWalPublish,
+    FaultPoint::AfterWalPublish,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1587,18 +1584,65 @@ fn crash_trace(fixture: &TempDatabase, mode: &str) -> (Vec<FaultPoint>, CrashSta
     let faults = Arc::new(RecordingFaults::never());
     let pager = crash_open(temp.path()).with_faults(faults.clone());
     let pre = crash_state(&pager);
+    let record_start = fs::metadata(wal_path(temp.path())).unwrap().len() as usize;
     crash_operation(&pager, mode);
     let post = crash_state(&pager);
     assert_eq!(post.rows, crash_model(true));
     assert_eq!(post.lsn, Lsn(2));
     if mode == "commit" {
-        assert_eq!(faults.observed(), CRASH_POINTS[..4]);
+        assert_commit_trace(&faults.observed());
+        // Count independently from actual persisted record framing, not from hooks.
+        let bytes = fs::read(wal_path(temp.path())).unwrap();
+        let mut offset = record_start;
+        let mut records = 0;
+        while offset < bytes.len() {
+            let payload =
+                u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
+            offset += 64 + payload;
+            records += 1;
+        }
+        assert_eq!(offset, bytes.len());
+        assert_eq!(
+            faults.observed().len(),
+            records * 4 + 4,
+            "each physical record must expose both prefix boundaries"
+        );
         assert_ne!(pre, post);
     } else {
         assert_eq!(pre, post, "checkpoint cannot change the logical state");
     }
     drop(pager);
     (faults.observed(), pre, post)
+}
+
+fn assert_commit_trace(trace: &[FaultPoint]) {
+    let record_points = [
+        FaultPoint::BeforeWalRecordWrite,
+        FaultPoint::AfterWalRecordHeaderPrefixWrite,
+        FaultPoint::AfterWalRecordPayloadPrefixWrite,
+        FaultPoint::AfterWalRecordWrite,
+    ];
+    assert!(
+        trace.len() >= 12 && (trace.len() - 4) % 4 == 0,
+        "invalid crash configuration: commit trace length"
+    );
+    let records_end = trace.len() - 4;
+    for record in trace[..records_end].chunks_exact(4) {
+        assert_eq!(
+            record, record_points,
+            "invalid crash configuration: record trace"
+        );
+    }
+    assert_eq!(
+        &trace[records_end..],
+        &[
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalPublish,
+            FaultPoint::AfterWalPublish
+        ],
+        "invalid crash configuration: publish trace"
+    );
 }
 
 fn crash_child_command(
@@ -1671,17 +1715,13 @@ fn phase_3_crash_child() {
         "invalid crash configuration: occurrence outside successful trace"
     );
     if mode == "commit" {
-        assert_eq!(
-            trace,
-            CRASH_POINTS[..4],
-            "invalid crash configuration: commit trace"
-        );
+        assert_commit_trace(&trace);
     } else {
         assert!(
             !trace.iter().any(|point| CRASH_POINTS[..2].contains(point)),
             "invalid crash configuration: checkpoint trace"
         );
-        for required in &CRASH_POINTS[2..] {
+        for required in &CRASH_POINTS[2..16] {
             assert!(
                 trace.contains(required),
                 "invalid crash configuration: incomplete checkpoint trace"
@@ -1773,7 +1813,7 @@ fn crash_child_rejects_invalid_configuration_without_writing() {
         ("invalid", "BeforeWalRecordWrite", "1", false),
         ("commit", "unknown", "1", false),
         ("commit", "BeforeWalRecordWrite", "0", false),
-        ("commit", "BeforeWalRecordWrite", "2", false),
+        ("commit", "BeforeWalRecordWrite", "999999", false),
         ("commit", "BeforeWalRecordWrite", "1", true),
     ] {
         let temp = copy_crash_fixture(&fixture);
@@ -1921,7 +1961,7 @@ fn phase_3_crash_recovery_matrix() {
         assert!(covered.contains(&point), "uncovered boundary: {point:?}");
     }
     eprintln!(
-        "phase3 crash matrix: {crashes} inspected child aborts; all 16 named boundaries covered"
+        "phase3 crash matrix: {crashes} inspected child aborts; all 20 named boundaries covered"
     );
     full_length_corruption_cases();
 }

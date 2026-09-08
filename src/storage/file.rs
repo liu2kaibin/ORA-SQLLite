@@ -32,6 +32,7 @@ pub(super) struct DatabaseFile {
     active_slot: SuperblockSlot,
     page_count: u64,
     max_bytes: u64,
+    initial_pair: bool,
     faults: Arc<dyn FaultInjector>,
 }
 
@@ -54,6 +55,16 @@ impl DatabaseFile {
         uuid: [u8; 16],
         max_bytes: u64,
     ) -> Result<Self> {
+        Self::create_with_faults(path, page_size, uuid, max_bytes, Arc::new(NoFaults))
+    }
+
+    pub(super) fn create_with_faults(
+        path: &Path,
+        page_size: u32,
+        uuid: [u8; 16],
+        max_bytes: u64,
+        faults: Arc<dyn FaultInjector>,
+    ) -> Result<Self> {
         let header = DatabaseHeader::new(page_size, uuid)?;
         checked_database_len(header.page_count(), page_size, max_bytes)?;
         let file = OpenOptions::new()
@@ -70,7 +81,8 @@ impl DatabaseFile {
             active_slot: SuperblockSlot::A,
             page_count: 1,
             max_bytes,
-            faults: Arc::new(NoFaults),
+            initial_pair: true,
+            faults,
         };
         database.write_superblock_slot(SuperblockSlot::A, header)?;
         database.sync_all()?;
@@ -85,6 +97,12 @@ impl DatabaseFile {
         database.sync_all()?;
         database.header = second;
         database.active_slot = SuperblockSlot::B;
+        sync_parent_directory(
+            path,
+            &*database.faults,
+            FaultPoint::BeforeMainDirectorySync,
+            FaultPoint::AfterMainDirectorySync,
+        )?;
         Ok(database)
     }
 
@@ -130,6 +148,10 @@ impl DatabaseFile {
             .map_err(|error| read_error("read database superblocks", error))?;
         let (header, active_slot) =
             DatabaseHeader::select(&slots[..SUPERBLOCK_SLOT_LEN], &slots[SUPERBLOCK_SLOT_LEN..])?;
+        let initial = DatabaseHeader::new(header.page_size(), header.uuid())?;
+        let second = initial.with_checkpoint(super::Lsn(0), 1, PageId(0), PageId(0), 1)?;
+        let initial_pair = slots[..SUPERBLOCK_SLOT_LEN] == initial.encode_slot()
+            && slots[SUPERBLOCK_SLOT_LEN..] == second.encode_slot();
         header.validate_open(mode)?;
 
         let len = file
@@ -156,6 +178,7 @@ impl DatabaseFile {
             active_slot,
             page_count,
             max_bytes,
+            initial_pair,
             faults: Arc::new(NoFaults),
         })
     }
@@ -186,6 +209,10 @@ impl DatabaseFile {
 
     pub(super) const fn header(&self) -> DatabaseHeader {
         self.header
+    }
+
+    pub(super) fn can_recreate_wal(&self) -> bool {
+        self.initial_pair && self.header.publish_sequence() <= 2
     }
 
     pub(super) fn read_page(&mut self, page_id: PageId) -> Result<Vec<u8>> {
@@ -283,6 +310,21 @@ impl DatabaseFile {
         Ok(())
     }
 
+    /// Sequences 1 and 2 belong only to create; sequence 3 durably acknowledges WAL setup.
+    pub(super) fn finish_wal_initialization(&mut self) -> Result<()> {
+        while self.header.publish_sequence() <= 2 {
+            let header = self.header;
+            self.publish_superblock(header.with_checkpoint(
+                header.checkpoint_lsn(),
+                header.page_count(),
+                header.catalog_root(),
+                header.freelist_root(),
+                header.wal_generation(),
+            )?)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn sync_all(&self) -> Result<()> {
         self.faults.check(FaultPoint::BeforeMainSync)?;
         self.file
@@ -347,6 +389,41 @@ impl DatabaseFile {
             FaultPoint::AfterSuperblockWrite,
         )
     }
+}
+
+/// Publish a newly created name. Errors are fatal to creation, never a no-op fallback.
+/// Windows requires a writable directory handle; read-only handles cannot be flushed.
+pub(super) fn sync_parent_directory(
+    path: &Path,
+    faults: &dyn FaultInjector,
+    before: FaultPoint,
+    after: FaultPoint,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    faults.check(before)?;
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(0x0200_0000)
+            .open(parent)
+    };
+    #[cfg(unix)]
+    let directory = File::open(parent);
+    #[cfg(not(any(windows, unix)))]
+    let directory: io::Result<File> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory durability is unsupported on this platform",
+    ));
+    directory
+        .map_err(|error| io_error("open parent directory for sync", error))?
+        .sync_all()
+        .map_err(|error| io_error("sync parent directory", error))?;
+    faults.check(after)
 }
 
 pub(super) fn checked_page_offset(page_id: PageId, page_size: u32, max_bytes: u64) -> Result<u64> {

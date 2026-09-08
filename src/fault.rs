@@ -8,10 +8,18 @@ pub(crate) enum FaultPoint {
     AfterMainPageWrite,
     BeforeMainSync,
     AfterMainSync,
+    BeforeMainDirectorySync,
+    AfterMainDirectorySync,
+    BeforeWalDirectorySync,
+    AfterWalDirectorySync,
     BeforeSuperblockWrite,
     AfterSuperblockWrite,
     BeforeWalRecordWrite,
     AfterWalRecordWrite,
+    AfterWalRecordHeaderPrefixWrite,
+    AfterWalRecordPayloadPrefixWrite,
+    BeforeWalPublish,
+    AfterWalPublish,
     BeforeWalHeaderWrite,
     AfterWalHeaderWrite,
     BeforeWalSync,
@@ -22,6 +30,12 @@ pub(crate) enum FaultPoint {
 
 pub(crate) trait FaultInjector: Send + Sync {
     fn check(&self, point: FaultPoint) -> Result<()>;
+
+    // Publication is not I/O: observers may record or terminate the process, but
+    // cannot turn an already durable, prevalidated commit into a recoverable error.
+    fn observe_publication(&self, point: FaultPoint) {
+        let _ = self.check(point);
+    }
 }
 
 pub(crate) struct NoFaults;
