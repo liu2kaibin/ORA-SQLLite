@@ -3,10 +3,26 @@ use crate::{DbError, ErrorCode, Result};
 const CHECKSUM_OFFSET: usize = 36;
 const CHECKSUM_LEN: usize = 4;
 
+pub(super) struct Crc32c(u32);
+
+impl Crc32c {
+    pub(super) const fn new() -> Self {
+        Self(!0)
+    }
+
+    pub(super) fn update(&mut self, bytes: &[u8]) {
+        crc32c_update(&mut self.0, bytes);
+    }
+
+    pub(super) const fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
 pub(super) fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    crc32c_update(&mut crc, bytes);
-    !crc
+    let mut crc = Crc32c::new();
+    crc.update(bytes);
+    crc.finish()
 }
 
 fn crc32c_update(crc: &mut u32, bytes: &[u8]) {
@@ -43,11 +59,11 @@ pub(super) fn verify_page_checksum(bytes: &[u8]) -> Result<()> {
 }
 
 fn checksum_with_zeroed_field(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    crc32c_update(&mut crc, &bytes[..CHECKSUM_OFFSET]);
-    crc32c_update(&mut crc, &[0; CHECKSUM_LEN]);
-    crc32c_update(&mut crc, &bytes[CHECKSUM_OFFSET + CHECKSUM_LEN..]);
-    !crc
+    let mut crc = Crc32c::new();
+    crc.update(&bytes[..CHECKSUM_OFFSET]);
+    crc.update(&[0; CHECKSUM_LEN]);
+    crc.update(&bytes[CHECKSUM_OFFSET + CHECKSUM_LEN..]);
+    crc.finish()
 }
 
 fn validate_page_size(page_len: usize) -> Result<()> {
@@ -65,6 +81,15 @@ fn corruption(message: &'static str) -> DbError {
 #[test]
 fn crc32c_matches_standard_vector() {
     assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+}
+
+#[test]
+fn streaming_crc32c_matches_the_same_bytes_in_one_slice() {
+    let mut checksum = Crc32c::new();
+    checksum.update(b"123");
+    checksum.update(b"");
+    checksum.update(b"456789");
+    assert_eq!(checksum.finish(), 0xe306_9283);
 }
 
 #[test]

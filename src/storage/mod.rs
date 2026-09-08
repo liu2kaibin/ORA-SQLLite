@@ -1,5 +1,6 @@
 pub(super) mod btree;
 mod cache;
+mod checkpoint;
 mod checksum;
 mod codec;
 mod file;
@@ -9,7 +10,9 @@ mod overflow;
 mod page;
 mod pager;
 mod slotted;
+mod snapshot;
 mod validate;
+mod wal;
 
 #[cfg(test)]
 mod test_support;
@@ -55,7 +58,7 @@ impl PageRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Lsn(pub(super) u64);
 
 #[test]

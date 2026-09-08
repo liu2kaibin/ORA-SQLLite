@@ -160,20 +160,12 @@ pub(super) fn load_node(
     reference: PageRef,
 ) -> Result<Node> {
     let handle = source.read_page(reference)?;
-    let mut frame = {
-        let cached = handle.try_borrow().map_err(|_| {
-            DbError::new(
-                ErrorCode::Busy,
-                "B+Tree node is mutably borrowed by another cache handle",
-            )
-        })?;
-        crate::storage::page::PageFrame::decode(
-            cached.bytes().to_vec(),
-            reference.page_id(),
-            None,
-            Some(reference.generation()),
-        )?
-    };
+    let mut frame = crate::storage::page::PageFrame::decode(
+        handle.bytes().to_vec(),
+        reference.page_id(),
+        None,
+        Some(reference.generation()),
+    )?;
     if frame.header().page_id() != reference.page_id()
         || frame.header().generation() != reference.generation()
     {
@@ -461,7 +453,7 @@ mod tests {
         slotted::SlottedPage,
         test_support::test_pager,
     };
-    use crate::{DbError, ErrorCode, Result};
+    use crate::{ErrorCode, Result};
 
     #[test]
     fn internal_routing_uses_last_separator_not_greater_than_key() {
@@ -480,7 +472,7 @@ mod tests {
 
     #[test]
     fn point_lookup_returns_the_exact_inline_leaf_value() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"ant", b"one"), (b"bee", b"two")]);
@@ -492,16 +484,17 @@ mod tests {
             root,
         };
 
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         assert_eq!(
-            tree.get(&mut pager, b"bee").expect("point lookup"),
+            tree.get(&mut snapshot, b"bee").expect("point lookup"),
             Some(b"two".to_vec())
         );
-        assert_eq!(tree.get(&mut pager, b"cat").expect("missing key"), None);
+        assert_eq!(tree.get(&mut snapshot, b"cat").expect("missing key"), None);
     }
 
     #[test]
     fn held_clean_handle_allows_point_and_range_search_without_a_refcell_panic() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let tree = {
             let mut batch = pager.begin_write().expect("begin tree batch");
             let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
@@ -513,11 +506,15 @@ mod tests {
             tree
         };
         let handle = pager.read(tree.root()).expect("hold clean root handle");
-        let held_frame = handle.borrow();
+        let _held_frame = handle.as_ref();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let point = tree.get(&mut pager, b"bee")?;
-            let mut cursor =
-                tree.scan(&mut pager, Bound::Included(b"ant"), Bound::Included(b"cat"))?;
+            let mut snapshot = pager.begin_read()?;
+            let point = tree.get(&mut snapshot, b"bee")?;
+            let mut cursor = tree.scan(
+                &mut snapshot,
+                Bound::Included(b"ant"),
+                Bound::Included(b"cat"),
+            )?;
             let mut rows = Vec::new();
             while let Some(row) = cursor.next()? {
                 rows.push(row);
@@ -538,12 +535,11 @@ mod tests {
                 ],
             )
         );
-        drop(held_frame);
     }
 
     #[test]
     fn write_batch_overlay_is_visible_to_point_and_bounded_range_reads() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let mut batch = pager.begin_write().expect("begin uncommitted write");
         let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
         tree.insert(&mut batch, b"ant", b"one")
@@ -594,7 +590,7 @@ mod tests {
 
     #[test]
     fn point_lookup_rejects_keys_longer_than_the_disk_limit() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let tree = {
             let mut batch = pager.begin_write().expect("begin write");
             let tree = BTree::create(&mut batch, TreeKind::Table).expect("empty tree");
@@ -602,8 +598,9 @@ mod tests {
             tree
         };
 
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         assert_eq!(
-            tree.get(&mut pager, &[0; 1025])
+            tree.get(&mut snapshot, &[0; 1025])
                 .expect_err("keys over 1024 bytes are invalid")
                 .code(),
             ErrorCode::Type
@@ -614,11 +611,12 @@ mod tests {
     fn range_scan_applies_inclusive_start_and_exclusive_end_across_leaf_pages() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_leaf_tree(&mut pager);
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
             collect_scan(
                 &tree,
-                &mut pager,
+                &mut snapshot,
                 Bound::Included(b"bee"),
                 Bound::Excluded(b"eel"),
             ),
@@ -634,9 +632,15 @@ mod tests {
     fn range_scan_supports_unbounded_start_and_inclusive_end() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_leaf_tree(&mut pager);
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            collect_scan(&tree, &mut pager, Bound::Unbounded, Bound::Included(b"cat"),),
+            collect_scan(
+                &tree,
+                &mut snapshot,
+                Bound::Unbounded,
+                Bound::Included(b"cat"),
+            ),
             vec![
                 (b"ant".to_vec(), b"one".to_vec()),
                 (b"bee".to_vec(), b"two".to_vec()),
@@ -649,11 +653,12 @@ mod tests {
     fn range_scan_excludes_an_existing_start_key() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_leaf_tree(&mut pager);
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
             collect_scan(
                 &tree,
-                &mut pager,
+                &mut snapshot,
                 Bound::Excluded(b"bee"),
                 Bound::Included(b"dog"),
             ),
@@ -668,7 +673,8 @@ mod tests {
     fn streaming_cursor_loads_each_visited_leaf_at_most_once() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_leaf_tree(&mut pager);
-        let mut source = CountingSource::new(&mut pager);
+        let snapshot = pager.begin_read().expect("begin read snapshot");
+        let mut source = CountingSource::new(snapshot);
         let mut cursor = tree
             .scan(&mut source, Bound::Unbounded, Bound::Unbounded)
             .expect("start full streaming scan");
@@ -694,13 +700,15 @@ mod tests {
     fn point_lookup_descends_three_levels_when_a_separator_equals_the_key() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_level_tree(&mut pager);
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            tree.get(&mut pager, b"m").expect("equal separator lookup"),
+            tree.get(&mut snapshot, b"m")
+                .expect("equal separator lookup"),
             Some(b"middle".to_vec())
         );
         assert_eq!(
-            tree.get(&mut pager, b"ant").expect("leftmost lookup"),
+            tree.get(&mut snapshot, b"ant").expect("leftmost lookup"),
             Some(b"one".to_vec())
         );
     }
@@ -709,9 +717,10 @@ mod tests {
     fn range_scan_descends_to_the_leftmost_leaf_of_a_three_level_tree() {
         let (_temp, mut pager) = test_pager(4096).expect("test pager");
         let tree = three_level_tree(&mut pager);
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            collect_scan(&tree, &mut pager, Bound::Unbounded, Bound::Unbounded),
+            collect_scan(&tree, &mut snapshot, Bound::Unbounded, Bound::Unbounded),
             vec![
                 (b"ant".to_vec(), b"one".to_vec()),
                 (b"bee".to_vec(), b"two".to_vec()),
@@ -723,7 +732,7 @@ mod tests {
 
     #[test]
     fn point_lookup_reads_an_overflow_value_from_the_pager_chain() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let value = vec![0x5a; 4097];
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
@@ -742,16 +751,17 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            tree.get(&mut pager, b"blob").expect("overflow lookup"),
+            tree.get(&mut snapshot, b"blob").expect("overflow lookup"),
             Some(value)
         );
     }
 
     #[test]
     fn point_lookup_rejects_a_cycle_in_internal_links() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = batch
@@ -768,9 +778,10 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            tree.get(&mut pager, b"key")
+            tree.get(&mut snapshot, b"key")
                 .expect_err("cyclic internal links must fail")
                 .code(),
             ErrorCode::Corruption
@@ -779,7 +790,7 @@ mod tests {
 
     #[test]
     fn point_lookup_rejects_leaf_cells_that_are_not_strictly_ordered() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"bee", b"two"), (b"ant", b"one")]);
@@ -790,9 +801,10 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            tree.get(&mut pager, b"ant")
+            tree.get(&mut snapshot, b"ant")
                 .expect_err("unordered leaf keys must fail")
                 .code(),
             ErrorCode::Corruption
@@ -801,7 +813,7 @@ mod tests {
 
     #[test]
     fn point_lookup_rejects_internal_cells_that_are_not_strictly_ordered() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let left = write_leaf(&mut batch, &[(b"ant", b"one")]);
@@ -814,9 +826,10 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            tree.get(&mut pager, b"m")
+            tree.get(&mut snapshot, b"m")
                 .expect_err("unordered internal keys must fail")
                 .code(),
             ErrorCode::Corruption
@@ -825,7 +838,7 @@ mod tests {
 
     #[test]
     fn point_lookup_rejects_a_root_with_the_wrong_tree_kind_page_type() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = batch
@@ -840,9 +853,10 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
 
         assert_eq!(
-            tree.get(&mut pager, b"key")
+            tree.get(&mut snapshot, b"key")
                 .expect_err("wrong B+Tree page type must fail")
                 .code(),
             ErrorCode::Corruption
@@ -851,7 +865,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_a_leaf_sibling_cycle() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"ant", b"one")]);
@@ -863,8 +877,9 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         let mut cursor = tree
-            .scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            .scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
             .expect("start scan");
 
         assert_eq!(
@@ -882,7 +897,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_a_non_leaf_sibling_target() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"ant", b"one")]);
@@ -895,8 +910,9 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         let mut cursor = tree
-            .scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            .scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
             .expect("start scan");
 
         assert!(cursor.next().expect("first leaf row").is_some());
@@ -911,7 +927,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_a_sibling_generation_mismatch() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"ant", b"one")]);
@@ -926,8 +942,9 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         let mut cursor = tree
-            .scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            .scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
             .expect("start scan");
 
         assert!(cursor.next().expect("first leaf row").is_some());
@@ -942,7 +959,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_leaf_chains_with_decreasing_first_keys() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"zoo", b"last")]);
@@ -955,8 +972,9 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         let mut cursor = tree
-            .scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            .scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
             .expect("start scan");
 
         assert!(cursor.next().expect("first leaf row").is_some());
@@ -971,7 +989,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_leaf_chains_with_duplicate_boundary_keys() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let root = {
             let mut batch = pager.begin_write().expect("begin write");
             let root = write_leaf(&mut batch, &[(b"bee", b"left")]);
@@ -984,8 +1002,9 @@ mod tests {
             kind: TreeKind::Table,
             root,
         };
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         let mut cursor = tree
-            .scan(&mut pager, Bound::Unbounded, Bound::Unbounded)
+            .scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)
             .expect("start scan");
 
         assert_eq!(
@@ -1003,7 +1022,7 @@ mod tests {
 
     #[test]
     fn scan_rejects_bounds_with_keys_longer_than_the_disk_limit() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let tree = {
             let mut batch = pager.begin_write().expect("begin write");
             let tree = BTree::create(&mut batch, TreeKind::Table).expect("empty tree");
@@ -1011,7 +1030,8 @@ mod tests {
             tree
         };
 
-        let error = match tree.scan(&mut pager, Bound::Included(&[0; 1025]), Bound::Unbounded) {
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
+        let error = match tree.scan(&mut snapshot, Bound::Included(&[0; 1025]), Bound::Unbounded) {
             Ok(_) => panic!("oversized start key must fail"),
             Err(error) => error,
         };
@@ -1124,28 +1144,24 @@ mod tests {
         rows
     }
 
-    struct CountingSource<'a> {
-        pager: &'a mut Pager,
+    struct CountingSource {
+        snapshot: crate::storage::pager::ReadSnapshot,
         leaf_loads: BTreeMap<PageId, usize>,
     }
 
-    impl<'a> CountingSource<'a> {
-        fn new(pager: &'a mut Pager) -> Self {
+    impl CountingSource {
+        fn new(snapshot: crate::storage::pager::ReadSnapshot) -> Self {
             Self {
-                pager,
+                snapshot,
                 leaf_loads: BTreeMap::new(),
             }
         }
     }
 
-    impl PageSource for CountingSource<'_> {
+    impl PageSource for CountingSource {
         fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
-            let handle = self.pager.read(reference)?;
-            let page_type = handle
-                .try_borrow()
-                .map_err(|_| DbError::new(ErrorCode::Busy, "counted page is mutably borrowed"))?
-                .header()
-                .page_type();
+            let handle = self.snapshot.read(reference)?;
+            let page_type = handle.header().page_type();
             if matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf) {
                 *self.leaf_loads.entry(reference.page_id()).or_default() += 1;
             }
@@ -1153,7 +1169,7 @@ mod tests {
         }
 
         fn page_count(&self) -> Result<u64> {
-            Ok(self.pager.page_count())
+            self.snapshot.page_count()
         }
     }
 }

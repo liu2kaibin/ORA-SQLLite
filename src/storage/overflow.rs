@@ -149,7 +149,7 @@ fn walk_chain(
         }
 
         let handle = source.read_page(current)?;
-        let frame = handle.borrow();
+        let frame = handle.as_ref();
         if frame.header().page_id() != current.page_id()
             || frame.header().generation() != current.generation()
         {
@@ -157,8 +157,8 @@ fn walk_chain(
                 "overflow page reference does not match the loaded page",
             ));
         }
-        let body = OverflowBody::decode(&frame)?;
-        let chunk = body.chunk(&frame)?;
+        let body = OverflowBody::decode(frame)?;
+        let chunk = body.chunk(frame)?;
         value_len = value_len
             .checked_add(
                 u64::try_from(chunk.len())
@@ -305,7 +305,7 @@ fn corruption(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+    use std::{collections::BTreeMap, sync::Arc};
 
     use super::{collect_chain, read_value, release_chain, write_value};
     use crate::{ErrorCode, Result};
@@ -313,9 +313,10 @@ mod tests {
     use super::super::{
         PageId, PageRef,
         cache::PageHandle,
+        file::OpenMode,
         page::{PageFrame, PageType},
-        pager::PageSource,
-        test_support::test_pager,
+        pager::{PageSource, Pager, PagerConfig},
+        test_support::{TempDatabase, test_pager},
     };
 
     const CHUNK_OFFSET: usize = 72;
@@ -323,7 +324,7 @@ mod tests {
     #[test]
     fn overflow_round_trips_and_releases_multiple_pages() {
         let value = vec![0x6d; 9000];
-        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
         let first = {
             let mut batch = pager.begin_write().expect("begin overflow write");
             let first = write_value(&mut batch, &value)
@@ -333,11 +334,12 @@ mod tests {
             first
         };
 
+        let mut snapshot = pager.begin_read().expect("begin read snapshot");
         assert_eq!(
-            read_value(&mut pager, first, value.len() as u64).expect("read overflow value"),
+            read_value(&mut snapshot, first, value.len() as u64).expect("read overflow value"),
             value
         );
-        let chain = collect_chain(&mut pager, first, 9000).expect("collect overflow chain");
+        let chain = collect_chain(&mut snapshot, first, 9000).expect("collect overflow chain");
         assert_eq!(chain.len(), 3);
 
         {
@@ -364,7 +366,7 @@ mod tests {
     #[test]
     fn overflow_round_trips_one_page_boundaries() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager) = test_pager(page_size).expect("create test pager");
+            let (_temp, pager) = test_pager(page_size).expect("create test pager");
             let before = pager.page_count();
             let empty = {
                 let mut batch = pager.begin_write().expect("begin empty value write");
@@ -379,7 +381,7 @@ mod tests {
                 usize::try_from(page_size).expect("test page size fits usize") - CHUNK_OFFSET;
             for len in [1, capacity, capacity + 1] {
                 let value = vec![0x3a; len];
-                let (_temp, mut pager) = test_pager(page_size).expect("create test pager");
+                let (_temp, pager) = test_pager(page_size).expect("create test pager");
                 let first = {
                     let mut batch = pager.begin_write().expect("begin overflow write");
                     let first = write_value(&mut batch, &value)
@@ -389,12 +391,13 @@ mod tests {
                     first
                 };
 
+                let mut snapshot = pager.begin_read().expect("begin read snapshot");
                 assert_eq!(
-                    read_value(&mut pager, first, len as u64).expect("read overflow value"),
+                    read_value(&mut snapshot, first, len as u64).expect("read overflow value"),
                     value
                 );
                 assert_eq!(
-                    collect_chain(&mut pager, first, len as u64)
+                    collect_chain(&mut snapshot, first, len as u64)
                         .expect("collect overflow chain")
                         .len(),
                     if len <= capacity { 1 } else { 2 }
@@ -406,7 +409,7 @@ mod tests {
     #[test]
     fn batch_overlay_reads_a_multi_page_overflow_chain_before_commit() {
         let value = vec![0x27; 9000];
-        let (_temp, mut pager) = test_pager(4096).expect("create test pager");
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
         let mut batch = pager.begin_write().expect("begin overflow write");
         let first = write_value(&mut batch, &value)
             .expect("write overflow value")
@@ -587,8 +590,17 @@ mod tests {
 
     #[test]
     fn malformed_dirty_overflow_body_rejects_commit_before_file_io() {
-        let (temp, mut pager) = test_pager(4096).expect("create test pager");
+        let temp = TempDatabase::new("overflow-invalid-body");
+        let pager =
+            Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create test pager");
+        drop(pager);
         let before = std::fs::read(temp.path()).expect("read database before invalid commit");
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .expect("reopen test pager");
         let error = {
             let mut batch = pager.begin_write().expect("begin overflow write");
             let first = write_value(&mut batch, b"x")
@@ -605,11 +617,12 @@ mod tests {
         };
 
         assert_eq!(error.code(), ErrorCode::Corruption);
+        assert!(!pager.is_poisoned());
+        drop(pager);
         assert_eq!(
             std::fs::read(temp.path()).expect("read database after invalid commit"),
             before
         );
-        assert!(!pager.is_poisoned());
     }
 
     fn read_from_source(
@@ -638,7 +651,7 @@ mod tests {
                 None,
                 Some(reference.generation()),
             )?;
-            Ok(Rc::new(RefCell::new(frame)))
+            Ok(Arc::new(frame))
         }
 
         fn page_count(&self) -> Result<u64> {

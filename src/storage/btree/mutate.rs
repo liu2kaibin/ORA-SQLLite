@@ -190,7 +190,7 @@ fn repair_after_delete(
             return Ok(());
         }
 
-        let page_len = batch.read(current_ref)?.borrow().bytes().len();
+        let page_len = batch.read(current_ref)?.bytes().len();
         if !node_is_underfull(page_len, &current)? {
             rewrite_node(batch, current_ref, &current)?;
             let minimum = node_minimum(batch, kind, &current)?;
@@ -595,20 +595,12 @@ fn cell_fits_target(
     encoded_len: usize,
 ) -> Result<bool> {
     let handle = batch.read(reference)?;
-    let mut frame = {
-        let cached = handle.try_borrow().map_err(|_| {
-            DbError::new(
-                ErrorCode::Busy,
-                "B+Tree target page is mutably borrowed by another cache handle",
-            )
-        })?;
-        PageFrame::decode(
-            cached.bytes().to_vec(),
-            reference.page_id(),
-            None,
-            Some(reference.generation()),
-        )?
-    };
+    let mut frame = PageFrame::decode(
+        handle.bytes().to_vec(),
+        reference.page_id(),
+        None,
+        Some(reference.generation()),
+    )?;
     let free = SlottedPage::open(&mut frame, metadata_end)?.compacted_free()?;
     Ok(encoded_len
         .checked_add(SLOT_LEN)
@@ -622,7 +614,7 @@ fn write_or_split_leaf(
     leaf: LeafNode,
 ) -> Result<Option<Split>> {
     let encoded = encode_leaf_cells(&leaf.cells)?;
-    let page_len = batch.read(left_ref)?.borrow().bytes().len();
+    let page_len = batch.read(left_ref)?.bytes().len();
     if encoded_cells_fit(page_len, LEAF_METADATA_END, &encoded)? {
         rewrite_leaf(batch, left_ref, leaf.right_sibling, &leaf.cells)?;
         return Ok(None);
@@ -651,7 +643,7 @@ fn write_or_split_internal(
     node: InternalNode,
 ) -> Result<Option<Split>> {
     let encoded = encode_internal_cells(&node.cells)?;
-    let page_len = batch.read(left_ref)?.borrow().bytes().len();
+    let page_len = batch.read(left_ref)?.bytes().len();
     if encoded_cells_fit(page_len, INTERNAL_METADATA_END, &encoded)? {
         rewrite_internal(batch, left_ref, node.leftmost, &node.cells)?;
         return Ok(None);
@@ -825,7 +817,7 @@ mod tests {
 
     #[test]
     fn insert_rejects_duplicate_physical_key() {
-        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let (_temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
         tree.insert(&mut batch, b"k", b"v1").unwrap();
@@ -837,7 +829,7 @@ mod tests {
 
     #[test]
     fn held_clean_handle_allows_insert_without_a_refcell_panic() {
-        let (_temp, mut pager) = test_pager(4096).expect("test pager");
+        let (_temp, pager) = test_pager(4096).expect("test pager");
         let mut tree = {
             let mut batch = pager.begin_write().expect("begin seed write");
             let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
@@ -847,7 +839,7 @@ mod tests {
             tree
         };
         let handle = pager.read(tree.root()).expect("hold clean root handle");
-        let held_frame = handle.borrow();
+        let _held_frame = handle.as_ref();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut batch = pager.begin_write()?;
             tree.insert(&mut batch, b"b", b"two")?;
@@ -857,12 +849,11 @@ mod tests {
         result
             .expect("insert must not panic while a clean frame is immutably borrowed")
             .expect("insert must retain normal supported behavior");
-        drop(held_frame);
     }
 
     #[test]
     fn delete_returns_value_and_missing_key_is_noop() {
-        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let (_temp, pager) = test_pager(4096).unwrap();
         let mut tree = {
             let mut batch = pager.begin_write().unwrap();
             let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
@@ -882,12 +873,16 @@ mod tests {
             Some(vec![150u32 as u8; 40])
         );
         batch.commit().unwrap();
-        assert_eq!(tree.get(&mut pager, &150u32.to_be_bytes()).unwrap(), None);
+        let mut snapshot = pager.begin_read().unwrap();
+        assert_eq!(
+            tree.get(&mut snapshot, &150u32.to_be_bytes()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn missing_delete_preserves_an_unregistered_tree_and_existing_batch_state() {
-        let (_temp, mut pager) = test_pager(4096).expect("create pager");
+        let (_temp, pager) = test_pager(4096).expect("create pager");
         let tree = {
             let mut batch = pager.begin_write().expect("begin tree batch");
             let tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
@@ -924,7 +919,6 @@ mod tests {
             batch
                 .read(existing)
                 .expect("existing unrelated batch page")
-                .borrow()
                 .header()
                 .page_type(),
             TreeKind::Index.leaf_page_type()
@@ -953,7 +947,7 @@ mod tests {
     #[test]
     fn delete_returns_overflow_value_and_releases_the_whole_chain() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager) = test_pager(page_size).unwrap();
+            let (_temp, pager) = test_pager(page_size).unwrap();
             let value = vec![0x5a; usize::try_from(page_size).unwrap() * 3];
             let (mut tree, overflow_pages) = {
                 let mut batch = pager.begin_write().unwrap();
@@ -1012,7 +1006,7 @@ mod tests {
     #[test]
     fn deletion_error_restores_partially_staged_overflow_releases() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager) = test_pager(page_size).unwrap();
+            let (_temp, pager) = test_pager(page_size).unwrap();
             let value = vec![0x6b; usize::try_from(page_size).unwrap() * 3];
             let (mut tree, first, chain) = {
                 let mut batch = pager.begin_write().unwrap();
@@ -1075,7 +1069,8 @@ mod tests {
                 );
                 batch.commit().unwrap();
             }
-            assert_eq!(tree.get(&mut pager, b"a").unwrap(), Some(value));
+            let mut snapshot = pager.begin_read().unwrap();
+            assert_eq!(tree.get(&mut snapshot, b"a").unwrap(), Some(value));
             let mut batch = pager.begin_write().unwrap();
             let appended = batch.allocate(TreeKind::Table.leaf_page_type()).unwrap();
             assert!(
@@ -1089,7 +1084,7 @@ mod tests {
 
     #[test]
     fn deleting_to_empty_shrinks_to_one_leaf_root() {
-        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let (_temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
         for i in 0..600u32 {
@@ -1109,7 +1104,7 @@ mod tests {
     #[test]
     fn leaf_borrows_from_left_then_right_at_every_page_size() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager, mut tree, left_ref, right_ref) =
+            let (_temp, pager, mut tree, left_ref, right_ref) =
                 committed_two_leaf_tree(page_size, 5, 3).unwrap();
             let mut batch = pager.begin_write().unwrap();
             assert_eq!(
@@ -1125,7 +1120,7 @@ mod tests {
             assert_exact_separators(&mut batch, &tree).unwrap();
             assert_eq!(leaf_right_sibling(&mut batch, left_ref), Some(right_ref));
 
-            let (_temp, mut pager, mut tree, left_ref, right_ref) =
+            let (_temp, pager, mut tree, left_ref, right_ref) =
                 committed_two_leaf_tree(page_size, 3, 5).unwrap();
             let mut batch = pager.begin_write().unwrap();
             assert_eq!(
@@ -1145,7 +1140,7 @@ mod tests {
 
     #[test]
     fn right_borrow_into_an_empty_nonleftmost_leaf_refreshes_its_parent_separator() {
-        let (_temp, mut pager, mut tree, left, middle, right) =
+        let (_temp, pager, mut tree, left, middle, right) =
             committed_three_leaf_tree(4096, 3, 1, 7).expect("create three-leaf tree");
         let mut batch = pager.begin_write().expect("begin delete batch");
 
@@ -1163,7 +1158,7 @@ mod tests {
     #[test]
     fn equal_cost_borrow_and_merge_prefer_the_left_sibling() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager, mut tree, left, middle, right) =
+            let (_temp, pager, mut tree, left, middle, right) =
                 committed_three_leaf_tree(page_size, 5, 3, 5).unwrap();
             let mut batch = pager.begin_write().unwrap();
             tree.delete(&mut batch, &small_key(5)).unwrap();
@@ -1172,7 +1167,7 @@ mod tests {
             assert_eq!(leaf_keys(&mut batch, right), vec![8, 9, 10, 11, 12]);
             assert_exact_separators(&mut batch, &tree).unwrap();
 
-            let (_temp, mut pager, mut tree, left, _middle, right) =
+            let (_temp, pager, mut tree, left, _middle, right) =
                 committed_three_leaf_tree(page_size, 3, 3, 3).unwrap();
             let mut batch = pager.begin_write().unwrap();
             tree.delete(&mut batch, &small_key(3)).unwrap();
@@ -1186,7 +1181,7 @@ mod tests {
     #[test]
     fn leaf_merge_shrinks_root_and_delays_reuse_at_every_page_size() {
         for page_size in [4096, 8192, 16384] {
-            let (_temp, mut pager, mut tree, left_ref, right_ref) =
+            let (_temp, pager, mut tree, left_ref, right_ref) =
                 committed_two_leaf_tree(page_size, 3, 3).unwrap();
             let old_root = tree.root();
             let appended = {
@@ -1251,7 +1246,7 @@ mod tests {
 
     #[test]
     fn deleting_a_catalog_root_can_shrink_to_its_left_leaf() {
-        let (_temp, mut pager, mut tree, left_ref, _right_ref) =
+        let (_temp, pager, mut tree, left_ref, _right_ref) =
             committed_two_leaf_tree(4096, 3, 3).expect("create two-leaf tree");
         let old_root = tree.root();
         {
@@ -1281,8 +1276,9 @@ mod tests {
             batch.commit().expect("commit catalog root shrink");
         }
 
+        let mut snapshot = pager.begin_read().expect("begin catalog snapshot");
         assert_eq!(
-            pager
+            snapshot
                 .catalog_tree(TreeKind::Table)
                 .expect("read catalog root")
                 .expect("catalog root is present")
@@ -1295,7 +1291,7 @@ mod tests {
     fn internal_nodes_borrow_from_both_sides_at_every_page_size() {
         for page_size in [4096, 8192, 16384] {
             let minimum_cells = minimum_large_internal_cells(page_size);
-            let (_temp, mut pager, mut tree, left_internal, right_internal, delete_key) =
+            let (_temp, pager, mut tree, left_internal, right_internal, delete_key) =
                 committed_three_level_tree(page_size, minimum_cells + 2, minimum_cells).unwrap();
             let mut batch = pager.begin_write().unwrap();
             assert!(tree.delete(&mut batch, &delete_key).unwrap().is_some());
@@ -1309,10 +1305,12 @@ mod tests {
             );
             assert_exact_separators(&mut batch, &tree).unwrap();
 
-            let (_temp, mut pager, mut tree, left_internal, right_internal, _) =
+            let (_temp, pager, mut tree, left_internal, right_internal, _) =
                 committed_three_level_tree(page_size, minimum_cells, minimum_cells + 2).unwrap();
-            let delete_key =
-                last_key_in_internal(&mut pager, TreeKind::Table, left_internal).unwrap();
+            let delete_key = {
+                let mut snapshot = pager.begin_read().unwrap();
+                last_key_in_internal(&mut snapshot, TreeKind::Table, left_internal).unwrap()
+            };
             let mut batch = pager.begin_write().unwrap();
             assert!(tree.delete(&mut batch, &delete_key).unwrap().is_some());
             assert_eq!(
@@ -1331,7 +1329,7 @@ mod tests {
     fn internal_merge_cascades_and_shrinks_root_at_every_page_size() {
         for page_size in [4096, 8192, 16384] {
             let minimum_cells = minimum_large_internal_cells(page_size);
-            let (_temp, mut pager, mut tree, left_internal, right_internal, delete_key) =
+            let (_temp, pager, mut tree, left_internal, right_internal, delete_key) =
                 committed_three_level_tree(page_size, minimum_cells, minimum_cells).unwrap();
             let old_root = tree.root();
             let expected_key_count = 2 * (minimum_cells + 1) - 1;
@@ -1350,7 +1348,8 @@ mod tests {
                 assert_exact_separators(&mut batch, &tree).unwrap();
                 batch.commit().unwrap();
             }
-            assert_eq!(tree.get(&mut pager, &delete_key).unwrap(), None);
+            let mut snapshot = pager.begin_read().unwrap();
+            assert_eq!(tree.get(&mut snapshot, &delete_key).unwrap(), None);
             let replacements = {
                 let mut batch = pager.begin_write().unwrap();
                 let pages = (0..2)
@@ -1385,7 +1384,7 @@ mod tests {
 
     #[test]
     fn inserts_grow_root_and_keep_all_values_visible() {
-        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let (_temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
         let old_root = tree.root();
@@ -1395,8 +1394,9 @@ mod tests {
         }
         assert_ne!(tree.root(), old_root);
         batch.commit().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
         assert_eq!(
-            tree.get(&mut pager, &599u32.to_be_bytes())
+            tree.get(&mut snapshot, &599u32.to_be_bytes())
                 .unwrap()
                 .unwrap(),
             vec![599u32 as u8; 40]
@@ -1405,14 +1405,15 @@ mod tests {
 
     #[test]
     fn large_values_round_trip_through_overflow_pages() {
-        let (_temp, mut pager) = test_pager(4096).unwrap();
+        let (_temp, pager) = test_pager(4096).unwrap();
         let value = vec![0x5a; 9000];
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
         tree.insert(&mut batch, b"large", &value).unwrap();
         batch.commit().unwrap();
 
-        assert_eq!(tree.get(&mut pager, b"large").unwrap(), Some(value));
+        let mut snapshot = pager.begin_read().unwrap();
+        assert_eq!(tree.get(&mut snapshot, b"large").unwrap(), Some(value));
     }
 
     #[test]
@@ -1432,7 +1433,7 @@ mod tests {
         let temp = TempDatabase::new("btree-mutation-rollback");
         let mut config = PagerConfig::test_default(4096);
         config.max_database_bytes = 3 * 4096;
-        let mut pager = Pager::create(temp.path(), config).unwrap();
+        let pager = Pager::create(temp.path(), config).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
 
@@ -1446,11 +1447,12 @@ mod tests {
         batch.commit().unwrap();
 
         assert_eq!(pager.page_count(), 2);
+        let mut snapshot = pager.begin_read().unwrap();
         assert_eq!(
-            tree.get(&mut pager, b"ok").unwrap(),
+            tree.get(&mut snapshot, b"ok").unwrap(),
             Some(b"value".to_vec())
         );
-        assert_eq!(tree.get(&mut pager, b"too-large").unwrap(), None);
+        assert_eq!(tree.get(&mut snapshot, b"too-large").unwrap(), None);
     }
 
     #[test]
@@ -1473,7 +1475,7 @@ mod tests {
     }
 
     fn verify_insert_order(page_size: u32, name: &str, order: &[u32]) -> Result<()> {
-        let (_temp, mut pager) = test_pager(page_size)?;
+        let (_temp, pager) = test_pager(page_size)?;
         let mut batch = pager.begin_write()?;
         let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
         let mut inserted = Vec::new();
@@ -1490,15 +1492,16 @@ mod tests {
         assert_all_visible(&mut batch, &tree, &inserted, name)?;
         assert_exact_separators(&mut batch, &tree)?;
         batch.commit()?;
+        let mut snapshot = pager.begin_read()?;
         for value in order {
             assert_eq!(
-                tree.get(&mut pager, &test_key(*value))?,
+                tree.get(&mut snapshot, &test_key(*value))?,
                 Some(test_value(*value)),
                 "{name} lookup failed at page size {page_size} for {value}"
             );
         }
         let mut scanned = Vec::new();
-        let mut cursor = tree.scan(&mut pager, Bound::Unbounded, Bound::Unbounded)?;
+        let mut cursor = tree.scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)?;
         while let Some((key, value)) = cursor.next()? {
             scanned.push((key, value));
         }
@@ -1627,7 +1630,7 @@ mod tests {
         left_count: u32,
         right_count: u32,
     ) -> Result<(TempDatabase, Pager, BTree, PageRef, PageRef)> {
-        let (temp, mut pager) = test_pager(page_size)?;
+        let (temp, pager) = test_pager(page_size)?;
         let mut batch = pager.begin_write()?;
         let left_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
         let right_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
@@ -1666,7 +1669,7 @@ mod tests {
         middle_count: u32,
         right_count: u32,
     ) -> Result<(TempDatabase, Pager, BTree, PageRef, PageRef, PageRef)> {
-        let (temp, mut pager) = test_pager(page_size)?;
+        let (temp, pager) = test_pager(page_size)?;
         let mut batch = pager.begin_write()?;
         let left_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
         let middle_ref = batch.allocate(TreeKind::Table.leaf_page_type())?;
@@ -1718,7 +1721,7 @@ mod tests {
         left_cells: usize,
         right_cells: usize,
     ) -> Result<(TempDatabase, Pager, BTree, PageRef, PageRef, Vec<u8>)> {
-        let (temp, mut pager) = test_pager(page_size)?;
+        let (temp, pager) = test_pager(page_size)?;
         let mut batch = pager.begin_write()?;
         let leaf_count = left_cells + right_cells + 2;
         let leaf_refs = (0..leaf_count)
@@ -1871,7 +1874,7 @@ mod tests {
     }
 
     fn insert_into_fragmented_leaf(value_len: usize) -> Result<ValueStorage> {
-        let (_temp, mut pager) = test_pager(4096)?;
+        let (_temp, pager) = test_pager(4096)?;
         let mut batch = pager.begin_write()?;
         let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
         let root = tree.root();

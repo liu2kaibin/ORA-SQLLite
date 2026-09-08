@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -17,13 +17,15 @@ use crate::{
 };
 
 use super::{
-    PageId, PageRef,
+    Lsn, PageId, PageRef,
     btree::{BTree, TreeKind},
     checksum::stamp_page_checksum,
-    file::OpenMode,
+    file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
+    header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
     pager::{PageSource, Pager, PagerConfig},
     validate::validate_tree,
+    wal::{Wal, wal_path},
 };
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -70,12 +72,19 @@ pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
 
 impl Drop for TempDatabase {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path) {
-            if error.kind() != ErrorKind::NotFound {
-                // Test cleanup is best effort; a later test must never remove a different path.
+        for path in [&self.path, &wal_path(&self.path)] {
+            if let Err(error) = fs::remove_file(path) {
+                if error.kind() != ErrorKind::NotFound {
+                    // Test cleanup is best effort; a later test must never remove a different path.
+                }
             }
         }
     }
+}
+
+pub(super) fn write_wal_fixture(database_path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(wal_path(database_path), bytes)
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("write WAL fixture: {error}")))
 }
 
 fn sanitized_label(label: &str) -> String {
@@ -125,8 +134,10 @@ fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_f
         "TempDatabase::new must retry immediately after the occupied first candidate"
     );
     let sentinel = database_path.with_extension("sentinel");
+    let wal = wal_path(&database_path);
     assert_ne!(database_path, collision);
     fs::write(&database_path, b"owned database file").expect("create owned file");
+    fs::write(&wal, b"owned WAL file").expect("create owned WAL file");
     fs::write(&sentinel, b"unrelated sentinel").expect("create sentinel file");
     drop(database);
 
@@ -139,11 +150,367 @@ fn temporary_database_skips_a_direct_name_collision_and_removes_only_its_exact_f
         "Drop must remove its exact generated filename"
     );
     assert!(
+        !wal.exists(),
+        "Drop must remove the WAL paired with its exact generated filename"
+    );
+    assert!(
         sentinel.exists(),
         "Drop must not remove an adjacent unrelated filename"
     );
     fs::remove_file(collision).expect("remove collision fixture");
     fs::remove_file(sentinel).expect("remove sentinel fixture");
+}
+
+#[test]
+fn multi_reader_single_writer_matches_reference_model() {
+    use std::{
+        sync::{Barrier, mpsc},
+        thread,
+    };
+
+    const FIRST_COMMIT: u64 = 1;
+    const FINAL_COMMIT: u64 = 20;
+
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Pager>();
+    assert_send::<super::pager::ReadSnapshot>();
+    assert_send_sync::<super::cache::PageHandle>();
+
+    let temp = TempDatabase::new("multi-reader-single-writer");
+    let pager = Arc::new(
+        Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .expect("create concurrent pager"),
+    );
+    let root = create_concurrency_table(&pager).expect("commit LSN-1 fixture");
+    assert_eq!(
+        pager.latest_lsn().expect("read fixture LSN"),
+        Lsn(FIRST_COMMIT)
+    );
+
+    let mut old_snapshot = pager.begin_read().expect("open LSN-1 snapshot");
+    assert_eq!(old_snapshot.lsn(), Lsn(FIRST_COMMIT));
+    let initial_model = BTreeMap::from([
+        (b"counter".to_vec(), vec![1]),
+        (b"stable".to_vec(), b"unchanged".to_vec()),
+    ]);
+    let start = Arc::new(Barrier::new(3));
+    let (old_commit_tx, old_commit_rx) = mpsc::sync_channel(0);
+    let (old_done_tx, old_done_rx) = mpsc::sync_channel(0);
+    let (fresh_commit_tx, fresh_commit_rx) = mpsc::sync_channel(0);
+    let (fresh_done_tx, fresh_done_rx) = mpsc::sync_channel(0);
+    let writer_initial_model = initial_model.clone();
+
+    let (final_model, old_observations, fresh_observations) = thread::scope(|scope| {
+        let writer_pager = Arc::clone(&pager);
+        let writer_start = Arc::clone(&start);
+        let writer = scope.spawn(move || -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+            let mut tree = BTree::from_root(TreeKind::Table, root);
+            let mut model = writer_initial_model;
+            writer_start.wait();
+            for commit in (FIRST_COMMIT + 1)..=FINAL_COMMIT {
+                let mut batch = writer_pager.begin_write()?;
+                let removed = tree.delete(&mut batch, b"counter")?;
+                assert_eq!(removed, model.remove(b"counter".as_slice()));
+                let value = vec![u8::try_from(commit).expect("test commit fits u8")];
+                tree.insert(&mut batch, b"counter", &value)?;
+                batch.track_tree(TreeKind::Table, tree.root())?;
+                batch.set_catalog_root(tree.root())?;
+                batch.commit()?;
+                model.insert(b"counter".to_vec(), value);
+
+                old_commit_tx
+                    .send(())
+                    .expect("old reader remains available");
+                fresh_commit_tx
+                    .send((Lsn(commit), model.clone()))
+                    .expect("fresh reader remains available");
+                old_done_rx.recv().expect("old reader completed commit");
+                fresh_done_rx.recv().expect("fresh reader completed commit");
+            }
+            Ok(model)
+        });
+
+        let old_start = Arc::clone(&start);
+        let old_reader = scope.spawn(move || -> Result<Vec<BTreeMap<Vec<u8>, Vec<u8>>>> {
+            let tree = BTree::from_root(TreeKind::Table, root);
+            let mut observations = Vec::new();
+            old_start.wait();
+            while old_commit_rx.recv().is_ok() {
+                let observed = collect_all(&tree, &mut old_snapshot)?.into_iter().collect();
+                observations.push(observed);
+                old_done_tx.send(()).expect("writer remains available");
+            }
+            Ok(observations)
+        });
+
+        let fresh_pager = Arc::clone(&pager);
+        let fresh_start = Arc::clone(&start);
+        let fresh_reader = scope.spawn(move || -> Result<Vec<_>> {
+            let tree = BTree::from_root(TreeKind::Table, root);
+            let mut observations = Vec::new();
+            fresh_start.wait();
+            while let Ok((expected_lsn, expected_model)) = fresh_commit_rx.recv() {
+                let mut snapshot = fresh_pager.begin_read()?;
+                let actual_lsn = snapshot.lsn();
+                let actual_model: BTreeMap<_, _> =
+                    collect_all(&tree, &mut snapshot)?.into_iter().collect();
+                observations.push((expected_lsn, actual_lsn, expected_model, actual_model));
+                fresh_done_tx.send(()).expect("writer remains available");
+            }
+            Ok(observations)
+        });
+
+        (
+            writer
+                .join()
+                .expect("writer thread must not panic")
+                .expect("writer commits"),
+            old_reader
+                .join()
+                .expect("old-reader thread must not panic")
+                .expect("old-reader observations"),
+            fresh_reader
+                .join()
+                .expect("fresh-reader thread must not panic")
+                .expect("fresh-reader observations"),
+        )
+    });
+
+    assert_eq!(old_observations.len(), 19);
+    for observed in old_observations {
+        assert_eq!(observed, initial_model, "LSN-1 snapshot must stay fixed");
+    }
+    assert_eq!(fresh_observations.len(), 19);
+    let mut previous_lsn = Lsn(FIRST_COMMIT);
+    for (expected_lsn, actual_lsn, expected_model, actual_model) in fresh_observations {
+        assert!(actual_lsn >= previous_lsn, "fresh snapshot LSN regressed");
+        assert_eq!(
+            actual_lsn, expected_lsn,
+            "reader must see the released commit"
+        );
+        assert_eq!(
+            actual_model, expected_model,
+            "fresh snapshot diverged from model"
+        );
+        previous_lsn = actual_lsn;
+    }
+
+    let tree = BTree::from_root(TreeKind::Table, root);
+    let mut final_snapshot = pager.begin_read().expect("open final snapshot");
+    assert_eq!(final_snapshot.lsn(), Lsn(FINAL_COMMIT));
+    let final_actual: BTreeMap<_, _> = collect_all(&tree, &mut final_snapshot)
+        .expect("scan final snapshot")
+        .into_iter()
+        .collect();
+    assert_eq!(final_actual, final_model);
+}
+
+#[test]
+fn unfinished_writer_is_busy_readers_progress_and_checkpoint_waits_for_rollback() {
+    use std::{sync::mpsc, thread};
+
+    let temp = TempDatabase::new("writer-checkpoint-contention");
+    let pager = Arc::new(
+        Pager::create(temp.path(), PagerConfig::test_default(4096))
+            .expect("create contention pager"),
+    );
+    let root = create_concurrency_table(&pager).expect("commit contention fixture");
+    let (writer_ready_tx, writer_ready_rx) = mpsc::sync_channel(0);
+    let (release_writer_tx, release_writer_rx) = mpsc::sync_channel(0);
+    let (checkpoint_go_tx, checkpoint_go_rx) = mpsc::sync_channel(0);
+    let (checkpoint_contended_tx, checkpoint_contended_rx) = mpsc::sync_channel(0);
+    let (checkpoint_done_tx, checkpoint_done_rx) = mpsc::sync_channel(0);
+
+    thread::scope(|scope| {
+        let writer_pager = Arc::clone(&pager);
+        let writer = scope.spawn(move || -> Result<()> {
+            let mut tree = BTree::from_root(TreeKind::Table, root);
+            let mut batch = writer_pager.begin_write()?;
+            assert_eq!(tree.delete(&mut batch, b"counter")?, Some(vec![1]));
+            tree.insert(&mut batch, b"counter", b"uncommitted")?;
+            writer_ready_tx
+                .send(())
+                .expect("contention driver remains available");
+            release_writer_rx
+                .recv()
+                .expect("contention driver releases writer");
+            drop(batch);
+            Ok(())
+        });
+
+        let checkpoint_pager = Arc::clone(&pager);
+        let checkpoint = scope.spawn(move || {
+            checkpoint_go_rx.recv().expect("checkpoint is started");
+            let result =
+                super::pager::checkpoint_after_writer_contention(&checkpoint_pager, || {
+                    checkpoint_contended_tx
+                        .send(())
+                        .expect("contention driver remains available");
+                });
+            checkpoint_done_tx
+                .send(result)
+                .expect("contention driver receives checkpoint result");
+        });
+
+        writer_ready_rx
+            .recv()
+            .expect("unfinished writer acquired guard");
+        let busy = match pager.try_begin_write() {
+            Ok(_) => panic!("second writer must not acquire the active writer guard"),
+            Err(error) => error,
+        };
+        assert_eq!(busy.code(), ErrorCode::Busy);
+
+        let tree = BTree::from_root(TreeKind::Table, root);
+        let mut reader = pager
+            .begin_read()
+            .expect("reader opens beside unfinished writer");
+        assert_eq!(reader.lsn(), Lsn(1));
+        assert_eq!(
+            tree.get(&mut reader, b"counter").expect("reader lookup"),
+            Some(vec![1])
+        );
+        drop(reader);
+
+        checkpoint_go_tx.send(()).expect("start checkpoint attempt");
+        checkpoint_contended_rx
+            .recv()
+            .expect("checkpoint observed the active writer before blocking");
+        release_writer_tx
+            .send(())
+            .expect("roll back unfinished writer");
+        writer
+            .join()
+            .expect("writer thread must not panic")
+            .expect("writer rollback");
+        let result = checkpoint_done_rx
+            .recv()
+            .expect("checkpoint completes after writer rollback")
+            .expect("checkpoint succeeds");
+        assert_eq!(result.to_lsn, Lsn(1));
+        checkpoint.join().expect("checkpoint thread must not panic");
+    });
+}
+
+#[test]
+#[ignore = "spawned by database_lock_is_process_wide_and_releases_windows_paths"]
+fn database_lock_child() {
+    let path = std::env::var_os("ORA_SQLLITE_LOCK_CHILD_PATH")
+        .expect("lock child database path is provided");
+    let expected =
+        std::env::var("ORA_SQLLITE_LOCK_CHILD_EXPECT").expect("lock child expectation is provided");
+    let marker_path = std::env::var_os("ORA_SQLLITE_LOCK_CHILD_MARKER_PATH")
+        .expect("lock child marker path is provided");
+    let nonce =
+        std::env::var("ORA_SQLLITE_LOCK_CHILD_NONCE").expect("lock child nonce is provided");
+    let opened = Pager::open(
+        Path::new(&path),
+        OpenMode::ReadWrite,
+        PagerConfig::test_default(4096),
+    );
+    match expected.as_str() {
+        "busy" => match opened {
+            Ok(_) => panic!("child unexpectedly acquired its parent's database lock"),
+            Err(error) => assert_eq!(error.code(), ErrorCode::Busy),
+        },
+        "open" => drop(opened.expect("child opens database after parent Pager drop")),
+        other => panic!("unknown lock child expectation: {other}"),
+    }
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker_path)
+        .expect("create unique lock child marker");
+    marker
+        .write_all(format!("{expected}:{nonce}").as_bytes())
+        .expect("write lock child marker");
+    marker.sync_all().expect("sync lock child marker");
+}
+
+#[test]
+fn database_lock_is_process_wide_and_releases_windows_paths() {
+    use std::process::Command;
+
+    let temp = TempDatabase::new("database-lock-process");
+    let database_path = temp.path().to_path_buf();
+    let wal = wal_path(&database_path);
+    let pager =
+        Pager::create(&database_path, PagerConfig::test_default(4096)).expect("create lock owner");
+    let executable = std::env::current_exe().expect("locate current test executable");
+    let busy_nonce = format!(
+        "{}-{}-busy",
+        std::process::id(),
+        NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed)
+    );
+    let busy_marker = database_path.with_extension(format!("{busy_nonce}.marker"));
+
+    let busy = Command::new(&executable)
+        .args([
+            "--exact",
+            "storage::test_support::database_lock_child",
+            "--ignored",
+        ])
+        .env("ORA_SQLLITE_LOCK_CHILD_PATH", &database_path)
+        .env("ORA_SQLLITE_LOCK_CHILD_EXPECT", "busy")
+        .env("ORA_SQLLITE_LOCK_CHILD_MARKER_PATH", &busy_marker)
+        .env("ORA_SQLLITE_LOCK_CHILD_NONCE", &busy_nonce)
+        .status()
+        .expect("run lock-contention child");
+    assert_eq!(
+        busy.code(),
+        Some(0),
+        "active owner must map child open to Busy"
+    );
+    verify_and_remove_lock_child_marker(&busy_marker, "busy", &busy_nonce);
+
+    drop(pager);
+    let open_nonce = format!(
+        "{}-{}-open",
+        std::process::id(),
+        NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed)
+    );
+    let open_marker = database_path.with_extension(format!("{open_nonce}.marker"));
+    let opened = Command::new(executable)
+        .args([
+            "--exact",
+            "storage::test_support::database_lock_child",
+            "--ignored",
+        ])
+        .env("ORA_SQLLITE_LOCK_CHILD_PATH", &database_path)
+        .env("ORA_SQLLITE_LOCK_CHILD_EXPECT", "open")
+        .env("ORA_SQLLITE_LOCK_CHILD_MARKER_PATH", &open_marker)
+        .env("ORA_SQLLITE_LOCK_CHILD_NONCE", &open_nonce)
+        .status()
+        .expect("run post-drop child");
+    assert_eq!(opened.code(), Some(0), "drop must release the process lock");
+    verify_and_remove_lock_child_marker(&open_marker, "open", &open_nonce);
+
+    fs::remove_file(&wal).expect("remove exact WAL path after child exit");
+    fs::remove_file(&database_path).expect("remove exact database path after child exit");
+    assert!(!database_path.exists());
+    assert!(!wal.exists());
+    assert!(!busy_marker.exists());
+    assert!(!open_marker.exists());
+}
+
+fn verify_and_remove_lock_child_marker(marker: &Path, mode: &str, nonce: &str) {
+    let contents = fs::read_to_string(marker)
+        .expect("lock child marker is missing; the exact helper may not have run");
+    fs::remove_file(marker).expect("remove exact lock child marker");
+    assert_eq!(contents, format!("{mode}:{nonce}"));
+}
+
+fn create_concurrency_table(pager: &Pager) -> Result<PageRef> {
+    let mut batch = pager.begin_write()?;
+    let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
+    tree.insert(&mut batch, b"counter", &[1])?;
+    tree.insert(&mut batch, b"stable", b"unchanged")?;
+    batch.track_tree(TreeKind::Table, tree.root())?;
+    batch.set_catalog_root(tree.root())?;
+    let root = tree.root();
+    batch.commit()?;
+    Ok(root)
 }
 
 struct RecordingFaults {
@@ -186,8 +553,8 @@ impl FaultInjector for RecordingFaults {
 #[test]
 fn test_fault_injector_is_used_after_pager_creation() {
     let temp = TempDatabase::new("test-fault-injector");
-    let faults = Arc::new(RecordingFaults::at(FaultPoint::BeforeFileWrite, 1));
-    let mut pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+    let faults = Arc::new(RecordingFaults::at(FaultPoint::BeforeWalRecordWrite, 1));
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
         .expect("create pager")
         .with_faults(faults.clone());
     let page = {
@@ -205,38 +572,36 @@ fn test_fault_injector_is_used_after_pager_creation() {
         page
     };
 
-    assert_eq!(faults.observed(), vec![FaultPoint::BeforeFileWrite]);
+    assert_eq!(faults.observed(), vec![FaultPoint::BeforeWalRecordWrite]);
     assert!(pager.is_poisoned());
     assert_eq!(
-        pager.read(page).expect_err("poisoned read").code(),
-        ErrorCode::Io
+        pager
+            .read(page)
+            .expect_err("unpublished page remains invisible")
+            .code(),
+        ErrorCode::Corruption
     );
 }
 
 #[test]
-fn every_multi_page_write_and_sync_fault_poisons_the_pager_until_reopen() {
+fn every_wal_commit_fault_requires_recovery_after_a_multi_page_transaction() {
     let baseline_faults = Arc::new(RecordingFaults::never());
     let baseline = commit_multi_page_tree(baseline_faults.clone()).expect("baseline commit");
-    assert!(
-        baseline
-            .iter()
-            .filter(|&&point| point == FaultPoint::BeforeFileWrite)
-            .count()
-            > 2,
-        "fixture must make a multi-page commit"
-    );
+    assert_commit_trace(&baseline);
 
     for point in [
-        FaultPoint::BeforeFileWrite,
-        FaultPoint::AfterFileWrite,
-        FaultPoint::BeforeFileSync,
-        FaultPoint::AfterFileSync,
+        FaultPoint::BeforeWalRecordWrite,
+        FaultPoint::AfterWalRecordHeaderPrefixWrite,
+        FaultPoint::AfterWalRecordPayloadPrefixWrite,
+        FaultPoint::AfterWalRecordWrite,
+        FaultPoint::BeforeWalSync,
+        FaultPoint::AfterWalSync,
     ] {
         let occurrences = baseline.iter().filter(|&&seen| seen == point).count();
         for occurrence in 1..=occurrences {
             let faults = Arc::new(RecordingFaults::at(point, occurrence));
             let temp = TempDatabase::new(&format!("multi-page-fault-{point:?}-{occurrence}"));
-            let mut pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
+            let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
                 .expect("create fault pager")
                 .with_faults(faults.clone());
             let root = {
@@ -263,14 +628,17 @@ fn every_multi_page_write_and_sync_fault_poisons_the_pager_until_reopen() {
             assert_eq!(faults.observed(), baseline[..=stop]);
             assert!(pager.is_poisoned());
             assert_eq!(
-                pager.read(root).expect_err("poisoned pager read").code(),
-                ErrorCode::Io
+                pager
+                    .read(root)
+                    .expect_err("unpublished root remains invisible")
+                    .code(),
+                ErrorCode::Corruption
             );
             let write_error = match pager.begin_write() {
                 Ok(_) => panic!("poisoned pager must reject write batches"),
                 Err(error) => error,
             };
-            assert_eq!(write_error.code(), ErrorCode::Io);
+            assert_eq!(write_error.code(), ErrorCode::Transaction);
 
             drop(pager);
             if let Ok(reopened) = Pager::open(
@@ -286,7 +654,7 @@ fn every_multi_page_write_and_sync_fault_poisons_the_pager_until_reopen() {
 
 fn commit_multi_page_tree(faults: Arc<RecordingFaults>) -> Result<Vec<FaultPoint>> {
     let temp = TempDatabase::new("multi-page-fault-baseline");
-    let mut pager =
+    let pager =
         Pager::create(temp.path(), PagerConfig::test_default(4096))?.with_faults(faults.clone());
     let mut batch = pager.begin_write()?;
     let mut tree = BTree::create(&mut batch, TreeKind::Table)?;
@@ -514,11 +882,12 @@ fn run_reference_model_operations(
             OpenMode::ReadWrite,
             PagerConfig::test_default(page_size),
         )?;
-        tree = pager
+        let mut snapshot = pager.begin_read()?;
+        tree = snapshot
             .catalog_tree(kind)?
             .ok_or_else(|| DbError::new(ErrorCode::Corruption, "model catalog root is missing"))?;
         assert_eq!(
-            collect_all(&tree, &mut pager)?,
+            collect_all(&tree, &mut snapshot)?,
             model
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -532,7 +901,8 @@ fn run_reference_model_operations(
         seen_key_lengths.into_iter().all(|seen| seen),
         "fixed-seed model must cover key lengths 0 through 64"
     );
-    let tree_height = tree_height(temp.path(), page_size, tree.root())?;
+    let mut snapshot = pager.begin_read()?;
+    let tree_height = tree_height(&mut snapshot, tree.root())?;
 
     Ok(ModelProof {
         operations,
@@ -685,17 +1055,18 @@ fn checksum_corruption_is_rejected_for_every_page_type_at_every_page_size() {
                 page_size as usize - 1,
             )
             .expect("corrupt whole-page checksum");
-            let mut pager = Pager::open(
+            let error = match Pager::open(
                 fixture.temp.path(),
                 OpenMode::ReadOnly,
                 PagerConfig::test_default(page_size),
-            )
-            .expect("open checksum-corrupted fixture");
-            assert_eq!(
-                pager
+            ) {
+                Ok(pager) => pager
                     .read(*reference)
-                    .expect_err("checksum-corrupted page must reject reads")
-                    .code(),
+                    .expect_err("checksum-corrupted page must reject reads"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code(),
                 ErrorCode::Corruption,
                 "checksum corruption must reject {page_type:?} at page size {page_size}"
             );
@@ -719,7 +1090,14 @@ fn truncation_and_restamped_field_corruption_return_controlled_errors() {
     }
 
     let fixture = corruption_fixture(4096).expect("create header corruption fixture");
-    flip_header_byte(fixture.temp.path(), 0).expect("corrupt header");
+    flip_header_byte(fixture.temp.path(), SuperblockSlot::A, 0).expect("corrupt first superblock");
+    Pager::open(
+        fixture.temp.path(),
+        OpenMode::ReadOnly,
+        PagerConfig::test_default(4096),
+    )
+    .expect("one valid superblock remains usable");
+    flip_header_byte(fixture.temp.path(), SuperblockSlot::B, 0).expect("corrupt second superblock");
     assert_controlled_corruption(|| {
         Pager::open(
             fixture.temp.path(),
@@ -779,7 +1157,7 @@ fn truncation_and_restamped_field_corruption_return_controlled_errors() {
     patch_page(&fixture, freelist, 68, &1u32.to_le_bytes())
         .expect("restamp freelist reserved field");
     assert_controlled_corruption(|| {
-        let mut pager = Pager::open(
+        let pager = Pager::open(
             fixture.temp.path(),
             OpenMode::ReadWrite,
             PagerConfig::test_default(4096),
@@ -799,7 +1177,7 @@ impl CorruptionFixture {
 
 fn corruption_fixture(page_size: u32) -> Result<CorruptionFixture> {
     let temp = TempDatabase::new(&format!("corruption-{page_size}"));
-    let mut pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
     let (mut table, index) = {
         let mut batch = pager.begin_write()?;
         let mut table = BTree::create(&mut batch, TreeKind::Table)?;
@@ -833,9 +1211,7 @@ fn corruption_fixture(page_size: u32) -> Result<CorruptionFixture> {
         batch.set_catalog_root(table.root())?;
         batch.commit()?;
     }
-    drop(pager);
-
-    let pages = fixture_pages(temp.path(), page_size)?;
+    let pages = materialize_wal_fixture_to_checkpoint(&temp, pager, table.root().page_id())?;
     for page_type in [
         PageType::Catalog,
         PageType::TableInternal,
@@ -859,6 +1235,64 @@ fn corruption_fixture(page_size: u32) -> Result<CorruptionFixture> {
     })
 }
 
+fn materialize_wal_fixture_to_checkpoint(
+    temp: &TempDatabase,
+    pager: Pager,
+    catalog_root: PageId,
+) -> Result<Vec<(PageRef, PageType)>> {
+    let latest_lsn = pager.latest_lsn()?;
+    let mut snapshot = pager.begin_read()?;
+    let page_count = snapshot.page_count()?;
+    let freelist_root = snapshot.freelist_root()?;
+    let mut images = Vec::new();
+    let mut pages = Vec::new();
+    for page_id in 1..page_count {
+        let page_id = PageId(page_id);
+        let frame = snapshot.read_page_by_id(page_id)?;
+        let reference = PageRef::new(frame.header().page_id(), frame.header().generation())?;
+        images.push((page_id, frame.bytes().to_vec()));
+        pages.push((reference, frame.header().page_type()));
+    }
+    drop(snapshot);
+    drop(pager);
+
+    let mut main =
+        DatabaseFile::open(temp.path(), OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)?;
+    main.extend_to_pages(page_count)?;
+    for (page_id, bytes) in images {
+        main.write_page(page_id, &bytes)?;
+    }
+    main.sync_all()?;
+    let base = main.header();
+    let checkpoint = base.with_checkpoint(
+        latest_lsn,
+        page_count,
+        catalog_root,
+        freelist_root,
+        base.wal_generation(),
+    )?;
+    main.publish_superblock(checkpoint)?;
+    let fallback_checkpoint = main.header().with_checkpoint(
+        latest_lsn,
+        page_count,
+        catalog_root,
+        freelist_root,
+        main.header().wal_generation(),
+    )?;
+    main.publish_superblock(fallback_checkpoint)?;
+    drop(main);
+
+    fs::remove_file(wal_path(temp.path())).map_err(|error| {
+        DbError::new(
+            ErrorCode::Io,
+            format!("remove fixture WAL before rebasing: {error}"),
+        )
+    })?;
+    let wal = Wal::create(temp.path(), &fallback_checkpoint)?;
+    drop(wal);
+    Ok(pages)
+}
+
 fn fixture_key(prefix: u8, number: u8) -> Vec<u8> {
     let mut key = vec![prefix; 1024];
     key[..2].copy_from_slice(&[prefix, number]);
@@ -870,12 +1304,17 @@ fn fixture_pages(path: &Path, page_size: u32) -> Result<Vec<(PageRef, PageType)>
         DbError::new(ErrorCode::Io, format!("read corruption fixture: {error}"))
     })?;
     let page_len = usize::try_from(page_size).expect("page size fits usize");
+    let ordinary_bytes = bytes
+        .len()
+        .checked_sub(usize::try_from(SUPERBLOCK_AREA_LEN).expect("prefix length fits usize"))
+        .ok_or_else(|| DbError::new(ErrorCode::Corruption, "fixture omits superblocks"))?;
     let mut pages = Vec::new();
-    for page_id in 1..bytes.len() / page_len {
-        let offset = page_id * page_len;
+    for page_id in 1..=ordinary_bytes / page_len {
+        let page_id = PageId(u64::try_from(page_id).expect("page id fits u64"));
+        let offset = fixture_page_offset(page_id, page_size)?;
         let frame = PageFrame::decode(
             bytes[offset..offset + page_len].to_vec(),
-            PageId(u64::try_from(page_id).expect("page id fits u64")),
+            page_id,
             None,
             None,
         )?;
@@ -888,7 +1327,8 @@ fn fixture_pages(path: &Path, page_size: u32) -> Result<Vec<(PageRef, PageType)>
 fn page_bytes(fixture: &CorruptionFixture, reference: PageRef) -> Vec<u8> {
     let bytes = fs::read(fixture.temp.path()).expect("read fixture bytes");
     let page_len = usize::try_from(fixture.page_size).expect("page size fits usize");
-    let offset = usize::try_from(reference.page_id().0).expect("page id fits usize") * page_len;
+    let offset =
+        fixture_page_offset(reference.page_id(), fixture.page_size).expect("fixture page offset");
     bytes[offset..offset + page_len].to_vec()
 }
 
@@ -901,8 +1341,7 @@ fn patch_page(
     let mut bytes = fs::read(fixture.temp.path())
         .map_err(|error| DbError::new(ErrorCode::Io, format!("read fixture for patch: {error}")))?;
     let page_len = usize::try_from(fixture.page_size).expect("page size fits usize");
-    let page_offset =
-        usize::try_from(reference.page_id().0).expect("page id fits usize") * page_len;
+    let page_offset = fixture_page_offset(reference.page_id(), fixture.page_size)?;
     let page = &mut bytes[page_offset..page_offset + page_len];
     page[offset..offset + replacement.len()].copy_from_slice(replacement);
     stamp_page_checksum(page)?;
@@ -917,9 +1356,7 @@ fn flip_page_byte(path: &Path, page_size: u32, reference: PageRef, offset: usize
             format!("read fixture for checksum flip: {error}"),
         )
     })?;
-    let page_len = usize::try_from(page_size).expect("page size fits usize");
-    let page_offset =
-        usize::try_from(reference.page_id().0).expect("page id fits usize") * page_len;
+    let page_offset = fixture_page_offset(reference.page_id(), page_size)?;
     bytes[page_offset + offset] ^= 1;
     fs::write(path, bytes).map_err(|error| {
         DbError::new(
@@ -929,12 +1366,27 @@ fn flip_page_byte(path: &Path, page_size: u32, reference: PageRef, offset: usize
     })
 }
 
-fn flip_header_byte(path: &Path, offset: usize) -> Result<()> {
+fn flip_header_byte(path: &Path, slot: SuperblockSlot, offset: usize) -> Result<()> {
+    if offset >= SUPERBLOCK_SLOT_LEN {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            "superblock corruption offset is outside the selected slot",
+        ));
+    }
     let mut bytes = fs::read(path)
         .map_err(|error| DbError::new(ErrorCode::Io, format!("read header fixture: {error}")))?;
-    bytes[offset] ^= 1;
+    let slot_start = match slot {
+        SuperblockSlot::A => 0,
+        SuperblockSlot::B => SUPERBLOCK_SLOT_LEN,
+    };
+    bytes[slot_start + offset] ^= 1;
     fs::write(path, bytes)
         .map_err(|error| DbError::new(ErrorCode::Io, format!("write header fixture: {error}")))
+}
+
+fn fixture_page_offset(page_id: PageId, page_size: u32) -> Result<usize> {
+    usize::try_from(checked_page_offset(page_id, page_size, u64::MAX)?)
+        .map_err(|_| DbError::new(ErrorCode::Corruption, "fixture page offset exceeds usize"))
 }
 
 fn truncate_file(path: &Path, len: u64) -> Result<()> {
@@ -947,7 +1399,7 @@ fn truncate_file(path: &Path, len: u64) -> Result<()> {
 }
 
 fn read_page_from_fixture(fixture: &CorruptionFixture, reference: PageRef) -> Result<()> {
-    let mut pager = Pager::open(
+    let pager = Pager::open(
         fixture.temp.path(),
         OpenMode::ReadOnly,
         PagerConfig::test_default(fixture.page_size),
@@ -956,7 +1408,7 @@ fn read_page_from_fixture(fixture: &CorruptionFixture, reference: PageRef) -> Re
 }
 
 fn validate_fixture_tree(fixture: &CorruptionFixture, kind: TreeKind) -> Result<()> {
-    let mut pager = Pager::open(
+    let pager = Pager::open(
         fixture.temp.path(),
         OpenMode::ReadOnly,
         PagerConfig::test_default(fixture.page_size),
@@ -965,7 +1417,8 @@ fn validate_fixture_tree(fixture: &CorruptionFixture, kind: TreeKind) -> Result<
         TreeKind::Table => &fixture.table,
         TreeKind::Index => &fixture.index,
     };
-    validate_tree(&mut pager, tree).map(|_| ())
+    let mut snapshot = pager.begin_read()?;
+    validate_tree(&mut snapshot, tree).map(|_| ())
 }
 
 fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
@@ -977,6 +1430,662 @@ fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
             .code(),
         ErrorCode::Corruption
     );
+}
+
+const CRASH_CHILD_TEST: &str = "storage::test_support::phase_3_crash_child";
+const CRASH_POINTS: [FaultPoint; 20] = [
+    FaultPoint::BeforeWalRecordWrite,
+    FaultPoint::AfterWalRecordWrite,
+    FaultPoint::BeforeWalSync,
+    FaultPoint::AfterWalSync,
+    FaultPoint::BeforeMainExtend,
+    FaultPoint::AfterMainExtend,
+    FaultPoint::BeforeMainPageWrite,
+    FaultPoint::AfterMainPageWrite,
+    FaultPoint::BeforeMainSync,
+    FaultPoint::AfterMainSync,
+    FaultPoint::BeforeSuperblockWrite,
+    FaultPoint::AfterSuperblockWrite,
+    FaultPoint::BeforeWalHeaderWrite,
+    FaultPoint::AfterWalHeaderWrite,
+    FaultPoint::BeforeWalTruncate,
+    FaultPoint::AfterWalTruncate,
+    FaultPoint::AfterWalRecordHeaderPrefixWrite,
+    FaultPoint::AfterWalRecordPayloadPrefixWrite,
+    FaultPoint::BeforeWalPublish,
+    FaultPoint::AfterWalPublish,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrashState {
+    lsn: Lsn,
+    root: PageRef,
+    page_count: u64,
+    freelist_root: PageId,
+    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+fn crash_model(post: bool) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut rows = BTreeMap::new();
+    for number in 0..8u8 {
+        rows.insert(fixture_key(0x33, number), vec![number; 128]);
+    }
+    rows.insert(b"stable-overflow".to_vec(), vec![0x71; 5000]);
+    if post {
+        rows.remove(&fixture_key(0x33, 0));
+        rows.remove(&fixture_key(0x33, 3));
+        rows.insert(fixture_key(0x33, 2), vec![0x92; 6000]);
+        for number in 8..12u8 {
+            rows.insert(fixture_key(0x33, number), vec![number; 128]);
+        }
+    }
+    rows
+}
+
+fn crash_state(pager: &Pager) -> CrashState {
+    let mut snapshot = pager.begin_read().expect("open crash snapshot");
+    let tree = snapshot
+        .catalog_tree(TreeKind::Table)
+        .expect("validate crash tree and freelist")
+        .expect("crash fixture has a catalog tree");
+    CrashState {
+        lsn: snapshot.lsn(),
+        root: tree.root(),
+        page_count: snapshot.page_count().expect("read page count"),
+        freelist_root: snapshot.freelist_root().expect("read freelist root"),
+        rows: collect_all(&tree, &mut snapshot)
+            .expect("scan complete crash tree")
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn crash_open(path: &Path) -> Pager {
+    Pager::open(path, OpenMode::ReadWrite, PagerConfig::test_default(4096))
+        .expect("open crash fixture with fresh parent/child handles")
+}
+
+fn crash_commit(pager: &Pager) {
+    let mut tree = {
+        let mut snapshot = pager.begin_read().expect("read commit root");
+        snapshot.catalog_tree(TreeKind::Table).unwrap().unwrap()
+    };
+    let mut batch = pager.begin_write().expect("begin exactly one crash commit");
+    for number in [0, 2, 3] {
+        assert!(
+            tree.delete(&mut batch, &fixture_key(0x33, number))
+                .unwrap()
+                .is_some()
+        );
+    }
+    tree.insert(&mut batch, &fixture_key(0x33, 2), &vec![0x92; 6000])
+        .unwrap();
+    for number in 8..12u8 {
+        tree.insert(&mut batch, &fixture_key(0x33, number), &[number; 128])
+            .unwrap();
+    }
+    batch.track_tree(TreeKind::Table, tree.root()).unwrap();
+    batch.set_catalog_root(tree.root()).unwrap();
+    batch.commit().expect("commit crash transaction");
+}
+
+fn crash_fixture(mode: &str) -> TempDatabase {
+    let temp = TempDatabase::new("phase3-crash-fixture");
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+    let mut batch = pager.begin_write().unwrap();
+    let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+    for (key, value) in crash_model(false) {
+        tree.insert(&mut batch, &key, &value).unwrap();
+    }
+    batch.track_tree(TreeKind::Table, tree.root()).unwrap();
+    batch.set_catalog_root(tree.root()).unwrap();
+    batch.commit().unwrap();
+    pager.checkpoint().unwrap();
+    match mode {
+        "commit" => {}
+        "checkpoint" => crash_commit(&pager),
+        _ => panic!("invalid crash fixture mode"),
+    }
+    let state = crash_state(&pager);
+    assert_eq!(state.rows, crash_model(mode == "checkpoint"));
+    assert_eq!(state.lsn, Lsn(if mode == "checkpoint" { 2 } else { 1 }));
+    drop(pager);
+    temp
+}
+
+fn crash_pair_bytes(path: &Path) -> (Vec<u8>, Vec<u8>) {
+    (fs::read(path).unwrap(), fs::read(wal_path(path)).unwrap())
+}
+
+fn copy_crash_fixture(fixture: &TempDatabase) -> TempDatabase {
+    let temp = TempDatabase::new("phase3-crash-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(fixture.path(), temp.path()).unwrap();
+    fs::copy(wal_path(fixture.path()), wal_path(temp.path())).unwrap();
+    assert_eq!(
+        crash_pair_bytes(temp.path()),
+        crash_pair_bytes(fixture.path())
+    );
+    temp
+}
+
+fn crash_operation(pager: &Pager, mode: &str) {
+    match mode {
+        "commit" => crash_commit(pager),
+        "checkpoint" => {
+            pager.checkpoint().expect("exactly one crash checkpoint");
+        }
+        _ => panic!("invalid crash operation mode"),
+    }
+}
+
+fn crash_trace(fixture: &TempDatabase, mode: &str) -> (Vec<FaultPoint>, CrashState, CrashState) {
+    let temp = copy_crash_fixture(fixture);
+    let faults = Arc::new(RecordingFaults::never());
+    let pager = crash_open(temp.path()).with_faults(faults.clone());
+    let pre = crash_state(&pager);
+    let record_start = fs::metadata(wal_path(temp.path())).unwrap().len() as usize;
+    crash_operation(&pager, mode);
+    let post = crash_state(&pager);
+    assert_eq!(post.rows, crash_model(true));
+    assert_eq!(post.lsn, Lsn(2));
+    if mode == "commit" {
+        assert_commit_trace(&faults.observed());
+        // Count independently from actual persisted record framing, not from hooks.
+        let bytes = fs::read(wal_path(temp.path())).unwrap();
+        let mut offset = record_start;
+        let mut records = 0;
+        while offset < bytes.len() {
+            let payload =
+                u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
+            offset += 64 + payload;
+            records += 1;
+        }
+        assert_eq!(offset, bytes.len());
+        assert_eq!(
+            faults.observed().len(),
+            records * 4 + 4,
+            "each physical record must expose both prefix boundaries"
+        );
+        assert_ne!(pre, post);
+    } else {
+        assert_eq!(pre, post, "checkpoint cannot change the logical state");
+    }
+    drop(pager);
+    (faults.observed(), pre, post)
+}
+
+fn assert_commit_trace(trace: &[FaultPoint]) {
+    let record_points = [
+        FaultPoint::BeforeWalRecordWrite,
+        FaultPoint::AfterWalRecordHeaderPrefixWrite,
+        FaultPoint::AfterWalRecordPayloadPrefixWrite,
+        FaultPoint::AfterWalRecordWrite,
+    ];
+    assert!(
+        trace.len() >= 12 && (trace.len() - 4) % 4 == 0,
+        "invalid crash configuration: commit trace length"
+    );
+    let records_end = trace.len() - 4;
+    for record in trace[..records_end].chunks_exact(4) {
+        assert_eq!(
+            record, record_points,
+            "invalid crash configuration: record trace"
+        );
+    }
+    assert_eq!(
+        &trace[records_end..],
+        &[
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalPublish,
+            FaultPoint::AfterWalPublish
+        ],
+        "invalid crash configuration: publish trace"
+    );
+}
+
+fn crash_child_command(
+    path: &Path,
+    mode: &str,
+    point: &str,
+    occurrence: &str,
+    trace: &[FaultPoint],
+) -> std::process::Command {
+    let executable = std::env::current_exe().expect("find test executable");
+    // Suppress core files without unsafe pre_exec or changing the parent's process limits.
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "ulimit -c 0 && exec \"$@\"", "ora-sqllite-crash"]);
+        command.arg(executable);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["--exact", CRASH_CHILD_TEST, "--ignored", "--nocapture"])
+        .env("ORA_SQLLITE_CRASH_PATH", path)
+        .env("ORA_SQLLITE_CRASH_MODE", mode)
+        .env("ORA_SQLLITE_CRASH_POINT", point)
+        .env("ORA_SQLLITE_CRASH_OCCURRENCE", occurrence)
+        .env(
+            "ORA_SQLLITE_CRASH_TRACE",
+            trace
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    command
+}
+
+#[test]
+#[ignore = "only launched with validated parameters by phase_3_crash_recovery_matrix"]
+fn phase_3_crash_child() {
+    let mode = std::env::var("ORA_SQLLITE_CRASH_MODE").expect("crash mode is required");
+    assert!(
+        matches!(mode.as_str(), "commit" | "checkpoint"),
+        "invalid crash configuration: mode"
+    );
+    let point_text = std::env::var("ORA_SQLLITE_CRASH_POINT").expect("crash point is required");
+    let parse_point = |name: &str| {
+        CRASH_POINTS
+            .into_iter()
+            .find(|point| format!("{point:?}") == name)
+    };
+    let point = parse_point(&point_text).expect("invalid crash configuration: point");
+    let occurrence_text =
+        std::env::var("ORA_SQLLITE_CRASH_OCCURRENCE").expect("crash occurrence is required");
+    let occurrence: usize = occurrence_text
+        .parse()
+        .expect("invalid crash configuration: occurrence");
+    assert!(
+        occurrence > 0 && occurrence_text == occurrence.to_string(),
+        "invalid crash configuration: occurrence"
+    );
+    let trace_text =
+        std::env::var("ORA_SQLLITE_CRASH_TRACE").expect("successful trace is required");
+    let trace: Vec<_> = trace_text
+        .split(',')
+        .map(|name| parse_point(name).expect("invalid crash configuration: trace point"))
+        .collect();
+    assert!(
+        occurrence <= trace.iter().filter(|&&seen| seen == point).count(),
+        "invalid crash configuration: occurrence outside successful trace"
+    );
+    if mode == "commit" {
+        assert_commit_trace(&trace);
+    } else {
+        assert!(
+            !trace.iter().any(|point| CRASH_POINTS[..2].contains(point)),
+            "invalid crash configuration: checkpoint trace"
+        );
+        for required in &CRASH_POINTS[2..16] {
+            assert!(
+                trace.contains(required),
+                "invalid crash configuration: incomplete checkpoint trace"
+            );
+        }
+    }
+    let path = PathBuf::from(
+        std::env::var_os("ORA_SQLLITE_CRASH_PATH").expect("scenario database path is required"),
+    );
+    let canonical = fs::canonicalize(&path).expect("invalid crash configuration: database path");
+    assert_eq!(
+        canonical, path,
+        "invalid crash configuration: noncanonical path"
+    );
+    assert_eq!(
+        path.parent(),
+        Some(fs::canonicalize(std::env::temp_dir()).unwrap().as_path()),
+        "invalid crash configuration: path outside temp directory"
+    );
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_str()
+            .is_some_and(|name| name.starts_with("ora-sqllite-")
+                && name.contains("-phase3-crash-case-")
+                && name.ends_with(".db")),
+        "invalid crash configuration: non-scenario path"
+    );
+    assert!(
+        path.is_file() && wal_path(&path).is_file(),
+        "invalid crash configuration: incomplete database/WAL pair"
+    );
+    let pager = crash_open(&path);
+    let initial = crash_state(&pager);
+    assert_eq!(
+        initial.rows,
+        crash_model(mode == "checkpoint"),
+        "invalid crash configuration: fixture model"
+    );
+    assert_eq!(
+        initial.lsn,
+        Lsn(if mode == "checkpoint" { 2 } else { 1 }),
+        "invalid crash configuration: fixture LSN"
+    );
+    let pager = pager.with_faults(Arc::new(AbortAt {
+        mode: mode.clone(),
+        point,
+        occurrence,
+        trace,
+        observed: Mutex::new(Vec::new()),
+    }));
+    crash_operation(&pager, &mode);
+    panic!("configured crash boundary was not reached");
+}
+
+struct AbortAt {
+    mode: String,
+    point: FaultPoint,
+    occurrence: usize,
+    trace: Vec<FaultPoint>,
+    observed: Mutex<Vec<FaultPoint>>,
+}
+
+impl FaultInjector for AbortAt {
+    fn check(&self, point: FaultPoint) -> Result<()> {
+        let mut observed = self.observed.lock().unwrap();
+        assert_eq!(
+            self.trace.get(observed.len()),
+            Some(&point),
+            "child diverged from successful trace"
+        );
+        observed.push(point);
+        let occurrence = observed.iter().filter(|&&seen| seen == point).count();
+        if (point, occurrence) == (self.point, self.occurrence) {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "PHASE3_ABORT {} {point:?} {occurrence}", self.mode).unwrap();
+            stderr.flush().unwrap();
+            std::process::abort();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn crash_child_rejects_invalid_configuration_without_writing() {
+    let fixture = crash_fixture("commit");
+    let (trace, _, _) = crash_trace(&fixture, "commit");
+    for (mode, point, occurrence, missing_path) in [
+        ("invalid", "BeforeWalRecordWrite", "1", false),
+        ("commit", "unknown", "1", false),
+        ("commit", "BeforeWalRecordWrite", "0", false),
+        ("commit", "BeforeWalRecordWrite", "999999", false),
+        ("commit", "BeforeWalRecordWrite", "1", true),
+    ] {
+        let temp = copy_crash_fixture(&fixture);
+        let before = crash_pair_bytes(temp.path());
+        let path = if missing_path {
+            temp.path().with_extension("missing")
+        } else {
+            fs::canonicalize(temp.path()).unwrap()
+        };
+        let output = crash_child_command(&path, mode, point, occurrence, &trace)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "bad child parameters must fail the test, not abort"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid crash configuration:"), "{stderr}");
+        assert!(!stderr.contains("PHASE3_ABORT"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        assert_eq!(crash_pair_bytes(temp.path()), before);
+    }
+}
+
+#[test]
+#[ignore = "dedicated subprocess crash matrix; each boundary aborts one child"]
+fn phase_3_crash_recovery_matrix() {
+    let mut covered = Vec::new();
+    let mut crashes = 0usize;
+    for mode in ["commit", "checkpoint"] {
+        let fixture = crash_fixture(mode);
+        let fixture_bytes = crash_pair_bytes(fixture.path());
+        let (trace, pre, post) = crash_trace(&fixture, mode);
+        assert!(
+            !trace.is_empty(),
+            "empty trace cannot establish crash coverage"
+        );
+        let durable_index = trace
+            .iter()
+            .position(|point| *point == FaultPoint::AfterWalSync)
+            .unwrap();
+        for point in CRASH_POINTS {
+            let count = trace.iter().filter(|&&seen| seen == point).count();
+            if count != 0 {
+                eprintln!("phase3 {mode} {point:?}: occurrences={count}");
+            }
+        }
+        for (index, &point) in trace.iter().enumerate() {
+            let occurrence = trace[..=index]
+                .iter()
+                .filter(|&&seen| seen == point)
+                .count();
+            let temp = copy_crash_fixture(&fixture);
+            let path = fs::canonicalize(temp.path()).unwrap();
+            let output = crash_child_command(
+                &path,
+                mode,
+                &format!("{point:?}"),
+                &occurrence.to_string(),
+                &trace,
+            )
+            .output()
+            .expect("synchronously wait and reap crash child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("running 1 test"),
+                "exact child test did not run: {stdout}"
+            );
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line == format!("PHASE3_ABORT {mode} {point:?} {occurrence}")),
+                "child did not hit its exact fault: status={} stderr={stderr}",
+                output.status
+            );
+            assert!(!output.status.success(), "crash child returned success");
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    output.status.signal(),
+                    Some(6),
+                    "child must die from SIGABRT"
+                );
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                output.status.code(),
+                Some(-1_073_740_791),
+                "child must die from Windows abort fast-fail (0xC0000409)"
+            );
+
+            let pager = crash_open(temp.path());
+            let recovered = crash_state(&pager);
+            if mode == "commit" && index >= durable_index {
+                assert_eq!(
+                    recovered, post,
+                    "durable commit must survive {point:?}/{occurrence}"
+                );
+            } else {
+                assert!(
+                    recovered == pre || recovered == post,
+                    "partial state at {mode} {point:?}/{occurrence}"
+                );
+            }
+            let verdict = if recovered == post { "post" } else { "pre" };
+            pager.checkpoint().expect("checkpoint recovered state");
+            assert_eq!(crash_state(&pager), recovered);
+            drop(pager);
+            let repaired_bytes = crash_pair_bytes(temp.path());
+            let reopened = crash_open(temp.path());
+            assert_eq!(
+                crash_state(&reopened),
+                recovered,
+                "second reopen changed logical state"
+            );
+            let checkpoint = reopened.checkpoint().expect("idempotent second checkpoint");
+            assert_eq!(checkpoint.pages_written, 0);
+            assert!(!checkpoint.wal_reset);
+            drop(reopened);
+            assert_eq!(
+                crash_pair_bytes(temp.path()),
+                repaired_bytes,
+                "second reopen/checkpoint changed bytes"
+            );
+            // Unlike best-effort Drop, prove all child/parent handles released both exact files.
+            fs::remove_file(wal_path(temp.path())).unwrap();
+            fs::remove_file(temp.path()).unwrap();
+            covered.push(point);
+            crashes = crashes.checked_add(1).unwrap();
+            eprintln!(
+                "phase3 {mode} {point:?}/{occurrence}: exit={} model={verdict} second-reopen+checkpoint=byte/logical-idempotent handles=released",
+                output.status
+            );
+        }
+        assert_eq!(
+            crash_pair_bytes(fixture.path()),
+            fixture_bytes,
+            "source fixture must remain unchanged"
+        );
+    }
+    for point in CRASH_POINTS {
+        assert!(covered.contains(&point), "uncovered boundary: {point:?}");
+    }
+    eprintln!(
+        "phase3 crash matrix: {crashes} inspected child aborts; all 20 named boundaries covered"
+    );
+    full_length_corruption_cases();
+}
+
+#[test]
+fn phase_3_full_length_corruption_matrix() {
+    full_length_corruption_cases();
+}
+
+fn full_length_corruption_cases() {
+    const RECORD_START: usize = 8192;
+    let fixture = crash_fixture("checkpoint");
+    for (case, field, value, restamp, reason) in [
+        ("bad header CRC", 52, None, false, "header checksum"),
+        ("bad payload CRC", 64, None, false, "payload checksum"),
+        (
+            "bad LSN",
+            16,
+            Some(1u64),
+            true,
+            "LSN does not follow the base checkpoint",
+        ),
+        (
+            "bad WAL generation",
+            56,
+            Some(3),
+            true,
+            "generation mismatch",
+        ),
+        (
+            "bad page generation",
+            40,
+            Some(0),
+            true,
+            "generation must be nonzero",
+        ),
+    ] {
+        let temp = copy_crash_fixture(&fixture);
+        let mut bytes = fs::read(wal_path(temp.path())).unwrap();
+        let original_len = bytes.len();
+        let offset = RECORD_START.checked_add(field).unwrap();
+        if let Some(value) = value {
+            bytes[offset..offset.checked_add(8).unwrap()].copy_from_slice(&value.to_le_bytes());
+        } else {
+            bytes[offset] ^= 1;
+        }
+        if restamp {
+            let header = &mut bytes[RECORD_START..RECORD_START + 64];
+            header[52..56].fill(0);
+            let crc = super::checksum::crc32c(header);
+            header[52..56].copy_from_slice(&crc.to_le_bytes());
+        }
+        assert_eq!(
+            bytes.len(),
+            original_len,
+            "{case} must not be a torn suffix"
+        );
+        fs::write(wal_path(temp.path()), bytes).unwrap();
+        assert_crash_corruption_retained(temp.path(), case, reason);
+    }
+
+    let temp = copy_crash_fixture(&fixture);
+    let old_wal = fs::read(wal_path(temp.path())).unwrap();
+    let pager = crash_open(temp.path());
+    pager.checkpoint().unwrap();
+    let expected = crash_state(&pager);
+    let mut batch = pager.begin_write().unwrap();
+    batch.allocate_append(PageType::TableLeaf).unwrap();
+    batch.commit().unwrap();
+    drop(pager);
+    let current_wal = fs::read(wal_path(temp.path())).unwrap();
+    assert!(old_wal.len() > RECORD_START && current_wal.len() > RECORD_START);
+    let mut mixed = current_wal[..RECORD_START].to_vec();
+    mixed.extend_from_slice(&old_wal[RECORD_START..]);
+    fs::write(wal_path(temp.path()), &mixed).unwrap();
+    // Control: these are valid, complete previous-generation records, not arbitrary garbage.
+    let old_only = Pager::open(
+        temp.path(),
+        OpenMode::ReadOnly,
+        PagerConfig::test_default(4096),
+    )
+    .unwrap();
+    assert_eq!(crash_state(&old_only), expected);
+    drop(old_only);
+    assert_eq!(fs::read(wal_path(temp.path())).unwrap(), mixed);
+    mixed.extend_from_slice(&current_wal[RECORD_START..]);
+    fs::write(wal_path(temp.path()), &mixed).unwrap();
+    assert_crash_corruption_retained(
+        temp.path(),
+        "valid old-generation suffix followed by current-generation records",
+        "contains another generation",
+    );
+
+    let temp = copy_crash_fixture(&fixture);
+    let original_len = fs::metadata(temp.path()).unwrap().len();
+    flip_header_byte(temp.path(), SuperblockSlot::A, 0).unwrap();
+    flip_header_byte(temp.path(), SuperblockSlot::B, 0).unwrap();
+    assert_eq!(fs::metadata(temp.path()).unwrap().len(), original_len);
+    assert_crash_corruption_retained(temp.path(), "both main superblocks invalid", "superblock");
+    eprintln!(
+        "phase3 corruption matrix: 7 full-length cases rejected; readonly/readwrite bytes retained"
+    );
+}
+
+fn assert_crash_corruption_retained(path: &Path, case: &str, reason: &str) {
+    let before = crash_pair_bytes(path);
+    for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+        let result = Pager::open(path, mode, PagerConfig::test_default(4096));
+        let error = match result {
+            Ok(_) => panic!("{case} was silently accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Corruption, "{case}: {error}");
+        assert!(
+            error.to_string().contains(reason),
+            "{case} failed for an unrelated reason: {error}"
+        );
+        assert_eq!(
+            crash_pair_bytes(path),
+            before,
+            "{case} must never silently truncate or rewrite either file"
+        );
+    }
+    eprintln!("phase3 corruption {case}: Corruption; full database/WAL bytes retained");
 }
 
 struct ScaleMetrics {
@@ -1022,10 +2131,17 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
         batch.set_catalog_root(tree.root())?;
         batch.commit()?;
     }
-    let file_bytes = fs::metadata(temp.path())
-        .map_err(|error| DbError::new(ErrorCode::Io, format!("read scale file metadata: {error}")))?
-        .len();
-    let tree_height = tree_height(temp.path(), page_size, tree.root())?;
+    let file_bytes = SUPERBLOCK_AREA_LEN
+        .checked_add(
+            pager
+                .page_count()
+                .checked_sub(1)
+                .and_then(|ordinary_pages| ordinary_pages.checked_mul(u64::from(page_size)))
+                .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale file length overflow"))?,
+        )
+        .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale file length overflow"))?;
+    let mut snapshot = pager.begin_read()?;
+    let tree_height = tree_height(&mut snapshot, tree.root())?;
 
     Ok(ScaleMetrics {
         rows,
@@ -1036,19 +2152,10 @@ fn run_scale_probe(rows: u64, page_size: u32) -> Result<ScaleMetrics> {
     })
 }
 
-fn tree_height(path: &Path, page_size: u32, mut current: PageRef) -> Result<u64> {
-    let bytes = fs::read(path)
-        .map_err(|error| DbError::new(ErrorCode::Io, format!("read scale tree: {error}")))?;
-    let page_len = usize::try_from(page_size).expect("page size fits usize");
+fn tree_height(source: &mut impl PageSource, mut current: PageRef) -> Result<u64> {
     let mut height = 0u64;
     loop {
-        let offset = usize::try_from(current.page_id().0).expect("page id fits usize") * page_len;
-        let frame = PageFrame::decode(
-            bytes[offset..offset + page_len].to_vec(),
-            current.page_id(),
-            None,
-            Some(current.generation()),
-        )?;
+        let frame = source.read_page(current)?;
         height = height
             .checked_add(1)
             .ok_or_else(|| DbError::new(ErrorCode::Corruption, "scale tree height overflow"))?;

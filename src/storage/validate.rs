@@ -76,13 +76,7 @@ pub(super) fn validate_tree(
     let root = tree.root();
     let root_page_type = {
         let root_handle = source.read_page(root).map_err(as_corruption)?;
-        let root_frame = root_handle.try_borrow().map_err(|_| {
-            DbError::new(
-                ErrorCode::Busy,
-                "B+Tree root is mutably borrowed by another cache handle",
-            )
-        })?;
-        root_frame.header().page_type()
+        root_handle.header().page_type()
     };
     if TreeKind::from_root_page_type(root_page_type) != Some(tree.kind()) {
         return Err(corruption(
@@ -286,20 +280,12 @@ fn load_validation_node(
     reference: PageRef,
 ) -> Result<ValidationNode> {
     let handle = source.read_page(reference).map_err(as_corruption)?;
-    let mut frame = {
-        let cached = handle.try_borrow().map_err(|_| {
-            DbError::new(
-                ErrorCode::Busy,
-                "B+Tree validation page is mutably borrowed by another cache handle",
-            )
-        })?;
-        super::page::PageFrame::decode(
-            cached.bytes().to_vec(),
-            reference.page_id(),
-            None,
-            Some(reference.generation()),
-        )?
-    };
+    let mut frame = super::page::PageFrame::decode(
+        handle.bytes().to_vec(),
+        reference.page_id(),
+        None,
+        Some(reference.generation()),
+    )?;
     if frame.header().page_id() != reference.page_id()
         || frame.header().generation() != reference.generation()
     {
@@ -388,22 +374,21 @@ pub(super) fn validate_freelist(
             return Err(corruption("freelist trunk chain has a cycle"));
         }
         let handle = source.read_page_by_id(current).map_err(as_corruption)?;
-        let frame = handle.borrow();
+        let frame = handle.as_ref();
         PageRef::new(current, frame.header().generation()).map_err(as_corruption)?;
         if frame.header().page_id() != current {
             return Err(corruption(
                 "freelist trunk page id does not match its frame",
             ));
         }
-        let trunk = Freelist::decode(&frame).map_err(as_corruption)?;
-        drop(frame);
+        let trunk = Freelist::decode(frame).map_err(as_corruption)?;
         for page_id in trunk.leaves() {
             validate_page_id(*page_id, page_count, "freelist")?;
             if !leaves.insert(*page_id) {
                 return Err(corruption("freelist has duplicate leaf page ids"));
             }
             let leaf = source.read_page_by_id(*page_id).map_err(as_corruption)?;
-            let leaf = leaf.borrow();
+            let leaf = leaf.as_ref();
             if leaf.header().page_id() != *page_id
                 || leaf.header().generation() == 0
                 || leaf.header().page_type() == super::page::PageType::Freelist
@@ -418,7 +403,7 @@ pub(super) fn validate_freelist(
             let next_handle = source
                 .read_page_by_id(next_reference.page_id())
                 .map_err(as_corruption)?;
-            let next_frame = next_handle.borrow();
+            let next_frame = next_handle.as_ref();
             if next_frame.header().generation() != next_reference.generation() {
                 return Err(corruption(
                     "freelist trunk generation does not match its reference",
@@ -464,9 +449,8 @@ fn corruption(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
         collections::{BTreeMap, BTreeSet},
-        rc::Rc,
+        sync::Arc,
     };
 
     use super::super::{
@@ -851,7 +835,7 @@ mod tests {
                 None,
                 Some(reference.generation()),
             )?;
-            Ok(Rc::new(RefCell::new(frame)))
+            Ok(Arc::new(frame))
         }
 
         fn read_page_by_id(&mut self, page_id: PageId) -> Result<PageHandle> {
@@ -861,7 +845,7 @@ mod tests {
                 .ok_or_else(|| DbError::new(ErrorCode::Corruption, "test page not found"))?
                 .clone();
             let frame = PageFrame::decode(bytes, page_id, None, None)?;
-            Ok(Rc::new(RefCell::new(frame)))
+            Ok(Arc::new(frame))
         }
 
         fn page_count(&self) -> Result<u64> {
