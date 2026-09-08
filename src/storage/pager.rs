@@ -1570,7 +1570,7 @@ mod tests {
             }
         }
 
-        for pause_point in [FaultPoint::BeforeFileSync, FaultPoint::BeforeWalWrite] {
+        for pause_point in [FaultPoint::BeforeMainSync, FaultPoint::BeforeWalHeaderWrite] {
             let temp = TempDatabase::new("checkpoint-registration-race");
             let (entered_tx, entered_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
@@ -1598,7 +1598,7 @@ mod tests {
             entered_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("checkpoint reached exact persistence boundary");
-            if pause_point == FaultPoint::BeforeFileSync {
+            if pause_point == FaultPoint::BeforeMainSync {
                 // This registration wins the race while materialization holds no state lock.
                 let mut snapshot = pager.begin_read().unwrap();
                 resume_tx.send(()).unwrap();
@@ -1809,8 +1809,8 @@ mod tests {
         assert_eq!(
             faults.recorded(),
             vec![
-                FaultPoint::BeforeWalWrite,
-                FaultPoint::AfterWalWrite,
+                FaultPoint::BeforeWalRecordWrite,
+                FaultPoint::AfterWalRecordWrite,
                 FaultPoint::BeforeWalSync,
             ]
         );
@@ -3969,8 +3969,8 @@ mod tests {
 
     fn commit_fault_points() -> Vec<FaultPoint> {
         vec![
-            FaultPoint::BeforeWalWrite,
-            FaultPoint::AfterWalWrite,
+            FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordWrite,
             FaultPoint::BeforeWalSync,
             FaultPoint::AfterWalSync,
         ]

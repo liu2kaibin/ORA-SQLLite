@@ -208,7 +208,7 @@ impl Wal {
         self.header
     }
 
-    /// `AfterWalWrite` can report an applied-but-unacknowledged append; its boundary is retained.
+    /// `AfterWalRecordWrite` can report an applied-but-unacknowledged append; its boundary is retained.
     pub(super) fn append_record(&mut self, bytes: &[u8]) -> Result<u64> {
         self.require_writable()?;
         if bytes.is_empty() {
@@ -220,9 +220,14 @@ impl Wal {
         let end = start
             .checked_add(byte_count)
             .ok_or_else(|| corruption("WAL record end overflow"))?;
-        self.write_at(start, "append WAL record", bytes)?;
+        self.write_at(
+            start,
+            "append WAL record",
+            bytes,
+            FaultPoint::BeforeWalRecordWrite,
+        )?;
         self.end_offset = end;
-        self.after_write()?;
+        self.faults.check(FaultPoint::AfterWalRecordWrite)?;
         Ok(start)
     }
 
@@ -468,24 +473,31 @@ impl Wal {
     }
 
     fn write_header(&mut self, offset: u64, header: WalHeader) -> Result<()> {
-        self.write_at(offset, "write WAL header", &header.encode()?)?;
-        self.after_write()
+        self.write_at(
+            offset,
+            "write WAL header",
+            &header.encode()?,
+            FaultPoint::BeforeWalHeaderWrite,
+        )?;
+        self.faults.check(FaultPoint::AfterWalHeaderWrite)
     }
 
-    fn write_at(&mut self, offset: u64, operation: &str, bytes: &[u8]) -> Result<()> {
+    fn write_at(
+        &mut self,
+        offset: u64,
+        operation: &str,
+        bytes: &[u8],
+        before: FaultPoint,
+    ) -> Result<()> {
         self.require_writable()?;
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|error| io_error(operation, error))?;
-        self.faults.check(FaultPoint::BeforeWalWrite)?;
+        self.faults.check(before)?;
         if let Err(error) = self.file.write_all(bytes) {
             return Err(self.poison_after_mutating_io(operation, error));
         }
         Ok(())
-    }
-
-    fn after_write(&self) -> Result<()> {
-        self.faults.check(FaultPoint::AfterWalWrite)
     }
 
     fn require_writable(&self) -> Result<()> {
@@ -739,7 +751,7 @@ mod tests {
         let temp = TempDatabase::new("wal-fault-points");
         let header = DatabaseHeader::new(4096, [8; 16]).unwrap();
 
-        let write_fault = Arc::new(FailAt(FaultPoint::BeforeWalWrite));
+        let write_fault = Arc::new(FailAt(FaultPoint::BeforeWalRecordWrite));
         let mut wal = Wal::create(temp.path(), &header)
             .unwrap()
             .with_faults(write_fault);
@@ -768,7 +780,7 @@ mod tests {
         let header = DatabaseHeader::new(4096, [9; 16]).unwrap();
         let mut wal = Wal::create(temp.path(), &header)
             .unwrap()
-            .with_faults(Arc::new(FailOnceAt::new(FaultPoint::AfterWalWrite)));
+            .with_faults(Arc::new(FailOnceAt::new(FaultPoint::AfterWalRecordWrite)));
         let path = wal.path().to_path_buf();
 
         assert_eq!(
@@ -802,12 +814,12 @@ mod tests {
     #[test]
     fn every_failed_wal_create_stage_removes_only_its_exact_wal_path() {
         for (point, occurrence) in [
-            (FaultPoint::BeforeWalWrite, 1),
-            (FaultPoint::AfterWalWrite, 1),
+            (FaultPoint::BeforeWalHeaderWrite, 1),
+            (FaultPoint::AfterWalHeaderWrite, 1),
             (FaultPoint::BeforeWalSync, 1),
             (FaultPoint::AfterWalSync, 1),
-            (FaultPoint::BeforeWalWrite, 2),
-            (FaultPoint::AfterWalWrite, 2),
+            (FaultPoint::BeforeWalHeaderWrite, 2),
+            (FaultPoint::AfterWalHeaderWrite, 2),
             (FaultPoint::BeforeWalSync, 2),
             (FaultPoint::AfterWalSync, 2),
         ] {

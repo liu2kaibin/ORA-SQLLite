@@ -2,18 +2,22 @@ use crate::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FaultPoint {
-    BeforeFileWrite,
-    AfterFileWrite,
-    BeforeFileSync,
-    AfterFileSync,
-    BeforeWalWrite,
-    AfterWalWrite,
+    BeforeMainExtend,
+    AfterMainExtend,
+    BeforeMainPageWrite,
+    AfterMainPageWrite,
+    BeforeMainSync,
+    AfterMainSync,
+    BeforeSuperblockWrite,
+    AfterSuperblockWrite,
+    BeforeWalRecordWrite,
+    AfterWalRecordWrite,
+    BeforeWalHeaderWrite,
+    AfterWalHeaderWrite,
     BeforeWalSync,
     AfterWalSync,
     BeforeWalTruncate,
     AfterWalTruncate,
-    BeforeCheckpointPublish,
-    AfterCheckpointPublish,
 }
 
 pub(crate) trait FaultInjector: Send + Sync {
@@ -36,18 +40,22 @@ mod tests {
     fn production_default_never_injects() {
         let injector = NoFaults;
         for point in [
-            FaultPoint::BeforeFileWrite,
-            FaultPoint::AfterFileWrite,
-            FaultPoint::BeforeFileSync,
-            FaultPoint::AfterFileSync,
-            FaultPoint::BeforeWalWrite,
-            FaultPoint::AfterWalWrite,
+            FaultPoint::BeforeMainExtend,
+            FaultPoint::AfterMainExtend,
+            FaultPoint::BeforeMainPageWrite,
+            FaultPoint::AfterMainPageWrite,
+            FaultPoint::BeforeMainSync,
+            FaultPoint::AfterMainSync,
+            FaultPoint::BeforeSuperblockWrite,
+            FaultPoint::AfterSuperblockWrite,
+            FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordWrite,
+            FaultPoint::BeforeWalHeaderWrite,
+            FaultPoint::AfterWalHeaderWrite,
             FaultPoint::BeforeWalSync,
             FaultPoint::AfterWalSync,
             FaultPoint::BeforeWalTruncate,
             FaultPoint::AfterWalTruncate,
-            FaultPoint::BeforeCheckpointPublish,
-            FaultPoint::AfterCheckpointPublish,
         ] {
             injector.check(point).expect("NoFaults must succeed");
         }

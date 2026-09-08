@@ -553,7 +553,7 @@ impl FaultInjector for RecordingFaults {
 #[test]
 fn test_fault_injector_is_used_after_pager_creation() {
     let temp = TempDatabase::new("test-fault-injector");
-    let faults = Arc::new(RecordingFaults::at(FaultPoint::BeforeWalWrite, 1));
+    let faults = Arc::new(RecordingFaults::at(FaultPoint::BeforeWalRecordWrite, 1));
     let pager = Pager::create(temp.path(), PagerConfig::test_default(4096))
         .expect("create pager")
         .with_faults(faults.clone());
@@ -572,7 +572,7 @@ fn test_fault_injector_is_used_after_pager_creation() {
         page
     };
 
-    assert_eq!(faults.observed(), vec![FaultPoint::BeforeWalWrite]);
+    assert_eq!(faults.observed(), vec![FaultPoint::BeforeWalRecordWrite]);
     assert!(pager.is_poisoned());
     assert_eq!(
         pager
@@ -590,8 +590,8 @@ fn every_wal_commit_fault_requires_recovery_after_a_multi_page_transaction() {
     assert_eq!(
         baseline,
         vec![
-            FaultPoint::BeforeWalWrite,
-            FaultPoint::AfterWalWrite,
+            FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordWrite,
             FaultPoint::BeforeWalSync,
             FaultPoint::AfterWalSync,
         ],
@@ -599,8 +599,8 @@ fn every_wal_commit_fault_requires_recovery_after_a_multi_page_transaction() {
     );
 
     for point in [
-        FaultPoint::BeforeWalWrite,
-        FaultPoint::AfterWalWrite,
+        FaultPoint::BeforeWalRecordWrite,
+        FaultPoint::AfterWalRecordWrite,
         FaultPoint::BeforeWalSync,
         FaultPoint::AfterWalSync,
     ] {
@@ -1437,6 +1437,615 @@ fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
             .code(),
         ErrorCode::Corruption
     );
+}
+
+const CRASH_CHILD_TEST: &str = "storage::test_support::phase_3_crash_child";
+const CRASH_POINTS: [FaultPoint; 16] = [
+    FaultPoint::BeforeWalRecordWrite,
+    FaultPoint::AfterWalRecordWrite,
+    FaultPoint::BeforeWalSync,
+    FaultPoint::AfterWalSync,
+    FaultPoint::BeforeMainExtend,
+    FaultPoint::AfterMainExtend,
+    FaultPoint::BeforeMainPageWrite,
+    FaultPoint::AfterMainPageWrite,
+    FaultPoint::BeforeMainSync,
+    FaultPoint::AfterMainSync,
+    FaultPoint::BeforeSuperblockWrite,
+    FaultPoint::AfterSuperblockWrite,
+    FaultPoint::BeforeWalHeaderWrite,
+    FaultPoint::AfterWalHeaderWrite,
+    FaultPoint::BeforeWalTruncate,
+    FaultPoint::AfterWalTruncate,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrashState {
+    lsn: Lsn,
+    root: PageRef,
+    page_count: u64,
+    freelist_root: PageId,
+    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+fn crash_model(post: bool) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut rows = BTreeMap::new();
+    for number in 0..8u8 {
+        rows.insert(fixture_key(0x33, number), vec![number; 128]);
+    }
+    rows.insert(b"stable-overflow".to_vec(), vec![0x71; 5000]);
+    if post {
+        rows.remove(&fixture_key(0x33, 0));
+        rows.remove(&fixture_key(0x33, 3));
+        rows.insert(fixture_key(0x33, 2), vec![0x92; 6000]);
+        for number in 8..12u8 {
+            rows.insert(fixture_key(0x33, number), vec![number; 128]);
+        }
+    }
+    rows
+}
+
+fn crash_state(pager: &Pager) -> CrashState {
+    let mut snapshot = pager.begin_read().expect("open crash snapshot");
+    let tree = snapshot
+        .catalog_tree(TreeKind::Table)
+        .expect("validate crash tree and freelist")
+        .expect("crash fixture has a catalog tree");
+    CrashState {
+        lsn: snapshot.lsn(),
+        root: tree.root(),
+        page_count: snapshot.page_count().expect("read page count"),
+        freelist_root: snapshot.freelist_root().expect("read freelist root"),
+        rows: collect_all(&tree, &mut snapshot)
+            .expect("scan complete crash tree")
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn crash_open(path: &Path) -> Pager {
+    Pager::open(path, OpenMode::ReadWrite, PagerConfig::test_default(4096))
+        .expect("open crash fixture with fresh parent/child handles")
+}
+
+fn crash_commit(pager: &Pager) {
+    let mut tree = {
+        let mut snapshot = pager.begin_read().expect("read commit root");
+        snapshot.catalog_tree(TreeKind::Table).unwrap().unwrap()
+    };
+    let mut batch = pager.begin_write().expect("begin exactly one crash commit");
+    for number in [0, 2, 3] {
+        assert!(
+            tree.delete(&mut batch, &fixture_key(0x33, number))
+                .unwrap()
+                .is_some()
+        );
+    }
+    tree.insert(&mut batch, &fixture_key(0x33, 2), &vec![0x92; 6000])
+        .unwrap();
+    for number in 8..12u8 {
+        tree.insert(&mut batch, &fixture_key(0x33, number), &[number; 128])
+            .unwrap();
+    }
+    batch.track_tree(TreeKind::Table, tree.root()).unwrap();
+    batch.set_catalog_root(tree.root()).unwrap();
+    batch.commit().expect("commit crash transaction");
+}
+
+fn crash_fixture(mode: &str) -> TempDatabase {
+    let temp = TempDatabase::new("phase3-crash-fixture");
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+    let mut batch = pager.begin_write().unwrap();
+    let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+    for (key, value) in crash_model(false) {
+        tree.insert(&mut batch, &key, &value).unwrap();
+    }
+    batch.track_tree(TreeKind::Table, tree.root()).unwrap();
+    batch.set_catalog_root(tree.root()).unwrap();
+    batch.commit().unwrap();
+    pager.checkpoint().unwrap();
+    match mode {
+        "commit" => {}
+        "checkpoint" => crash_commit(&pager),
+        _ => panic!("invalid crash fixture mode"),
+    }
+    let state = crash_state(&pager);
+    assert_eq!(state.rows, crash_model(mode == "checkpoint"));
+    assert_eq!(state.lsn, Lsn(if mode == "checkpoint" { 2 } else { 1 }));
+    drop(pager);
+    temp
+}
+
+fn crash_pair_bytes(path: &Path) -> (Vec<u8>, Vec<u8>) {
+    (fs::read(path).unwrap(), fs::read(wal_path(path)).unwrap())
+}
+
+fn copy_crash_fixture(fixture: &TempDatabase) -> TempDatabase {
+    let temp = TempDatabase::new("phase3-crash-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(fixture.path(), temp.path()).unwrap();
+    fs::copy(wal_path(fixture.path()), wal_path(temp.path())).unwrap();
+    assert_eq!(
+        crash_pair_bytes(temp.path()),
+        crash_pair_bytes(fixture.path())
+    );
+    temp
+}
+
+fn crash_operation(pager: &Pager, mode: &str) {
+    match mode {
+        "commit" => crash_commit(pager),
+        "checkpoint" => {
+            pager.checkpoint().expect("exactly one crash checkpoint");
+        }
+        _ => panic!("invalid crash operation mode"),
+    }
+}
+
+fn crash_trace(fixture: &TempDatabase, mode: &str) -> (Vec<FaultPoint>, CrashState, CrashState) {
+    let temp = copy_crash_fixture(fixture);
+    let faults = Arc::new(RecordingFaults::never());
+    let pager = crash_open(temp.path()).with_faults(faults.clone());
+    let pre = crash_state(&pager);
+    crash_operation(&pager, mode);
+    let post = crash_state(&pager);
+    assert_eq!(post.rows, crash_model(true));
+    assert_eq!(post.lsn, Lsn(2));
+    if mode == "commit" {
+        assert_eq!(faults.observed(), CRASH_POINTS[..4]);
+        assert_ne!(pre, post);
+    } else {
+        assert_eq!(pre, post, "checkpoint cannot change the logical state");
+    }
+    drop(pager);
+    (faults.observed(), pre, post)
+}
+
+fn crash_child_command(
+    path: &Path,
+    mode: &str,
+    point: &str,
+    occurrence: &str,
+    trace: &[FaultPoint],
+) -> std::process::Command {
+    let executable = std::env::current_exe().expect("find test executable");
+    // Suppress core files without unsafe pre_exec or changing the parent's process limits.
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "ulimit -c 0 && exec \"$@\"", "ora-sqllite-crash"]);
+        command.arg(executable);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["--exact", CRASH_CHILD_TEST, "--ignored", "--nocapture"])
+        .env("ORA_SQLLITE_CRASH_PATH", path)
+        .env("ORA_SQLLITE_CRASH_MODE", mode)
+        .env("ORA_SQLLITE_CRASH_POINT", point)
+        .env("ORA_SQLLITE_CRASH_OCCURRENCE", occurrence)
+        .env(
+            "ORA_SQLLITE_CRASH_TRACE",
+            trace
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    command
+}
+
+#[test]
+#[ignore = "only launched with validated parameters by phase_3_crash_recovery_matrix"]
+fn phase_3_crash_child() {
+    let mode = std::env::var("ORA_SQLLITE_CRASH_MODE").expect("crash mode is required");
+    assert!(
+        matches!(mode.as_str(), "commit" | "checkpoint"),
+        "invalid crash configuration: mode"
+    );
+    let point_text = std::env::var("ORA_SQLLITE_CRASH_POINT").expect("crash point is required");
+    let parse_point = |name: &str| {
+        CRASH_POINTS
+            .into_iter()
+            .find(|point| format!("{point:?}") == name)
+    };
+    let point = parse_point(&point_text).expect("invalid crash configuration: point");
+    let occurrence_text =
+        std::env::var("ORA_SQLLITE_CRASH_OCCURRENCE").expect("crash occurrence is required");
+    let occurrence: usize = occurrence_text
+        .parse()
+        .expect("invalid crash configuration: occurrence");
+    assert!(
+        occurrence > 0 && occurrence_text == occurrence.to_string(),
+        "invalid crash configuration: occurrence"
+    );
+    let trace_text =
+        std::env::var("ORA_SQLLITE_CRASH_TRACE").expect("successful trace is required");
+    let trace: Vec<_> = trace_text
+        .split(',')
+        .map(|name| parse_point(name).expect("invalid crash configuration: trace point"))
+        .collect();
+    assert!(
+        occurrence <= trace.iter().filter(|&&seen| seen == point).count(),
+        "invalid crash configuration: occurrence outside successful trace"
+    );
+    if mode == "commit" {
+        assert_eq!(
+            trace,
+            CRASH_POINTS[..4],
+            "invalid crash configuration: commit trace"
+        );
+    } else {
+        assert!(
+            !trace.iter().any(|point| CRASH_POINTS[..2].contains(point)),
+            "invalid crash configuration: checkpoint trace"
+        );
+        for required in &CRASH_POINTS[2..] {
+            assert!(
+                trace.contains(required),
+                "invalid crash configuration: incomplete checkpoint trace"
+            );
+        }
+    }
+    let path = PathBuf::from(
+        std::env::var_os("ORA_SQLLITE_CRASH_PATH").expect("scenario database path is required"),
+    );
+    let canonical = fs::canonicalize(&path).expect("invalid crash configuration: database path");
+    assert_eq!(
+        canonical, path,
+        "invalid crash configuration: noncanonical path"
+    );
+    assert_eq!(
+        path.parent(),
+        Some(fs::canonicalize(std::env::temp_dir()).unwrap().as_path()),
+        "invalid crash configuration: path outside temp directory"
+    );
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_str()
+            .is_some_and(|name| name.starts_with("ora-sqllite-")
+                && name.contains("-phase3-crash-case-")
+                && name.ends_with(".db")),
+        "invalid crash configuration: non-scenario path"
+    );
+    assert!(
+        path.is_file() && wal_path(&path).is_file(),
+        "invalid crash configuration: incomplete database/WAL pair"
+    );
+    let pager = crash_open(&path);
+    let initial = crash_state(&pager);
+    assert_eq!(
+        initial.rows,
+        crash_model(mode == "checkpoint"),
+        "invalid crash configuration: fixture model"
+    );
+    assert_eq!(
+        initial.lsn,
+        Lsn(if mode == "checkpoint" { 2 } else { 1 }),
+        "invalid crash configuration: fixture LSN"
+    );
+    let pager = pager.with_faults(Arc::new(AbortAt {
+        mode: mode.clone(),
+        point,
+        occurrence,
+        trace,
+        observed: Mutex::new(Vec::new()),
+    }));
+    crash_operation(&pager, &mode);
+    panic!("configured crash boundary was not reached");
+}
+
+struct AbortAt {
+    mode: String,
+    point: FaultPoint,
+    occurrence: usize,
+    trace: Vec<FaultPoint>,
+    observed: Mutex<Vec<FaultPoint>>,
+}
+
+impl FaultInjector for AbortAt {
+    fn check(&self, point: FaultPoint) -> Result<()> {
+        let mut observed = self.observed.lock().unwrap();
+        assert_eq!(
+            self.trace.get(observed.len()),
+            Some(&point),
+            "child diverged from successful trace"
+        );
+        observed.push(point);
+        let occurrence = observed.iter().filter(|&&seen| seen == point).count();
+        if (point, occurrence) == (self.point, self.occurrence) {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "PHASE3_ABORT {} {point:?} {occurrence}", self.mode).unwrap();
+            stderr.flush().unwrap();
+            std::process::abort();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn crash_child_rejects_invalid_configuration_without_writing() {
+    let fixture = crash_fixture("commit");
+    let (trace, _, _) = crash_trace(&fixture, "commit");
+    for (mode, point, occurrence, missing_path) in [
+        ("invalid", "BeforeWalRecordWrite", "1", false),
+        ("commit", "unknown", "1", false),
+        ("commit", "BeforeWalRecordWrite", "0", false),
+        ("commit", "BeforeWalRecordWrite", "2", false),
+        ("commit", "BeforeWalRecordWrite", "1", true),
+    ] {
+        let temp = copy_crash_fixture(&fixture);
+        let before = crash_pair_bytes(temp.path());
+        let path = if missing_path {
+            temp.path().with_extension("missing")
+        } else {
+            fs::canonicalize(temp.path()).unwrap()
+        };
+        let output = crash_child_command(&path, mode, point, occurrence, &trace)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "bad child parameters must fail the test, not abort"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid crash configuration:"), "{stderr}");
+        assert!(!stderr.contains("PHASE3_ABORT"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        assert_eq!(crash_pair_bytes(temp.path()), before);
+    }
+}
+
+#[test]
+#[ignore = "dedicated subprocess crash matrix; each boundary aborts one child"]
+fn phase_3_crash_recovery_matrix() {
+    let mut covered = Vec::new();
+    let mut crashes = 0usize;
+    for mode in ["commit", "checkpoint"] {
+        let fixture = crash_fixture(mode);
+        let fixture_bytes = crash_pair_bytes(fixture.path());
+        let (trace, pre, post) = crash_trace(&fixture, mode);
+        assert!(
+            !trace.is_empty(),
+            "empty trace cannot establish crash coverage"
+        );
+        let durable_index = trace
+            .iter()
+            .position(|point| *point == FaultPoint::AfterWalSync)
+            .unwrap();
+        for point in CRASH_POINTS {
+            let count = trace.iter().filter(|&&seen| seen == point).count();
+            if count != 0 {
+                eprintln!("phase3 {mode} {point:?}: occurrences={count}");
+            }
+        }
+        for (index, &point) in trace.iter().enumerate() {
+            let occurrence = trace[..=index]
+                .iter()
+                .filter(|&&seen| seen == point)
+                .count();
+            let temp = copy_crash_fixture(&fixture);
+            let path = fs::canonicalize(temp.path()).unwrap();
+            let output = crash_child_command(
+                &path,
+                mode,
+                &format!("{point:?}"),
+                &occurrence.to_string(),
+                &trace,
+            )
+            .output()
+            .expect("synchronously wait and reap crash child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("running 1 test"),
+                "exact child test did not run: {stdout}"
+            );
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line == format!("PHASE3_ABORT {mode} {point:?} {occurrence}")),
+                "child did not hit its exact fault: status={} stderr={stderr}",
+                output.status
+            );
+            assert!(!output.status.success(), "crash child returned success");
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    output.status.signal(),
+                    Some(6),
+                    "child must die from SIGABRT"
+                );
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                output.status.code(),
+                Some(-1_073_740_791),
+                "child must die from Windows abort fast-fail (0xC0000409)"
+            );
+
+            let pager = crash_open(temp.path());
+            let recovered = crash_state(&pager);
+            if mode == "commit" && index >= durable_index {
+                assert_eq!(
+                    recovered, post,
+                    "durable commit must survive {point:?}/{occurrence}"
+                );
+            } else {
+                assert!(
+                    recovered == pre || recovered == post,
+                    "partial state at {mode} {point:?}/{occurrence}"
+                );
+            }
+            let verdict = if recovered == post { "post" } else { "pre" };
+            pager.checkpoint().expect("checkpoint recovered state");
+            assert_eq!(crash_state(&pager), recovered);
+            drop(pager);
+            let repaired_bytes = crash_pair_bytes(temp.path());
+            let reopened = crash_open(temp.path());
+            assert_eq!(
+                crash_state(&reopened),
+                recovered,
+                "second reopen changed logical state"
+            );
+            let checkpoint = reopened.checkpoint().expect("idempotent second checkpoint");
+            assert_eq!(checkpoint.pages_written, 0);
+            assert!(!checkpoint.wal_reset);
+            drop(reopened);
+            assert_eq!(
+                crash_pair_bytes(temp.path()),
+                repaired_bytes,
+                "second reopen/checkpoint changed bytes"
+            );
+            // Unlike best-effort Drop, prove all child/parent handles released both exact files.
+            fs::remove_file(wal_path(temp.path())).unwrap();
+            fs::remove_file(temp.path()).unwrap();
+            covered.push(point);
+            crashes = crashes.checked_add(1).unwrap();
+            eprintln!(
+                "phase3 {mode} {point:?}/{occurrence}: exit={} model={verdict} second-reopen+checkpoint=byte/logical-idempotent handles=released",
+                output.status
+            );
+        }
+        assert_eq!(
+            crash_pair_bytes(fixture.path()),
+            fixture_bytes,
+            "source fixture must remain unchanged"
+        );
+    }
+    for point in CRASH_POINTS {
+        assert!(covered.contains(&point), "uncovered boundary: {point:?}");
+    }
+    eprintln!(
+        "phase3 crash matrix: {crashes} inspected child aborts; all 16 named boundaries covered"
+    );
+    full_length_corruption_cases();
+}
+
+#[test]
+fn phase_3_full_length_corruption_matrix() {
+    full_length_corruption_cases();
+}
+
+fn full_length_corruption_cases() {
+    const RECORD_START: usize = 8192;
+    let fixture = crash_fixture("checkpoint");
+    for (case, field, value, restamp, reason) in [
+        ("bad header CRC", 52, None, false, "header checksum"),
+        ("bad payload CRC", 64, None, false, "payload checksum"),
+        (
+            "bad LSN",
+            16,
+            Some(1u64),
+            true,
+            "LSN does not follow the base checkpoint",
+        ),
+        (
+            "bad WAL generation",
+            56,
+            Some(3),
+            true,
+            "generation mismatch",
+        ),
+        (
+            "bad page generation",
+            40,
+            Some(0),
+            true,
+            "generation must be nonzero",
+        ),
+    ] {
+        let temp = copy_crash_fixture(&fixture);
+        let mut bytes = fs::read(wal_path(temp.path())).unwrap();
+        let original_len = bytes.len();
+        let offset = RECORD_START.checked_add(field).unwrap();
+        if let Some(value) = value {
+            bytes[offset..offset.checked_add(8).unwrap()].copy_from_slice(&value.to_le_bytes());
+        } else {
+            bytes[offset] ^= 1;
+        }
+        if restamp {
+            let header = &mut bytes[RECORD_START..RECORD_START + 64];
+            header[52..56].fill(0);
+            let crc = super::checksum::crc32c(header);
+            header[52..56].copy_from_slice(&crc.to_le_bytes());
+        }
+        assert_eq!(
+            bytes.len(),
+            original_len,
+            "{case} must not be a torn suffix"
+        );
+        fs::write(wal_path(temp.path()), bytes).unwrap();
+        assert_crash_corruption_retained(temp.path(), case, reason);
+    }
+
+    let temp = copy_crash_fixture(&fixture);
+    let old_wal = fs::read(wal_path(temp.path())).unwrap();
+    let pager = crash_open(temp.path());
+    pager.checkpoint().unwrap();
+    let expected = crash_state(&pager);
+    let mut batch = pager.begin_write().unwrap();
+    batch.allocate_append(PageType::TableLeaf).unwrap();
+    batch.commit().unwrap();
+    drop(pager);
+    let current_wal = fs::read(wal_path(temp.path())).unwrap();
+    assert!(old_wal.len() > RECORD_START && current_wal.len() > RECORD_START);
+    let mut mixed = current_wal[..RECORD_START].to_vec();
+    mixed.extend_from_slice(&old_wal[RECORD_START..]);
+    fs::write(wal_path(temp.path()), &mixed).unwrap();
+    // Control: these are valid, complete previous-generation records, not arbitrary garbage.
+    let old_only = Pager::open(
+        temp.path(),
+        OpenMode::ReadOnly,
+        PagerConfig::test_default(4096),
+    )
+    .unwrap();
+    assert_eq!(crash_state(&old_only), expected);
+    drop(old_only);
+    assert_eq!(fs::read(wal_path(temp.path())).unwrap(), mixed);
+    mixed.extend_from_slice(&current_wal[RECORD_START..]);
+    fs::write(wal_path(temp.path()), &mixed).unwrap();
+    assert_crash_corruption_retained(
+        temp.path(),
+        "valid old-generation suffix followed by current-generation records",
+        "contains another generation",
+    );
+
+    let temp = copy_crash_fixture(&fixture);
+    let original_len = fs::metadata(temp.path()).unwrap().len();
+    flip_header_byte(temp.path(), SuperblockSlot::A, 0).unwrap();
+    flip_header_byte(temp.path(), SuperblockSlot::B, 0).unwrap();
+    assert_eq!(fs::metadata(temp.path()).unwrap().len(), original_len);
+    assert_crash_corruption_retained(temp.path(), "both main superblocks invalid", "superblock");
+    eprintln!(
+        "phase3 corruption matrix: 7 full-length cases rejected; readonly/readwrite bytes retained"
+    );
+}
+
+fn assert_crash_corruption_retained(path: &Path, case: &str, reason: &str) {
+    let before = crash_pair_bytes(path);
+    for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+        let result = Pager::open(path, mode, PagerConfig::test_default(4096));
+        let error = match result {
+            Ok(_) => panic!("{case} was silently accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Corruption, "{case}: {error}");
+        assert!(
+            error.to_string().contains(reason),
+            "{case} failed for an unrelated reason: {error}"
+        );
+        assert_eq!(
+            crash_pair_bytes(path),
+            before,
+            "{case} must never silently truncate or rewrite either file"
+        );
+    }
+    eprintln!("phase3 corruption {case}: Corruption; full database/WAL bytes retained");
 }
 
 struct ScaleMetrics {

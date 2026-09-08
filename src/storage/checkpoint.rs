@@ -264,34 +264,36 @@ mod tests {
         recording.arm(None);
         pager.checkpoint().unwrap();
         let points = recording.recorded();
-        use FaultPoint::*;
         assert_eq!(
-            points,
+            points
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>(),
             vec![
-                BeforeFileWrite,
-                AfterFileWrite, // Main extension.
-                BeforeFileWrite,
-                AfterFileWrite, // Page 1.
-                BeforeFileWrite,
-                AfterFileWrite, // Page 2.
-                BeforeFileSync,
-                AfterFileSync, // All materialized pages durable.
-                BeforeFileWrite,
-                AfterFileWrite, // Alternate checkpoint superblock.
-                BeforeFileSync,
-                AfterFileSync,
-                BeforeWalWrite,
-                AfterWalWrite, // Inactive next-generation WAL header.
-                BeforeWalSync,
-                AfterWalSync,
-                BeforeFileWrite,
-                AfterFileWrite, // Matching main generation superblock.
-                BeforeFileSync,
-                AfterFileSync,
-                BeforeWalTruncate,
-                AfterWalTruncate,
-                BeforeWalSync,
-                AfterWalSync,
+                "BeforeMainExtend",
+                "AfterMainExtend",
+                "BeforeMainPageWrite",
+                "AfterMainPageWrite",
+                "BeforeMainPageWrite",
+                "AfterMainPageWrite",
+                "BeforeMainSync",
+                "AfterMainSync",
+                "BeforeSuperblockWrite",
+                "AfterSuperblockWrite",
+                "BeforeMainSync",
+                "AfterMainSync",
+                "BeforeWalHeaderWrite",
+                "AfterWalHeaderWrite",
+                "BeforeWalSync",
+                "AfterWalSync",
+                "BeforeSuperblockWrite",
+                "AfterSuperblockWrite",
+                "BeforeMainSync",
+                "AfterMainSync",
+                "BeforeWalTruncate",
+                "AfterWalTruncate",
+                "BeforeWalSync",
+                "AfterWalSync",
             ]
         );
         drop(pager);

@@ -211,7 +211,13 @@ impl DatabaseFile {
         }
         let offset = self.ordinary_page_offset(page_id)?;
         let operation = format!("write page {}", page_id.0);
-        self.write_at(offset, &operation, bytes)
+        self.write_at(
+            offset,
+            &operation,
+            bytes,
+            FaultPoint::BeforeMainPageWrite,
+            FaultPoint::AfterMainPageWrite,
+        )
     }
 
     pub(super) fn extend_to_pages(&mut self, page_count: u64) -> Result<()> {
@@ -228,11 +234,11 @@ impl DatabaseFile {
             .checked_add(u64::from(self.page_size()))
             .ok_or_else(|| corruption("database file length overflow"))?;
 
-        self.faults.check(FaultPoint::BeforeFileWrite)?;
+        self.faults.check(FaultPoint::BeforeMainExtend)?;
         self.file
             .set_len(new_len)
             .map_err(|error| io_error("extend database", error))?;
-        self.faults.check(FaultPoint::AfterFileWrite)?;
+        self.faults.check(FaultPoint::AfterMainExtend)?;
         self.page_count = page_count;
         Ok(())
     }
@@ -278,11 +284,11 @@ impl DatabaseFile {
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
-        self.faults.check(FaultPoint::BeforeFileSync)?;
+        self.faults.check(FaultPoint::BeforeMainSync)?;
         self.file
             .sync_all()
             .map_err(|error| io_error("sync database", error))?;
-        self.faults.check(FaultPoint::AfterFileSync)
+        self.faults.check(FaultPoint::AfterMainSync)
     }
 
     #[cfg(test)]
@@ -304,15 +310,22 @@ impl DatabaseFile {
         checked_page_offset(page_id, self.page_size(), self.max_bytes)
     }
 
-    fn write_at(&mut self, offset: u64, operation: &str, bytes: &[u8]) -> Result<()> {
+    fn write_at(
+        &mut self,
+        offset: u64,
+        operation: &str,
+        bytes: &[u8],
+        before: FaultPoint,
+        after: FaultPoint,
+    ) -> Result<()> {
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|error| io_error(operation, error))?;
-        self.faults.check(FaultPoint::BeforeFileWrite)?;
+        self.faults.check(before)?;
         self.file
             .write_all(bytes)
             .map_err(|error| io_error(operation, error))?;
-        self.faults.check(FaultPoint::AfterFileWrite)
+        self.faults.check(after)
     }
 
     fn write_superblock_slot(
@@ -326,7 +339,13 @@ impl DatabaseFile {
                 u64::try_from(SUPERBLOCK_SLOT_LEN).expect("superblock slot length fits u64")
             }
         };
-        self.write_at(offset, "write database superblock", &header.encode_slot())
+        self.write_at(
+            offset,
+            "write database superblock",
+            &header.encode_slot(),
+            FaultPoint::BeforeSuperblockWrite,
+            FaultPoint::AfterSuperblockWrite,
+        )
     }
 }
 
@@ -508,16 +527,20 @@ fn file_writes_and_syncs_cross_fault_boundaries() {
     db.publish_superblock(header).unwrap();
 
     assert_eq!(
-        faults.recorded(),
+        faults
+            .recorded()
+            .iter()
+            .map(|point| format!("{point:?}"))
+            .collect::<Vec<_>>(),
         vec![
-            FaultPoint::BeforeFileWrite,
-            FaultPoint::AfterFileWrite,
-            FaultPoint::BeforeFileWrite,
-            FaultPoint::AfterFileWrite,
-            FaultPoint::BeforeFileWrite,
-            FaultPoint::AfterFileWrite,
-            FaultPoint::BeforeFileSync,
-            FaultPoint::AfterFileSync,
+            "BeforeMainExtend",
+            "AfterMainExtend",
+            "BeforeMainPageWrite",
+            "AfterMainPageWrite",
+            "BeforeSuperblockWrite",
+            "AfterSuperblockWrite",
+            "BeforeMainSync",
+            "AfterMainSync",
         ]
     );
 }

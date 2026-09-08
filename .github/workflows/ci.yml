@@ -68,3 +68,17 @@ jobs:
           rustup run stable cargo test
           fixed_seed_reference_model_covers_every_page_size_and_tree_kind
           -- --ignored --nocapture
+
+  phase3-crash-recovery:
+    name: Linux WAL crash recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run the WAL crash recovery matrix
+        run: >-
+          rustup run stable cargo test
+          storage::test_support::phase_3_crash_recovery_matrix
+          -- --exact --ignored --nocapture
