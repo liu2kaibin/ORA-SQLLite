@@ -396,6 +396,7 @@ fn verify_old_generation_suffix(
                     .is_some_and(|lsn| lsn > database_header.checkpoint_lsn())
                     || transactions.previous_state.is_some_and(|state| {
                         state.page_count > database_header.page_count()
+                            || database_header.features() & state.feature_bits != state.feature_bits
                             || (transactions.previous_lsn == Some(database_header.checkpoint_lsn())
                                 && state != checkpoint_state(database_header))
                     })
@@ -854,6 +855,81 @@ mod tests {
             assert_eq!(fs::metadata(wal.path()).unwrap().len(), before, "{name}");
             drop(wal);
             drop(temp);
+        }
+    }
+
+    #[test]
+    fn recovery_old_generation_rejects_checkpoint_feature_loss_without_mutating_files() {
+        use crate::storage::{
+            features::CATALOG_V1,
+            pager::{Pager, PagerConfig},
+        };
+        let database = DatabaseHeader::new(PAGE_SIZE, [0x73; 16])
+            .unwrap()
+            .with_checkpoint(Lsn(2), 2, PageId(0), PageId(0), 2)
+            .unwrap();
+        let old_state = CommitState {
+            feature_bits: CATALOG_V1,
+            ..commit_state(2, 1, 0)
+        };
+        let records = encoded_transaction_for_generation(1, 0, &[(PageId(1), 1)], old_state, 1);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let (temp, mut wal) = fixture_wal(&database, 2, Lsn(2), &records, mode);
+            let wal_path = wal.path().to_owned();
+            let main = [
+                database.encode_slot().to_vec(),
+                database.encode_slot().to_vec(),
+                page_payload(PageId(1), 1),
+            ]
+            .concat();
+            fs::write(temp.path(), &main).unwrap();
+            let before_wal = fs::read(&wal_path).unwrap();
+            assert_eq!(
+                wal.recover(&database, mode).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+            assert_eq!(fs::read(temp.path()).unwrap(), main);
+            assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+            drop(wal);
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(PAGE_SIZE)) {
+                Ok(_) => panic!("pager accepted old-generation checkpoint feature loss"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert_eq!(fs::read(temp.path()).unwrap(), main);
+            assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+        }
+    }
+
+    #[test]
+    fn recovery_old_generation_allows_checkpoint_feature_enablement() {
+        use crate::storage::features::CATALOG_V1;
+        let mut database = DatabaseHeader::new(PAGE_SIZE, [0x74; 16])
+            .unwrap()
+            .with_checkpoint(Lsn(2), 2, PageId(1), PageId(0), 2)
+            .unwrap();
+        database.set_features(CATALOG_V1).unwrap();
+        let records =
+            encoded_transaction_for_generation(1, 0, &[(PageId(1), 1)], commit_state(2, 0, 0), 1);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let (_temp, mut wal) = fixture_wal(&database, 2, Lsn(2), &records, mode);
+            let before = fs::read(wal.path()).unwrap();
+            let recovered = wal.recover(&database, mode).unwrap();
+            assert_eq!(recovered.latest_lsn, Lsn(2));
+            assert_eq!(
+                recovered.latest_state,
+                CommitState {
+                    feature_bits: CATALOG_V1,
+                    ..commit_state(2, 1, 0)
+                }
+            );
+            assert_eq!(recovered.truncate_to, Some(WAL_HEADER_AREA_LEN));
+            let expected = if mode == OpenMode::ReadWrite {
+                &before[..usize::try_from(WAL_HEADER_AREA_LEN).unwrap()]
+            } else {
+                &before[..]
+            };
+            assert_eq!(fs::read(wal.path()).unwrap(), expected);
         }
     }
 
