@@ -46,13 +46,14 @@ pub(super) fn run(inner: &PagerInner) -> Result<CheckpointResult> {
             wal_reset: false,
         };
         if target > checkpoint.checkpoint_lsn() {
-            let candidate = checkpoint.with_checkpoint(
+            let mut candidate = checkpoint.with_checkpoint(
                 target,
                 state.page_count,
                 state.catalog_root,
                 state.freelist_root,
                 checkpoint.wal_generation(),
             )?;
+            candidate.set_features(state.feature_bits)?;
             let mut main = inner.main.lock().map_err(|_| lock_error())?;
             main.extend_to_pages(state.page_count)?;
             for (page_id, version) in versions {
@@ -83,13 +84,14 @@ pub(super) fn run(inner: &PagerInner) -> Result<CheckpointResult> {
             };
             let mut wal = inner.wal.lock().map_err(|_| lock_error())?;
             let reset = wal.begin_generation_reset(latest)?;
-            let candidate = published.checkpoint.with_checkpoint(
+            let mut candidate = published.checkpoint.with_checkpoint(
                 latest,
                 state.page_count,
                 state.catalog_root,
                 state.freelist_root,
                 reset.generation(),
             )?;
+            candidate.set_features(state.feature_bits)?;
             inner
                 .main
                 .lock()
@@ -129,6 +131,7 @@ fn lock_error() -> DbError {
 mod tests {
     use crate::storage::{
         Lsn, PageRef,
+        features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode},
         page::PageType,
         pager::{Pager, PagerConfig},
@@ -606,5 +609,33 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.latest_lsn().unwrap(), Lsn(2));
         assert_eq!(reopened.read(second).unwrap().bytes()[100], 22);
+    }
+
+    #[test]
+    fn checkpoint_reset_preserves_feature_bits_for_snapshots_and_reopen() {
+        let temp = TempDatabase::new("checkpoint-feature-bits");
+        let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+        {
+            let mut batch = pager.begin_write().unwrap();
+            super::super::catalog::CatalogWriter::bootstrap(&mut batch)
+                .unwrap()
+                .finish(&mut batch)
+                .unwrap();
+            batch.commit().unwrap();
+        }
+        assert_eq!(pager.begin_read().unwrap().feature_bits(), CATALOG_V1);
+
+        let result = pager.checkpoint().unwrap();
+        assert!(result.wal_reset);
+        assert_eq!(pager.begin_read().unwrap().feature_bits(), CATALOG_V1);
+
+        drop(pager);
+        let reopened = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        assert_eq!(reopened.begin_read().unwrap().feature_bits(), CATALOG_V1);
     }
 }

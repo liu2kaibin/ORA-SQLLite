@@ -1,14 +1,17 @@
 pub(super) mod btree;
 mod cache;
+pub(crate) mod catalog;
 mod checkpoint;
 mod checksum;
 mod codec;
+mod features;
 mod file;
 mod freelist;
 mod header;
 mod overflow;
 mod page;
 mod pager;
+mod row;
 mod slotted;
 mod snapshot;
 mod validate;

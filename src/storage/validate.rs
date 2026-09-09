@@ -28,6 +28,54 @@ impl ValidationReport {
     }
 }
 
+/// Normal catalog open checks user root identities only, never their descendants.
+pub(super) fn validate_table_roots(
+    source: &mut impl PageSource,
+    roots: impl IntoIterator<Item = PageRef>,
+    live: &mut BTreeSet<PageId>,
+) -> Result<()> {
+    let page_count = source.page_count().map_err(as_corruption)?;
+    for root in roots {
+        validate_page_id(root.page_id(), page_count, "table root")?;
+        if !live.insert(root.page_id()) {
+            return Err(corruption(
+                "table root overlaps another live catalog page or table root",
+            ));
+        }
+        let handle = source.read_page(root).map_err(as_corruption)?;
+        let header = handle.header();
+        if header.page_id() != root.page_id()
+            || header.generation() != root.generation()
+            || TreeKind::from_root_page_type(header.page_type()) != Some(TreeKind::Table)
+        {
+            return Err(corruption(
+                "table root has an invalid type or page reference",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extend a catalog's live set only after proving each user tree is disjoint.
+/// Freelist validation is deliberately left to the caller, once for the full set.
+pub(super) fn validate_table_trees(
+    source: &mut impl PageSource,
+    roots: impl IntoIterator<Item = PageRef>,
+    live: &mut BTreeSet<PageId>,
+) -> Result<()> {
+    for root in roots {
+        let pages =
+            validate_tree(source, &BTree::from_root(TreeKind::Table, root))?.all_live_pages();
+        if !live.is_disjoint(&pages) {
+            return Err(corruption(
+                "user tree overlaps another live catalog or user tree",
+            ));
+        }
+        live.extend(pages);
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Subtree {
     minimum: Option<Vec<u8>>,
