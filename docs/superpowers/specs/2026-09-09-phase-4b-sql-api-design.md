@@ -85,7 +85,9 @@ src/
 
 禁止反向依赖：`storage` 不得引用 `api`、`sql` 或 `sqlparser`；公共 API 不得出现 `sqlparser` 类型。
 
-## 4. 解析依赖
+## 4. 依赖
+
+### 4.1 SQL 解析
 
 Phase 4B 使用：
 
@@ -100,6 +102,18 @@ sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] 
 项目继续不提交 `Cargo.lock`。直接依赖使用精确版本；每次依赖升级使用独立提交，并重新运行完整语法语料库和 MSRV 门禁。
 
 解析入口使用 `sqlparser` 的 Oracle Dialect 作为基础，但必须由项目私有适配器补足 Oracle 风格参数和项目允许列表。适配器先通过依赖的 tokenizer 获得带 span 的 token，再把源码中相邻的 `:` 与合法数字/名称 token 转成项目允许的 placeholder token，并通过 `Parser::with_tokens` 解析；字符串、引用标识符和注释内的冒号不得转换。合并 span 后仍以原 SQL 字节位置为准。依赖支持某种语法不等于 ORA-SQLLite 支持该语法。
+
+### 4.2 数据库 UUID
+
+公共 `Database::create()` 使用最小的操作系统随机源：
+
+```toml
+getrandom = { version = "=0.4.3", default-features = false, features = ["std"] }
+```
+
+getrandom 0.4.3 采用 MIT OR Apache-2.0 许可证并明确声明 Rust 1.85 MSRV。项目不引入通用随机数生成器或 UUID 格式化依赖。
+
+创建前先调用 `getrandom::fill` 填充 16 字节，再把 byte 6 高四位设为 `0100`、byte 8 高两位设为 `10`，形成 RFC 4122 variant 的版本 4 UUID。随机源失败映射为 `Io`，并且必须发生在创建主文件或 WAL 之前。测试通过 crate 内部可注入 UUID 源证明固定字节、位规范化、随机源失败无文件副作用，以及连续创建得到不同数据库身份。
 
 ## 5. 公共 API
 
@@ -122,6 +136,7 @@ Phase 4B 不公开 `Row`、游标、`execute()` 或 `query()`；这些名称只�
 语义边界：
 
 - `Database::create(path, options)` 只创建新数据库；路径存在时返回 I/O 分类错误，不覆盖。
+- `Database::create` 在任何文件 I/O 前生成并规范化随机 UUID；随机源失败时主文件和 WAL 均不存在。
 - `Database::open(path, options)` 只打开已有数据库；路径不存在时失败，不隐式创建。
 - `Options` 明确选择读写或只读模式，并承载已有页、缓存、数据库和 WAL 限制及本阶段 SQL 限制。
 - 页大小只在创建时生效；打开时必须服从磁盘格式。
