@@ -336,7 +336,7 @@ mod tests {
         );
 
         let multibyte = CatalogName::new(format!("{}a", "表".repeat(337))).unwrap();
-        assert_eq!(multibyte.as_str().as_bytes().len(), 1012);
+        assert_eq!(multibyte.as_str().len(), 1012);
         assert_eq!(
             CatalogName::new("表".repeat(338)).unwrap_err().code(),
             ErrorCode::Type
