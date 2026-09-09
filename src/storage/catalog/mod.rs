@@ -216,8 +216,13 @@ impl CatalogReader {
         if tree.kind() != TreeKind::Table {
             return Err(corruption("catalog must use a Table B+Tree"));
         }
+        batch.require_current_catalog_root(tree.root())?;
         let report = validate_tree(batch, tree)?;
-        Self::open_validated(batch, tree, report)
+        let reader = Self::open_validated(batch, tree, report)?;
+        for table in reader.image.tables.values() {
+            batch.require_current_catalog_root(table.root())?;
+        }
+        Ok(reader)
     }
 
     fn open_validated(
@@ -395,10 +400,9 @@ impl CatalogWriter {
                 .get(batch, &key)?
                 .ok_or_else(|| corruption("catalog meta record is missing"))?;
             let candidate = record::decode_catalog_meta(&bytes)?.next_object_id();
-            let next = candidate
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| corruption("catalog object ID counter is exhausted"))?;
+            let next = candidate.get().checked_add(1).ok_or_else(|| {
+                DbError::new(ErrorCode::Type, "catalog object ID counter is exhausted")
+            })?;
             require_available_object(tree, batch, candidate)?;
             let meta = CatalogMeta::new(ObjectId::new(next)?);
             replace_record(tree, batch, &key, &record::encode_catalog_meta(&meta))?;
@@ -500,7 +504,7 @@ impl CatalogWriter {
             let candidate = table.next_rowid();
             let next = candidate.get().checked_add(1).ok_or_else(|| {
                 DbError::new(
-                    ErrorCode::Corruption,
+                    ErrorCode::Type,
                     format!("ROWID counter exhausted for table {}", table_id.get()),
                 )
             })?;
@@ -875,8 +879,8 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_and_malformed_counters_never_mutate() {
-        let (_temp, pager, table_id) = committed_single_column_catalog();
+    fn exhausted_and_malformed_object_counters_never_mutate() {
+        let (_temp, pager, _table_id) = committed_single_column_catalog();
         let mut batch = pager.begin_write().unwrap();
         let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
         for candidate in [u64::MAX - 1, u64::MAX, 0] {
@@ -896,10 +900,21 @@ mod tests {
             let before = current_records(&writer, &mut batch);
             assert_eq!(
                 writer.allocate_object_id(&mut batch).unwrap_err().code(),
-                ErrorCode::Corruption
+                if candidate == 0 {
+                    ErrorCode::Corruption
+                } else {
+                    ErrorCode::Type
+                }
             );
             assert_eq!(current_records(&writer, &mut batch), before);
         }
+    }
+
+    #[test]
+    fn exhausted_and_malformed_rowid_counters_never_mutate() {
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
         let key = table_definition_key(table_id);
         for candidate in [u64::MAX - 1, u64::MAX, 0] {
             let mut value = writer.tree.get(&mut batch, &key).unwrap().unwrap();
@@ -918,10 +933,226 @@ mod tests {
                     .allocate_rowid(&mut batch, table_id)
                     .unwrap_err()
                     .code(),
-                ErrorCode::Corruption
+                if candidate == 0 {
+                    ErrorCode::Corruption
+                } else {
+                    ErrorCode::Type
+                }
             );
             assert_eq!(current_records(&writer, &mut batch), before);
         }
+    }
+
+    fn split_user_tree(tree: &mut BTree, batch: &mut WriteBatch<'_>) -> u64 {
+        let old_root = tree.root();
+        for key in 0u64..200 {
+            tree.insert(batch, &key.to_be_bytes(), &[7; 128]).unwrap();
+            if tree.root() != old_root {
+                return key + 1;
+            }
+        }
+        panic!("fixture must split its user tree root");
+    }
+
+    // A finished writer must not authorize later releases or stale root pointers.
+    // Every rejected batch must leave both files and the published LSN unchanged.
+    fn reject_invalid_final_catalog_root(split: bool, timing: &str, dirty: bool) {
+        struct NoWrites;
+        impl crate::fault::FaultInjector for NoWrites {
+            fn check(&self, point: crate::fault::FaultPoint) -> Result<()> {
+                panic!("invalid final catalog reached I/O/publication: {point:?}");
+            }
+        }
+        let (temp, pager, table_id) = committed_single_column_catalog();
+        let reader = CatalogReader::open_empty_or_v1(&mut pager.begin_read().unwrap()).unwrap();
+        let root = reader.find_table_by_id(table_id).unwrap().root();
+        let lsn = pager.latest_lsn().unwrap();
+        drop(pager);
+        let wal_path = crate::storage::wal::wal_path(temp.path());
+        let before = (
+            std::fs::read(temp.path()).unwrap(),
+            std::fs::read(&wal_path).unwrap(),
+        );
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap()
+        .with_faults(std::sync::Arc::new(NoWrites));
+        let mut batch = pager.begin_write().unwrap();
+        let mut tree = BTree::from_root(TreeKind::Table, root);
+        let mutate = |tree: &mut BTree, batch: &mut WriteBatch<'_>| {
+            if split {
+                split_user_tree(tree, batch);
+            } else {
+                batch.release_later(root).unwrap();
+            }
+        };
+        if timing == "before" {
+            mutate(&mut tree, &mut batch);
+        }
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        if dirty {
+            writer.allocate_object_id(&mut batch).unwrap();
+        }
+        if timing == "during" {
+            mutate(&mut tree, &mut batch);
+        }
+        let finish = writer.finish(&mut batch);
+        if timing == "after" {
+            finish.unwrap();
+            mutate(&mut tree, &mut batch);
+            assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Corruption);
+        } else {
+            assert_eq!(finish.unwrap_err().code(), ErrorCode::Corruption);
+            assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
+        }
+        assert_eq!(pager.latest_lsn().unwrap(), lsn);
+        drop(pager);
+        assert_eq!(std::fs::read(temp.path()).unwrap(), before.0);
+        assert_eq!(std::fs::read(wal_path).unwrap(), before.1);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut read = pager.begin_read().unwrap();
+        let reader = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        assert_eq!(reader.find_table_by_id(table_id).unwrap().root(), root);
+        reader.validate_deep(&mut read).unwrap();
+    }
+
+    #[test]
+    fn catalog_pending_root_releases_are_rejected_before_during_and_after_finish() {
+        for timing in ["after", "before", "during"] {
+            for dirty in [false, true] {
+                reject_invalid_final_catalog_root(false, timing, dirty);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_unrecorded_root_splits_are_rejected_before_during_and_after_finish() {
+        for timing in ["after", "before", "during"] {
+            for dirty in [false, true] {
+                reject_invalid_final_catalog_root(true, timing, dirty);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_recorded_root_splits_commit_before_during_and_after_writer_lifetime() {
+        for timing in ["before", "during", "after"] {
+            let (temp, pager, table_id) = committed_single_column_catalog();
+            let reader = CatalogReader::open_empty_or_v1(&mut pager.begin_read().unwrap()).unwrap();
+            let old_root = reader.find_table_by_id(table_id).unwrap().root();
+            let mut batch = pager.begin_write().unwrap();
+            let mut tree = BTree::from_root(TreeKind::Table, old_root);
+            let (mut writer, count) = if timing == "before" {
+                let count = split_user_tree(&mut tree, &mut batch);
+                (CatalogWriter::bootstrap(&mut batch).unwrap(), count)
+            } else {
+                let writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+                if timing == "after" {
+                    writer.finish(&mut batch).unwrap();
+                    let count = split_user_tree(&mut tree, &mut batch);
+                    (CatalogWriter::bootstrap(&mut batch).unwrap(), count)
+                } else {
+                    let count = split_user_tree(&mut tree, &mut batch);
+                    (writer, count)
+                }
+            };
+            writer
+                .update_table_root(&mut batch, table_id, tree.root())
+                .unwrap();
+            writer.finish(&mut batch).unwrap();
+            batch.commit().unwrap();
+            drop(pager);
+            let pager = Pager::open(
+                temp.path(),
+                OpenMode::ReadOnly,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let reader = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(
+                reader.find_table_by_id(table_id).unwrap().root(),
+                tree.root()
+            );
+            for key in 0..count {
+                assert_eq!(
+                    tree.get(&mut read, &key.to_be_bytes()).unwrap(),
+                    Some(vec![7; 128])
+                );
+            }
+            reader.validate_deep(&mut read).unwrap();
+        }
+    }
+
+    #[test]
+    fn catalog_root_checkpoints_restore_valid_and_invalid_final_states() {
+        for split in [false, true] {
+            for restore_invalid in [false, true] {
+                let (_temp, pager, table_id) = committed_single_column_catalog();
+                let reader =
+                    CatalogReader::open_empty_or_v1(&mut pager.begin_read().unwrap()).unwrap();
+                let root = reader.find_table_by_id(table_id).unwrap().root();
+                let mut batch = pager.begin_write().unwrap();
+                CatalogWriter::bootstrap(&mut batch)
+                    .unwrap()
+                    .finish(&mut batch)
+                    .unwrap();
+                let valid = batch.checkpoint_mutation().unwrap();
+                if split {
+                    split_user_tree(&mut BTree::from_root(TreeKind::Table, root), &mut batch);
+                } else {
+                    batch.release_later(root).unwrap();
+                }
+                let invalid = batch.checkpoint_mutation().unwrap();
+                batch.restore_mutation(valid);
+                // A rolled-back split must not leave the old root superseded.
+                CatalogWriter::bootstrap(&mut batch)
+                    .unwrap()
+                    .finish(&mut batch)
+                    .unwrap();
+                if restore_invalid {
+                    batch.restore_mutation(invalid);
+                    assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Corruption);
+                } else {
+                    batch.commit().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_root_can_become_current_again_after_split_then_collapse() {
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let reader = CatalogReader::open_empty_or_v1(&mut pager.begin_read().unwrap()).unwrap();
+        let root = reader.find_table_by_id(table_id).unwrap().root();
+        let mut batch = pager.begin_write().unwrap();
+        let writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let mut tree = BTree::from_root(TreeKind::Table, root);
+        let count = split_user_tree(&mut tree, &mut batch);
+        for key in (1..count).rev() {
+            assert_eq!(
+                tree.delete(&mut batch, &key.to_be_bytes()).unwrap(),
+                Some(vec![7; 128])
+            );
+        }
+        assert_eq!(tree.root(), root);
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let mut read = pager.begin_read().unwrap();
+        let reader = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        reader.validate_deep(&mut read).unwrap();
+        assert_eq!(
+            tree.get(&mut read, &0u64.to_be_bytes()).unwrap(),
+            Some(vec![7; 128])
+        );
     }
 
     #[test]

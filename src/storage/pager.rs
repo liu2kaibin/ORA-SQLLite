@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
     sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError},
 };
@@ -346,7 +346,9 @@ impl Pager {
             committed_catalog,
             candidate_header: None,
             tracked_trees: Vec::new(),
+            superseded_roots: HashSet::new(),
             catalog_update_pending: false,
+            catalog_validation_required: false,
             finished: false,
         })
     }
@@ -730,7 +732,13 @@ pub(super) struct WriteBatch<'a> {
     committed_catalog: Option<(PageRef, BTreeSet<PageId>)>,
     candidate_header: Option<DatabaseHeader>,
     tracked_trees: Vec<(TreeKind, PageRef)>,
+    // Retain transitions even before a catalog writer opens. An old root may
+    // still be a valid descendant, so page validation alone cannot reject it.
+    superseded_roots: HashSet<PageRef>,
     catalog_update_pending: bool,
+    // A successful finish binds this batch to catalog validation through commit.
+    // Raw low-level batches remain available for deliberate corruption fixtures.
+    catalog_validation_required: bool,
     finished: bool,
 }
 
@@ -741,7 +749,9 @@ pub(super) struct WriteBatchCheckpoint {
     pending_releases: BTreeMap<PageId, PageRef>,
     candidate_header: Option<DatabaseHeader>,
     tracked_trees: Vec<(TreeKind, PageRef)>,
+    superseded_roots: HashSet<PageRef>,
     catalog_update_pending: bool,
+    catalog_validation_required: bool,
 }
 
 impl WriteBatch<'_> {
@@ -764,6 +774,13 @@ impl WriteBatch<'_> {
                 "no catalog update is pending",
             ));
         }
+        self.validate_catalog_candidate()?;
+        self.catalog_update_pending = false;
+        self.catalog_validation_required = true;
+        Ok(())
+    }
+
+    fn validate_catalog_candidate(&mut self) -> Result<()> {
         let features = self.feature_bits();
         validate_feature_bits(features)?;
         if features & super::features::CATALOG_V1 == 0 || self.catalog_root().0 == 0 {
@@ -775,7 +792,16 @@ impl WriteBatch<'_> {
         let root = PageRef::new(self.catalog_root(), frame.header().generation())?;
         let tree = BTree::from_root(TreeKind::Table, root);
         super::catalog::CatalogReader::open_candidate(self, &tree, features)?;
-        self.catalog_update_pending = false;
+        Ok(())
+    }
+
+    pub(super) fn require_current_catalog_root(&self, root: PageRef) -> Result<()> {
+        if self.pending_releases.contains_key(&root.page_id()) {
+            return Err(corruption("catalog references a root pending release"));
+        }
+        if self.superseded_roots.contains(&root) {
+            return Err(corruption("catalog references a superseded B+Tree root"));
+        }
         Ok(())
     }
 
@@ -824,7 +850,9 @@ impl WriteBatch<'_> {
             pending_releases: self.pending_releases.clone(),
             candidate_header: self.candidate_header,
             tracked_trees: self.tracked_trees.clone(),
+            superseded_roots: self.superseded_roots.clone(),
             catalog_update_pending: self.catalog_update_pending,
+            catalog_validation_required: self.catalog_validation_required,
         })
     }
 
@@ -835,7 +863,9 @@ impl WriteBatch<'_> {
         self.pending_releases = checkpoint.pending_releases;
         self.candidate_header = checkpoint.candidate_header;
         self.tracked_trees = checkpoint.tracked_trees;
+        self.superseded_roots = checkpoint.superseded_roots;
         self.catalog_update_pending = checkpoint.catalog_update_pending;
+        self.catalog_validation_required = checkpoint.catalog_validation_required;
     }
 
     pub(super) fn track_tree(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
@@ -855,9 +885,8 @@ impl WriteBatch<'_> {
     /// A catalog root replacement must name an exact current registered Table root.
     pub(super) fn require_tracked_table_root(&mut self, root: PageRef) -> Result<()> {
         self.require_active()?;
-        if self.pending_releases.contains_key(&root.page_id())
-            || !self.tracked_trees.contains(&(TreeKind::Table, root))
-        {
+        self.require_current_catalog_root(root)?;
+        if !self.tracked_trees.contains(&(TreeKind::Table, root)) {
             return Err(corruption(
                 "table root must be a registered current Table B+Tree root",
             ));
@@ -880,7 +909,13 @@ impl WriteBatch<'_> {
             self.tracked_trees
                 .retain(|tracked| *tracked != (kind, previous_root));
         }
-        self.track_tree(kind, root)
+        self.track_tree(kind, root)?;
+        if previous_root != root {
+            self.superseded_roots.insert(previous_root);
+            // A root can become current again after a split followed by collapse.
+            self.superseded_roots.remove(&root);
+        }
+        Ok(())
     }
 
     pub(super) fn replace_tree_root(
@@ -1293,6 +1328,9 @@ impl WriteBatch<'_> {
 
     fn validate_for_commit(&mut self) -> Result<()> {
         self.require_catalog_finished()?;
+        if self.catalog_validation_required {
+            self.validate_catalog_candidate()?;
+        }
         let target_page_count = self.target_page_count()?;
         if target_page_count == 1 {
             if super::header::SUPERBLOCK_AREA_LEN > self.pager.inner.max_database_bytes {
@@ -1557,7 +1595,9 @@ impl WriteBatch<'_> {
         self.committed_catalog = None;
         self.candidate_header = None;
         self.tracked_trees.clear();
+        self.superseded_roots.clear();
         self.catalog_update_pending = false;
+        self.catalog_validation_required = false;
         self.finished = true;
     }
 }
@@ -1841,6 +1881,33 @@ mod tests {
         assert_eq!(batch.page_count().unwrap(), 1);
         batch.commit().unwrap();
         assert_eq!(pager.latest_lsn().unwrap(), Lsn(0));
+    }
+
+    #[test]
+    fn finished_catalog_validation_survives_checkpoint_restore_and_clears_on_rollback() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let empty = batch.checkpoint_mutation().unwrap();
+        CatalogWriter::bootstrap(&mut batch)
+            .unwrap()
+            .finish(&mut batch)
+            .unwrap();
+        let finished = batch.checkpoint_mutation().unwrap();
+        batch.restore_mutation(empty);
+        batch.validate_for_commit().unwrap();
+        batch.restore_mutation(finished);
+        let (mut tree, _) = batch
+            .catalog_tree_with_report(TreeKind::Table)
+            .unwrap()
+            .unwrap();
+        tree.delete(&mut batch, &[0x00]).unwrap();
+        assert_eq!(
+            batch.validate_for_commit().unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        batch.rollback().unwrap();
+        assert!(!batch.catalog_validation_required);
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
     }
 
     #[test]

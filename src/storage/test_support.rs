@@ -2774,12 +2774,24 @@ fn phase_4a_crash_child_rejects_invalid_configuration_without_writing() {
         ("bootstrap", "BeforeWalRecordWrite", "1", "fixture"),
     ] {
         let temp = phase4a_copy_fixture(&fixture);
-        let before = crash_pair_bytes(temp.path());
         let path = match path_mode {
             "missing" => temp.path().with_extension("missing"),
             "fixture" => fs::canonicalize(fixture.path()).unwrap(),
             _ => fs::canonicalize(temp.path()).unwrap(),
         };
+        let protected_path = if path_mode == "fixture" {
+            fixture.path()
+        } else {
+            temp.path()
+        };
+        if path.is_file() {
+            assert_eq!(
+                fs::canonicalize(protected_path).unwrap(),
+                path,
+                "snapshot must protect the actual child DB/WAL pair"
+            );
+        }
+        let before = crash_pair_bytes(protected_path);
         let output = phase4a_child_command(&path, scenario, point, occurrence, &trace)
             .output()
             .unwrap();
@@ -2792,7 +2804,7 @@ fn phase_4a_crash_child_rejects_invalid_configuration_without_writing() {
         assert!(stderr.contains("invalid crash configuration:"), "{stderr}");
         assert!(!stderr.contains("PHASE4A_ABORT"));
         assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
-        assert_eq!(crash_pair_bytes(temp.path()), before);
+        assert_eq!(crash_pair_bytes(protected_path), before);
     }
 }
 
