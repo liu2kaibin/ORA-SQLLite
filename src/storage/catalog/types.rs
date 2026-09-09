@@ -201,6 +201,16 @@ impl TableDef {
     pub(crate) const fn name(&self) -> &CatalogName {
         &self.name
     }
+
+    pub(super) fn with_root(mut self, root: PageRef) -> Self {
+        self.root = root;
+        self
+    }
+
+    pub(super) fn with_next_rowid(mut self, next_rowid: RowId) -> Self {
+        self.next_rowid = next_rowid;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

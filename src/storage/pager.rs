@@ -844,6 +844,24 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
+    /// A catalog root replacement must name an exact current registered Table root.
+    pub(super) fn require_tracked_table_root(&mut self, root: PageRef) -> Result<()> {
+        self.require_active()?;
+        if self.pending_releases.contains_key(&root.page_id())
+            || !self.tracked_trees.contains(&(TreeKind::Table, root))
+        {
+            return Err(corruption(
+                "table root must be a registered current Table B+Tree root",
+            ));
+        }
+        if TreeKind::from_root_page_type(self.read(root)?.header().page_type())
+            != Some(TreeKind::Table)
+        {
+            return Err(corruption("table root must reference a Table B+Tree page"));
+        }
+        Ok(())
+    }
+
     pub(super) fn refresh_tree(
         &mut self,
         kind: TreeKind,
