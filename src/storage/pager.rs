@@ -346,6 +346,7 @@ impl Pager {
             committed_catalog,
             candidate_header: None,
             tracked_trees: Vec::new(),
+            catalog_update_pending: false,
             finished: false,
         })
     }
@@ -721,6 +722,7 @@ pub(super) struct WriteBatch<'a> {
     committed_catalog: Option<(PageRef, BTreeSet<PageId>)>,
     candidate_header: Option<DatabaseHeader>,
     tracked_trees: Vec<(TreeKind, PageRef)>,
+    catalog_update_pending: bool,
     finished: bool,
 }
 
@@ -731,9 +733,44 @@ pub(super) struct WriteBatchCheckpoint {
     pending_releases: BTreeMap<PageId, PageRef>,
     candidate_header: Option<DatabaseHeader>,
     tracked_trees: Vec<(TreeKind, PageRef)>,
+    catalog_update_pending: bool,
 }
 
 impl WriteBatch<'_> {
+    pub(super) const fn catalog_root(&self) -> PageId {
+        self.current_header().catalog_root()
+    }
+
+    pub(super) fn begin_catalog_update(&mut self) -> Result<()> {
+        self.require_active()?;
+        self.require_catalog_finished()?;
+        self.catalog_update_pending = true;
+        Ok(())
+    }
+
+    pub(super) fn finish_catalog_update(&mut self) -> Result<()> {
+        self.require_active()?;
+        if !self.catalog_update_pending {
+            return Err(DbError::new(
+                ErrorCode::Transaction,
+                "no catalog update is pending",
+            ));
+        }
+        let features = self.feature_bits();
+        validate_feature_bits(features)?;
+        if features & super::features::CATALOG_V1 == 0 || self.catalog_root().0 == 0 {
+            return Err(corruption(
+                "catalog update requires a complete V1 root state",
+            ));
+        }
+        let frame = self.read_frame_by_id(self.catalog_root())?;
+        let root = PageRef::new(self.catalog_root(), frame.header().generation())?;
+        let tree = BTree::from_root(TreeKind::Table, root);
+        super::catalog::CatalogReader::open_candidate(self, &tree, features)?;
+        self.catalog_update_pending = false;
+        Ok(())
+    }
+
     pub(super) fn catalog_tree_with_report(
         &mut self,
         kind: TreeKind,
@@ -779,6 +816,7 @@ impl WriteBatch<'_> {
             pending_releases: self.pending_releases.clone(),
             candidate_header: self.candidate_header,
             tracked_trees: self.tracked_trees.clone(),
+            catalog_update_pending: self.catalog_update_pending,
         })
     }
 
@@ -789,6 +827,7 @@ impl WriteBatch<'_> {
         self.pending_releases = checkpoint.pending_releases;
         self.candidate_header = checkpoint.candidate_header;
         self.tracked_trees = checkpoint.tracked_trees;
+        self.catalog_update_pending = checkpoint.catalog_update_pending;
     }
 
     pub(super) fn track_tree(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
@@ -1092,6 +1131,9 @@ impl WriteBatch<'_> {
 
     pub(super) fn commit(mut self) -> Result<()> {
         self.require_active()?;
+        // Reject before preparing releases or materializing a header-only change,
+        // so unfinished writers always produce Transaction and never reach WAL I/O.
+        self.require_catalog_finished()?;
         self.prepare_freelist_releases()?;
         if self.dirty.is_empty() && self.candidate_header.is_some() {
             let catalog_root = self.current_header().catalog_root();
@@ -1224,6 +1266,7 @@ impl WriteBatch<'_> {
     }
 
     fn validate_for_commit(&mut self) -> Result<()> {
+        self.require_catalog_finished()?;
         let target_page_count = self.target_page_count()?;
         if target_page_count == 1 {
             if super::header::SUPERBLOCK_AREA_LEN > self.pager.inner.max_database_bytes {
@@ -1469,6 +1512,16 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
+    fn require_catalog_finished(&self) -> Result<()> {
+        if self.catalog_update_pending {
+            return Err(DbError::new(
+                ErrorCode::Transaction,
+                "catalog writer must finish before the batch can commit",
+            ));
+        }
+        Ok(())
+    }
+
     fn finish(&mut self) {
         self.dirty.clear();
         self.new_pages.clear();
@@ -1478,6 +1531,7 @@ impl WriteBatch<'_> {
         self.committed_catalog = None;
         self.candidate_header = None;
         self.tracked_trees.clear();
+        self.catalog_update_pending = false;
         self.finished = true;
     }
 }
@@ -1595,6 +1649,7 @@ mod tests {
             BTree, INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, TreeKind,
             decode_internal_leftmost, encode_internal_leftmost,
         },
+        catalog::CatalogWriter,
         features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
         freelist::Freelist,
@@ -1604,6 +1659,98 @@ mod tests {
         validate::validate_tree,
         wal::{Wal, format::CommitState, wal_path},
     };
+
+    #[test]
+    fn catalog_update_gate_requires_an_active_batch_and_valid_v1_state() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        assert_eq!(
+            batch.finish_catalog_update().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        batch.begin_catalog_update().unwrap();
+        assert_eq!(
+            batch.begin_catalog_update().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        assert_eq!(
+            batch.finish_catalog_update().unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        assert_eq!(
+            batch.validate_for_commit().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        batch.enable_feature_bits(CATALOG_V1).unwrap();
+        assert_eq!(
+            batch.finish_catalog_update().unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        assert_eq!(
+            batch.validate_for_commit().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        batch.rollback().unwrap();
+        assert_eq!(
+            batch.begin_catalog_update().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        assert_eq!(
+            batch.finish_catalog_update().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+    }
+
+    #[test]
+    fn catalog_update_checkpoints_restore_both_pending_and_nonpending_states() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let empty = batch.checkpoint_mutation().unwrap();
+        let writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let pending = batch.checkpoint_mutation().unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.validate_for_commit().unwrap();
+        batch.restore_mutation(pending);
+        assert_eq!(
+            batch.validate_for_commit().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        batch.restore_mutation(empty);
+        assert_eq!(batch.feature_bits(), 0);
+        assert_eq!(batch.catalog_root(), PageId(0));
+        assert_eq!(batch.page_count().unwrap(), 1);
+        batch.commit().unwrap();
+        assert_eq!(pager.latest_lsn().unwrap(), Lsn(0));
+    }
+
+    #[test]
+    fn failed_bootstrap_allocation_restores_existing_batch_mutations_and_gate() {
+        let temp = TempDatabase::new("catalog-bootstrap-allocation-limit");
+        let mut config = PagerConfig::test_default(4096);
+        config.max_database_bytes = super::super::header::SUPERBLOCK_AREA_LEN + 4096;
+        let pager = Pager::create(temp.path(), config).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let unrelated = batch.allocate(PageType::Catalog).unwrap();
+        batch.modify(unrelated).unwrap().bytes_mut()[100] = 0x5a;
+        let before = batch.checkpoint_mutation().unwrap();
+        let error = match CatalogWriter::bootstrap(&mut batch) {
+            Ok(_) => panic!("catalog allocation exceeded the configured database limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_eq!(batch.candidate_header, before.candidate_header);
+        assert_eq!(batch.new_pages, before.new_pages);
+        assert_eq!(batch.pending_generations, before.pending_generations);
+        assert_eq!(batch.pending_releases, before.pending_releases);
+        assert_eq!(batch.tracked_trees, before.tracked_trees);
+        assert_eq!(batch.read(unrelated).unwrap().bytes()[100], 0x5a);
+        assert_eq!(batch.page_count().unwrap(), 2);
+        batch.commit().unwrap();
+        let mut read = pager.begin_read().unwrap();
+        assert_eq!(read.feature_bits(), 0);
+        assert_eq!(read.catalog_root(), PageId(0));
+        assert_eq!(read.read(unrelated).unwrap().bytes()[100], 0x5a);
+    }
 
     #[test]
     fn final_c1_initialized_database_never_recreates_a_missing_wal() {
