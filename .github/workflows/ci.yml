@@ -87,3 +87,17 @@ jobs:
           rustup run stable cargo test
           phase_3_every_record_byte_truncation_matrix
           -- --ignored --nocapture
+
+  phase4a-catalog-recovery:
+    name: Linux catalog and row recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run catalog crash recovery matrix
+        run: >-
+          rustup run stable cargo test
+          storage::test_support::phase_4a_catalog_crash_recovery_matrix
+          -- --exact --ignored --nocapture
