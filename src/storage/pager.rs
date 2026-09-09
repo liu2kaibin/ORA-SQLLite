@@ -19,7 +19,7 @@ use super::{
     page::{PageFrame, PageType},
     slotted::SlottedPage,
     snapshot::{SnapshotLease, SnapshotRegistry},
-    validate::{validate_freelist, validate_tree},
+    validate::{ValidationReport, validate_freelist, validate_tree},
     wal::{Wal, format::CommitState, index::WalIndex},
 };
 use crate::{DbError, ErrorCode, Result};
@@ -588,25 +588,46 @@ impl ReadSnapshot {
     }
 
     pub(super) fn catalog_tree(&mut self, kind: TreeKind) -> Result<Option<BTree>> {
-        let page_id = self.state.catalog_root;
-        if page_id.0 == 0 {
+        let Some((tree, report)) = self.catalog_tree_with_report(kind)? else {
             return Ok(None);
-        }
-        if page_id.0 >= self.state.page_count {
-            return Err(corruption("catalog root is outside the database"));
-        }
-        let frame = self.read_page_by_id(page_id)?;
-        let root = PageRef::new(page_id, frame.header().generation())?;
-        if TreeKind::from_root_page_type(frame.header().page_type()) != Some(kind) {
-            return Err(corruption(
-                "catalog root page type does not match the requested tree kind",
-            ));
-        }
-        let tree = BTree::from_root(kind, root);
-        let report = validate_tree(self, &tree)?;
+        };
         validate_freelist(self, &report.all_live_pages())?;
         Ok(Some(tree))
     }
+
+    pub(super) const fn catalog_root(&self) -> PageId {
+        self.state.catalog_root
+    }
+
+    pub(super) fn catalog_tree_with_report(
+        &mut self,
+        kind: TreeKind,
+    ) -> Result<Option<(BTree, ValidationReport)>> {
+        catalog_tree_with_report(self, self.state.catalog_root, kind)
+    }
+}
+
+fn catalog_tree_with_report(
+    source: &mut impl PageSource,
+    page_id: PageId,
+    kind: TreeKind,
+) -> Result<Option<(BTree, ValidationReport)>> {
+    if page_id.0 == 0 {
+        return Ok(None);
+    }
+    if page_id.0 >= source.page_count()? {
+        return Err(corruption("catalog root is outside the database"));
+    }
+    let frame = source.read_page_by_id(page_id)?;
+    let root = PageRef::new(page_id, frame.header().generation())?;
+    if TreeKind::from_root_page_type(frame.header().page_type()) != Some(kind) {
+        return Err(corruption(
+            "catalog root page type does not match the requested tree kind",
+        ));
+    }
+    let tree = BTree::from_root(kind, root);
+    let report = validate_tree(source, &tree)?;
+    Ok(Some((tree, report)))
 }
 
 impl PageSource for ReadSnapshot {
@@ -713,6 +734,14 @@ pub(super) struct WriteBatchCheckpoint {
 }
 
 impl WriteBatch<'_> {
+    pub(super) fn catalog_tree_with_report(
+        &mut self,
+        kind: TreeKind,
+    ) -> Result<Option<(BTree, ValidationReport)>> {
+        self.require_active()?;
+        catalog_tree_with_report(self, self.current_header().catalog_root(), kind)
+    }
+
     fn read_base(&self, reference: PageRef) -> Result<PageHandle> {
         self.pager.read_at(
             self.base_lsn,

@@ -28,6 +28,34 @@ impl ValidationReport {
     }
 }
 
+/// Normal catalog open checks user root identities only, never their descendants.
+pub(super) fn validate_table_roots(
+    source: &mut impl PageSource,
+    roots: impl IntoIterator<Item = PageRef>,
+    live: &mut BTreeSet<PageId>,
+) -> Result<()> {
+    let page_count = source.page_count().map_err(as_corruption)?;
+    for root in roots {
+        validate_page_id(root.page_id(), page_count, "table root")?;
+        if !live.insert(root.page_id()) {
+            return Err(corruption(
+                "table root overlaps another live catalog page or table root",
+            ));
+        }
+        let handle = source.read_page(root).map_err(as_corruption)?;
+        let header = handle.header();
+        if header.page_id() != root.page_id()
+            || header.generation() != root.generation()
+            || TreeKind::from_root_page_type(header.page_type()) != Some(TreeKind::Table)
+        {
+            return Err(corruption(
+                "table root has an invalid type or page reference",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Subtree {
     minimum: Option<Vec<u8>>,
