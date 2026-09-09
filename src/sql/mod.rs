@@ -1,3 +1,5 @@
+#[allow(dead_code, reason = "later SQL frontend layers consume the owned AST")]
+mod ast;
 mod limits;
 #[allow(
     dead_code,
