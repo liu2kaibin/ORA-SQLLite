@@ -45,6 +45,7 @@ pub(crate) enum SqlType {
 impl SqlType {
     pub(crate) fn unify(self, other: Self) -> Result<Self> {
         match (self, other) {
+            (Self::Null, Self::Unknown) | (Self::Unknown, Self::Null) => Ok(Self::Unknown),
             (Self::Null, value) | (Self::Unknown, value) => Ok(value),
             (value, Self::Null) | (value, Self::Unknown) => Ok(value),
             (Self::Int64, Self::Decimal) | (Self::Decimal, Self::Int64) => Ok(Self::Decimal),
@@ -85,6 +86,30 @@ mod tests {
             SqlType::Decimal.unify(SqlType::Float64).unwrap_err().code(),
             ErrorCode::Type
         );
+    }
+
+    #[test]
+    fn sql_type_unification_is_symmetric_for_every_supported_pair() {
+        let all = [
+            SqlType::Null,
+            SqlType::Unknown,
+            SqlType::Int64,
+            SqlType::Decimal,
+            SqlType::Float64,
+            SqlType::Text,
+            SqlType::Blob,
+            SqlType::Date,
+            SqlType::Timestamp,
+            SqlType::Bool,
+        ];
+
+        for left in all {
+            for right in all {
+                let forward = left.unify(right).map_err(|error| error.code());
+                let reverse = right.unify(left).map_err(|error| error.code());
+                assert_eq!(forward, reverse, "{left:?} and {right:?} must be symmetric");
+            }
+        }
     }
 
     #[test]

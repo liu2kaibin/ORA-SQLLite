@@ -150,6 +150,7 @@ fn invalid_parameter(message: &str) -> DbError {
 mod tests {
     use super::{Identifier, ParameterKey, ParameterStyle};
     use crate::{ErrorCode, sql::SqlSpan};
+    use std::num::NonZeroU16;
 
     #[test]
     fn oracle_identifier_normalization_is_byte_bounded() {
@@ -164,6 +165,14 @@ mod tests {
         assert_eq!(
             Identifier::quoted("Users", span()).unwrap().as_str(),
             "Users"
+        );
+        assert!(Identifier::unquoted("a".repeat(127), span()).is_ok());
+        assert!(Identifier::unquoted("a".repeat(128), span()).is_ok());
+        assert_eq!(
+            Identifier::unquoted("a".repeat(129), span())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
         );
         assert!(Identifier::quoted("界".repeat(42), span()).is_ok());
         assert_eq!(
@@ -181,6 +190,10 @@ mod tests {
         }
 
         assert!(ParameterKey::parse(":1", span()).is_ok());
+        assert_eq!(
+            ParameterKey::parse(":65535", span()).unwrap(),
+            ParameterKey::Position(NonZeroU16::new(65_535).unwrap())
+        );
         for invalid in [":0", ":01", ":65536"] {
             assert_eq!(
                 ParameterKey::parse(invalid, span()).unwrap_err().code(),

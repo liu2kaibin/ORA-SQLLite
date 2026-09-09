@@ -152,4 +152,133 @@ mod tests {
             64
         );
     }
+
+    #[test]
+    fn every_limit_builder_checks_zero_exact_maximum_and_overflow() {
+        let u32_overflow = (u32::MAX as usize) + 1;
+        let u16_overflow = (u16::MAX as usize) + 1;
+
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_sql_bytes(0)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_sql_bytes(u32::MAX as usize)
+                .unwrap()
+                .max_sql_bytes(),
+            u32::MAX
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_sql_bytes(u32_overflow)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+
+        assert_eq!(
+            SqlLimits::default().with_max_tokens(0).unwrap_err().code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_tokens(u32::MAX as usize)
+                .unwrap()
+                .max_tokens(),
+            u32::MAX
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_tokens(u32_overflow)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_ast_nodes(0)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_ast_nodes(u32::MAX as usize)
+                .unwrap()
+                .max_ast_nodes(),
+            u32::MAX
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_ast_nodes(u32_overflow)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+
+        assert_eq!(
+            SqlLimits::default().with_max_nesting(0).unwrap_err().code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_nesting(u16::MAX as usize)
+                .unwrap()
+                .max_nesting(),
+            u16::MAX
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_nesting(u16_overflow)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_parameters(0)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_parameters(u16::MAX as usize)
+                .unwrap()
+                .max_parameters(),
+            u16::MAX
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_parameters(u16_overflow)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+
+        assert_eq!(
+            SqlLimits::default().with_max_joins(0).unwrap_err().code(),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_joins(u16::MAX as usize)
+                .unwrap()
+                .max_joins(),
+            u16::MAX
+        );
+        assert_eq!(
+            SqlLimits::default()
+                .with_max_joins(u16_overflow)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
+        );
+    }
 }
