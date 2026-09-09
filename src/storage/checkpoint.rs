@@ -617,8 +617,10 @@ mod tests {
         let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
         {
             let mut batch = pager.begin_write().unwrap();
-            batch.enable_feature_bits(CATALOG_V1).unwrap();
-            batch.allocate_append(PageType::Catalog).unwrap();
+            super::super::catalog::CatalogWriter::bootstrap(&mut batch)
+                .unwrap()
+                .finish(&mut batch)
+                .unwrap();
             batch.commit().unwrap();
         }
         assert_eq!(pager.begin_read().unwrap().feature_bits(), CATALOG_V1);

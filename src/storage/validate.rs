@@ -56,6 +56,26 @@ pub(super) fn validate_table_roots(
     Ok(())
 }
 
+/// Extend a catalog's live set only after proving each user tree is disjoint.
+/// Freelist validation is deliberately left to the caller, once for the full set.
+pub(super) fn validate_table_trees(
+    source: &mut impl PageSource,
+    roots: impl IntoIterator<Item = PageRef>,
+    live: &mut BTreeSet<PageId>,
+) -> Result<()> {
+    for root in roots {
+        let pages =
+            validate_tree(source, &BTree::from_root(TreeKind::Table, root))?.all_live_pages();
+        if !live.is_disjoint(&pages) {
+            return Err(corruption(
+                "user tree overlaps another live catalog or user tree",
+            ));
+        }
+        live.extend(pages);
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Subtree {
     minimum: Option<Vec<u8>>,

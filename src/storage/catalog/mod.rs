@@ -12,14 +12,17 @@ use super::{
     btree::{BTree, TreeKind},
     features::{CATALOG_V1, validate_feature_bits},
     pager::{PageSource, ReadSnapshot, WriteBatch, WriteBatchCheckpoint},
-    validate::{ValidationReport, validate_freelist, validate_table_roots, validate_tree},
+    validate::{
+        ValidationReport, validate_freelist, validate_table_roots, validate_table_trees,
+        validate_tree,
+    },
 };
 use crate::{DbError, ErrorCode, Result};
 use key::DecodedCatalogKey;
 use types::{CatalogMeta, CatalogName, ColumnDef, ColumnId, ObjectId, RowId, TableDef, TableId};
 
 /// A fully decoded and cross-checked image. No page source is retained.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CatalogImage {
     meta: CatalogMeta,
     tables: BTreeMap<TableId, TableDef>,
@@ -227,6 +230,51 @@ impl CatalogReader {
         validate_table_roots(source, image.tables.values().map(TableDef::root), &mut live)?;
         validate_freelist(source, &live)?;
         Ok(Self { image })
+    }
+
+    /// Explicit, potentially expensive validation. Ordinary open never walks the
+    /// user descendants; here every live tree is checked against every other tree.
+    pub(super) fn validate_deep(&self, snapshot: &mut ReadSnapshot) -> Result<()> {
+        validate_feature_bits(snapshot.feature_bits())?;
+        if snapshot.feature_bits() & CATALOG_V1 == 0 {
+            if snapshot.catalog_root().0 != 0 {
+                return Err(unsupported_legacy());
+            }
+            self.require_matching_image(&CatalogImage::empty())?;
+            return validate_freelist(snapshot, &BTreeSet::new()).map(|_| ());
+        }
+        let (tree, report) = snapshot
+            .catalog_tree_with_report(TreeKind::Table)?
+            .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
+        self.validate_deep_from(snapshot, &tree, report)
+    }
+
+    fn validate_deep_from(
+        &self,
+        source: &mut impl PageSource,
+        tree: &BTree,
+        report: ValidationReport,
+    ) -> Result<()> {
+        // A reader retains no snapshot lease. Do not combine its immutable
+        // definitions with a different snapshot's catalog, roots, or counters.
+        self.require_matching_image(&CatalogImage::decode(source, tree)?)?;
+        let mut live = report.all_live_pages();
+        validate_table_trees(
+            source,
+            self.image.tables.values().map(TableDef::root),
+            &mut live,
+        )?;
+        validate_freelist(source, &live).map(|_| ())
+    }
+
+    fn require_matching_image(&self, image: &CatalogImage) -> Result<()> {
+        if &self.image != image {
+            return Err(DbError::new(
+                ErrorCode::Transaction,
+                "deep validation snapshot does not match the catalog reader",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn find_table_by_name(&self, name: &CatalogName) -> Option<&TableDef> {
@@ -1901,7 +1949,7 @@ mod tests {
         expected: ErrorCode,
         mutate: impl FnOnce(&mut Records, PageRef),
     ) {
-        let (_temp, pager) = test_pager(4096).unwrap();
+        let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
         let mut rows = records(root);
@@ -1924,6 +1972,15 @@ mod tests {
             expected,
             "snapshot: {label}"
         );
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                Ok(_) => panic!("recovery accepted {label}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), expected, "recovery: {label}");
+        }
     }
 
     #[test]
@@ -2219,7 +2276,7 @@ mod tests {
     #[test]
     fn user_root_in_freelist_is_corruption_in_candidate_and_snapshot() {
         use crate::storage::freelist::Freelist;
-        let (_temp, pager) = test_pager(4096).unwrap();
+        let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let user = BTree::create(&mut batch, TreeKind::Table).unwrap();
         let spare = batch.allocate_append(PageType::TableLeaf).unwrap();
@@ -2249,6 +2306,442 @@ mod tests {
                 .code(),
             ErrorCode::Corruption
         );
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                Ok(_) => panic!("recovery accepted a free user root"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Corruption);
+        }
+    }
+
+    #[test]
+    fn recovery_reopen_discards_an_incomplete_v1_tail_without_mixing_catalogs() {
+        use crate::fault::{FaultInjector, FaultPoint};
+        struct TornPage;
+        impl FaultInjector for TornPage {
+            fn check(&self, point: FaultPoint) -> Result<()> {
+                if point == FaultPoint::AfterWalRecordPayloadPrefixWrite {
+                    return Err(DbError::new(ErrorCode::Io, "injected incomplete V1 tail"));
+                }
+                Ok(())
+            }
+        }
+        let (temp, pager, table_id) = committed_single_column_catalog();
+        let committed_lsn = pager.latest_lsn().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let original = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+        drop(snapshot);
+        let pager = pager.with_faults(std::sync::Arc::new(TornPage));
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        assert_eq!(
+            writer.allocate_rowid(&mut batch, table_id).unwrap().get(),
+            1
+        );
+        let id = writer.allocate_object_id(&mut batch).unwrap();
+        let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        writer
+            .insert_table_definition(&mut batch, &new_table(id.get(), root, 0, "INCOMPLETE"))
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Io);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let pager = Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+            let mut read = pager.begin_read().unwrap();
+            assert_eq!(read.lsn(), committed_lsn);
+            let recovered = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(recovered.image, original.image);
+            recovered.validate_deep(&mut read).unwrap();
+        }
+    }
+
+    #[test]
+    fn deep_catalog_validation_handles_empty_catalog_and_rejects_mismatched_image() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut empty_snapshot = pager.begin_read().unwrap();
+        let empty = CatalogReader::open_empty_or_v1(&mut empty_snapshot).unwrap();
+        empty.validate_deep(&mut empty_snapshot).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        CatalogWriter::bootstrap(&mut batch)
+            .unwrap()
+            .finish(&mut batch)
+            .unwrap();
+        batch.commit().unwrap();
+        let mut initialized = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut initialized).unwrap();
+        catalog.validate_deep(&mut initialized).unwrap();
+        drop(initialized);
+        drop(empty_snapshot);
+
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let mut old = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut old).unwrap();
+        allocate_then_commit(&pager, table_id);
+        let mut latest = pager.begin_read().unwrap();
+        assert_eq!(
+            catalog.validate_deep(&mut latest).unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        catalog.validate_deep(&mut old).unwrap();
+    }
+
+    #[test]
+    fn recovery_reopen_rejects_complete_v1_catalog_state_defects() {
+        for checkpoint in [false, true] {
+            for defect in [
+                "missing root",
+                "missing meta",
+                "mapping",
+                "schema",
+                "generation",
+                "type",
+                "bounds",
+                "record version",
+                "meta version",
+                "catalog type",
+            ] {
+                let (temp, pager) = test_pager(4096).unwrap();
+                let mut batch = pager.begin_write().unwrap();
+                if defect == "missing root" {
+                    batch.allocate_append(PageType::TableLeaf).unwrap();
+                } else {
+                    CatalogWriter::bootstrap(&mut batch)
+                        .unwrap()
+                        .finish(&mut batch)
+                        .unwrap();
+                }
+                batch.commit().unwrap();
+                let previous_lsn = pager.latest_lsn().unwrap();
+                let mut batch = pager.begin_write().unwrap();
+                if defect == "missing root" {
+                    batch.enable_feature_bits(CATALOG_V1).unwrap();
+                    batch.allocate_append(PageType::TableLeaf).unwrap();
+                } else {
+                    let kind = if defect == "type" {
+                        TreeKind::Index
+                    } else {
+                        TreeKind::Table
+                    };
+                    let user = BTree::create(&mut batch, kind).unwrap();
+                    let mut rows = records(user.root());
+                    match defect {
+                        "missing meta" => {
+                            rows.remove(0);
+                        }
+                        "mapping" => {
+                            rows.remove(1);
+                        }
+                        "schema" => rows[2].1[16..24].fill(0),
+                        "generation" => rows[2].1[32..40].copy_from_slice(&2_u64.to_le_bytes()),
+                        "bounds" => rows[2].1[24..32].copy_from_slice(&u64::MAX.to_le_bytes()),
+                        "record version" => rows[0].1[1] = 2,
+                        "meta version" => rows[0].1[8..10].fill(0),
+                        "type" | "catalog type" => {}
+                        _ => unreachable!(),
+                    }
+                    let tree = if defect == "catalog type" {
+                        let mut tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+                        for (key, value) in rows {
+                            tree.insert(&mut batch, &key, &value).unwrap();
+                        }
+                        tree
+                    } else {
+                        raw_tree(&mut batch, rows)
+                    };
+                    publish(&mut batch, &tree);
+                }
+                // The low-level storage fixture commits complete checksummed bytes,
+                // bypassing CatalogWriter::finish deliberately. Recovery may not hide
+                // this durable corruption by selecting the older complete commit.
+                batch.commit().unwrap();
+                assert!(pager.latest_lsn().unwrap() > previous_lsn);
+                if checkpoint {
+                    pager.checkpoint().unwrap();
+                }
+                drop(pager);
+                let before = std::fs::read(temp.path()).unwrap();
+                let wal_path = crate::storage::wal::wal_path(temp.path());
+                let wal_before = std::fs::read(&wal_path).unwrap();
+                for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                    let error =
+                        match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                            Ok(_) => panic!("recovery published {defect}, checkpoint={checkpoint}"),
+                            Err(error) => error,
+                        };
+                    let expected = if defect == "record version" {
+                        ErrorCode::Unsupported
+                    } else {
+                        ErrorCode::Corruption
+                    };
+                    assert_eq!(error.code(), expected, "{defect}, checkpoint={checkpoint}");
+                    assert_eq!(std::fs::read(temp.path()).unwrap(), before);
+                    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_catalog_snapshot_survives_new_rows_tables_checkpoint_and_reopen() {
+        let (temp, pager, table_id) = committed_single_column_catalog();
+        let mut old_snapshot = pager.begin_read().unwrap();
+        let old = CatalogReader::open_empty_or_v1(&mut old_snapshot).unwrap();
+        let old_table = old.find_table_by_id(table_id).unwrap().clone();
+        let old_columns = old.columns_for_table(table_id).cloned().collect::<Vec<_>>();
+        let old_lsn = old_snapshot.lsn();
+        let old_root = old_snapshot.catalog_root();
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let mut rows = BTree::from_root(TreeKind::Table, old_table.root());
+        for value in 1..=96 {
+            let rowid = writer.allocate_rowid(&mut batch, table_id).unwrap();
+            assert_eq!(rowid.get(), value);
+            let encoded = RowCodec::encode(
+                &old_table,
+                &old_columns,
+                &[crate::Value::Int64(i64::try_from(value).unwrap())],
+                1024,
+            )
+            .unwrap();
+            rows.insert(&mut batch, &encode_rowid_key(rowid), &encoded)
+                .unwrap();
+        }
+        writer
+            .update_table_root(&mut batch, table_id, rows.root())
+            .unwrap();
+        for index in 0..48 {
+            let id = writer.allocate_object_id(&mut batch).unwrap();
+            let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+            writer
+                .insert_table_definition(
+                    &mut batch,
+                    &new_table(id.get(), root, 0, &format!("NEW{index}")),
+                )
+                .unwrap();
+        }
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let latest_lsn = pager.latest_lsn().unwrap();
+        let first_checkpoint = pager.checkpoint().unwrap();
+        assert_eq!(first_checkpoint.to_lsn, old_lsn);
+        assert!(!first_checkpoint.wal_reset);
+        assert_eq!(old_snapshot.lsn(), old_lsn);
+        assert_eq!(old_snapshot.catalog_root(), old_root);
+        assert_eq!(old.find_table_by_id(table_id).unwrap(), &old_table);
+        assert_eq!(
+            old.columns_for_table(table_id).cloned().collect::<Vec<_>>(),
+            old_columns
+        );
+        assert_eq!(old_table.next_rowid().get(), 1);
+        assert_eq!(old.image.meta.next_object_id().get(), 3);
+        assert_eq!(old.image.tables.len(), 1);
+        let reread = CatalogReader::open_empty_or_v1(&mut old_snapshot).unwrap();
+        assert_eq!(reread.image, old.image);
+        old.validate_deep(&mut old_snapshot).unwrap();
+        let mut latest_snapshot = pager.begin_read().unwrap();
+        let latest = CatalogReader::open_empty_or_v1(&mut latest_snapshot).unwrap();
+        assert_ne!(latest_snapshot.catalog_root(), old_root);
+        assert_eq!(latest.image.tables.len(), 49);
+        assert_eq!(latest.image.meta.next_object_id().get(), 51);
+        let latest_table = latest.find_table_by_id(table_id).unwrap();
+        assert_eq!(latest_table.next_rowid().get(), 97);
+        assert_eq!(latest_table.root(), rows.root());
+        assert_ne!(latest_table.root(), old_table.root());
+        latest.validate_deep(&mut latest_snapshot).unwrap();
+        drop(latest_snapshot);
+        drop(old_snapshot);
+        // Reopen first with the old checkpoint plus the newer complete WAL state.
+        drop(pager);
+        for reset in [false, true] {
+            let pager = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            if reset {
+                assert!(pager.checkpoint().unwrap().wal_reset);
+            }
+            let mut read = pager.begin_read().unwrap();
+            assert_eq!(read.lsn(), latest_lsn);
+            let recovered = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(recovered.image, latest.image);
+            recovered.validate_deep(&mut read).unwrap();
+        }
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut read = pager.begin_read().unwrap();
+        assert_eq!(
+            CatalogReader::open_empty_or_v1(&mut read).unwrap().image,
+            latest.image
+        );
+    }
+
+    fn large_user_tree(batch: &mut WriteBatch<'_>) -> BTree {
+        let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
+        for key in 0_u64..80 {
+            tree.insert(batch, &key.to_be_bytes(), &[42; 700]).unwrap();
+        }
+        tree.insert(batch, b"overflow", &[43; 5000]).unwrap();
+        tree
+    }
+
+    fn copy_internal_root(batch: &mut WriteBatch<'_>, from: PageRef, to: PageRef) {
+        let source = batch.read(from).unwrap();
+        let header = source.header();
+        assert_eq!(header.page_type(), PageType::TableInternal);
+        let target = batch.modify(to).unwrap();
+        target
+            .set_layout(
+                header.cell_count(),
+                header.slot_end(),
+                header.payload_start(),
+            )
+            .unwrap();
+        target.bytes_mut()[48..].copy_from_slice(&source.bytes()[48..]);
+    }
+
+    #[test]
+    fn deep_catalog_validation_rejects_cross_tree_overlap() {
+        for overlap_catalog in [false, true] {
+            let (_temp, pager) = test_pager(4096).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            let user = large_user_tree(&mut batch);
+            let alias = batch.allocate_append(PageType::TableInternal).unwrap();
+            let mut rows = records(user.root());
+            let second = new_table(30, alias, 0, "U");
+            rows.extend([
+                (
+                    table_name_key(second.name()).unwrap(),
+                    encode_table_name_mapping(second.id()),
+                ),
+                (
+                    table_definition_key(second.id()),
+                    encode_table_definition(&second),
+                ),
+            ]);
+            // Force an internal catalog root so a distinct user root can share its
+            // entire descendant set while both trees remain individually valid.
+            for id in 31..80 {
+                let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+                let table = new_table(id, root, 0, &format!("T{id}"));
+                rows.extend([
+                    (
+                        table_name_key(table.name()).unwrap(),
+                        encode_table_name_mapping(table.id()),
+                    ),
+                    (
+                        table_definition_key(table.id()),
+                        encode_table_definition(&table),
+                    ),
+                ]);
+            }
+            let catalog_tree = raw_tree(&mut batch, rows);
+            let original = if overlap_catalog {
+                catalog_tree.root()
+            } else {
+                user.root()
+            };
+            copy_internal_root(&mut batch, original, alias);
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, alias)).unwrap();
+            CatalogReader::open_candidate(&mut batch, &catalog_tree, CATALOG_V1).unwrap();
+            publish(&mut batch, &catalog_tree);
+            batch.commit().unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            let error = catalog.validate_deep(&mut read).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert!(error.to_string().contains("overlap"));
+        }
+    }
+
+    #[test]
+    fn deep_catalog_validation_visits_internal_leaf_and_overflow_pages() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let user = large_user_tree(&mut batch);
+        let user_report = validate_tree(&mut batch, &user).unwrap();
+        assert!(user_report.tree_pages.len() > 2);
+        assert!(!user_report.overflow_pages.is_empty());
+        let tree = raw_tree(&mut batch, records(user.root()));
+        publish(&mut batch, &tree);
+        batch.commit().unwrap();
+        let mut read = pager.begin_read().unwrap();
+        let (tree, report) = read
+            .catalog_tree_with_report(TreeKind::Table)
+            .unwrap()
+            .unwrap();
+        let catalog_pages = report.all_live_pages();
+        let mut source = CountingSource {
+            snapshot: &mut read,
+            reads: BTreeMap::new(),
+        };
+        let catalog = CatalogReader::open_validated(&mut source, &tree, report).unwrap();
+        assert_eq!(source.reads.get(&user.root().page_id()), Some(&1));
+        assert!(
+            source
+                .reads
+                .keys()
+                .all(|id| catalog_pages.contains(id) || *id == user.root().page_id())
+        );
+        source.reads.clear();
+        let report = validate_tree(&mut source, &tree).unwrap();
+        catalog
+            .validate_deep_from(&mut source, &tree, report)
+            .unwrap();
+        assert!(
+            user_report
+                .all_live_pages()
+                .iter()
+                .all(|id| source.reads.contains_key(id))
+        );
+        assert!(catalog_pages.iter().all(|id| source.reads.contains_key(id)));
+        catalog.validate_deep(&mut read).unwrap();
+    }
+
+    #[test]
+    fn deep_catalog_validation_rejects_user_descendants_in_freelist() {
+        use crate::storage::freelist::Freelist;
+        for overflow in [false, true] {
+            let (_temp, pager) = test_pager(4096).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            let user = large_user_tree(&mut batch);
+            let report = validate_tree(&mut batch, &user).unwrap();
+            let target = if overflow {
+                *report.overflow_pages.first().unwrap()
+            } else {
+                *report
+                    .tree_pages
+                    .iter()
+                    .find(|id| **id != user.root().page_id())
+                    .unwrap()
+            };
+            let spare = batch.allocate_append(PageType::TableLeaf).unwrap();
+            let tree = raw_tree(&mut batch, records(user.root()));
+            publish(&mut batch, &tree);
+            batch.commit().unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            batch.release_later(spare).unwrap();
+            batch.commit().unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            let mut trunk = Freelist::decode(batch.modify(spare).unwrap()).unwrap();
+            Freelist::release(&mut trunk, target, 4096).unwrap();
+            Freelist::write(batch.modify(spare).unwrap(), &trunk).unwrap();
+            batch.commit().unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            let error = catalog.validate_deep(&mut read).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Corruption);
+            assert!(error.to_string().contains("overlap"));
+        }
     }
 
     struct CountingSource<'a> {
@@ -2280,7 +2773,7 @@ mod tests {
 
     #[test]
     fn normal_open_scans_full_catalog_but_reads_each_user_root_once_and_no_descendants() {
-        let (_temp, pager) = test_pager(4096).unwrap();
+        let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let mut user = BTree::create(&mut batch, TreeKind::Table).unwrap();
         for key in 0_u64..120 {
@@ -2373,5 +2866,18 @@ mod tests {
                 .keys()
                 .all(|id| catalog_pages.contains(id) || user_roots.contains(id))
         );
+        drop(read);
+        drop(pager);
+        // Pager recovery uses the same shallow contract, even when the descendant
+        // bytes are durably checksummed but semantically invalid.
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let pager = Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(
+                catalog.validate_deep(&mut read).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+        }
     }
 }

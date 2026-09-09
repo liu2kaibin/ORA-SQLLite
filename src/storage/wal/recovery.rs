@@ -111,6 +111,11 @@ fn scan(wal: &mut Wal, database_header: &DatabaseHeader) -> Result<RecoveryResul
                 if transaction.state.page_count < latest_state.page_count {
                     return Err(corruption("WAL commit shrinks the checkpoint page count"));
                 }
+                if transaction.state.feature_bits & latest_state.feature_bits
+                    != latest_state.feature_bits
+                {
+                    return Err(corruption("WAL commit loses checkpoint feature bits"));
+                }
                 index.publish(
                     transaction.lsn,
                     Some(transaction.state),
@@ -275,7 +280,8 @@ impl TransactionScanner {
                 }
                 if self.previous_state.is_some_and(|previous| {
                     commit.state.page_count < previous.page_count
-                        || commit.state.feature_bits != previous.feature_bits
+                        || commit.state.feature_bits & previous.feature_bits
+                            != previous.feature_bits
                 }) {
                     return Err(corruption(
                         "WAL commit regresses the logical database state",
@@ -582,6 +588,72 @@ mod tests {
                     assert_eq!(fs::read(temp.path()).unwrap(), main);
                     assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_feature_enablement_is_monotonic_across_complete_commits() {
+        use crate::storage::features::CATALOG_V1;
+        let database = DatabaseHeader::new(PAGE_SIZE, [0x71; 16]).unwrap();
+        let first_state = commit_state(2, 0, 0);
+        let enabled = CommitState {
+            feature_bits: CATALOG_V1,
+            ..commit_state(3, 2, 0)
+        };
+        let mut records = encoded_transaction(1, 0, &[(PageId(1), 1)], first_state);
+        records.extend(encoded_transaction(2, 1, &[(PageId(2), 1)], enabled));
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let (_temp, mut wal) = fixture_wal(&database, WAL_GENERATION, Lsn(0), &records, mode);
+            let before = fs::read(wal.path()).unwrap();
+            let recovered = wal.recover(&database, mode).unwrap();
+            assert_eq!(recovered.latest_lsn, Lsn(2));
+            assert_eq!(recovered.latest_state, enabled);
+            assert_eq!(recovered.truncate_to, None);
+            assert_eq!(fs::read(wal.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn recovery_feature_loss_is_corruption_in_a_chain_or_after_checkpoint() {
+        use crate::storage::features::CATALOG_V1;
+        for after_checkpoint in [false, true] {
+            let mut database = DatabaseHeader::new(PAGE_SIZE, [0x72; 16]).unwrap();
+            let enabled = CommitState {
+                feature_bits: CATALOG_V1,
+                ..commit_state(2, 1, 0)
+            };
+            let records = if after_checkpoint {
+                database = database
+                    .with_checkpoint(Lsn(1), 2, PageId(1), PageId(0), WAL_GENERATION)
+                    .unwrap();
+                database.set_features(CATALOG_V1).unwrap();
+                encoded_transaction(2, 1, &[(PageId(1), 2)], commit_state(2, 1, 0))
+            } else {
+                let mut records = encoded_transaction(1, 0, &[(PageId(1), 1)], enabled);
+                records.extend(encoded_transaction(
+                    2,
+                    1,
+                    &[(PageId(1), 2)],
+                    commit_state(2, 1, 0),
+                ));
+                records
+            };
+            for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                let (_temp, mut wal) = fixture_wal(
+                    &database,
+                    WAL_GENERATION,
+                    database.checkpoint_lsn(),
+                    &records,
+                    mode,
+                );
+                let before = fs::read(wal.path()).unwrap();
+                assert_eq!(
+                    wal.recover(&database, mode).unwrap_err().code(),
+                    ErrorCode::Corruption,
+                    "after_checkpoint={after_checkpoint}"
+                );
+                assert_eq!(fs::read(wal.path()).unwrap(), before);
             }
         }
     }

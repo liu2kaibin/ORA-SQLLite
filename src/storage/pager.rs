@@ -424,6 +424,14 @@ impl Pager {
 
     fn validate_recovered(&self) -> Result<()> {
         let mut snapshot = self.begin_read()?;
+        validate_feature_bits(snapshot.feature_bits())?;
+        if snapshot.feature_bits() & super::features::CATALOG_V1 != 0 {
+            // Recovery has selected a complete commit. Semantic corruption in that
+            // candidate is fatal; do not reinterpret it as an incomplete WAL tail.
+            return super::catalog::CatalogReader::open_empty_or_v1(&mut snapshot).map(|_| ());
+        }
+        // Featureless Phase 3 catalogs have no V1 record contract. Retain their
+        // existing structural and freelist validation without decoding V1 records.
         let catalog_root = snapshot.state.catalog_root;
         let page_count = snapshot.state.page_count;
         let catalog = snapshot_catalog_reachability(&mut snapshot, catalog_root, page_count)?;
@@ -1677,6 +1685,100 @@ mod tests {
         validate::validate_tree,
         wal::{Wal, format::CommitState, wal_path},
     };
+
+    #[test]
+    fn catalog_checkpoint_publishes_the_matching_snapshot_commit_state() {
+        use super::super::catalog::{CatalogReader, types::*};
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        batch.allocate_append(PageType::TableLeaf).unwrap();
+        batch.commit().unwrap();
+        let featureless = pager.begin_read().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        CatalogWriter::bootstrap(&mut batch)
+            .unwrap()
+            .finish(&mut batch)
+            .unwrap();
+        batch.commit().unwrap();
+        let mut old_v1 = pager.begin_read().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        for index in 0..48 {
+            let id = writer.allocate_object_id(&mut batch).unwrap();
+            let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+            let table = TableDef::new(
+                TableId::new(id.get()).unwrap(),
+                SchemaVersion::new(1).unwrap(),
+                root,
+                RowId::new(1).unwrap(),
+                0,
+                CatalogName::new(format!("T{index}")).unwrap(),
+            )
+            .unwrap();
+            writer.insert_table_definition(&mut batch, &table).unwrap();
+        }
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let latest = pager.begin_read().unwrap();
+        assert_ne!(latest.catalog_root(), old_v1.catalog_root());
+        assert_eq!(pager.checkpoint().unwrap().to_lsn, featureless.lsn());
+        assert_eq!(
+            super::checkpoint_state(&pager.published_read().unwrap().checkpoint),
+            featureless.state
+        );
+        drop(featureless);
+        assert_eq!(pager.checkpoint().unwrap().to_lsn, old_v1.lsn());
+        assert_eq!(
+            super::checkpoint_state(&pager.published_read().unwrap().checkpoint),
+            old_v1.state
+        );
+        let old = CatalogReader::open_empty_or_v1(&mut old_v1).unwrap();
+        assert!(old.find_table_by_id(TableId::new(1).unwrap()).is_none());
+        old.validate_deep(&mut old_v1).unwrap();
+        drop(old_v1);
+        let latest_lsn = latest.lsn();
+        drop(latest);
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut read = pager.begin_read().unwrap();
+        assert_eq!(read.lsn(), latest_lsn);
+        let recovered = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        assert!(
+            recovered
+                .find_table_by_id(TableId::new(48).unwrap())
+                .is_some()
+        );
+        recovered.validate_deep(&mut read).unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_featureless_legacy_catalog_trees() {
+        for kind in [TreeKind::Table, TreeKind::Index] {
+            let (temp, pager) = test_pager(4096).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            let mut tree = BTree::create(&mut batch, kind).unwrap();
+            tree.insert(&mut batch, b"legacy", b"not a V1 record")
+                .unwrap();
+            batch.set_catalog_root(tree.root()).unwrap();
+            batch.commit().unwrap();
+            drop(pager);
+            for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                let pager =
+                    Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+                let mut snapshot = pager.begin_read().unwrap();
+                assert_eq!(snapshot.feature_bits(), 0);
+                assert_eq!(
+                    tree.get(&mut snapshot, b"legacy").unwrap(),
+                    Some(b"not a V1 record".to_vec())
+                );
+            }
+        }
+    }
 
     #[test]
     fn catalog_update_gate_requires_an_active_batch_and_valid_v1_state() {
