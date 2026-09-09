@@ -9,6 +9,7 @@ pub mod error;
     reason = "fault boundaries are consumed by later storage tasks"
 )]
 mod fault;
+mod sql;
 #[allow(
     dead_code,
     reason = "phase 1 primitives are consumed by later storage tasks"
@@ -19,4 +20,5 @@ mod value;
 pub use datetime::{OracleDate, OracleTimestamp};
 pub use decimal::Decimal;
 pub use error::{DbError, ErrorCode, Result};
+pub use sql::SqlLimits;
 pub use value::Value;

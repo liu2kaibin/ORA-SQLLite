@@ -1,0 +1,23 @@
+mod limits;
+#[allow(
+    dead_code,
+    reason = "later SQL frontend layers consume checked name primitives"
+)]
+mod name;
+#[allow(
+    dead_code,
+    reason = "later SQL frontend layers consume checked type primitives"
+)]
+mod types;
+
+pub use limits::SqlLimits;
+#[allow(
+    unused_imports,
+    reason = "later SQL frontend layers import these shared name primitives"
+)]
+pub(crate) use name::{Identifier, ParameterKey, ParameterStyle};
+#[allow(
+    unused_imports,
+    reason = "later SQL frontend layers import these shared type primitives"
+)]
+pub(crate) use types::{SqlSpan, SqlType};
