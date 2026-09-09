@@ -1442,6 +1442,7 @@ fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
 // Phase 4A expectations are deliberately separate from the production codecs.
 #[derive(Debug, Clone, PartialEq)]
 struct CatalogModel {
+    initialized: bool,
     next_object_id: u64,
     tables: BTreeMap<u64, ModelTable>,
 }
@@ -1465,12 +1466,14 @@ struct ModelColumn {
 impl CatalogModel {
     fn empty() -> Self {
         Self {
+            initialized: false,
             next_object_id: 1,
             tables: BTreeMap::new(),
         }
     }
 
     fn add_table(&mut self, name: String, kinds: &[ColumnType]) -> u64 {
+        self.initialized = true;
         let id = self.next_object_id;
         self.next_object_id += 1;
         let columns = kinds
@@ -1665,11 +1668,26 @@ fn model_name_key(kind: u8, owner: Option<u64>, name: &str) -> Vec<u8> {
 }
 
 fn assert_phase4a_model(snapshot: &mut ReadSnapshot, model: &CatalogModel) -> Result<()> {
+    assert_eq!(
+        snapshot.feature_bits(),
+        if model.initialized {
+            super::features::CATALOG_V1
+        } else {
+            0
+        },
+        "catalog initialization feature must match the independent model"
+    );
+    assert_eq!(
+        snapshot.catalog_root().0 != 0,
+        model.initialized,
+        "catalog initialization root must match the independent model"
+    );
     let reader = CatalogReader::open_empty_or_v1(snapshot)?;
     reader.validate_deep(snapshot)?;
     let tree = snapshot.catalog_tree(TreeKind::Table)?;
     let mut expected_records = BTreeMap::new();
-    if tree.is_some() {
+    assert_eq!(tree.is_some(), model.initialized);
+    if model.initialized {
         let mut meta = vec![1, 0, 0, 0];
         meta.extend_from_slice(&model.next_object_id.to_le_bytes());
         expected_records.insert(vec![0], model_envelope(0, meta));
@@ -1889,6 +1907,161 @@ fn phase_4a_reference_model() {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatalogMutationScalars {
+    next_object_id: u64,
+    schema_version: u64,
+    next_rowid: u64,
+}
+
+fn phase4a_catalog_flip_expectation(
+    family: u8,
+    offset: usize,
+    next_object_id: u64,
+) -> std::result::Result<CatalogMutationScalars, ErrorCode> {
+    let mut expected = CatalogMutationScalars {
+        next_object_id,
+        schema_version: 1,
+        next_rowid: 1,
+    };
+    // These are the only valid single-byte flips in this independently specified
+    // one-table fixture. All other fields violate framing, mappings, or root identity.
+    match (family, offset) {
+        (_, 0 | 1) => return Err(ErrorCode::Unsupported),
+        (0, 12..=19) => expected.next_object_id ^= 0x80u64 << ((offset - 12) * 8),
+        (0x11, 16..=23) => expected.schema_version ^= 0x80u64 << ((offset - 16) * 8),
+        (0x11, 40..=47) => expected.next_rowid ^= 0x80u64 << ((offset - 40) * 8),
+        _ => return Err(ErrorCode::Corruption),
+    }
+    Ok(expected)
+}
+
+#[test]
+fn phase_4a_catalog_reserved_field_expectations() {
+    for offset in [27, 30, 31, 24, 25, 26, 28, 29] {
+        assert_eq!(
+            phase4a_catalog_flip_expectation(0x14, offset, 6),
+            Err(ErrorCode::Corruption),
+            "ColumnDef offset {offset} is a known malformed field, not an optional error"
+        );
+    }
+}
+
+fn assert_phase4a_catalog_mutation(
+    reader: &CatalogReader,
+    batch: &mut WriteBatch<'_>,
+    tree: &BTree,
+    original: &TableDef,
+    model: &CatalogModel,
+    records: &[(Vec<u8>, Vec<u8>)],
+    scalars: CatalogMutationScalars,
+) {
+    let expected = TableDef::new(
+        original.id(),
+        SchemaVersion::new(scalars.schema_version).unwrap(),
+        original.root(),
+        RowId::new(scalars.next_rowid).unwrap(),
+        original.column_count(),
+        original.name().clone(),
+    )
+    .unwrap();
+    assert_eq!(reader.find_table_by_id(expected.id()), Some(&expected));
+    assert_eq!(reader.find_table_by_name(expected.name()), Some(&expected));
+    let (_, columns) = model_definitions(
+        original.id().get(),
+        &model.tables[&original.id().get()],
+        original.root(),
+    );
+    assert_eq!(
+        reader
+            .columns_for_table(expected.id())
+            .cloned()
+            .collect::<Vec<_>>(),
+        columns
+    );
+    for column in &columns {
+        assert_eq!(
+            reader.find_column_by_name(expected.id(), column.name()),
+            Some(column)
+        );
+    }
+    // The unmodified records were already checked against the independent model.
+    // Rebuild both possibly changed payloads from predicted scalars, never from
+    // decoded fields or by copying the mutated payload as its own expectation.
+    let mut expected_records: BTreeMap<_, _> = records.iter().cloned().collect();
+    let mut meta = vec![1, 0, 0, 0];
+    meta.extend_from_slice(&scalars.next_object_id.to_le_bytes());
+    expected_records.insert(vec![0], model_envelope(0, meta));
+    let mut definition = Vec::new();
+    for value in [
+        original.id().get(),
+        scalars.schema_version,
+        original.root().page_id().0,
+        original.root().generation(),
+        scalars.next_rowid,
+    ] {
+        definition.extend_from_slice(&value.to_le_bytes());
+    }
+    definition.extend_from_slice(&original.column_count().to_le_bytes());
+    definition.extend_from_slice(&(original.name().as_bytes().len() as u16).to_le_bytes());
+    definition.extend_from_slice(original.name().as_bytes());
+    expected_records.insert(
+        model_id_key(0x11, original.id().get()),
+        model_envelope(0x11, definition),
+    );
+    assert_eq!(
+        collect_all(tree, batch)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        expected_records
+    );
+    // CatalogReader's meta is private. Exercise the real decoded counter via
+    // allocation as well as asserting the independently reconstructed meta bytes.
+    let mut writer = CatalogWriter::bootstrap(batch).unwrap();
+    assert_eq!(
+        writer.allocate_object_id(batch).unwrap().get(),
+        scalars.next_object_id
+    );
+}
+
+#[test]
+fn phase_4a_bootstrap_oracle_rejects_allocation_without_catalog() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (_temp, pager) = test_pager(4096).unwrap();
+    let before = phase4a_state(&pager);
+    let mut batch = pager.begin_write().unwrap();
+    BTree::create(&mut batch, TreeKind::Table).unwrap();
+    batch.commit().unwrap();
+    let unpublished = phase4a_state(&pager);
+    assert_eq!(unpublished.lsn.0, before.lsn.0 + 1);
+    assert!(unpublished.page_count > before.page_count);
+    assert_eq!(unpublished.features, 0);
+    assert_eq!(unpublished.root, None);
+    let rejected = catch_unwind(AssertUnwindSafe(|| {
+        assert_phase4a_model(
+            &mut pager.begin_read().unwrap(),
+            &phase4a_scenario_model("bootstrap", true),
+        )
+        .unwrap();
+    }));
+    assert!(
+        rejected.is_err(),
+        "bootstrap oracle accepted allocation/LSN progress without catalog publication"
+    );
+}
+
+#[test]
+fn phase_4a_bootstrap_model_requires_initialized_meta() {
+    let (_temp, pager) = test_pager(4096).unwrap();
+    let pre = phase4a_scenario_model("bootstrap", false);
+    let post = phase4a_scenario_model("bootstrap", true);
+    let mut retained = pager.begin_read().unwrap();
+    phase4a_apply_model(&pager, &pre, &post).unwrap();
+    assert_phase4a_model(&mut retained, &pre).unwrap();
+    assert_phase4a_model(&mut pager.begin_read().unwrap(), &post).unwrap();
+}
+
 #[test]
 fn catalog_record_corruption_matrix_never_panics() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1897,14 +2070,16 @@ fn catalog_record_corruption_matrix_never_panics() {
     let id = model.add_table("T表".to_owned(), &PHASE_4A_KINDS);
     let mut batch = pager.begin_write().unwrap();
     let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
-    phase4a_create_table(&mut writer, &mut batch, &model, id).unwrap();
+    let original = phase4a_create_table(&mut writer, &mut batch, &model, id).unwrap();
     writer.finish(&mut batch).unwrap();
     batch.commit().unwrap();
     let mut snapshot = pager.begin_read().unwrap();
+    assert_phase4a_model(&mut snapshot, &model).unwrap();
     let tree = snapshot.catalog_tree(TreeKind::Table).unwrap().unwrap();
     let records = collect_all(&tree, &mut snapshot).unwrap();
     drop(snapshot);
     let mut cases = 0;
+    let mut valid_cases = 0;
     let mut families = std::collections::BTreeSet::new();
     for (key, value) in &records {
         families.insert(key[0]);
@@ -1913,29 +2088,24 @@ fn catalog_record_corruption_matrix_never_panics() {
             variants.push((
                 key.clone(),
                 value[..end].to_vec(),
-                Some(ErrorCode::Corruption),
+                Err(ErrorCode::Corruption),
             ));
         }
         for offset in 0..value.len() {
             let mut changed = value.clone();
             changed[offset] ^= 0x80;
-            let code = match offset {
-                0 | 1 => Some(ErrorCode::Unsupported),
-                2..=7 => Some(ErrorCode::Corruption),
-                8..=11 if key == &[0] => Some(ErrorCode::Corruption),
-                _ => None,
-            };
-            variants.push((key.clone(), changed, code));
+            let expected = phase4a_catalog_flip_expectation(key[0], offset, model.next_object_id);
+            variants.push((key.clone(), changed, expected));
         }
         let mut version_zero = value.clone();
         version_zero[1] = 0;
-        variants.push((key.clone(), version_zero, Some(ErrorCode::Corruption)));
+        variants.push((key.clone(), version_zero, Err(ErrorCode::Corruption)));
         // Include keys, not just values: malformed names/IDs must never escape the reader.
         for end in 0..key.len() {
             variants.push((
                 key[..end].to_vec(),
                 value.clone(),
-                Some(ErrorCode::Corruption),
+                Err(ErrorCode::Corruption),
             ));
         }
         for offset in 0..key.len() {
@@ -1944,7 +2114,7 @@ fn catalog_record_corruption_matrix_never_panics() {
             variants.push((
                 changed,
                 value.clone(),
-                Some(if offset == 0 {
+                Err(if offset == 0 {
                     ErrorCode::Unsupported
                 } else {
                     ErrorCode::Corruption
@@ -1954,22 +2124,30 @@ fn catalog_record_corruption_matrix_never_panics() {
         for (changed_key, changed_value, expected) in variants {
             let mut batch = pager.begin_write().unwrap();
             let mut candidate = BTree::from_root(TreeKind::Table, tree.root());
-            let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+            let result = catch_unwind(AssertUnwindSafe(|| -> Result<CatalogReader> {
                 assert_eq!(candidate.delete(&mut batch, key)?, Some(value.clone()));
                 candidate.insert(&mut batch, &changed_key, &changed_value)?;
-                CatalogReader::open_candidate(&mut batch, &candidate, super::features::CATALOG_V1)?;
-                Ok(())
+                CatalogReader::open_candidate(&mut batch, &candidate, super::features::CATALOG_V1)
             }))
             .expect("catalog mutation/open must never panic");
             match (result, expected) {
-                (Err(error), Some(code)) => assert_eq!(
+                (Err(error), Err(code)) => assert_eq!(
                     error.code(),
                     code,
                     "key={key:?} mutation={changed_key:?}/{changed_value:?}"
                 ),
-                (Err(error), None) => assert_eq!(error.code(), ErrorCode::Corruption),
-                (Ok(()), None) => {}
-                (Ok(()), Some(code)) => panic!("invalid catalog record accepted, wanted {code:?}"),
+                (Err(error), Ok(wanted)) => {
+                    panic!("valid catalog mutation {wanted:?} rejected: {error}")
+                }
+                (Ok(reader), Ok(wanted)) => {
+                    assert_phase4a_catalog_mutation(
+                        &reader, &mut batch, &candidate, &original, &model, &records, wanted,
+                    );
+                    valid_cases += 1;
+                }
+                (Ok(_), Err(code)) => panic!(
+                    "invalid catalog record accepted, wanted {code:?}; key={changed_key:?} bytes={changed_value:?}"
+                ),
             }
             batch.rollback().unwrap();
             cases += 1;
@@ -1981,8 +2159,12 @@ fn catalog_record_corruption_matrix_never_panics() {
     );
     assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
     assert!(cases > 500);
+    assert_eq!(
+        valid_cases, 24,
+        "exactly three independently predicted eight-byte scalar ranges"
+    );
     eprintln!(
-        "catalog corruption: {cases} truncation/byte-flip cases across all six record families"
+        "catalog corruption: {cases} cases across six record families; {valid_cases} independently checked valid mutations"
     );
 }
 
@@ -2104,6 +2286,7 @@ const PHASE_4A_WAL_POINTS: [FaultPoint; 8] = [
 
 fn phase4a_scenario_model(scenario: &str, post: bool) -> CatalogModel {
     let mut model = CatalogModel::empty();
+    model.initialized = post || scenario != "bootstrap";
     match scenario {
         "bootstrap" => {}
         "catalog-root-split" => {
@@ -2203,15 +2386,15 @@ struct Phase4aState {
 }
 
 fn phase4a_state(pager: &Pager) -> Phase4aState {
-    let mut snapshot = pager.begin_read().unwrap();
-    let reader = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
-    reader.validate_deep(&mut snapshot).unwrap();
+    phase4a_snapshot_state(&mut pager.begin_read().unwrap())
+}
+
+fn phase4a_snapshot_state(snapshot: &mut ReadSnapshot) -> Phase4aState {
+    let reader = CatalogReader::open_empty_or_v1(snapshot).unwrap();
+    reader.validate_deep(snapshot).unwrap();
     let tree = snapshot.catalog_tree(TreeKind::Table).unwrap();
     let records: BTreeMap<_, _> = tree.as_ref().map_or_else(BTreeMap::new, |tree| {
-        collect_all(tree, &mut snapshot)
-            .unwrap()
-            .into_iter()
-            .collect()
+        collect_all(tree, snapshot).unwrap().into_iter().collect()
     });
     let mut rows = BTreeMap::new();
     for key in records.keys().filter(|key| key[0] == 0x11) {
@@ -2219,7 +2402,7 @@ fn phase4a_state(pager: &Pager) -> Phase4aState {
         let table = reader.find_table_by_id(TableId::new(id).unwrap()).unwrap();
         let columns: Vec<_> = reader.columns_for_table(table.id()).cloned().collect();
         let tree = BTree::from_root(TreeKind::Table, table.root());
-        let entries = collect_all(&tree, &mut snapshot).unwrap();
+        let entries = collect_all(&tree, snapshot).unwrap();
         for (key, value) in &entries {
             decode_rowid_key(key).unwrap();
             RowCodec::decode(table, &columns, value, PHASE_4A_MAX_ROW).unwrap();
@@ -2366,6 +2549,7 @@ fn phase_4a_catalog_io_fault_boundaries() {
             let temp = phase4a_copy_fixture(&fixture);
             let faults = Arc::new(RecordingFaults::at(point, 1));
             let pager = crash_open(temp.path()).with_faults(faults.clone());
+            let mut retained = pager.begin_read().unwrap();
             let result = phase4a_apply_model(
                 &pager,
                 &phase4a_scenario_model(scenario, false),
@@ -2381,6 +2565,29 @@ fn phase_4a_catalog_io_fault_boundaries() {
                 assert_eq!(result.unwrap_err().code(), ErrorCode::Io);
                 assert_eq!(faults.observed(), trace[..=index]);
             }
+            // A synced transaction with an injected error is durable but unpublished.
+            // Publication observers cannot convert successful publication into I/O failure.
+            let live_post = matches!(
+                point,
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish
+            );
+            assert_eq!(
+                &phase4a_state(&pager),
+                if live_post { &post } else { &pre },
+                "fresh live snapshot at {scenario} {point:?}"
+            );
+            assert_phase4a_model(
+                &mut pager.begin_read().unwrap(),
+                &phase4a_scenario_model(scenario, live_post),
+            )
+            .unwrap();
+            assert_eq!(
+                phase4a_snapshot_state(&mut retained),
+                pre,
+                "retained snapshot at {scenario} {point:?}"
+            );
+            assert_phase4a_model(&mut retained, &phase4a_scenario_model(scenario, false)).unwrap();
+            drop(retained);
             drop(pager);
             phase4a_assert_recovery(temp.path(), scenario, &pre, &post, index >= durable);
             cases += 1;
