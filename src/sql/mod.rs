@@ -8,6 +8,11 @@ mod limits;
 mod name;
 #[allow(
     dead_code,
+    reason = "later SQL frontend layers consume source-mapped parser tokens"
+)]
+mod parser;
+#[allow(
+    dead_code,
     reason = "later SQL frontend layers consume checked type primitives"
 )]
 mod types;
