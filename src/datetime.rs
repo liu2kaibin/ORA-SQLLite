@@ -49,6 +49,30 @@ impl OracleDate {
             second,
         })
     }
+
+    pub const fn year(self) -> u16 {
+        self.year
+    }
+
+    pub const fn month(self) -> u8 {
+        self.month
+    }
+
+    pub const fn day(self) -> u8 {
+        self.day
+    }
+
+    pub const fn hour(self) -> u8 {
+        self.hour
+    }
+
+    pub const fn minute(self) -> u8 {
+        self.minute
+    }
+
+    pub const fn second(self) -> u8 {
+        self.second
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +97,18 @@ impl OracleTimestamp {
             micros,
             offset_minutes,
         })
+    }
+
+    pub const fn date(self) -> OracleDate {
+        self.date
+    }
+
+    pub const fn micros(self) -> u32 {
+        self.micros
+    }
+
+    pub const fn offset_minutes(self) -> Option<i16> {
+        self.offset_minutes
     }
 }
 

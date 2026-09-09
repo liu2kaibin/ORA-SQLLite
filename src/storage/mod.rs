@@ -11,6 +11,7 @@ mod header;
 mod overflow;
 mod page;
 mod pager;
+mod row;
 mod slotted;
 mod snapshot;
 mod validate;
