@@ -2,6 +2,7 @@ use super::{
     Lsn, OpenMode, PageId,
     checksum::crc32c,
     codec::{Decoder, Encoder},
+    features::validate_feature_bits,
 };
 use crate::{DbError, ErrorCode, Result};
 
@@ -12,7 +13,6 @@ const SUPERBLOCK_PREFIX_LEN: usize = SUPERBLOCK_SLOT_LEN - 4;
 const DATABASE_MAGIC: &[u8; 16] = b"ORA-SQLLITE-SB\0\0";
 const FORMAT_MAJOR: u16 = 2;
 const FORMAT_MINOR: u16 = 0;
-const KNOWN_FEATURES: u64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SuperblockSlot {
@@ -114,6 +114,12 @@ impl DatabaseHeader {
 
     pub(super) const fn features(&self) -> u64 {
         self.features
+    }
+
+    pub(super) fn set_features(&mut self, features: u64) -> Result<()> {
+        validate_feature_bits(features)?;
+        self.features = features;
+        Ok(())
     }
 
     pub(super) const fn catalog_root(&self) -> PageId {
@@ -269,9 +275,7 @@ impl DatabaseHeader {
         if self.wal_generation == 0 {
             return Err(corruption("database WAL generation must be nonzero"));
         }
-        if self.features & !KNOWN_FEATURES != 0 {
-            return Err(corruption("database header has unknown feature bits"));
-        }
+        validate_feature_bits(self.features)?;
         Ok(())
     }
 }
@@ -300,6 +304,19 @@ fn database_header_round_trips() {
     let bytes = header.encode_slot();
     assert_eq!(&bytes[..16], b"ORA-SQLLITE-SB\0\0");
     assert_eq!(DatabaseHeader::decode_slot(&bytes).expect("decode"), header);
+}
+
+#[test]
+fn database_header_rejects_unknown_feature_bits() {
+    let mut header = DatabaseHeader::new(4096, [7; 16]).expect("valid header");
+    assert_eq!(
+        header
+            .set_features(1 << 63)
+            .expect_err("unknown feature bit")
+            .code(),
+        ErrorCode::Corruption
+    );
+    assert_eq!(header.features(), 0);
 }
 
 #[test]
@@ -414,7 +431,7 @@ fn database_header_decode_rejects_invalid_disk_fields_as_corruption() {
         |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[40..48].copy_from_slice(&0u64.to_le_bytes()),
         |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[56..64].copy_from_slice(&0u64.to_le_bytes()),
         |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[80..88].copy_from_slice(&0u64.to_le_bytes()),
-        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[88] = 1,
+        |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[88] = 2,
         |bytes: &mut [u8; SUPERBLOCK_SLOT_LEN]| bytes[96] = 1,
     ] {
         let mut bytes = valid;

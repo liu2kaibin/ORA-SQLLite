@@ -1,6 +1,7 @@
 use super::super::{
     Lsn, PageId,
     checksum::{Crc32c, crc32c},
+    features::validate_feature_bits,
 };
 use crate::{DbError, ErrorCode, Result};
 
@@ -14,7 +15,6 @@ const WAL_FORMAT_MAJOR: u16 = 1;
 const WAL_FORMAT_MINOR: u16 = 0;
 const WAL_HEADER_CRC_OFFSET: usize = WAL_HEADER_SLOT_LEN - 4;
 const RECORD_HEADER_CRC_OFFSET: usize = 52;
-const KNOWN_FEATURE_BITS: u64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WalHeader {
@@ -346,9 +346,7 @@ impl CommitPayload {
         }
         validate_root("catalog", self.state.catalog_root, self.state.page_count)?;
         validate_root("freelist", self.state.freelist_root, self.state.page_count)?;
-        if self.state.feature_bits & !KNOWN_FEATURE_BITS != 0 {
-            return Err(corruption("commit payload has unknown feature bits"));
-        }
+        validate_feature_bits(self.state.feature_bits)?;
         Ok(())
     }
 }
@@ -426,7 +424,7 @@ mod tests {
     use super::*;
     use crate::{
         ErrorCode,
-        storage::{Lsn, PageId},
+        storage::{Lsn, PageId, features::CATALOG_V1, header::DatabaseHeader},
     };
 
     const UUID: [u8; 16] = [
@@ -639,6 +637,37 @@ mod tests {
         let mut reserved = bytes;
         reserved[48] = 1;
         assert_corruption(CommitPayload::decode(&reserved));
+    }
+
+    #[test]
+    fn catalog_v1_feature_round_trips_through_header_and_wal() {
+        let mut header = DatabaseHeader::new(4096, [7; 16]).unwrap();
+        header.set_features(CATALOG_V1).unwrap();
+        assert_eq!(
+            DatabaseHeader::decode_slot(&header.encode_slot())
+                .unwrap()
+                .features(),
+            CATALOG_V1
+        );
+
+        let state = CommitState {
+            page_count: 2,
+            catalog_root: PageId(1),
+            freelist_root: PageId(0),
+            feature_bits: CATALOG_V1,
+        };
+        let encoded = CommitPayload {
+            previous_lsn: Lsn(0),
+            state,
+            frame_count: 0,
+            transaction_crc32c: 0,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            CommitPayload::decode(&encoded).unwrap().state.feature_bits,
+            CATALOG_V1
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use super::{
         decode_internal_leftmost, decode_leaf_right_sibling,
     },
     cache::{CacheKey, PageCache, PageHandle},
+    features::validate_feature_bits,
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
     freelist::{Freelist, FreelistWalk},
     header::DatabaseHeader,
@@ -313,6 +314,7 @@ impl Pager {
         let mut base_header = checkpoint;
         base_header.set_catalog_root(committed_state.catalog_root);
         base_header.set_freelist_root(committed_state.freelist_root);
+        base_header.set_features(committed_state.feature_bits)?;
         let mut read = self.begin_read()?;
         let committed_freelist = walk_freelist(
             &mut read,
@@ -576,6 +578,10 @@ impl ReadSnapshot {
         self.lsn
     }
 
+    pub(super) const fn feature_bits(&self) -> u64 {
+        self.state.feature_bits
+    }
+
     pub(super) fn read(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.pager
             .read_at(self.lsn, self.state, self.checkpoint, reference)
@@ -714,6 +720,20 @@ impl WriteBatch<'_> {
             self.base_header,
             reference,
         )
+    }
+
+    pub(super) const fn feature_bits(&self) -> u64 {
+        self.current_header().features()
+    }
+
+    pub(super) fn enable_feature_bits(&mut self, bits: u64) -> Result<()> {
+        self.require_active()?;
+        let candidate = self.feature_bits() | bits;
+        validate_feature_bits(candidate)?;
+        let mut header = self.current_header();
+        header.set_features(candidate)?;
+        self.candidate_header = Some(header);
+        Ok(())
     }
 
     pub(super) fn checkpoint_mutation(&mut self) -> Result<WriteBatchCheckpoint> {
@@ -1070,7 +1090,7 @@ impl WriteBatch<'_> {
             page_count: target_page_count,
             catalog_root: roots.catalog_root(),
             freelist_root: roots.freelist_root(),
-            feature_bits: self.committed_state.feature_bits,
+            feature_bits: roots.features(),
         };
         let frames = self
             .dirty
@@ -1366,8 +1386,11 @@ impl WriteBatch<'_> {
         copy_clean_frame(handle.as_ref())
     }
 
-    fn current_header(&self) -> DatabaseHeader {
-        self.candidate_header.unwrap_or(self.base_header)
+    const fn current_header(&self) -> DatabaseHeader {
+        match self.candidate_header {
+            Some(header) => header,
+            None => self.base_header,
+        }
     }
 
     fn stage_freelist_root(&mut self, root: PageId) {
@@ -1543,6 +1566,7 @@ mod tests {
             BTree, INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, TreeKind,
             decode_internal_leftmost, encode_internal_leftmost,
         },
+        features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
         freelist::Freelist,
         page::{PageFrame, PageType},
@@ -2060,6 +2084,28 @@ mod tests {
                 .bytes()[100],
             0x22
         );
+    }
+
+    #[test]
+    fn committed_feature_bits_are_visible_only_to_new_snapshots() {
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
+        let old_snapshot = pager.begin_read().expect("begin old snapshot");
+        assert_eq!(old_snapshot.feature_bits(), 0);
+
+        let mut batch = pager.begin_write().expect("begin feature write");
+        assert_eq!(batch.feature_bits(), 0);
+        batch
+            .enable_feature_bits(CATALOG_V1)
+            .expect("enable catalog feature");
+        assert_eq!(batch.feature_bits(), CATALOG_V1);
+        batch
+            .allocate_append(PageType::Catalog)
+            .expect("allocate catalog page");
+        batch.commit().expect("commit catalog feature");
+
+        let new_snapshot = pager.begin_read().expect("begin new snapshot");
+        assert_eq!(old_snapshot.feature_bits(), 0);
+        assert_eq!(new_snapshot.feature_bits(), CATALOG_V1);
     }
 
     #[test]
