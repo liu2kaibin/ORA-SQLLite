@@ -213,6 +213,16 @@ pub(crate) struct ColumnDef {
     name: CatalogName,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatalogRecord {
+    CatalogMeta(CatalogMeta),
+    TableName(TableId),
+    TableDefinition(TableDef),
+    ColumnName(ColumnId),
+    ColumnOrdinal(ColumnId),
+    ColumnDefinition(ColumnDef),
+}
+
 impl ColumnDef {
     pub(crate) fn new(
         id: ColumnId,
