@@ -75,13 +75,13 @@ pub(super) fn column_definition_key(id: ColumnId) -> Vec<u8> {
 }
 
 pub(super) fn decode_key(bytes: &[u8]) -> Result<DecodedCatalogKey<'_>> {
-    if bytes.len() > MAX_KEY_BYTES {
-        return Err(corruption("catalog key exceeds 1024 bytes"));
-    }
     let family = *bytes
         .first()
         .ok_or_else(|| corruption("catalog key is empty"))?;
     let kind = RecordKind::from_byte(family)?;
+    if bytes.len() > MAX_KEY_BYTES {
+        return Err(corruption("catalog key exceeds 1024 bytes"));
+    }
 
     match kind {
         RecordKind::CatalogMeta => {
@@ -384,6 +384,15 @@ mod tests {
         ] {
             assert_eq!(
                 decode_key(bytes).unwrap_err().code(),
+                ErrorCode::Unsupported
+            );
+        }
+
+        for family in [0x20, 0x40] {
+            let mut oversized = vec![0; 1025];
+            oversized[0] = family;
+            assert_eq!(
+                decode_key(&oversized).unwrap_err().code(),
                 ErrorCode::Unsupported
             );
         }
