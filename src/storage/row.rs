@@ -19,6 +19,14 @@ const BOOL_LEN: usize = 1;
 
 pub(crate) struct RowCodec;
 
+#[derive(Debug, Clone, Copy)]
+struct RowLayout {
+    bitmap_len: usize,
+    directory_len: usize,
+    payload_len: usize,
+    total_len: usize,
+}
+
 impl RowCodec {
     pub(crate) fn encode(
         table: &TableDef,
@@ -26,57 +34,34 @@ impl RowCodec {
         values: &[Value],
         max_row_bytes: usize,
     ) -> Result<Vec<u8>> {
-        validate_caller_schema(table, columns)?;
-        if values.len() != columns.len() {
-            return Err(type_error(
-                "row value count does not match the table schema",
-            ));
-        }
-
-        let bitmap_len = bitmap_len(columns.len())
-            .ok_or_else(|| type_error("row NULL bitmap length overflows"))?;
-        let directory_len = columns
-            .len()
-            .checked_mul(DIRECTORY_ENTRY_LEN)
-            .ok_or_else(|| type_error("row directory length overflows"))?;
+        let layout = preflight_row_layout(table, columns, values, max_row_bytes)?;
         let mut payloads = Vec::with_capacity(columns.len());
-        let mut payload_len = 0_usize;
 
         for (column, value) in columns.iter().zip(values) {
             if matches!(value, Value::Null) {
-                if !column.nullable() {
-                    return Err(type_error("NULL is not valid for a non-nullable column"));
-                }
                 payloads.push(None);
                 continue;
             }
 
             let payload = encode_value(column.column_type(), value)?;
-            payload_len = payload_len
-                .checked_add(payload.len())
-                .ok_or_else(|| type_error("row payload length overflows"))?;
             payloads.push(Some(payload));
         }
 
-        let total_len = checked_total_len(bitmap_len, directory_len, payload_len)
-            .ok_or_else(|| type_error("row length overflows"))?;
-        require_encodable_row_len(total_len, max_row_bytes)?;
-
-        let bitmap_len_u16 = u16::try_from(bitmap_len)
+        let bitmap_len_u16 = u16::try_from(layout.bitmap_len)
             .map_err(|_| type_error("row NULL bitmap length exceeds the disk format"))?;
-        let directory_len_u32 = u32::try_from(directory_len)
+        let directory_len_u32 = u32::try_from(layout.directory_len)
             .map_err(|_| type_error("row directory length exceeds the disk format"))?;
-        let payload_len_u32 = u32::try_from(payload_len)
+        let payload_len_u32 = u32::try_from(layout.payload_len)
             .map_err(|_| type_error("row payload length exceeds the disk format"))?;
 
-        let mut bitmap = vec![0_u8; bitmap_len];
+        let mut bitmap = vec![0_u8; layout.bitmap_len];
         for (index, payload) in payloads.iter().enumerate() {
             if payload.is_none() {
                 bitmap[index / 8] |= 1 << (index % 8);
             }
         }
 
-        let mut bytes = Vec::with_capacity(total_len);
+        let mut bytes = Vec::with_capacity(layout.total_len);
         bytes.extend_from_slice(ROW_MAGIC);
         bytes.extend_from_slice(&ROW_FORMAT_VERSION.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
@@ -112,7 +97,7 @@ impl RowCodec {
             bytes.extend_from_slice(payload);
         }
 
-        if bytes.len() != total_len || payload_offset != payload_len {
+        if bytes.len() != layout.total_len || payload_offset != layout.payload_len {
             return Err(DbError::new(
                 ErrorCode::Internal,
                 "row encoder produced an inconsistent length",
@@ -214,6 +199,71 @@ impl RowCodec {
             }
         }
         Ok(values)
+    }
+}
+
+fn preflight_row_layout(
+    table: &TableDef,
+    columns: &[ColumnDef],
+    values: &[Value],
+    max_row_bytes: usize,
+) -> Result<RowLayout> {
+    validate_caller_schema(table, columns)?;
+    if values.len() != columns.len() {
+        return Err(type_error(
+            "row value count does not match the table schema",
+        ));
+    }
+
+    let bitmap_len =
+        bitmap_len(columns.len()).ok_or_else(|| type_error("row NULL bitmap length overflows"))?;
+    let directory_len = columns
+        .len()
+        .checked_mul(DIRECTORY_ENTRY_LEN)
+        .ok_or_else(|| type_error("row directory length overflows"))?;
+    let mut payload_len = 0_usize;
+
+    for (column, value) in columns.iter().zip(values) {
+        if matches!(value, Value::Null) {
+            if !column.nullable() {
+                return Err(type_error("NULL is not valid for a non-nullable column"));
+            }
+            continue;
+        }
+        payload_len = payload_len
+            .checked_add(encoded_value_len(column.column_type(), value)?)
+            .ok_or_else(|| type_error("row payload length overflows"))?;
+    }
+
+    let total_len = checked_total_len(bitmap_len, directory_len, payload_len)
+        .ok_or_else(|| type_error("row length overflows"))?;
+    require_encodable_row_len(total_len, max_row_bytes)?;
+    Ok(RowLayout {
+        bitmap_len,
+        directory_len,
+        payload_len,
+        total_len,
+    })
+}
+
+fn encoded_value_len(column_type: ColumnType, value: &Value) -> Result<usize> {
+    match (column_type, value) {
+        (ColumnType::Int64, Value::Int64(_)) => Ok(INT64_LEN),
+        (ColumnType::Decimal, Value::Decimal(_)) => Ok(DECIMAL_LEN),
+        (ColumnType::Float64, Value::Float64(_)) => Ok(FLOAT64_LEN),
+        (ColumnType::Text, Value::Text(value)) => Ok(value.len()),
+        (ColumnType::Blob, Value::Blob(value)) => Ok(value.len()),
+        (ColumnType::Date, Value::Date(_)) => Ok(DATE_LEN),
+        (ColumnType::Timestamp, Value::Timestamp(value)) if value.offset_minutes().is_none() => {
+            Ok(TIMESTAMP_LEN)
+        }
+        (ColumnType::TimestampWithTimeZone, Value::Timestamp(value))
+            if value.offset_minutes().is_some() =>
+        {
+            Ok(TIMESTAMP_WITH_TIME_ZONE_LEN)
+        }
+        (ColumnType::Bool, Value::Bool(_)) => Ok(BOOL_LEN),
+        _ => Err(type_mismatch()),
     }
 }
 
@@ -495,7 +545,10 @@ fn corruption(message: &'static str) -> DbError {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use super::{RowCodec, decode_rowid_key, decode_value, encode_rowid_key, encode_value};
+    use super::{
+        RowCodec, decode_rowid_key, decode_value, encode_rowid_key, encode_value,
+        preflight_row_layout,
+    };
     use crate::storage::catalog::types::{
         CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef, TableId,
     };
@@ -798,6 +851,30 @@ mod tests {
                 .code(),
             ErrorCode::Type
         );
+    }
+
+    #[test]
+    fn oversized_text_and_blob_fail_size_preflight_before_encoding() {
+        let cases = [
+            (ColumnType::Text, Value::Text("x".repeat(4096))),
+            (ColumnType::Blob, Value::Blob(vec![0xa5; 4096])),
+        ];
+
+        for (column_type, value) in cases {
+            let (table, columns) = schema(&[(column_type, false)]);
+            assert_eq!(
+                preflight_row_layout(&table, &columns, std::slice::from_ref(&value), 41)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Type
+            );
+            assert_eq!(
+                RowCodec::encode(&table, &columns, &[value], 41)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Type
+            );
+        }
     }
 
     #[test]
