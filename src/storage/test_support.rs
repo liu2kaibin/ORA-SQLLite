@@ -12,18 +12,25 @@ use std::{
 };
 
 use crate::{
-    DbError, ErrorCode, Result,
+    DbError, ErrorCode, Result, Value,
     fault::{FaultInjector, FaultPoint},
 };
 
 use super::{
     Lsn, PageId, PageRef,
     btree::{BTree, TreeKind},
+    catalog::{
+        CatalogReader, CatalogWriter,
+        types::{
+            CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef, TableId,
+        },
+    },
     checksum::stamp_page_checksum,
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
-    pager::{PageSource, Pager, PagerConfig},
+    pager::{PageSource, Pager, PagerConfig, ReadSnapshot, WriteBatch},
+    row::{RowCodec, decode_rowid_key, encode_rowid_key},
     validate::validate_tree,
     wal::{Wal, wal_path},
 };
@@ -1430,6 +1437,1228 @@ fn assert_controlled_corruption(action: impl FnOnce() -> Result<()>) {
             .code(),
         ErrorCode::Corruption
     );
+}
+
+// Phase 4A expectations are deliberately separate from the production codecs.
+#[derive(Debug, Clone, PartialEq)]
+struct CatalogModel {
+    next_object_id: u64,
+    tables: BTreeMap<u64, ModelTable>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ModelTable {
+    name: String,
+    next_rowid: u64,
+    columns: Vec<ModelColumn>,
+    rows: BTreeMap<u64, (Vec<Value>, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ModelColumn {
+    id: u64,
+    name: String,
+    kind: ColumnType,
+    nullable: bool,
+}
+
+impl CatalogModel {
+    fn empty() -> Self {
+        Self {
+            next_object_id: 1,
+            tables: BTreeMap::new(),
+        }
+    }
+
+    fn add_table(&mut self, name: String, kinds: &[ColumnType]) -> u64 {
+        let id = self.next_object_id;
+        self.next_object_id += 1;
+        let columns = kinds
+            .iter()
+            .enumerate()
+            .map(|(ordinal, &kind)| {
+                let column = ModelColumn {
+                    id: self.next_object_id,
+                    name: format!("C{ordinal}"),
+                    kind,
+                    nullable: ordinal != 0,
+                };
+                self.next_object_id += 1;
+                column
+            })
+            .collect();
+        assert!(
+            self.tables
+                .insert(
+                    id,
+                    ModelTable {
+                        name,
+                        next_rowid: 1,
+                        columns,
+                        rows: BTreeMap::new(),
+                    }
+                )
+                .is_none()
+        );
+        id
+    }
+
+    fn add_row(&mut self, table: u64, values: Vec<Value>) -> u64 {
+        let table = self.tables.get_mut(&table).unwrap();
+        let id = table.next_rowid;
+        table.next_rowid += 1;
+        let bytes = model_row_bytes(&values);
+        assert!(table.rows.insert(id, (values, bytes)).is_none());
+        id
+    }
+}
+
+struct Phase4aLcg(u64);
+
+impl Phase4aLcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 16
+    }
+}
+
+const PHASE_4A_KINDS: [ColumnType; 4] = [
+    ColumnType::Int64,
+    ColumnType::Text,
+    ColumnType::Blob,
+    ColumnType::Bool,
+];
+const PHASE_4A_MAX_ROW: usize = 16_384;
+
+// A small, independent specification encoder for the model's four scalar types.
+// It uses literal V1 framing, not RowCodec or the storage Encoder.
+fn model_row_bytes(values: &[Value]) -> Vec<u8> {
+    let mut bytes = b"OROW\x01\x00\x00\x00".to_vec();
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&(values.len() as u16).to_le_bytes());
+    let bitmap_len = values.len().div_ceil(8);
+    bytes.extend_from_slice(&(bitmap_len as u16).to_le_bytes());
+    bytes.extend_from_slice(&(values.len() as u32 * 8).to_le_bytes());
+    let mut bitmap = vec![0u8; bitmap_len];
+    let mut directory = Vec::new();
+    let mut payload = Vec::new();
+    for (ordinal, value) in values.iter().enumerate() {
+        let encoded = match value {
+            Value::Null => {
+                bitmap[ordinal / 8] |= 1 << (ordinal % 8);
+                directory.extend_from_slice(&[0; 8]);
+                continue;
+            }
+            Value::Int64(value) => value.to_le_bytes().to_vec(),
+            Value::Text(value) => value.as_bytes().to_vec(),
+            Value::Blob(value) => value.clone(),
+            Value::Bool(value) => vec![u8::from(*value)],
+            _ => panic!("scalar is outside the reference model"),
+        };
+        directory.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        directory.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        payload.extend(encoded);
+    }
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend(bitmap);
+    bytes.extend(directory);
+    bytes.extend(payload);
+    bytes
+}
+
+fn model_definitions(id: u64, table: &ModelTable, root: PageRef) -> (TableDef, Vec<ColumnDef>) {
+    let definition = TableDef::new(
+        TableId::new(id).unwrap(),
+        SchemaVersion::new(1).unwrap(),
+        root,
+        RowId::new(1).unwrap(),
+        table.columns.len() as u16,
+        CatalogName::new(table.name.clone()).unwrap(),
+    )
+    .unwrap();
+    let columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| {
+            ColumnDef::new(
+                ColumnId::new(column.id).unwrap(),
+                definition.id(),
+                ordinal as u16,
+                column.kind,
+                column.nullable,
+                CatalogName::new(column.name.clone()).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    (definition, columns)
+}
+
+fn phase4a_create_table(
+    writer: &mut CatalogWriter,
+    batch: &mut WriteBatch<'_>,
+    model: &CatalogModel,
+    id: u64,
+) -> Result<TableDef> {
+    assert_eq!(writer.allocate_object_id(batch)?.get(), id);
+    let root = BTree::create(batch, TreeKind::Table)?.root();
+    let (table, columns) = model_definitions(id, &model.tables[&id], root);
+    writer.insert_table_definition(batch, &table)?;
+    // Allocate in model order, insert in reverse order to test ordinal sorting.
+    for column in &columns {
+        assert_eq!(writer.allocate_object_id(batch)?.get(), column.id().get());
+    }
+    for column in columns.iter().rev() {
+        writer.insert_column_definition(batch, column)?;
+    }
+    Ok(table)
+}
+
+fn phase4a_insert_row(
+    writer: &mut CatalogWriter,
+    batch: &mut WriteBatch<'_>,
+    table: &TableDef,
+    model: &CatalogModel,
+    rowid: u64,
+    tree: &mut BTree,
+) -> Result<()> {
+    let expected = &model.tables[&table.id().get()];
+    let (_, columns) = model_definitions(table.id().get(), expected, tree.root());
+    let (values, expected_bytes) = &expected.rows[&rowid];
+    let allocated = writer.allocate_rowid(batch, table.id())?;
+    assert_eq!(allocated.get(), rowid);
+    let bytes = RowCodec::encode(table, &columns, values, PHASE_4A_MAX_ROW)?;
+    assert_eq!(
+        &bytes, expected_bytes,
+        "encoder must match independent V1 bytes"
+    );
+    tree.insert(batch, &encode_rowid_key(allocated), &bytes)?;
+    writer.update_table_root(batch, table.id(), tree.root())
+}
+
+fn model_envelope(kind: u8, payload: Vec<u8>) -> Vec<u8> {
+    let mut bytes = vec![kind, 1, 0, 0];
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes.extend(payload);
+    bytes
+}
+
+fn model_id_key(kind: u8, id: u64) -> Vec<u8> {
+    let mut bytes = vec![kind];
+    bytes.extend_from_slice(&id.to_be_bytes());
+    bytes
+}
+
+fn model_name_key(kind: u8, owner: Option<u64>, name: &str) -> Vec<u8> {
+    let mut bytes = vec![kind];
+    if let Some(id) = owner {
+        bytes.extend_from_slice(&id.to_be_bytes());
+    }
+    bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    bytes
+}
+
+fn assert_phase4a_model(snapshot: &mut ReadSnapshot, model: &CatalogModel) -> Result<()> {
+    let reader = CatalogReader::open_empty_or_v1(snapshot)?;
+    reader.validate_deep(snapshot)?;
+    let tree = snapshot.catalog_tree(TreeKind::Table)?;
+    let mut expected_records = BTreeMap::new();
+    if tree.is_some() {
+        let mut meta = vec![1, 0, 0, 0];
+        meta.extend_from_slice(&model.next_object_id.to_le_bytes());
+        expected_records.insert(vec![0], model_envelope(0, meta));
+    }
+    for (&id, table) in &model.tables {
+        let actual = reader
+            .find_table_by_id(TableId::new(id)?)
+            .expect("model table exists");
+        assert_eq!(
+            reader.find_table_by_name(&CatalogName::new(table.name.clone())?),
+            Some(actual)
+        );
+        assert_eq!(actual.name().as_str(), table.name);
+        assert_eq!(actual.schema_version().get(), 1);
+        assert_eq!(actual.next_rowid().get(), table.next_rowid);
+        assert_eq!(usize::from(actual.column_count()), table.columns.len());
+        let (_, columns) = model_definitions(id, table, actual.root());
+        assert_eq!(
+            reader
+                .columns_for_table(actual.id())
+                .cloned()
+                .collect::<Vec<_>>(),
+            columns
+        );
+        assert!(
+            reader
+                .find_column_by_name(actual.id(), &CatalogName::new("MISSING")?)
+                .is_none()
+        );
+
+        expected_records.insert(
+            model_name_key(0x10, None, &table.name),
+            model_envelope(0x10, id.to_le_bytes().to_vec()),
+        );
+        let mut definition = Vec::new();
+        for value in [
+            id,
+            1,
+            actual.root().page_id().0,
+            actual.root().generation(),
+            table.next_rowid,
+        ] {
+            definition.extend_from_slice(&value.to_le_bytes());
+        }
+        definition.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+        definition.extend_from_slice(&(table.name.len() as u16).to_le_bytes());
+        definition.extend_from_slice(table.name.as_bytes());
+        expected_records.insert(model_id_key(0x11, id), model_envelope(0x11, definition));
+
+        for column in &columns {
+            assert_eq!(
+                reader.find_column_by_name(actual.id(), column.name()),
+                Some(column)
+            );
+            let mapping = column.id().get().to_le_bytes().to_vec();
+            expected_records.insert(
+                model_name_key(0x12, Some(id), column.name().as_str()),
+                model_envelope(0x12, mapping.clone()),
+            );
+            let mut ordinal_key = model_id_key(0x13, id);
+            ordinal_key.extend_from_slice(&column.ordinal().to_be_bytes());
+            expected_records.insert(ordinal_key, model_envelope(0x13, mapping));
+            let mut definition = column.id().get().to_le_bytes().to_vec();
+            definition.extend_from_slice(&id.to_le_bytes());
+            definition.extend_from_slice(&column.ordinal().to_le_bytes());
+            definition
+                .extend_from_slice(&[column.column_type() as u8, u8::from(column.nullable())]);
+            definition.extend_from_slice(&(column.name().as_bytes().len() as u16).to_le_bytes());
+            definition.extend_from_slice(&[0, 0]);
+            definition.extend_from_slice(column.name().as_bytes());
+            expected_records.insert(
+                model_id_key(0x14, column.id().get()),
+                model_envelope(0x14, definition),
+            );
+        }
+        let rows = BTree::from_root(TreeKind::Table, actual.root());
+        let scanned = collect_all(&rows, snapshot)?;
+        assert_eq!(
+            scanned.len(),
+            table.rows.len(),
+            "all rows, including rollback absence"
+        );
+        for ((key, bytes), (&rowid, (values, expected_bytes))) in scanned.iter().zip(&table.rows) {
+            assert_eq!(key, &rowid.to_be_bytes());
+            assert_eq!(decode_rowid_key(key)?.get(), rowid);
+            assert_eq!(bytes, expected_bytes);
+            assert_eq!(
+                &RowCodec::decode(actual, &columns, bytes, PHASE_4A_MAX_ROW)?,
+                values
+            );
+            assert_eq!(rows.get(snapshot, key)?.as_ref(), Some(bytes));
+        }
+        assert!(
+            rows.get(snapshot, &table.next_rowid.to_be_bytes())?
+                .is_none()
+        );
+    }
+    assert!(
+        reader
+            .find_table_by_name(&CatalogName::new("MISSING")?)
+            .is_none()
+    );
+    assert!(
+        reader
+            .find_table_by_id(TableId::new(model.next_object_id)?)
+            .is_none()
+    );
+    let actual_records: BTreeMap<_, _> = match tree {
+        Some(tree) => collect_all(&tree, snapshot)?.into_iter().collect(),
+        None => BTreeMap::new(),
+    };
+    assert_eq!(
+        actual_records, expected_records,
+        "every mapping, definition, and global counter"
+    );
+    Ok(())
+}
+
+#[test]
+fn phase_4a_reference_model() {
+    // A missing row insert, counter update, mapping, or rollback must fail this model.
+    for seed in [0x04a0_cafe_0123_4567, 0x04a0_dead_7654_3210] {
+        let temp = TempDatabase::new("phase4a-reference");
+        let mut pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+        let mut model = CatalogModel::empty();
+        let mut random = Phase4aLcg(seed);
+        let (mut operations, mut commits, mut rollbacks, mut reopens) = (0, 0, 0, 0);
+        for window in 0..8 {
+            let mut old = pager.begin_read().unwrap();
+            assert_phase4a_model(&mut old, &model).unwrap();
+            let mut candidate = model.clone();
+            let mut batch = pager.begin_write().unwrap();
+            let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+            let id = candidate.add_table(format!("T{window}_表"), &PHASE_4A_KINDS);
+            let table = phase4a_create_table(&mut writer, &mut batch, &candidate, id).unwrap();
+            operations += 5;
+            let reader = CatalogReader::open_empty_or_v1(&mut old).unwrap();
+            let mut roots = BTreeMap::new();
+            roots.insert(id, BTree::from_root(TreeKind::Table, table.root()));
+            for sequence in 0..58 {
+                let ids: Vec<_> = candidate.tables.keys().copied().collect();
+                let target = ids[random.next() as usize % ids.len()];
+                let definition = if target == id {
+                    table.clone()
+                } else {
+                    reader
+                        .find_table_by_id(TableId::new(target).unwrap())
+                        .unwrap()
+                        .clone()
+                };
+                let tree = roots
+                    .entry(target)
+                    .or_insert_with(|| BTree::from_root(TreeKind::Table, definition.root()));
+                let number = random.next();
+                let values = vec![
+                    Value::Int64(number as i64),
+                    if number % 5 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Text(format!("行-{number}"))
+                    },
+                    Value::Blob(vec![
+                        number as u8;
+                        if window == 0 && sequence == 0 {
+                            5000
+                        } else {
+                            7
+                        }
+                    ]),
+                    Value::Bool(number & 1 != 0),
+                ];
+                let rowid = candidate.add_row(target, values);
+                phase4a_insert_row(
+                    &mut writer,
+                    &mut batch,
+                    &definition,
+                    &candidate,
+                    rowid,
+                    tree,
+                )
+                .unwrap();
+                operations += 1;
+            }
+            if window % 4 == 3 {
+                // Exercise rollback both before and after the catalog publication gate.
+                if window == 3 {
+                    writer.finish(&mut batch).unwrap();
+                }
+                batch.rollback().unwrap();
+                drop(batch);
+                rollbacks += 1;
+            } else {
+                writer.finish(&mut batch).unwrap();
+                batch.commit().unwrap();
+                commits += 1;
+            }
+            assert_phase4a_model(&mut old, &model).unwrap();
+            drop(old);
+            if window % 4 != 3 {
+                model = candidate;
+            }
+            assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
+            if window % 2 == 1 {
+                if window % 4 == 1 {
+                    pager.checkpoint().unwrap();
+                }
+                drop(pager);
+                pager = crash_open(temp.path());
+                assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
+                reopens += 1;
+            }
+        }
+        assert_eq!((operations, commits, rollbacks, reopens), (504, 6, 2, 4));
+        eprintln!(
+            "phase4a seed={seed:#x}: {operations} mutations, {commits} commits, {rollbacks} rollbacks, {reopens} reopens, 8 retained snapshots"
+        );
+    }
+}
+
+#[test]
+fn catalog_record_corruption_matrix_never_panics() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (_temp, pager) = test_pager(4096).unwrap();
+    let mut model = CatalogModel::empty();
+    let id = model.add_table("T表".to_owned(), &PHASE_4A_KINDS);
+    let mut batch = pager.begin_write().unwrap();
+    let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+    phase4a_create_table(&mut writer, &mut batch, &model, id).unwrap();
+    writer.finish(&mut batch).unwrap();
+    batch.commit().unwrap();
+    let mut snapshot = pager.begin_read().unwrap();
+    let tree = snapshot.catalog_tree(TreeKind::Table).unwrap().unwrap();
+    let records = collect_all(&tree, &mut snapshot).unwrap();
+    drop(snapshot);
+    let mut cases = 0;
+    let mut families = std::collections::BTreeSet::new();
+    for (key, value) in &records {
+        families.insert(key[0]);
+        let mut variants = Vec::new();
+        for end in 0..value.len() {
+            variants.push((
+                key.clone(),
+                value[..end].to_vec(),
+                Some(ErrorCode::Corruption),
+            ));
+        }
+        for offset in 0..value.len() {
+            let mut changed = value.clone();
+            changed[offset] ^= 0x80;
+            let code = match offset {
+                0 | 1 => Some(ErrorCode::Unsupported),
+                2..=7 => Some(ErrorCode::Corruption),
+                8..=11 if key == &[0] => Some(ErrorCode::Corruption),
+                _ => None,
+            };
+            variants.push((key.clone(), changed, code));
+        }
+        let mut version_zero = value.clone();
+        version_zero[1] = 0;
+        variants.push((key.clone(), version_zero, Some(ErrorCode::Corruption)));
+        // Include keys, not just values: malformed names/IDs must never escape the reader.
+        for end in 0..key.len() {
+            variants.push((
+                key[..end].to_vec(),
+                value.clone(),
+                Some(ErrorCode::Corruption),
+            ));
+        }
+        for offset in 0..key.len() {
+            let mut changed = key.clone();
+            changed[offset] ^= 0x80;
+            variants.push((
+                changed,
+                value.clone(),
+                Some(if offset == 0 {
+                    ErrorCode::Unsupported
+                } else {
+                    ErrorCode::Corruption
+                }),
+            ));
+        }
+        for (changed_key, changed_value, expected) in variants {
+            let mut batch = pager.begin_write().unwrap();
+            let mut candidate = BTree::from_root(TreeKind::Table, tree.root());
+            let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                assert_eq!(candidate.delete(&mut batch, key)?, Some(value.clone()));
+                candidate.insert(&mut batch, &changed_key, &changed_value)?;
+                CatalogReader::open_candidate(&mut batch, &candidate, super::features::CATALOG_V1)?;
+                Ok(())
+            }))
+            .expect("catalog mutation/open must never panic");
+            match (result, expected) {
+                (Err(error), Some(code)) => assert_eq!(
+                    error.code(),
+                    code,
+                    "key={key:?} mutation={changed_key:?}/{changed_value:?}"
+                ),
+                (Err(error), None) => assert_eq!(error.code(), ErrorCode::Corruption),
+                (Ok(()), None) => {}
+                (Ok(()), Some(code)) => panic!("invalid catalog record accepted, wanted {code:?}"),
+            }
+            batch.rollback().unwrap();
+            cases += 1;
+        }
+    }
+    assert_eq!(
+        families.into_iter().collect::<Vec<_>>(),
+        [0, 0x10, 0x11, 0x12, 0x13, 0x14]
+    );
+    assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
+    assert!(cases > 500);
+    eprintln!(
+        "catalog corruption: {cases} truncation/byte-flip cases across all six record families"
+    );
+}
+
+#[test]
+fn row_corruption_matrix_never_panics() {
+    use std::panic::catch_unwind;
+    let kinds = [
+        ColumnType::Int64,
+        ColumnType::Decimal,
+        ColumnType::Float64,
+        ColumnType::Text,
+        ColumnType::Blob,
+        ColumnType::Date,
+        ColumnType::Timestamp,
+        ColumnType::TimestampWithTimeZone,
+        ColumnType::Bool,
+        ColumnType::Text,
+    ];
+    let mut model = CatalogModel::empty();
+    let id = model.add_table("MIXED".to_owned(), &kinds);
+    let (table, columns) =
+        model_definitions(id, &model.tables[&id], PageRef::new(PageId(2), 1).unwrap());
+    let date = crate::OracleDate::new(2024, 2, 29, 23, 59, 58).unwrap();
+    let values = vec![
+        Value::Int64(-123),
+        Value::Decimal(crate::Decimal::new(true, 2, 12345).unwrap()),
+        Value::Float64(1.25),
+        Value::Text("中文".to_owned()),
+        Value::Blob(vec![0, 1, 255]),
+        Value::Date(date),
+        Value::Timestamp(crate::OracleTimestamp::new(date, 123456, None).unwrap()),
+        Value::Timestamp(crate::OracleTimestamp::new(date, 654321, Some(-480)).unwrap()),
+        Value::Bool(true),
+        Value::Null,
+    ];
+    let mut cases = 0;
+    for values in [values.clone(), {
+        let mut sparse = vec![Value::Null; values.len()];
+        sparse[0] = Value::Int64(i64::MIN);
+        sparse[3] = Value::Text(String::new());
+        sparse[4] = Value::Blob(Vec::new());
+        sparse
+    }] {
+        let bytes = RowCodec::encode(&table, &columns, &values, PHASE_4A_MAX_ROW).unwrap();
+        assert_eq!(
+            RowCodec::decode(&table, &columns, &bytes, PHASE_4A_MAX_ROW).unwrap(),
+            values
+        );
+        let mut variants = Vec::new();
+        for end in 0..bytes.len() {
+            variants.push((bytes[..end].to_vec(), Some(ErrorCode::Corruption)));
+        }
+        // Every byte includes all headers, bitmaps, directory offsets/lengths,
+        // scalar reserved fields, and variable payloads.
+        for offset in 0..bytes.len() {
+            let mut changed = bytes.clone();
+            changed[offset] ^= 0x80;
+            variants.push((
+                changed,
+                if [4, 5].contains(&offset) {
+                    Some(ErrorCode::Unsupported)
+                } else if offset < 32 {
+                    Some(ErrorCode::Corruption)
+                } else {
+                    None
+                },
+            ));
+        }
+        let mut zero_version = bytes.clone();
+        zero_version[4..6].fill(0);
+        variants.push((zero_version, Some(ErrorCode::Corruption)));
+        for (changed, expected) in variants {
+            let decoded =
+                catch_unwind(|| RowCodec::decode(&table, &columns, &changed, PHASE_4A_MAX_ROW))
+                    .expect("row decoding must never panic");
+            match (decoded, expected) {
+                (Err(error), Some(code)) => assert_eq!(error.code(), code, "{changed:?}"),
+                (Err(error), None) => assert_eq!(error.code(), ErrorCode::Corruption),
+                (Ok(decoded), None) => {
+                    assert_eq!(decoded.len(), columns.len());
+                    assert_eq!(
+                        RowCodec::encode(&table, &columns, &decoded, PHASE_4A_MAX_ROW).unwrap(),
+                        changed
+                    );
+                }
+                (Ok(_), Some(code)) => panic!("invalid row accepted, wanted {code:?}"),
+            }
+            cases += 1;
+        }
+    }
+    assert!(cases > 500);
+    eprintln!(
+        "row corruption: {cases} truncation/byte-flip cases, all nine types and NULL/empty payloads"
+    );
+}
+
+const PHASE_4A_CRASH_CHILD: &str = "storage::test_support::phase_4a_catalog_crash_child";
+const PHASE_4A_SCENARIO_ENV: &str = "ORA_SQLLITE_PHASE4A_SCENARIO";
+const PHASE_4A_FAULT_ENV: &str = "ORA_SQLLITE_PHASE4A_FAULT";
+const PHASE_4A_OCCURRENCE_ENV: &str = "ORA_SQLLITE_PHASE4A_OCCURRENCE";
+const PHASE_4A_PATH_ENV: &str = "ORA_SQLLITE_PHASE4A_PATH";
+const PHASE_4A_TRACE_ENV: &str = "ORA_SQLLITE_PHASE4A_TRACE";
+const PHASE_4A_SCENARIOS: [&str; 4] = [
+    "bootstrap",
+    "catalog-root-split",
+    "bulk-metadata",
+    "row-insert",
+];
+const PHASE_4A_WAL_POINTS: [FaultPoint; 8] = [
+    FaultPoint::BeforeWalRecordWrite,
+    FaultPoint::AfterWalRecordHeaderPrefixWrite,
+    FaultPoint::AfterWalRecordPayloadPrefixWrite,
+    FaultPoint::AfterWalRecordWrite,
+    FaultPoint::BeforeWalSync,
+    FaultPoint::AfterWalSync,
+    FaultPoint::BeforeWalPublish,
+    FaultPoint::AfterWalPublish,
+];
+
+fn phase4a_scenario_model(scenario: &str, post: bool) -> CatalogModel {
+    let mut model = CatalogModel::empty();
+    match scenario {
+        "bootstrap" => {}
+        "catalog-root-split" => {
+            for n in 0..if post { 3 } else { 1 } {
+                model.add_table(format!("S{n}_{}", "x".repeat(900)), &[]);
+            }
+        }
+        "bulk-metadata" => {
+            if post {
+                for n in 0..8 {
+                    model.add_table(format!("B{n}_{}", "y".repeat(80)), &PHASE_4A_KINDS);
+                }
+            }
+        }
+        "row-insert" => {
+            let id = model.add_table("ROWS".to_owned(), &PHASE_4A_KINDS);
+            for n in 0..if post { 32 } else { 8 } {
+                model.add_row(
+                    id,
+                    vec![
+                        Value::Int64(n),
+                        Value::Text(format!("row-{n}")),
+                        Value::Blob(vec![n as u8; if n == 31 { 5000 } else { 128 }]),
+                        Value::Bool(n % 2 == 0),
+                    ],
+                );
+            }
+        }
+        _ => panic!("invalid crash configuration: scenario"),
+    }
+    model
+}
+
+fn phase4a_apply_model(pager: &Pager, before: &CatalogModel, after: &CatalogModel) -> Result<()> {
+    let mut snapshot = pager.begin_read()?;
+    assert_phase4a_model(&mut snapshot, before)?;
+    let reader = CatalogReader::open_empty_or_v1(&mut snapshot)?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    for (&id, table) in &after.tables {
+        let definition = if before.tables.contains_key(&id) {
+            reader.find_table_by_id(TableId::new(id)?).unwrap().clone()
+        } else {
+            phase4a_create_table(&mut writer, &mut batch, after, id)?
+        };
+        let mut rows = BTree::from_root(TreeKind::Table, definition.root());
+        let first = before.tables.get(&id).map_or(1, |table| table.next_rowid);
+        for rowid in first..table.next_rowid {
+            phase4a_insert_row(
+                &mut writer,
+                &mut batch,
+                &definition,
+                after,
+                rowid,
+                &mut rows,
+            )?;
+        }
+    }
+    writer.finish(&mut batch)?;
+    batch.commit()
+}
+
+fn phase4a_fixture(scenario: &str) -> TempDatabase {
+    let temp = TempDatabase::new("phase4a-crash-fixture");
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(4096)).unwrap();
+    let model = phase4a_scenario_model(scenario, false);
+    if scenario != "bootstrap" {
+        phase4a_apply_model(&pager, &CatalogModel::empty(), &model).unwrap();
+        pager.checkpoint().unwrap();
+    }
+    assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
+    drop(pager);
+    temp
+}
+
+fn phase4a_copy_fixture(fixture: &TempDatabase) -> TempDatabase {
+    let temp = TempDatabase::new("phase4a-crash-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(fixture.path(), temp.path()).unwrap();
+    fs::copy(wal_path(fixture.path()), wal_path(temp.path())).unwrap();
+    assert_eq!(
+        crash_pair_bytes(temp.path()),
+        crash_pair_bytes(fixture.path())
+    );
+    temp
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Phase4aState {
+    lsn: Lsn,
+    features: u64,
+    root: Option<PageRef>,
+    page_count: u64,
+    freelist: PageId,
+    records: BTreeMap<Vec<u8>, Vec<u8>>,
+    rows: BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>>,
+}
+
+fn phase4a_state(pager: &Pager) -> Phase4aState {
+    let mut snapshot = pager.begin_read().unwrap();
+    let reader = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+    reader.validate_deep(&mut snapshot).unwrap();
+    let tree = snapshot.catalog_tree(TreeKind::Table).unwrap();
+    let records: BTreeMap<_, _> = tree.as_ref().map_or_else(BTreeMap::new, |tree| {
+        collect_all(tree, &mut snapshot)
+            .unwrap()
+            .into_iter()
+            .collect()
+    });
+    let mut rows = BTreeMap::new();
+    for key in records.keys().filter(|key| key[0] == 0x11) {
+        let id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+        let table = reader.find_table_by_id(TableId::new(id).unwrap()).unwrap();
+        let columns: Vec<_> = reader.columns_for_table(table.id()).cloned().collect();
+        let tree = BTree::from_root(TreeKind::Table, table.root());
+        let entries = collect_all(&tree, &mut snapshot).unwrap();
+        for (key, value) in &entries {
+            decode_rowid_key(key).unwrap();
+            RowCodec::decode(table, &columns, value, PHASE_4A_MAX_ROW).unwrap();
+        }
+        rows.insert(id, entries.into_iter().collect());
+    }
+    Phase4aState {
+        lsn: snapshot.lsn(),
+        features: snapshot.feature_bits(),
+        root: tree.map(|tree| tree.root()),
+        page_count: snapshot.page_count().unwrap(),
+        freelist: snapshot.freelist_root().unwrap(),
+        records,
+        rows,
+    }
+}
+
+fn phase4a_trace(
+    fixture: &TempDatabase,
+    scenario: &str,
+) -> (Vec<FaultPoint>, Phase4aState, Phase4aState) {
+    let temp = phase4a_copy_fixture(fixture);
+    let faults = Arc::new(RecordingFaults::never());
+    let pager = crash_open(temp.path()).with_faults(faults.clone());
+    let pre = phase4a_state(&pager);
+    let wal_start = fs::metadata(wal_path(temp.path())).unwrap().len() as usize;
+    phase4a_apply_model(
+        &pager,
+        &phase4a_scenario_model(scenario, false),
+        &phase4a_scenario_model(scenario, true),
+    )
+    .unwrap();
+    let post = phase4a_state(&pager);
+    assert_phase4a_model(
+        &mut pager.begin_read().unwrap(),
+        &phase4a_scenario_model(scenario, true),
+    )
+    .unwrap();
+    assert_ne!(pre, post);
+    assert_eq!(post.lsn.0, pre.lsn.0 + 1, "one transaction per scenario");
+    if scenario == "catalog-root-split" {
+        assert_ne!(pre.root, post.root, "catalog root really split");
+    }
+    if scenario == "bulk-metadata" {
+        assert_ne!(
+            pre.root, post.root,
+            "bulk definitions really split the catalog"
+        );
+        assert_eq!(post.records.len(), 1 + 8 * (2 + 4 * 3));
+    }
+    if scenario == "row-insert" {
+        let old = &pre.records[&model_id_key(0x11, 1)];
+        let new = &post.records[&model_id_key(0x11, 1)];
+        assert_ne!(&old[24..40], &new[24..40], "user row root really split");
+        assert_eq!(post.rows[&1].len(), 32);
+    }
+    let trace = faults.observed();
+    assert_commit_trace(&trace);
+    let bytes = fs::read(wal_path(temp.path())).unwrap();
+    let (mut offset, mut records) = (wal_start, 0);
+    while offset < bytes.len() {
+        let payload =
+            u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()) as usize;
+        offset += 64 + payload;
+        records += 1;
+    }
+    assert_eq!(offset, bytes.len());
+    assert_eq!(
+        trace.len(),
+        records * 4 + 4,
+        "all physical records expose every boundary"
+    );
+    drop(pager);
+    (trace, pre, post)
+}
+
+fn phase4a_assert_recovery(
+    path: &Path,
+    scenario: &str,
+    pre: &Phase4aState,
+    post: &Phase4aState,
+    durable: bool,
+) {
+    let pager = crash_open(path);
+    let recovered = phase4a_state(&pager);
+    if durable {
+        assert_eq!(
+            &recovered, post,
+            "durable WAL sync must preserve the whole post-state"
+        );
+    } else {
+        assert!(
+            &recovered == pre || &recovered == post,
+            "partial catalog/counter/root/row state"
+        );
+    }
+    let is_post = &recovered == post;
+    let model = phase4a_scenario_model(scenario, is_post);
+    assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
+    drop(pager);
+    // Reopen before checkpoint too: recovery itself must be repeatable.
+    let repaired = crash_pair_bytes(path);
+    let pager = crash_open(path);
+    assert_eq!(phase4a_state(&pager), recovered);
+    drop(pager);
+    assert_eq!(
+        crash_pair_bytes(path),
+        repaired,
+        "repeat recovery changed files"
+    );
+    let pager = crash_open(path);
+    pager.checkpoint().unwrap();
+    assert_eq!(phase4a_state(&pager), recovered);
+    drop(pager);
+    let checkpointed = crash_pair_bytes(path);
+    let pager = crash_open(path);
+    assert_eq!(phase4a_state(&pager), recovered);
+    assert_phase4a_model(&mut pager.begin_read().unwrap(), &model).unwrap();
+    let result = pager.checkpoint().unwrap();
+    assert_eq!(result.pages_written, 0);
+    assert!(!result.wal_reset);
+    drop(pager);
+    assert_eq!(crash_pair_bytes(path), checkpointed);
+    // Synchronous child wait plus exact removals prove no leaked handles/artifacts.
+    fs::remove_file(wal_path(path)).unwrap();
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn phase_4a_catalog_io_fault_boundaries() {
+    let mut cases = 0;
+    for scenario in PHASE_4A_SCENARIOS {
+        let fixture = phase4a_fixture(scenario);
+        let unchanged = crash_pair_bytes(fixture.path());
+        let (trace, pre, post) = phase4a_trace(&fixture, scenario);
+        let durable = trace
+            .iter()
+            .position(|&point| point == FaultPoint::AfterWalSync)
+            .unwrap();
+        // Fast ordinary suite covers all eight kinds at their first occurrence.
+        // The dedicated subprocess matrix below covers *every* occurrence.
+        for point in PHASE_4A_WAL_POINTS {
+            let index = trace.iter().position(|&seen| seen == point).unwrap();
+            let temp = phase4a_copy_fixture(&fixture);
+            let faults = Arc::new(RecordingFaults::at(point, 1));
+            let pager = crash_open(temp.path()).with_faults(faults.clone());
+            let result = phase4a_apply_model(
+                &pager,
+                &phase4a_scenario_model(scenario, false),
+                &phase4a_scenario_model(scenario, true),
+            );
+            if matches!(
+                point,
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish
+            ) {
+                result.unwrap(); // Publication observers cannot report recoverable I/O errors.
+                assert_eq!(faults.observed(), trace);
+            } else {
+                assert_eq!(result.unwrap_err().code(), ErrorCode::Io);
+                assert_eq!(faults.observed(), trace[..=index]);
+            }
+            drop(pager);
+            phase4a_assert_recovery(temp.path(), scenario, &pre, &post, index >= durable);
+            cases += 1;
+        }
+        assert_eq!(crash_pair_bytes(fixture.path()), unchanged);
+    }
+    assert_eq!(cases, 32);
+    eprintln!("phase4a I/O matrix: {cases} exact injected boundaries and repeat-open checks");
+}
+
+fn phase4a_child_command(
+    path: &Path,
+    scenario: &str,
+    point: &str,
+    occurrence: &str,
+    trace: &[FaultPoint],
+) -> std::process::Command {
+    let executable = std::env::current_exe().unwrap();
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "ulimit -c 0 && exec \"$@\"",
+            "ora-sqllite-phase4a-crash",
+        ]);
+        command.arg(executable);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["--exact", PHASE_4A_CRASH_CHILD, "--ignored", "--nocapture"])
+        .env(PHASE_4A_PATH_ENV, path)
+        .env(PHASE_4A_SCENARIO_ENV, scenario)
+        .env(PHASE_4A_FAULT_ENV, point)
+        .env(PHASE_4A_OCCURRENCE_ENV, occurrence)
+        .env(
+            PHASE_4A_TRACE_ENV,
+            trace
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    command
+}
+
+#[test]
+#[ignore = "only launched with validated parameters by phase_4a_catalog_crash_recovery_matrix"]
+fn phase_4a_catalog_crash_child() {
+    let scenario =
+        std::env::var(PHASE_4A_SCENARIO_ENV).expect("invalid crash configuration: scenario");
+    assert!(
+        PHASE_4A_SCENARIOS.contains(&scenario.as_str()),
+        "invalid crash configuration: scenario"
+    );
+    let parse = |name: &str| {
+        PHASE_4A_WAL_POINTS
+            .into_iter()
+            .find(|point| format!("{point:?}") == name)
+    };
+    let point =
+        parse(&std::env::var(PHASE_4A_FAULT_ENV).expect("invalid crash configuration: point"))
+            .expect("invalid crash configuration: point");
+    let occurrence_text =
+        std::env::var(PHASE_4A_OCCURRENCE_ENV).expect("invalid crash configuration: occurrence");
+    let occurrence: usize = occurrence_text
+        .parse()
+        .expect("invalid crash configuration: occurrence");
+    assert!(
+        occurrence > 0 && occurrence.to_string() == occurrence_text,
+        "invalid crash configuration: occurrence"
+    );
+    let trace_text = std::env::var(PHASE_4A_TRACE_ENV).expect("invalid crash configuration: trace");
+    let trace: Vec<_> = trace_text
+        .split(',')
+        .map(|name| parse(name).expect("invalid crash configuration: trace"))
+        .collect();
+    assert_commit_trace(&trace);
+    assert!(
+        trace.iter().filter(|&&seen| seen == point).count() >= occurrence,
+        "invalid crash configuration: occurrence outside successful trace"
+    );
+    let path = PathBuf::from(
+        std::env::var_os(PHASE_4A_PATH_ENV).expect("invalid crash configuration: path"),
+    );
+    assert_eq!(
+        fs::canonicalize(&path).expect("invalid crash configuration: path"),
+        path,
+        "invalid crash configuration: noncanonical path"
+    );
+    assert_eq!(
+        path.parent(),
+        Some(fs::canonicalize(std::env::temp_dir()).unwrap().as_path()),
+        "invalid crash configuration: path outside temp directory"
+    );
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_str()
+            .is_some_and(|name| name.starts_with("ora-sqllite-")
+                && name.contains("-phase4a-crash-case-")
+                && name.ends_with(".db")),
+        "invalid crash configuration: non-scenario path"
+    );
+    assert!(
+        path.is_file() && wal_path(&path).is_file(),
+        "invalid crash configuration: incomplete pair"
+    );
+    // Validate the fixture read-only before any potentially mutating recovery.
+    let read_only =
+        Pager::open(&path, OpenMode::ReadOnly, PagerConfig::test_default(4096)).unwrap();
+    assert_phase4a_model(
+        &mut read_only.begin_read().unwrap(),
+        &phase4a_scenario_model(&scenario, false),
+    )
+    .unwrap();
+    assert_eq!(
+        read_only.latest_lsn().unwrap().0,
+        u64::from(scenario != "bootstrap")
+    );
+    drop(read_only);
+    let pager = crash_open(&path).with_faults(Arc::new(Phase4aAbortAt {
+        scenario: scenario.clone(),
+        point,
+        occurrence,
+        trace,
+        observed: Mutex::new(Vec::new()),
+    }));
+    phase4a_apply_model(
+        &pager,
+        &phase4a_scenario_model(&scenario, false),
+        &phase4a_scenario_model(&scenario, true),
+    )
+    .unwrap();
+    panic!("configured crash boundary was not reached");
+}
+
+struct Phase4aAbortAt {
+    scenario: String,
+    point: FaultPoint,
+    occurrence: usize,
+    trace: Vec<FaultPoint>,
+    observed: Mutex<Vec<FaultPoint>>,
+}
+
+impl FaultInjector for Phase4aAbortAt {
+    fn check(&self, point: FaultPoint) -> Result<()> {
+        let mut observed = self.observed.lock().unwrap();
+        assert_eq!(
+            self.trace.get(observed.len()),
+            Some(&point),
+            "child diverged from successful trace"
+        );
+        observed.push(point);
+        let occurrence = observed.iter().filter(|&&seen| seen == point).count();
+        if (point, occurrence) == (self.point, self.occurrence) {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(
+                stderr,
+                "PHASE4A_ABORT {} {point:?} {occurrence}",
+                self.scenario
+            )
+            .unwrap();
+            stderr.flush().unwrap();
+            std::process::abort();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn phase_4a_crash_child_rejects_invalid_configuration_without_writing() {
+    let fixture = phase4a_fixture("bootstrap");
+    let (trace, _, _) = phase4a_trace(&fixture, "bootstrap");
+    for (scenario, point, occurrence, path_mode) in [
+        ("invalid", "BeforeWalRecordWrite", "1", "valid"),
+        ("bootstrap", "unknown", "1", "valid"),
+        ("bootstrap", "BeforeWalRecordWrite", "0", "valid"),
+        ("bootstrap", "BeforeWalRecordWrite", "01", "valid"),
+        ("bootstrap", "BeforeWalRecordWrite", "999999", "valid"),
+        ("bootstrap", "BeforeWalRecordWrite", "1", "missing"),
+        ("bootstrap", "BeforeWalRecordWrite", "1", "fixture"),
+    ] {
+        let temp = phase4a_copy_fixture(&fixture);
+        let before = crash_pair_bytes(temp.path());
+        let path = match path_mode {
+            "missing" => temp.path().with_extension("missing"),
+            "fixture" => fs::canonicalize(fixture.path()).unwrap(),
+            _ => fs::canonicalize(temp.path()).unwrap(),
+        };
+        let output = phase4a_child_command(&path, scenario, point, occurrence, &trace)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "invalid child parameters must fail, not abort"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid crash configuration:"), "{stderr}");
+        assert!(!stderr.contains("PHASE4A_ABORT"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        assert_eq!(crash_pair_bytes(temp.path()), before);
+    }
+}
+
+#[test]
+#[ignore = "dedicated Phase 4A subprocess matrix; every WAL occurrence aborts one child"]
+fn phase_4a_catalog_crash_recovery_matrix() {
+    let mut crashes = 0;
+    for scenario in PHASE_4A_SCENARIOS {
+        let fixture = phase4a_fixture(scenario);
+        let unchanged = crash_pair_bytes(fixture.path());
+        let (trace, pre, post) = phase4a_trace(&fixture, scenario);
+        let durable = trace
+            .iter()
+            .position(|&point| point == FaultPoint::AfterWalSync)
+            .unwrap();
+        for point in PHASE_4A_WAL_POINTS {
+            let count = trace.iter().filter(|&&seen| seen == point).count();
+            assert!(count > 0, "uncovered {scenario} {point:?}");
+            eprintln!("phase4a {scenario} {point:?}: occurrences={count}");
+        }
+        for (index, &point) in trace.iter().enumerate() {
+            let occurrence = trace[..=index]
+                .iter()
+                .filter(|&&seen| seen == point)
+                .count();
+            let temp = phase4a_copy_fixture(&fixture);
+            let output = phase4a_child_command(
+                &fs::canonicalize(temp.path()).unwrap(),
+                scenario,
+                &format!("{point:?}"),
+                &occurrence.to_string(),
+                &trace,
+            )
+            .output()
+            .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("running 1 test"),
+                "exact child did not run: {stdout}"
+            );
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line == format!("PHASE4A_ABORT {scenario} {point:?} {occurrence}")),
+                "child missed fault: status={} stderr={stderr}",
+                output.status
+            );
+            assert!(!output.status.success());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    output.status.signal(),
+                    Some(6),
+                    "child must die from SIGABRT"
+                );
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                output.status.code(),
+                Some(-1_073_740_791),
+                "Windows abort fast-fail 0xC0000409"
+            );
+            phase4a_assert_recovery(temp.path(), scenario, &pre, &post, index >= durable);
+            crashes += 1;
+            eprintln!(
+                "phase4a {scenario} {point:?}/{occurrence}: atomic, deep-valid, repeat-open stable, handles released"
+            );
+        }
+        assert_eq!(crash_pair_bytes(fixture.path()), unchanged);
+    }
+    eprintln!("phase4a crash matrix: {crashes} inspected child aborts across all four scenarios");
 }
 
 const CRASH_CHILD_TEST: &str = "storage::test_support::phase_3_crash_child";
