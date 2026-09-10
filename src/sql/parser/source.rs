@@ -71,6 +71,10 @@ impl<'sql> SourceMap<'sql> {
         self.location(self.byte_offset(location)?)
     }
 
+    pub(super) const fn sql(&self) -> &'sql str {
+        self.sql
+    }
+
     fn byte_offset(&self, location: Location) -> Result<usize> {
         let line = usize::try_from(location.line).map_err(|_| invalid_source_location())?;
         let column = usize::try_from(location.column).map_err(|_| invalid_source_location())?;

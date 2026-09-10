@@ -3,6 +3,9 @@ use sqlparser::ast::{
     FunctionArguments, Ident, ObjectNamePart, Spanned, UnaryOperator as ParserUnaryOp, Value,
     ValueWithSpan,
 };
+use sqlparser::dialect::OracleDialect;
+use sqlparser::keywords::Keyword;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use super::AstBudget;
 use super::source::SourceMap;
@@ -11,6 +14,156 @@ use crate::sql::ast::{
 };
 use crate::sql::{Identifier, ParameterKey, SqlSpan};
 use crate::{DbError, ErrorCode, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SourceToken {
+    kind: SourceTokenKind,
+    span: SqlSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceTokenKind {
+    LeftParenthesis,
+    RightParenthesis,
+    Plus,
+    Minus,
+    Star,
+    Not,
+    Is,
+    Null,
+    Other,
+}
+
+fn source_tokens<'a>(
+    budget: &'a mut AstBudget,
+    source_map: &SourceMap<'_>,
+) -> Result<&'a [SourceToken]> {
+    if budget.source_tokens.is_none() {
+        let raw_tokens = Tokenizer::new(&OracleDialect, source_map.sql())
+            .tokenize_with_location()
+            .map_err(|error| {
+                source_map
+                    .sqlparser_location(error.location)
+                    .map(|location| {
+                        DbError::new(ErrorCode::Syntax, error.message).with_sql_location(location)
+                    })
+                    .unwrap_or_else(|mapping_error| mapping_error)
+            })?;
+        let mut tokens = Vec::new();
+        for token in raw_tokens {
+            if matches!(token.token, Token::Whitespace(_)) {
+                continue;
+            }
+            tokens.push(SourceToken {
+                kind: source_token_kind(&token.token),
+                span: source_map.span(token.span)?,
+            });
+        }
+        budget.source_tokens = Some(tokens);
+    }
+    budget.source_tokens.as_deref().ok_or_else(|| {
+        DbError::new(
+            ErrorCode::Internal,
+            "SQL source token index was not initialized",
+        )
+    })
+}
+
+fn source_token_kind(token: &Token) -> SourceTokenKind {
+    match token {
+        Token::LParen => SourceTokenKind::LeftParenthesis,
+        Token::RParen => SourceTokenKind::RightParenthesis,
+        Token::Plus => SourceTokenKind::Plus,
+        Token::Minus => SourceTokenKind::Minus,
+        Token::Mul => SourceTokenKind::Star,
+        Token::Word(word) if word.keyword == Keyword::NOT => SourceTokenKind::Not,
+        Token::Word(word) if word.keyword == Keyword::IS => SourceTokenKind::Is,
+        Token::Word(word) if word.keyword == Keyword::NULL => SourceTokenKind::Null,
+        _ => SourceTokenKind::Other,
+    }
+}
+
+fn token_before(
+    boundary: usize,
+    expected: SourceTokenKind,
+    source_map: &SourceMap<'_>,
+    budget: &mut AstBudget,
+) -> Result<SourceToken> {
+    source_tokens(budget, source_map)?
+        .iter()
+        .rev()
+        .find(|token| token.span.end() <= boundary)
+        .copied()
+        .filter(|token| token.kind == expected)
+        .ok_or_else(|| source_shape_error(boundary, source_map))
+}
+
+fn token_after(
+    boundary: usize,
+    expected: SourceTokenKind,
+    source_map: &SourceMap<'_>,
+    budget: &mut AstBudget,
+) -> Result<SourceToken> {
+    source_tokens(budget, source_map)?
+        .iter()
+        .find(|token| token.span.start() >= boundary)
+        .copied()
+        .filter(|token| token.kind == expected)
+        .ok_or_else(|| source_shape_error(boundary, source_map))
+}
+
+fn token_between(
+    start: usize,
+    end: usize,
+    expected: SourceTokenKind,
+    source_map: &SourceMap<'_>,
+    budget: &mut AstBudget,
+) -> Result<SourceToken> {
+    source_tokens(budget, source_map)?
+        .iter()
+        .find(|token| {
+            token.span.start() >= start && token.span.end() <= end && token.kind == expected
+        })
+        .copied()
+        .ok_or_else(|| source_shape_error(start, source_map))
+}
+
+fn matching_right_parenthesis(
+    opening: SourceToken,
+    source_map: &SourceMap<'_>,
+    budget: &mut AstBudget,
+) -> Result<SourceToken> {
+    let mut depth = 0usize;
+    for token in source_tokens(budget, source_map)?
+        .iter()
+        .filter(|token| token.span.start() >= opening.span.start())
+    {
+        match token.kind {
+            SourceTokenKind::LeftParenthesis => depth = depth.saturating_add(1),
+            SourceTokenKind::RightParenthesis => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| source_shape_error(token.span.start(), source_map))?;
+                if depth == 0 {
+                    return Ok(*token);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(source_shape_error(opening.span.start(), source_map))
+}
+
+fn source_shape_error(offset: usize, source_map: &SourceMap<'_>) -> DbError {
+    let error = DbError::new(
+        ErrorCode::Internal,
+        "parsed SQL expression does not match its source tokens",
+    );
+    match source_map.location(offset) {
+        Ok(location) => error.with_sql_location(location),
+        Err(_) => error,
+    }
+}
 
 pub(super) fn convert_expr(
     expr: Expr,
@@ -34,40 +187,57 @@ fn convert_expr_inner(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<AstExpr> {
-    let span = source_map.span(upstream_span);
-    let kind = match expr {
+    let partial_span = source_map.span(upstream_span);
+    match expr {
         Expr::Identifier(ident) => {
-            AstExprKind::Column(vec![convert_identifier(ident, source_map)?])
+            let identifier = convert_identifier(ident, source_map)?;
+            Ok(AstExpr {
+                span: identifier.span(),
+                kind: AstExprKind::Column(vec![identifier]),
+            })
         }
         Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
             let mut parts = Vec::new();
             for ident in idents {
                 parts.push(convert_identifier(ident, source_map)?);
             }
-            AstExprKind::Column(parts)
+            let [first, second] = parts.as_slice() else {
+                return Err(source_shape_error(0, source_map));
+            };
+            Ok(AstExpr {
+                span: SqlSpan::new(first.span().start(), second.span().end())?,
+                kind: AstExprKind::Column(parts),
+            })
         }
-        Expr::Value(value) => convert_value(value, source_map)?,
-        Expr::UnaryOp { op, expr } => AstExprKind::Unary {
-            op: convert_unary_op(op).ok_or_else(|| unsupported(source_map, span.as_ref().ok()))?,
-            expr: Box::new(convert_expr(*expr, source_map, budget)?),
-        },
+        Expr::Value(value) => {
+            let span = source_map.span(value.span)?;
+            Ok(AstExpr {
+                kind: convert_value(value, source_map)?,
+                span,
+            })
+        }
+        Expr::UnaryOp { op, expr } => {
+            let (op, source_kind) = convert_unary_op(op)
+                .ok_or_else(|| unsupported(source_map, partial_span.as_ref().ok()))?;
+            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
+            let operator = token_before(expr.span.start(), source_kind, source_map, budget)?;
+            Ok(AstExpr {
+                span: SqlSpan::new(operator.span.start(), expr.span.end())?,
+                kind: AstExprKind::Unary { op, expr },
+            })
+        }
         Expr::BinaryOp { left, op, right } => {
             let op = convert_binary_op(&op)
-                .ok_or_else(|| unsupported(source_map, span.as_ref().ok()))?;
-            AstExprKind::Binary {
-                left: Box::new(convert_expr(*left, source_map, budget)?),
-                op,
-                right: Box::new(convert_expr(*right, source_map, budget)?),
-            }
+                .ok_or_else(|| unsupported(source_map, partial_span.as_ref().ok()))?;
+            let left = Box::new(convert_expr(*left, source_map, budget)?);
+            let right = Box::new(convert_expr(*right, source_map, budget)?);
+            Ok(AstExpr {
+                span: SqlSpan::new(left.span.start(), right.span.end())?,
+                kind: AstExprKind::Binary { left, op, right },
+            })
         }
-        Expr::IsNull(expr) => AstExprKind::IsNull {
-            expr: Box::new(convert_expr(*expr, source_map, budget)?),
-            negated: false,
-        },
-        Expr::IsNotNull(expr) => AstExprKind::IsNull {
-            expr: Box::new(convert_expr(*expr, source_map, budget)?),
-            negated: true,
-        },
+        Expr::IsNull(expr) => convert_is_null(*expr, false, source_map, budget),
+        Expr::IsNotNull(expr) => convert_is_null(*expr, true, source_map, budget),
         Expr::InList {
             expr,
             list,
@@ -78,40 +248,107 @@ fn convert_expr_inner(
             for value in list {
                 values.push(convert_expr(value, source_map, budget)?);
             }
-            AstExprKind::InList {
-                expr,
-                values,
-                negated,
-            }
+            let Some(first) = values.first() else {
+                return Err(source_shape_error(expr.span.end(), source_map));
+            };
+            let opening = token_between(
+                expr.span.end(),
+                first.span.start(),
+                SourceTokenKind::LeftParenthesis,
+                source_map,
+                budget,
+            )?;
+            let closing = matching_right_parenthesis(opening, source_map, budget)?;
+            Ok(AstExpr {
+                span: SqlSpan::new(expr.span.start(), closing.span.end())?,
+                kind: AstExprKind::InList {
+                    expr,
+                    values,
+                    negated,
+                },
+            })
         }
         Expr::Between {
             expr,
             negated,
             low,
             high,
-        } => AstExprKind::Between {
-            expr: Box::new(convert_expr(*expr, source_map, budget)?),
-            low: Box::new(convert_expr(*low, source_map, budget)?),
-            high: Box::new(convert_expr(*high, source_map, budget)?),
-            negated,
-        },
+        } => {
+            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
+            let low = Box::new(convert_expr(*low, source_map, budget)?);
+            let high = Box::new(convert_expr(*high, source_map, budget)?);
+            Ok(AstExpr {
+                span: SqlSpan::new(expr.span.start(), high.span.end())?,
+                kind: AstExprKind::Between {
+                    expr,
+                    low,
+                    high,
+                    negated,
+                },
+            })
+        }
         Expr::Like {
             negated,
             any: false,
             expr,
             pattern,
             escape_char: None,
-        } => AstExprKind::Like {
-            expr: Box::new(convert_expr(*expr, source_map, budget)?),
-            pattern: Box::new(convert_expr(*pattern, source_map, budget)?),
-            negated,
-        },
-        Expr::Nested(expr) => return convert_expr(*expr, source_map, budget),
-        Expr::Function(function) => convert_aggregate(function, source_map, budget)?,
-        _ => return Err(unsupported(source_map, span.as_ref().ok())),
-    };
+        } => {
+            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
+            let pattern = Box::new(convert_expr(*pattern, source_map, budget)?);
+            Ok(AstExpr {
+                span: SqlSpan::new(expr.span.start(), pattern.span.end())?,
+                kind: AstExprKind::Like {
+                    expr,
+                    pattern,
+                    negated,
+                },
+            })
+        }
+        Expr::Nested(expr) => {
+            let mut expr = convert_expr(*expr, source_map, budget)?;
+            let opening = token_before(
+                expr.span.start(),
+                SourceTokenKind::LeftParenthesis,
+                source_map,
+                budget,
+            )?;
+            let closing = token_after(
+                expr.span.end(),
+                SourceTokenKind::RightParenthesis,
+                source_map,
+                budget,
+            )?;
+            expr.span = SqlSpan::new(opening.span.start(), closing.span.end())?;
+            Ok(expr)
+        }
+        Expr::Function(function) => convert_aggregate(function, source_map, budget),
+        _ => Err(unsupported(source_map, partial_span.as_ref().ok())),
+    }
+}
 
-    Ok(AstExpr { kind, span: span? })
+fn convert_is_null(
+    expr: Expr,
+    negated: bool,
+    source_map: &SourceMap<'_>,
+    budget: &mut AstBudget,
+) -> Result<AstExpr> {
+    let expr = Box::new(convert_expr(expr, source_map, budget)?);
+    let is = token_after(expr.span.end(), SourceTokenKind::Is, source_map, budget)?;
+    let end = if negated {
+        let not = token_after(is.span.end(), SourceTokenKind::Not, source_map, budget)?;
+        token_after(not.span.end(), SourceTokenKind::Null, source_map, budget)?
+            .span
+            .end()
+    } else {
+        token_after(is.span.end(), SourceTokenKind::Null, source_map, budget)?
+            .span
+            .end()
+    };
+    Ok(AstExpr {
+        span: SqlSpan::new(expr.span.start(), end)?,
+        kind: AstExprKind::IsNull { expr, negated },
+    })
 }
 
 fn convert_identifier(ident: Ident, source_map: &SourceMap<'_>) -> Result<Identifier> {
@@ -204,11 +441,11 @@ fn decode_blob(value: &str, span: SqlSpan, source_map: &SourceMap<'_>) -> Result
     Ok(bytes)
 }
 
-fn convert_unary_op(op: ParserUnaryOp) -> Option<UnaryOp> {
+fn convert_unary_op(op: ParserUnaryOp) -> Option<(UnaryOp, SourceTokenKind)> {
     match op {
-        ParserUnaryOp::Plus => Some(UnaryOp::Positive),
-        ParserUnaryOp::Minus => Some(UnaryOp::Negative),
-        ParserUnaryOp::Not => Some(UnaryOp::Not),
+        ParserUnaryOp::Plus => Some((UnaryOp::Positive, SourceTokenKind::Plus)),
+        ParserUnaryOp::Minus => Some((UnaryOp::Negative, SourceTokenKind::Minus)),
+        ParserUnaryOp::Not => Some((UnaryOp::Not, SourceTokenKind::Not)),
         _ => None,
     }
 }
@@ -236,7 +473,7 @@ fn convert_aggregate(
     function: Function,
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
-) -> Result<AstExprKind> {
+) -> Result<AstExpr> {
     let function_span = source_map.span(function.span()).ok();
     let Function {
         name,
@@ -257,12 +494,22 @@ fn convert_aggregate(
     {
         return Err(unsupported(source_map, function_span.as_ref()));
     }
-    let [ObjectNamePart::Identifier(name)] = name.0.as_slice() else {
-        return Err(unsupported(source_map, function_span.as_ref()));
+    let mut name_parts = name.0.into_iter();
+    let name = match (name_parts.next(), name_parts.next()) {
+        (Some(ObjectNamePart::Identifier(name)), None) => name,
+        _ => return Err(unsupported(source_map, function_span.as_ref())),
     };
     if name.quote_style.is_some() {
         return Err(unsupported(source_map, function_span.as_ref()));
     }
+    let name_span = source_map.span(name.span)?;
+    let opening = token_after(
+        name_span.end(),
+        SourceTokenKind::LeftParenthesis,
+        source_map,
+        budget,
+    )?;
+    let closing = matching_right_parenthesis(opening, source_map, budget)?;
     let function = match name.value.to_ascii_uppercase().as_str() {
         "COUNT" => AggregateFunction::Count,
         "SUM" => AggregateFunction::Sum,
@@ -271,19 +518,30 @@ fn convert_aggregate(
         "MAX" => AggregateFunction::Max,
         _ => return Err(unsupported(source_map, function_span.as_ref())),
     };
-    let [FunctionArg::Unnamed(argument)] = arguments.args.as_slice() else {
-        return Err(unsupported(source_map, function_span.as_ref()));
+    let mut args = arguments.args.into_iter();
+    let argument = match (args.next(), args.next()) {
+        (Some(FunctionArg::Unnamed(argument)), None) => argument,
+        _ => return Err(unsupported(source_map, function_span.as_ref())),
     };
     let argument = match argument {
-        FunctionArgExpr::Wildcard => {
-            AggregateArgument::Wildcard(function_span.ok_or_else(|| unsupported(source_map, None))?)
-        }
+        FunctionArgExpr::Wildcard => AggregateArgument::Wildcard(
+            token_after(
+                opening.span.end(),
+                SourceTokenKind::Star,
+                source_map,
+                budget,
+            )?
+            .span,
+        ),
         FunctionArgExpr::Expr(expr) => {
-            AggregateArgument::Expr(Box::new(convert_expr(expr.clone(), source_map, budget)?))
+            AggregateArgument::Expr(Box::new(convert_expr(expr, source_map, budget)?))
         }
         _ => return Err(unsupported(source_map, function_span.as_ref())),
     };
-    Ok(AstExprKind::Aggregate { function, argument })
+    Ok(AstExpr {
+        span: SqlSpan::new(name_span.start(), closing.span.end())?,
+        kind: AstExprKind::Aggregate { function, argument },
+    })
 }
 
 fn syntax_error(message: &str, span: SqlSpan, source_map: &SourceMap<'_>) -> DbError {
@@ -326,26 +584,34 @@ mod tests {
             .with_tokens_with_locations(tokens)
             .parse_statements()
             .map_err(|error| DbError::new(ErrorCode::Syntax, error.to_string()))?;
-        let [Statement::Query(query)] = statements.as_slice() else {
-            return Err(DbError::new(
-                ErrorCode::Syntax,
-                "expression fixture did not parse as one query",
-            ));
+        let mut statements = statements.into_iter();
+        let query = match (statements.next(), statements.next()) {
+            (Some(Statement::Query(query)), None) => query,
+            _ => {
+                return Err(DbError::new(
+                    ErrorCode::Syntax,
+                    "expression fixture did not parse as one query",
+                ));
+            }
         };
-        let SetExpr::Select(select) = query.body.as_ref() else {
+        let SetExpr::Select(select) = *query.body else {
             return Err(DbError::new(
                 ErrorCode::Syntax,
                 "expression fixture did not parse as SELECT",
             ));
         };
-        let [SelectItem::UnnamedExpr(expr)] = select.projection.as_slice() else {
-            return Err(DbError::new(
-                ErrorCode::Syntax,
-                "expression fixture did not produce one expression",
-            ));
+        let mut projection = select.projection.into_iter();
+        let expr = match (projection.next(), projection.next()) {
+            (Some(SelectItem::UnnamedExpr(expr)), None) => expr,
+            _ => {
+                return Err(DbError::new(
+                    ErrorCode::Syntax,
+                    "expression fixture did not produce one expression",
+                ));
+            }
         };
         let mut budget = AstBudget::new(limits);
-        convert_expr(expr.clone(), &source_map, &mut budget)
+        convert_expr(expr, &source_map, &mut budget)
     }
 
     #[test]
@@ -606,5 +872,90 @@ mod tests {
             let error = parse_expr_fragment(fragment, &SqlLimits::default()).unwrap_err();
             assert_eq!(error.code(), ErrorCode::Syntax, "{fragment}: {error:?}");
         }
+    }
+
+    #[test]
+    fn source_aware_expression_spans_include_authored_operators_and_delimiters() {
+        let count = parse_expr_fragment("COUNT(*)", &SqlLimits::default()).unwrap();
+        assert_eq!(count.span, SqlSpan::new(7, 15).unwrap());
+        assert!(matches!(
+            count.kind,
+            AstExprKind::Aggregate {
+                function: AggregateFunction::Count,
+                argument: AggregateArgument::Wildcard(span),
+            } if span == SqlSpan::new(13, 14).unwrap()
+        ));
+
+        let not = parse_expr_fragment("NOT A", &SqlLimits::default()).unwrap();
+        assert_eq!(not.span, SqlSpan::new(7, 12).unwrap());
+        assert!(matches!(
+            not.kind,
+            AstExprKind::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } if expr.span == SqlSpan::new(11, 12).unwrap()
+        ));
+
+        let negative = parse_expr_fragment("-A", &SqlLimits::default()).unwrap();
+        assert_eq!(negative.span, SqlSpan::new(7, 9).unwrap());
+        assert!(matches!(
+            negative.kind,
+            AstExprKind::Unary {
+                op: UnaryOp::Negative,
+                expr,
+            } if expr.span == SqlSpan::new(8, 9).unwrap()
+        ));
+
+        let is_not_null = parse_expr_fragment("A IS NOT NULL", &SqlLimits::default()).unwrap();
+        assert_eq!(is_not_null.span, SqlSpan::new(7, 20).unwrap());
+        assert!(matches!(
+            is_not_null.kind,
+            AstExprKind::IsNull {
+                negated: true,
+                expr,
+            } if expr.span == SqlSpan::new(7, 8).unwrap()
+        ));
+
+        let nested = parse_expr_fragment("(A + 1)", &SqlLimits::default()).unwrap();
+        assert_eq!(nested.span, SqlSpan::new(7, 14).unwrap());
+        assert!(matches!(
+            nested.kind,
+            AstExprKind::Binary { left, right, .. }
+                if left.span == SqlSpan::new(8, 9).unwrap()
+                    && right.span == SqlSpan::new(12, 13).unwrap()
+        ));
+
+        let trivia =
+            parse_expr_fragment("COUNT /*a*/ ( /*b*/ * /*c*/ )", &SqlLimits::default()).unwrap();
+        assert_eq!(trivia.span, SqlSpan::new(7, 36).unwrap());
+        assert!(matches!(
+            trivia.kind,
+            AstExprKind::Aggregate {
+                argument: AggregateArgument::Wildcard(span),
+                ..
+            } if span == SqlSpan::new(27, 28).unwrap()
+        ));
+    }
+
+    #[test]
+    fn aggregate_argument_budget_is_entered_before_owned_child_allocation() {
+        let limits = SqlLimits::default().with_max_ast_nodes(1).unwrap();
+        let error = parse_expr_fragment("SUM(A + B)", &limits).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Syntax);
+        assert_eq!(
+            error.sql_location(),
+            Some(crate::error::SqlLocation::new(11, 1, 12).unwrap())
+        );
+
+        let exact = SqlLimits::default().with_max_ast_nodes(4).unwrap();
+        let aggregate = parse_expr_fragment("SUM(A + B)", &exact).unwrap();
+        assert_eq!(aggregate.span, SqlSpan::new(7, 17).unwrap());
+        assert!(matches!(
+            aggregate.kind,
+            AstExprKind::Aggregate {
+                function: AggregateFunction::Sum,
+                argument: AggregateArgument::Expr(expr),
+            } if matches!(expr.kind, AstExprKind::Binary { .. })
+        ));
     }
 }

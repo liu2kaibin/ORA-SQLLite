@@ -9,6 +9,7 @@ use crate::{DbError, ErrorCode, Result};
 pub(super) struct AstBudget {
     remaining_nodes: u32,
     remaining_depth: u16,
+    source_tokens: Option<Vec<expr::SourceToken>>,
 }
 
 impl AstBudget {
@@ -16,6 +17,7 @@ impl AstBudget {
         Self {
             remaining_nodes: limits.max_ast_nodes(),
             remaining_depth: limits.max_nesting(),
+            source_tokens: None,
         }
     }
 
