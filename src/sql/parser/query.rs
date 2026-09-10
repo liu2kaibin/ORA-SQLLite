@@ -34,7 +34,9 @@ struct QueryToken {
     kind: QueryTokenKind,
     keyword: Keyword,
     is_model_word: bool,
+    is_model_clause_follower: bool,
     depth: usize,
+    matching_left_parenthesis: Option<usize>,
     span: SqlSpan,
 }
 
@@ -60,6 +62,7 @@ impl QueryTokenIndex {
     fn from_tokens(raw_tokens: &[TokenWithSpan], source_map: &SourceMap<'_>) -> Result<Self> {
         let mut tokens = Vec::with_capacity(raw_tokens.len());
         let mut depth = 0usize;
+        let mut open_parentheses = Vec::new();
         for token in raw_tokens {
             if matches!(token.token, Token::Whitespace(_)) {
                 continue;
@@ -67,12 +70,27 @@ impl QueryTokenIndex {
             if matches!(token.token, Token::RParen) {
                 depth = depth.saturating_sub(1);
             }
-            let (keyword, is_model_word) = match &token.token {
+            let (keyword, is_model_word, is_model_clause_follower) = match &token.token {
                 Token::Word(word) => (
                     word.keyword,
                     word.quote_style.is_none() && word.value.eq_ignore_ascii_case("MODEL"),
+                    word.quote_style.is_none()
+                        && [
+                            "RETURN",
+                            "DIMENSION",
+                            "MEASURES",
+                            "RULES",
+                            "REFERENCE",
+                            "IGNORE",
+                            "KEEP",
+                            "UNIQUE",
+                            "AUTOMATIC",
+                            "SEQUENTIAL",
+                        ]
+                        .iter()
+                        .any(|candidate| word.value.eq_ignore_ascii_case(candidate)),
                 ),
-                _ => (Keyword::NoKeyword, false),
+                _ => (Keyword::NoKeyword, false, false),
             };
             let kind = match &token.token {
                 Token::Comma => QueryTokenKind::Comma,
@@ -83,15 +101,24 @@ impl QueryTokenIndex {
                 Token::Word(_) => QueryTokenKind::Word,
                 _ => QueryTokenKind::Other,
             };
+            let matching_left_parenthesis = if matches!(token.token, Token::RParen) {
+                open_parentheses.pop()
+            } else {
+                None
+            };
+            let token_index = tokens.len();
             tokens.push(QueryToken {
                 kind,
                 keyword,
                 is_model_word,
+                is_model_clause_follower,
                 depth,
+                matching_left_parenthesis,
                 span: source_map.span(token.span)?,
             });
             if matches!(token.token, Token::LParen) {
                 depth = depth.saturating_add(1);
+                open_parentheses.push(token_index);
             }
         }
         Ok(Self { tokens })
@@ -138,6 +165,15 @@ impl QueryTokenIndex {
             .iter()
             .find(|token| {
                 token.depth == 0 && token.keyword == keyword && token.span.start() >= start
+            })
+            .map(|token| token.span)
+    }
+
+    fn first_keyword_span_after(&self, keywords: &[Keyword], start: usize) -> Option<SqlSpan> {
+        self.tokens
+            .iter()
+            .find(|token| {
+                token.depth == 0 && token.span.start() >= start && keywords.contains(&token.keyword)
             })
             .map(|token| token.span)
     }
@@ -189,76 +225,48 @@ impl QueryTokenIndex {
     }
 
     fn model_clause_span(&self) -> Option<SqlSpan> {
-        let mut in_from_clause = false;
-        for (index, token) in self.tokens.iter().enumerate() {
-            if token.depth != 0 {
-                continue;
-            }
-            if token.keyword == Keyword::SELECT {
-                in_from_clause = false;
-                continue;
-            }
-            if token.keyword == Keyword::FROM {
-                in_from_clause = true;
-                continue;
-            }
-            if in_from_clause
-                && matches!(
-                    token.keyword,
-                    Keyword::WHERE
-                        | Keyword::GROUP
-                        | Keyword::HAVING
-                        | Keyword::ORDER
-                        | Keyword::QUALIFY
-                        | Keyword::CONNECT
-                        | Keyword::LIMIT
-                        | Keyword::OFFSET
-                        | Keyword::FETCH
-                        | Keyword::FOR
-                        | Keyword::UNION
-                        | Keyword::INTERSECT
-                        | Keyword::EXCEPT
-                        | Keyword::MINUS
-                )
-            {
-                in_from_clause = false;
-            }
-            if !in_from_clause || !token.is_model_word {
-                continue;
-            }
-            let previous = index
-                .checked_sub(1)
-                .and_then(|index| self.tokens.get(index));
-            if previous.is_some_and(|previous| {
-                previous.kind == QueryTokenKind::Dot
-                    || previous.kind == QueryTokenKind::Comma
-                    || matches!(
-                        previous.keyword,
-                        Keyword::FROM | Keyword::JOIN | Keyword::AS
-                    )
-            }) {
-                continue;
-            }
-            return Some(token.span);
-        }
-        None
+        self.tokens.windows(2).find_map(|pair| {
+            let [model, follower] = pair else {
+                return None;
+            };
+            (model.depth == 0
+                && model.is_model_word
+                && follower.depth == 0
+                && follower.is_model_clause_follower)
+                .then_some(model.span)
+        })
     }
 
     fn window_clause_span(&self) -> Option<SqlSpan> {
         self.tokens.windows(3).find_map(|window| {
-            let [previous, over, next] = window else {
+            let [function_end, over, window_spec] = window else {
                 return None;
             };
-            (over.depth == 0
+            let function_name = function_end
+                .matching_left_parenthesis
+                .and_then(|opening| opening.checked_sub(1))
+                .and_then(|name| self.tokens.get(name));
+            let has_function_name = function_name.is_some_and(|name| {
+                name.kind == QueryTokenKind::Word
+                    && !matches!(
+                        name.keyword,
+                        Keyword::SELECT
+                            | Keyword::FROM
+                            | Keyword::WHERE
+                            | Keyword::GROUP
+                            | Keyword::HAVING
+                            | Keyword::ORDER
+                    )
+            });
+            let has_window_spec = window_spec.kind == QueryTokenKind::LeftParenthesis
+                || (window_spec.kind == QueryTokenKind::Word
+                    && window_spec.keyword == Keyword::NoKeyword);
+            (has_function_name
                 && over.keyword == Keyword::OVER
-                && previous.depth == 0
-                && previous.kind == QueryTokenKind::RightParenthesis
-                && next.depth == 0
-                && matches!(
-                    next.kind,
-                    QueryTokenKind::LeftParenthesis | QueryTokenKind::Word
-                ))
-            .then_some(over.span)
+                && function_end.depth == over.depth
+                && window_spec.depth == over.depth
+                && has_window_spec)
+                .then_some(over.span)
         })
     }
 
@@ -349,8 +357,7 @@ pub(super) fn convert_query(
         return Err(unsupported(
             source_map,
             token_index
-                .keyword_span_after(Keyword::LIMIT, tail_clause_start)
-                .or_else(|| token_index.keyword_span_after(Keyword::OFFSET, tail_clause_start))
+                .first_keyword_span_after(&[Keyword::LIMIT, Keyword::OFFSET], tail_clause_start)
                 .or_else(|| source_map.span(limit.span()).ok()),
         ));
     }
@@ -824,10 +831,19 @@ fn convert_order_by(
     let order_items_start = token_index
         .keyword_pair_end(Keyword::ORDER, Keyword::BY, body_end, query_end)
         .unwrap_or(body_end);
-    if order_by.interpolate.is_some() {
+    if let Some(interpolate) = &order_by.interpolate {
+        let interpolate_content_start = source_map
+            .span(interpolate.span())
+            .ok()
+            .filter(|span| span.start() < span.end())
+            .map_or(query_end, |span| span.start());
         return Err(unsupported(
             source_map,
-            token_index.keyword_span_after(Keyword::INTERPOLATE, order_items_start),
+            token_index.keyword_span_before(
+                Keyword::INTERPOLATE,
+                order_items_start,
+                interpolate_content_start,
+            ),
         ));
     }
     let OrderByKind::Expressions(items) = order_by.kind else {
@@ -1406,6 +1422,33 @@ mod tests {
     }
 
     #[test]
+    fn order_extensions_and_limit_clauses_report_the_first_authored_clause() {
+        assert_unsupported_at(
+            parse_query_with_dialect(
+                "SELECT A FROM T ORDER BY INTERPOLATE WITH FILL INTERPOLATE",
+                &ClickHouseDialect {},
+            ),
+            "interpolate after same-named order expression",
+            47,
+        );
+
+        for (family, sql, offset) in [
+            (
+                "offset before limit",
+                "SELECT T.OFFSET FROM T OFFSET 1 ROWS LIMIT 2",
+                23,
+            ),
+            (
+                "limit before offset",
+                "SELECT T.LIMIT FROM T LIMIT 2 OFFSET 1 ROWS",
+                22,
+            ),
+        ] {
+            assert_unsupported_at(parse_query(sql), family, offset);
+        }
+    }
+
+    #[test]
     fn model_and_over_identifiers_are_not_raw_syntax_false_positives() {
         for sql in [
             "SELECT MODEL FROM T",
@@ -1418,19 +1461,63 @@ mod tests {
             assert!(preflight_only(sql).is_ok(), "raw preflight rejected {sql}");
             assert!(parse_query(sql).is_ok(), "query conversion rejected {sql}");
         }
+
+        let join = parse_query("SELECT T.ID FROM T INNER JOIN U ON MODEL = U.ID").unwrap();
+        assert_column(
+            match &join.joins[0].condition.kind {
+                AstExprKind::Binary { left, .. } => left,
+                other => panic!("expected binary JOIN condition, got {other:?}"),
+            },
+            &["MODEL"],
+            SqlSpan::new(35, 40).unwrap(),
+        );
+
+        let alias = parse_query("SELECT (A) OVER FROM T").unwrap();
+        let SelectItem::Expr {
+            alias: Some(alias), ..
+        } = &alias.projection[0]
+        else {
+            panic!("expected OVER implicit alias");
+        };
+        assert_eq!(alias.as_str(), "OVER");
+        assert_eq!(alias.span(), SqlSpan::new(11, 15).unwrap());
     }
 
     #[test]
     fn raw_preflight_rejects_only_actual_model_and_window_syntax_at_exact_tokens() {
-        assert_unsupported_at(
-            preflight_only("SELECT A FROM T MODEL RETURN UPDATED ROWS"),
-            "model preflight",
-            16,
-        );
+        for (family, sql, offset) in [
+            (
+                "model after from",
+                "SELECT A FROM T MODEL RETURN UPDATED ROWS",
+                16,
+            ),
+            (
+                "model after where",
+                "SELECT A FROM T WHERE A = 1 MODEL RETURN UPDATED ROWS",
+                28,
+            ),
+            (
+                "model after group by",
+                "SELECT A FROM T GROUP BY A MODEL RETURN UPDATED ROWS",
+                27,
+            ),
+            (
+                "model after having",
+                "SELECT A FROM T GROUP BY A HAVING COUNT(*) > 0 MODEL RETURN UPDATED ROWS",
+                47,
+            ),
+        ] {
+            assert_unsupported_at(preflight_only(sql), family, offset);
+        }
         assert_unsupported_at(
             preflight_only("SELECT SUM(A) OVER () FROM T"),
             "window preflight",
             14,
+        );
+        assert_unsupported_at(
+            preflight_only("SELECT (SUM(A) OVER ()) FROM T"),
+            "nested window preflight",
+            15,
         );
     }
 
