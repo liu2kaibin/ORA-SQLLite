@@ -1,5 +1,11 @@
 #[allow(dead_code, reason = "later SQL frontend layers consume the owned AST")]
 mod ast;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "later Phase 4B binders and Phase 4C execution consume the bound IR"
+)]
+pub(crate) mod bound;
 mod limits;
 #[allow(
     dead_code,

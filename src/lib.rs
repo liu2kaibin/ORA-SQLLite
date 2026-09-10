@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "ORA-SQLLite: a lightweight embedded database with an Oracle-compatible CRUD dialect."]
 
+mod api;
 mod datetime;
 mod decimal;
 pub mod error;
@@ -17,6 +18,7 @@ mod sql;
 mod storage;
 mod value;
 
+pub use api::{ColumnMetadata, DataType, ParameterIdentifier, ParameterMetadata, Statement};
 pub use datetime::{OracleDate, OracleTimestamp};
 pub use decimal::Decimal;
 pub use error::{DbError, ErrorCode, Result};

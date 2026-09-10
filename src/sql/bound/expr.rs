@@ -1,0 +1,92 @@
+use crate::{
+    Value,
+    api::ParameterIdentifier,
+    storage::catalog::types::{ColumnId, TableId},
+};
+
+use super::super::{SqlSpan, SqlType};
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundExpr {
+    pub kind: BoundExprKind,
+    pub sql_type: SqlType,
+    pub nullable: bool,
+    pub span: SqlSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundExprKind {
+    Literal(Value),
+    Column {
+        table_id: TableId,
+        column_id: ColumnId,
+        ordinal: u16,
+    },
+    Parameter(ParameterIdentifier),
+    Unary {
+        op: BoundUnaryOp,
+        expr: Box<BoundExpr>,
+    },
+    Binary {
+        left: Box<BoundExpr>,
+        op: BoundBinaryOp,
+        right: Box<BoundExpr>,
+    },
+    IsNull {
+        expr: Box<BoundExpr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<BoundExpr>,
+        values: Vec<BoundExpr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<BoundExpr>,
+        low: Box<BoundExpr>,
+        high: Box<BoundExpr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<BoundExpr>,
+        pattern: Box<BoundExpr>,
+        negated: bool,
+    },
+    Aggregate {
+        function: BoundAggregateFunction,
+        argument: Option<Box<BoundExpr>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundUnaryOp {
+    Positive,
+    Negative,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundAggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
