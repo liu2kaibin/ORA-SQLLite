@@ -62,3 +62,25 @@ fn database_is_clone_send_and_sync() {
     fn assert_contract<T: Clone + Send + Sync>() {}
     assert_contract::<Database>();
 }
+
+#[test]
+fn unfinished_write_transaction_rolls_back_and_read_only_rejects_writes() {
+    let paths = TempPaths::new("transaction-raii");
+    let db = Database::create(paths.main(), Options::default()).unwrap();
+    drop(db);
+    let before = std::fs::read(paths.main()).unwrap();
+    let db = Database::open(paths.main(), Options::default()).unwrap();
+    {
+        let mut conn = db.connect().unwrap();
+        let _write = conn.begin_write().unwrap();
+    }
+    drop(db);
+    assert_eq!(std::fs::read(paths.main()).unwrap(), before);
+
+    let read_only = Database::open(paths.main(), Options::default().read_only()).unwrap();
+    let mut conn = read_only.connect().unwrap();
+    assert_eq!(
+        conn.begin_write().unwrap_err().code(),
+        ErrorCode::Unsupported
+    );
+}

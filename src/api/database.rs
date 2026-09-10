@@ -5,7 +5,7 @@ use crate::{
     storage::{OpenMode, Pager, PagerConfig},
 };
 
-use super::{AccessMode, Options, options::default_create_page_size};
+use super::{AccessMode, Connection, Options, options::default_create_page_size};
 
 pub(crate) trait UuidSource {
     fn fill(&self, uuid: &mut [u8; 16]) -> std::result::Result<(), ()>;
@@ -67,6 +67,11 @@ impl Database {
             pager,
             sql_limits: *options.sql_limits(),
         })
+    }
+
+    /// Creates an independent session for this database.
+    pub fn connect(&self) -> Result<Connection> {
+        Ok(Connection::new(self.pager.clone(), self.sql_limits))
     }
 
     pub(crate) fn create_with_uuid_source(
