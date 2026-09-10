@@ -1,11 +1,12 @@
 use sqlparser::ast::{
     Distinct, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart,
     OrderByKind, Query, Select, SelectFlavor, SelectItem as ParserSelectItem,
-    SelectItemQualifiedWildcardKind, Spanned, TableAlias, TableFactor, WildcardAdditionalOptions,
+    SelectItemQualifiedWildcardKind, SetOperator, Spanned, TableAlias, TableFactor,
+    WildcardAdditionalOptions,
 };
 use sqlparser::dialect::OracleDialect;
 use sqlparser::keywords::Keyword;
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
 use super::AstBudget;
 use super::expr::convert_expr;
@@ -20,10 +21,6 @@ use crate::{DbError, ErrorCode, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryTokenKind {
     Comma,
-    Inner,
-    Join,
-    Left,
-    Outer,
     Semicolon,
     Other,
 }
@@ -31,6 +28,7 @@ enum QueryTokenKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueryToken {
     kind: QueryTokenKind,
+    keyword: Keyword,
     span: SqlSpan,
 }
 
@@ -55,17 +53,18 @@ impl QueryTokenIndex {
             if matches!(token.token, Token::Whitespace(_)) {
                 continue;
             }
+            let keyword = match &token.token {
+                Token::Word(word) => word.keyword,
+                _ => Keyword::NoKeyword,
+            };
             let kind = match token.token {
                 Token::Comma => QueryTokenKind::Comma,
                 Token::SemiColon => QueryTokenKind::Semicolon,
-                Token::Word(word) if word.keyword == Keyword::INNER => QueryTokenKind::Inner,
-                Token::Word(word) if word.keyword == Keyword::JOIN => QueryTokenKind::Join,
-                Token::Word(word) if word.keyword == Keyword::LEFT => QueryTokenKind::Left,
-                Token::Word(word) if word.keyword == Keyword::OUTER => QueryTokenKind::Outer,
                 _ => QueryTokenKind::Other,
             };
             tokens.push(QueryToken {
                 kind,
+                keyword,
                 span: source_map.span(token.span)?,
             });
         }
@@ -78,22 +77,76 @@ impl QueryTokenIndex {
             .partition_point(|token| token.span.end() <= relation_start);
         let join_index = index.checked_sub(1)?;
         let join = self.tokens.get(join_index)?;
-        if join.kind != QueryTokenKind::Join {
+        if join.keyword != Keyword::JOIN {
             return None;
         }
         let Some(prefix_index) = join_index.checked_sub(1) else {
             return Some(join.span.start());
         };
         let prefix = self.tokens.get(prefix_index)?;
-        match prefix.kind {
-            QueryTokenKind::Inner | QueryTokenKind::Left => Some(prefix.span.start()),
-            QueryTokenKind::Outer => prefix_index
+        match prefix.keyword {
+            Keyword::INNER
+            | Keyword::LEFT
+            | Keyword::RIGHT
+            | Keyword::FULL
+            | Keyword::CROSS
+            | Keyword::NATURAL => Some(prefix.span.start()),
+            Keyword::OUTER => prefix_index
                 .checked_sub(1)
-                .and_then(|left_index| self.tokens.get(left_index))
-                .filter(|left| left.kind == QueryTokenKind::Left)
-                .map_or(Some(prefix.span.start()), |left| Some(left.span.start())),
+                .and_then(|outer_prefix_index| self.tokens.get(outer_prefix_index))
+                .filter(|outer_prefix| {
+                    matches!(
+                        outer_prefix.keyword,
+                        Keyword::LEFT | Keyword::RIGHT | Keyword::FULL
+                    )
+                })
+                .map_or(Some(prefix.span.start()), |outer_prefix| {
+                    Some(outer_prefix.span.start())
+                }),
             _ => Some(join.span.start()),
         }
+    }
+
+    fn keyword_span(&self, keyword: Keyword) -> Option<SqlSpan> {
+        self.tokens
+            .iter()
+            .find(|token| token.keyword == keyword)
+            .map(|token| token.span)
+    }
+
+    fn keyword_span_after(&self, keyword: Keyword, start: usize) -> Option<SqlSpan> {
+        self.tokens
+            .iter()
+            .find(|token| token.keyword == keyword && token.span.start() >= start)
+            .map(|token| token.span)
+    }
+
+    fn keyword_span_before(&self, keyword: Keyword, start: usize, end: usize) -> Option<SqlSpan> {
+        self.tokens
+            .iter()
+            .rev()
+            .find(|token| {
+                token.keyword == keyword && token.span.start() >= start && token.span.end() <= end
+            })
+            .map(|token| token.span)
+    }
+
+    fn keyword_span_between(&self, keyword: Keyword, start: usize, end: usize) -> Option<SqlSpan> {
+        self.tokens
+            .iter()
+            .find(|token| {
+                token.keyword == keyword && token.span.start() >= start && token.span.end() <= end
+            })
+            .map(|token| token.span)
+    }
+
+    fn kind_span_between(&self, kind: QueryTokenKind, start: usize, end: usize) -> Option<SqlSpan> {
+        self.tokens
+            .iter()
+            .find(|token| {
+                token.kind == kind && token.span.start() >= start && token.span.end() <= end
+            })
+            .map(|token| token.span)
     }
 
     fn item_end_before(&self, boundary: usize) -> Option<usize> {
@@ -117,6 +170,37 @@ impl QueryTokenIndex {
             .find(|token| token.kind != QueryTokenKind::Semicolon)
             .map(|token| token.span.end())
     }
+}
+
+pub(super) fn preflight_unparsed_query_syntax(
+    tokens: &[TokenWithSpan],
+    source_map: &SourceMap<'_>,
+) -> Result<()> {
+    let significant = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    for (index, token) in significant.iter().enumerate() {
+        if unquoted_word_eq(token, "MODEL") {
+            return Err(unsupported(source_map, source_map.span(token.span).ok()));
+        }
+        if unquoted_word_eq(token, "ALL")
+            && index >= 2
+            && unquoted_word_eq(significant[index - 2], "ORDER")
+            && unquoted_word_eq(significant[index - 1], "BY")
+        {
+            return Err(unsupported(source_map, source_map.span(token.span).ok()));
+        }
+    }
+    Ok(())
+}
+
+fn unquoted_word_eq(token: &TokenWithSpan, expected: &str) -> bool {
+    matches!(
+        &token.token,
+        Token::Word(word)
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+    )
 }
 
 pub(super) fn convert_query(
@@ -146,13 +230,31 @@ pub(super) fn convert_query(
         return Err(unsupported(source_map, source_map.span(with.span()).ok()));
     }
     if let Some(limit) = limit_clause {
-        return Err(unsupported(source_map, source_map.span(limit.span()).ok()));
+        return Err(unsupported(
+            source_map,
+            token_index
+                .keyword_span(Keyword::LIMIT)
+                .or_else(|| token_index.keyword_span(Keyword::OFFSET))
+                .or_else(|| source_map.span(limit.span()).ok()),
+        ));
     }
     if let Some(fetch) = fetch {
-        return Err(unsupported(source_map, source_map.span(fetch.span()).ok()));
+        return Err(unsupported(
+            source_map,
+            token_index
+                .keyword_span(Keyword::FETCH)
+                .or_else(|| source_map.span(fetch.span()).ok()),
+        ));
     }
-    if !locks.is_empty()
-        || for_clause.is_some()
+    if !locks.is_empty() {
+        return Err(unsupported(
+            source_map,
+            token_index
+                .keyword_span(Keyword::FOR)
+                .or(query_partial_span),
+        ));
+    }
+    if for_clause.is_some()
         || settings.is_some()
         || format_clause.is_some()
         || !pipe_operators.is_empty()
@@ -160,8 +262,28 @@ pub(super) fn convert_query(
         return Err(unsupported(source_map, query_partial_span));
     }
 
-    let sqlparser::ast::SetExpr::Select(select) = *body else {
-        return Err(unsupported(source_map, source_map.span(body.span()).ok()));
+    let select = match *body {
+        sqlparser::ast::SetExpr::Select(select) => select,
+        sqlparser::ast::SetExpr::SetOperation {
+            left: _,
+            op,
+            set_quantifier: _,
+            right: _,
+        } => {
+            let keyword = match op {
+                SetOperator::Union => Keyword::UNION,
+                SetOperator::Except => Keyword::EXCEPT,
+                SetOperator::Intersect => Keyword::INTERSECT,
+                SetOperator::Minus => Keyword::MINUS,
+            };
+            return Err(unsupported(
+                source_map,
+                token_index
+                    .keyword_span(keyword)
+                    .or_else(|| source_map.span(body.span()).ok()),
+            ));
+        }
+        body => return Err(unsupported(source_map, source_map.span(body.span()).ok())),
     };
     preflight_select(&select, source_map, limits, &token_index)?;
 
@@ -215,6 +337,24 @@ fn preflight_select(
         flavor,
     } = select;
 
+    if !connect_by.is_empty() {
+        return Err(unsupported(
+            source_map,
+            token_index.keyword_span(Keyword::CONNECT).or(select_span),
+        ));
+    }
+    if qualify.is_some() {
+        return Err(unsupported(
+            source_map,
+            token_index.keyword_span(Keyword::QUALIFY).or(select_span),
+        ));
+    }
+    if token_index.keyword_span(Keyword::OVER).is_some() {
+        return Err(unsupported(
+            source_map,
+            token_index.keyword_span(Keyword::OVER).or(select_span),
+        ));
+    }
     if !optimizer_hints.is_empty()
         || select_modifiers.is_some()
         || top.is_some()
@@ -222,12 +362,10 @@ fn preflight_select(
         || into.is_some()
         || !lateral_views.is_empty()
         || prewhere.is_some()
-        || !connect_by.is_empty()
         || !cluster_by.is_empty()
         || !distribute_by.is_empty()
         || !sort_by.is_empty()
         || !named_window.is_empty()
-        || qualify.is_some()
         || value_table_mode.is_some()
         || *flavor != SelectFlavor::Standard
     {
@@ -236,13 +374,26 @@ fn preflight_select(
     if !matches!(distinct, None | Some(Distinct::Distinct)) {
         return Err(unsupported(source_map, select_span));
     }
-    if projection.is_empty() || from.len() != 1 {
+    if projection.is_empty() || from.is_empty() {
         return Err(unsupported(source_map, select_span));
     }
-    if !matches!(group_by, GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty()) {
+    if from.len() != 1 {
+        let first_end = source_map.span(from[0].span())?.end();
+        let second_start = source_map.span(from[1].span())?.start();
         return Err(unsupported(
             source_map,
-            source_map.span(group_by.span()).ok().or(select_span),
+            token_index
+                .kind_span_between(QueryTokenKind::Comma, first_end, second_start)
+                .or(select_span),
+        ));
+    }
+    if !matches!(group_by, GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty()) {
+        let group_span = source_map.span(group_by.span()).ok();
+        let modifier_span =
+            group_span.and_then(|span| token_index.keyword_span_after(Keyword::WITH, span.end()));
+        return Err(unsupported(
+            source_map,
+            modifier_span.or(group_span).or(select_span),
         ));
     }
 
@@ -302,14 +453,15 @@ fn convert_select(
         converted_projection.push(convert_select_item(item, source_map, budget)?);
     }
 
-    let converted_from = convert_table_source(table_with_joins.relation, source_map, budget)?;
+    let converted_from =
+        convert_table_source(table_with_joins.relation, source_map, budget, token_index)?;
     let mut converted_joins = Vec::with_capacity(table_with_joins.joins.len());
     for join in table_with_joins.joins {
         let relation_start = source_map.span(join.relation.span())?.start();
         let start = token_index
             .join_start_before(relation_start)
             .ok_or_else(|| source_shape_error(relation_start, source_map))?;
-        let converted = convert_join(join, start, source_map, budget)?;
+        let converted = convert_join(join, start, source_map, budget, token_index)?;
         converted_joins.push(converted);
     }
 
@@ -396,8 +548,17 @@ fn convert_table_source(
     relation: TableFactor,
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
+    token_index: &QueryTokenIndex,
 ) -> Result<TableSource> {
     let span = source_map.span(relation.span())?;
+    if matches!(&relation, TableFactor::Pivot { .. }) {
+        return Err(unsupported(
+            source_map,
+            token_index
+                .keyword_span_between(Keyword::PIVOT, span.start(), span.end())
+                .or(Some(span)),
+        ));
+    }
     with_ast_node(span, source_map, budget, |_| match relation {
         TableFactor::Table {
             name,
@@ -422,7 +583,7 @@ fn convert_table_source(
             Ok(TableSource {
                 table: convert_single_name(name, source_map)?,
                 alias: alias
-                    .map(|alias| convert_table_alias(alias, source_map))
+                    .map(|alias| convert_table_alias(alias, span.start(), source_map, token_index))
                     .transpose()?,
                 span,
             })
@@ -431,7 +592,12 @@ fn convert_table_source(
     })
 }
 
-fn convert_table_alias(alias: TableAlias, source_map: &SourceMap<'_>) -> Result<Identifier> {
+fn convert_table_alias(
+    alias: TableAlias,
+    relation_start: usize,
+    source_map: &SourceMap<'_>,
+    token_index: &QueryTokenIndex,
+) -> Result<Identifier> {
     let TableAlias {
         explicit,
         name,
@@ -439,7 +605,11 @@ fn convert_table_alias(alias: TableAlias, source_map: &SourceMap<'_>) -> Result<
         at,
     } = alias;
     if explicit || !columns.is_empty() || at.is_some() {
-        return Err(unsupported(source_map, source_map.span(name.span).ok()));
+        let name_span = source_map.span(name.span).ok();
+        let explicit_span = name_span.and_then(|span| {
+            token_index.keyword_span_before(Keyword::AS, relation_start, span.start())
+        });
+        return Err(unsupported(source_map, explicit_span.or(name_span)));
     }
     convert_identifier(name, source_map)
 }
@@ -449,6 +619,7 @@ fn convert_join(
     start: usize,
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
+    token_index: &QueryTokenIndex,
 ) -> Result<Join> {
     let partial_span = source_map.span(join.span())?;
     let sqlparser::ast::Join {
@@ -463,11 +634,16 @@ fn convert_join(
         JoinOperator::Inner(JoinConstraint::On(condition)) => (JoinKind::Inner, condition),
         JoinOperator::Left(JoinConstraint::On(condition))
         | JoinOperator::LeftOuter(JoinConstraint::On(condition)) => (JoinKind::Left, condition),
-        _ => return Err(unsupported(source_map, Some(partial_span))),
+        _ => {
+            return Err(unsupported(
+                source_map,
+                SqlSpan::new(start, partial_span.end()).ok(),
+            ));
+        }
     };
     let span = SqlSpan::new(start, partial_span.end())?;
     with_ast_node(span, source_map, budget, |budget| {
-        let source = convert_table_source(relation, source_map, budget)?;
+        let source = convert_table_source(relation, source_map, budget, token_index)?;
         let condition = convert_query_expr(condition, source_map, budget)?;
         let end = condition.span.end();
         Ok(Join {
@@ -492,13 +668,13 @@ fn convert_order_by(
     if order_by.interpolate.is_some() {
         return Err(unsupported(
             source_map,
-            source_map.span(order_by.span()).ok(),
+            token_index.keyword_span(Keyword::INTERPOLATE),
         ));
     }
     let OrderByKind::Expressions(items) = order_by.kind else {
         return Err(unsupported(
             source_map,
-            source_map.span(order_by.span()).ok(),
+            token_index.keyword_span(Keyword::ALL),
         ));
     };
 
@@ -509,7 +685,12 @@ fn convert_order_by(
     let mut converted = Vec::with_capacity(items.len());
     for (index, item) in items.into_iter().enumerate() {
         if item.with_fill.is_some() {
-            return Err(unsupported(source_map, source_map.span(item.span()).ok()));
+            let expr_span = source_map.span(item.expr.span())?;
+            let boundary = starts.get(index + 1).copied().unwrap_or(query_end);
+            return Err(unsupported(
+                source_map,
+                token_index.keyword_span_between(Keyword::WITH, expr_span.end(), boundary),
+            ));
         }
         let start = starts[index];
         let boundary = starts.get(index + 1).copied().unwrap_or(query_end);
@@ -554,11 +735,62 @@ fn convert_query_expr(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<AstExpr> {
-    let converted = convert_expr(expression, source_map, budget)?;
+    let mut converted = convert_expr(expression, source_map, budget)?;
+    normalize_query_boolean_literals(&mut converted);
     if let Some(span) = rownum_span(&converted) {
         return Err(unsupported(source_map, Some(span)));
     }
     Ok(converted)
+}
+
+fn normalize_query_boolean_literals(expression: &mut AstExpr) {
+    match &mut expression.kind {
+        AstExprKind::Column(parts) if matches!(parts.as_slice(), [part] if !part.is_quoted() && matches!(part.as_str(), "TRUE" | "FALSE")) =>
+        {
+            expression.kind = AstExprKind::Bool(parts[0].as_str() == "TRUE");
+        }
+        AstExprKind::Unary { expr, .. } | AstExprKind::IsNull { expr, .. } => {
+            normalize_query_boolean_literals(expr);
+        }
+        AstExprKind::Binary { left, right, .. } => {
+            normalize_query_boolean_literals(left);
+            normalize_query_boolean_literals(right);
+        }
+        AstExprKind::InList { expr, values, .. } => {
+            normalize_query_boolean_literals(expr);
+            for value in values {
+                normalize_query_boolean_literals(value);
+            }
+        }
+        AstExprKind::Between {
+            expr, low, high, ..
+        } => {
+            normalize_query_boolean_literals(expr);
+            normalize_query_boolean_literals(low);
+            normalize_query_boolean_literals(high);
+        }
+        AstExprKind::Like { expr, pattern, .. } => {
+            normalize_query_boolean_literals(expr);
+            normalize_query_boolean_literals(pattern);
+        }
+        AstExprKind::Aggregate {
+            argument: AggregateArgument::Expr(expr),
+            ..
+        } => normalize_query_boolean_literals(expr),
+        AstExprKind::Null
+        | AstExprKind::Bool(_)
+        | AstExprKind::Integer(_)
+        | AstExprKind::Decimal(_)
+        | AstExprKind::Float(_)
+        | AstExprKind::Text(_)
+        | AstExprKind::Blob(_)
+        | AstExprKind::Parameter(_)
+        | AstExprKind::Column(_)
+        | AstExprKind::Aggregate {
+            argument: AggregateArgument::Wildcard(_),
+            ..
+        } => {}
+    }
 }
 
 fn rownum_span(expression: &AstExpr) -> Option<SqlSpan> {
@@ -677,12 +909,16 @@ fn source_shape_error(offset: usize, source_map: &SourceMap<'_>) -> DbError {
 #[cfg(test)]
 mod tests {
     use sqlparser::ast::Statement;
-    use sqlparser::dialect::OracleDialect;
+    use sqlparser::dialect::{ClickHouseDialect, Dialect, GenericDialect, OracleDialect};
     use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::Tokenizer;
 
-    use super::convert_query;
+    use super::{convert_query, preflight_unparsed_query_syntax};
     use crate::error::SqlLocation;
-    use crate::sql::ast::{AstExprKind, AstQuery, JoinKind, NullPlacement, OrderDirection};
+    use crate::sql::ast::{
+        AggregateArgument, AggregateFunction, AstExpr, AstExprKind, AstQuery, BinaryOp, JoinKind,
+        NullPlacement, OrderDirection, SelectItem,
+    };
     use crate::sql::parser::AstBudget;
     use crate::sql::parser::source::SourceMap;
     use crate::sql::parser::tokens::tokenize;
@@ -696,7 +932,26 @@ mod tests {
     fn parse_query_with_limits(sql: &str, limits: &SqlLimits) -> Result<AstQuery> {
         let source_map = SourceMap::new(sql)?;
         let tokens = tokenize(sql, limits)?;
-        let statements = Parser::new(&OracleDialect)
+        convert_parsed_query(&source_map, limits, &OracleDialect, tokens)
+    }
+
+    fn parse_query_with_dialect(sql: &str, dialect: &dyn Dialect) -> Result<AstQuery> {
+        let limits = SqlLimits::default();
+        let source_map = SourceMap::new(sql)?;
+        let tokens = Tokenizer::new(dialect, sql)
+            .tokenize_with_location()
+            .map_err(|error| DbError::new(ErrorCode::Syntax, error.to_string()))?;
+        convert_parsed_query(&source_map, &limits, dialect, tokens)
+    }
+
+    fn convert_parsed_query(
+        source_map: &SourceMap<'_>,
+        limits: &SqlLimits,
+        dialect: &dyn Dialect,
+        tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+    ) -> Result<AstQuery> {
+        preflight_unparsed_query_syntax(&tokens, source_map)?;
+        let statements = Parser::new(dialect)
             .with_recursion_limit(limits.max_nesting() as usize)
             .with_tokens_with_locations(tokens)
             .parse_statements()
@@ -712,7 +967,28 @@ mod tests {
             }
         };
         let mut budget = AstBudget::new(limits);
-        convert_query(query, &source_map, &mut budget, limits)
+        convert_query(query, source_map, &mut budget, limits)
+    }
+
+    fn assert_column(expression: &AstExpr, parts: &[&str], span: SqlSpan) {
+        assert_eq!(expression.span(), span);
+        let AstExprKind::Column(actual) = &expression.kind else {
+            panic!("expected column expression, got {expression:?}");
+        };
+        assert_eq!(
+            actual.iter().map(|part| part.as_str()).collect::<Vec<_>>(),
+            parts
+        );
+    }
+
+    fn assert_unsupported_at(result: Result<AstQuery>, family: &str, offset: usize) {
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unsupported, "{family}: {error:?}");
+        assert_eq!(
+            error.sql_location(),
+            Some(SqlLocation::new(offset, 1, offset + 1).unwrap()),
+            "{family}: {error:?}"
+        );
     }
 
     #[test]
@@ -759,36 +1035,102 @@ mod tests {
 
     #[test]
     fn every_excluded_query_family_is_project_unsupported_with_a_location() {
-        for (family, sql) in [
-            ("derived subquery", "SELECT X.ID FROM (SELECT ID FROM T) X"),
-            ("cte", "WITH X AS (SELECT ID FROM T) SELECT ID FROM X"),
-            ("union", "SELECT ID FROM A UNION SELECT ID FROM B"),
-            ("intersect", "SELECT ID FROM A INTERSECT SELECT ID FROM B"),
-            ("minus", "SELECT ID FROM A MINUS SELECT ID FROM B"),
-            ("natural join", "SELECT A.ID FROM A NATURAL JOIN B"),
-            ("using join", "SELECT A.ID FROM A INNER JOIN B USING (ID)"),
-            ("cross join", "SELECT A.ID FROM A CROSS JOIN B"),
+        for (family, sql, offset) in [
+            (
+                "derived subquery",
+                "SELECT X.ID FROM (SELECT ID FROM T) X",
+                18,
+            ),
+            (
+                "scalar subquery",
+                "SELECT (SELECT ID FROM T) AS X FROM U",
+                8,
+            ),
+            ("cte", "WITH X AS (SELECT ID FROM T) SELECT ID FROM X", 0),
+            (
+                "recursive cte",
+                "WITH RECURSIVE X AS (SELECT ID FROM T) SELECT ID FROM X",
+                0,
+            ),
+            ("union", "SELECT ID FROM A UNION SELECT ID FROM B", 17),
+            (
+                "intersect",
+                "SELECT ID FROM A INTERSECT SELECT ID FROM B",
+                17,
+            ),
+            ("minus", "SELECT ID FROM A MINUS SELECT ID FROM B", 17),
+            ("window", "SELECT SUM(A) OVER () FROM T", 14),
+            ("qualify", "SELECT A FROM T QUALIFY A = 1", 16),
+            (
+                "pivot",
+                "SELECT * FROM SALES PIVOT(SUM(AMOUNT) FOR QUARTER IN ('Q1'))",
+                20,
+            ),
+            ("model", "SELECT A FROM T MODEL RETURN UPDATED ROWS", 16),
+            ("connect by", "SELECT A FROM T CONNECT BY PRIOR A = B", 16),
+            ("natural join", "SELECT A.ID FROM A NATURAL JOIN B", 19),
+            (
+                "using join",
+                "SELECT A.ID FROM A INNER JOIN B USING (ID)",
+                19,
+            ),
+            ("cross join", "SELECT A.ID FROM A CROSS JOIN B", 19),
             (
                 "full join",
                 "SELECT A.ID FROM A FULL OUTER JOIN B ON B.ID = A.ID",
+                19,
             ),
             (
                 "right join",
                 "SELECT A.ID FROM A RIGHT JOIN B ON B.ID = A.ID",
+                19,
             ),
-            ("join without on", "SELECT A.ID FROM A INNER JOIN B"),
-            ("table alias with as", "SELECT U.ID FROM USERS AS U"),
-            ("multiple base tables", "SELECT A.ID FROM A, B"),
-            ("missing base table", "SELECT 1"),
-            ("limit", "SELECT ID FROM A LIMIT 1"),
-            ("offset", "SELECT ID FROM A OFFSET 1 ROWS"),
-            ("fetch", "SELECT ID FROM A FETCH FIRST 1 ROWS ONLY"),
-            ("rownum", "SELECT ID FROM A WHERE ROWNUM <= 1"),
-            ("select for update", "SELECT ID FROM A FOR UPDATE"),
+            ("join without on", "SELECT A.ID FROM A INNER JOIN B", 19),
+            ("table alias with as", "SELECT U.ID FROM USERS AS U", 23),
+            ("multiple base tables", "SELECT A.ID FROM A, B", 18),
+            ("missing base table", "SELECT 1", 0),
+            ("limit", "SELECT ID FROM A LIMIT 1", 17),
+            ("offset", "SELECT ID FROM A OFFSET 1 ROWS", 17),
+            ("fetch", "SELECT ID FROM A FETCH FIRST 1 ROWS ONLY", 17),
+            ("rownum", "SELECT ID FROM A WHERE ROWNUM <= 1", 23),
+            ("select for update", "SELECT ID FROM A FOR UPDATE", 17),
         ] {
-            let error = parse_query(sql).unwrap_err();
-            assert_eq!(error.code(), ErrorCode::Unsupported, "{family}: {error:?}");
-            assert!(error.sql_location().is_some(), "{family}: {error:?}");
+            assert_unsupported_at(parse_query(sql), family, offset);
+        }
+
+        for (family, sql, offset, dialect) in [
+            (
+                "except",
+                "SELECT ID FROM A EXCEPT SELECT ID FROM B",
+                17,
+                &GenericDialect as &dyn Dialect,
+            ),
+            (
+                "order by all",
+                "SELECT A FROM T ORDER BY ALL",
+                25,
+                &GenericDialect as &dyn Dialect,
+            ),
+            (
+                "order by with fill",
+                "SELECT A FROM T ORDER BY A WITH FILL",
+                27,
+                &ClickHouseDialect {} as &dyn Dialect,
+            ),
+            (
+                "order by interpolate",
+                "SELECT A FROM T ORDER BY A WITH FILL INTERPOLATE",
+                37,
+                &ClickHouseDialect {} as &dyn Dialect,
+            ),
+            (
+                "group by modifier",
+                "SELECT A FROM T GROUP BY A WITH ROLLUP",
+                27,
+                &ClickHouseDialect {} as &dyn Dialect,
+            ),
+        ] {
+            assert_unsupported_at(parse_query_with_dialect(sql, dialect), family, offset);
         }
     }
 
@@ -817,6 +1159,121 @@ mod tests {
         assert_eq!(query.joins[0].source.span(), SqlSpan::new(54, 62).unwrap());
         assert_eq!(query.joins[0].span(), SqlSpan::new(38, 82).unwrap());
         assert_eq!(query.order_by[0].span(), SqlSpan::new(92, 109).unwrap());
+    }
+
+    #[test]
+    fn full_query_preserves_owned_expression_shapes_aliases_and_clause_spans() {
+        let query = parse_query(
+            "SELECT DISTINCT U.ID AS USER_ID, COUNT(O.ID) AS N FROM USERS U LEFT JOIN ORDERS O ON O.USER_ID = U.ID WHERE U.ACTIVE = TRUE GROUP BY U.ID HAVING COUNT(O.ID) > 0 ORDER BY USER_ID DESC NULLS FIRST",
+        )
+        .unwrap();
+
+        assert_eq!(query.span(), SqlSpan::new(0, 194).unwrap());
+        let SelectItem::Expr {
+            expr: user_id,
+            alias: Some(user_id_alias),
+            span: user_id_item_span,
+        } = &query.projection[0]
+        else {
+            panic!("expected aliased USER_ID projection");
+        };
+        assert_column(user_id, &["U", "ID"], SqlSpan::new(16, 20).unwrap());
+        assert_eq!(user_id_alias.as_str(), "USER_ID");
+        assert_eq!(user_id_alias.span(), SqlSpan::new(24, 31).unwrap());
+        assert_eq!(*user_id_item_span, SqlSpan::new(16, 31).unwrap());
+
+        let SelectItem::Expr {
+            expr: count,
+            alias: Some(count_alias),
+            span: count_item_span,
+        } = &query.projection[1]
+        else {
+            panic!("expected aliased COUNT projection");
+        };
+        assert!(matches!(
+            &count.kind,
+            AstExprKind::Aggregate {
+                function: AggregateFunction::Count,
+                argument: AggregateArgument::Expr(argument),
+            } if {
+                assert_column(argument, &["O", "ID"], SqlSpan::new(39, 43).unwrap());
+                true
+            }
+        ));
+        assert_eq!(count.span(), SqlSpan::new(33, 44).unwrap());
+        assert_eq!(count_alias.as_str(), "N");
+        assert_eq!(count_alias.span(), SqlSpan::new(48, 49).unwrap());
+        assert_eq!(*count_item_span, SqlSpan::new(33, 49).unwrap());
+
+        assert_eq!(query.from.span(), SqlSpan::new(55, 62).unwrap());
+        assert_eq!(query.from.table.span(), SqlSpan::new(55, 60).unwrap());
+        assert_eq!(
+            query.from.alias.as_ref().unwrap().span(),
+            SqlSpan::new(61, 62).unwrap()
+        );
+        assert_eq!(query.joins[0].span(), SqlSpan::new(63, 101).unwrap());
+        assert_eq!(query.joins[0].source.span(), SqlSpan::new(73, 81).unwrap());
+        let AstExprKind::Binary {
+            left,
+            op: BinaryOp::Equal,
+            right,
+        } = &query.joins[0].condition.kind
+        else {
+            panic!("expected equality JOIN condition");
+        };
+        assert_eq!(
+            query.joins[0].condition.span(),
+            SqlSpan::new(85, 101).unwrap()
+        );
+        assert_column(left, &["O", "USER_ID"], SqlSpan::new(85, 94).unwrap());
+        assert_column(right, &["U", "ID"], SqlSpan::new(97, 101).unwrap());
+
+        let selection = query.selection.as_ref().unwrap();
+        let AstExprKind::Binary {
+            left,
+            op: BinaryOp::Equal,
+            right,
+        } = &selection.kind
+        else {
+            panic!("expected equality WHERE condition");
+        };
+        assert_eq!(selection.span(), SqlSpan::new(108, 123).unwrap());
+        assert_column(left, &["U", "ACTIVE"], SqlSpan::new(108, 116).unwrap());
+        assert!(matches!(right.kind, AstExprKind::Bool(true)));
+        assert_eq!(right.span(), SqlSpan::new(119, 123).unwrap());
+
+        assert_column(
+            &query.group_by[0],
+            &["U", "ID"],
+            SqlSpan::new(133, 137).unwrap(),
+        );
+        let having = query.having.as_ref().unwrap();
+        let AstExprKind::Binary {
+            left,
+            op: BinaryOp::GreaterThan,
+            right,
+        } = &having.kind
+        else {
+            panic!("expected greater-than HAVING condition");
+        };
+        assert_eq!(having.span(), SqlSpan::new(145, 160).unwrap());
+        assert!(matches!(
+            left.kind,
+            AstExprKind::Aggregate {
+                function: AggregateFunction::Count,
+                ..
+            }
+        ));
+        assert_eq!(left.span(), SqlSpan::new(145, 156).unwrap());
+        assert!(matches!(right.kind, AstExprKind::Integer(ref value) if value == "0"));
+        assert_eq!(right.span(), SqlSpan::new(159, 160).unwrap());
+
+        assert_column(
+            &query.order_by[0].expr,
+            &["USER_ID"],
+            SqlSpan::new(170, 177).unwrap(),
+        );
+        assert_eq!(query.order_by[0].span(), SqlSpan::new(170, 194).unwrap());
     }
 
     #[test]
