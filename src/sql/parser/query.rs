@@ -30,13 +30,58 @@ enum QueryTokenKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelWord {
+    All,
+    By,
+    Dimension,
+    Ignore,
+    Keep,
+    Main,
+    Model,
+    Nav,
+    On,
+    Partition,
+    Reference,
+    Return,
+    Rows,
+    Single,
+    Unique,
+    Updated,
+}
+
+impl ModelWord {
+    fn from_unquoted(value: &str) -> Option<Self> {
+        [
+            ("ALL", Self::All),
+            ("BY", Self::By),
+            ("DIMENSION", Self::Dimension),
+            ("IGNORE", Self::Ignore),
+            ("KEEP", Self::Keep),
+            ("MAIN", Self::Main),
+            ("MODEL", Self::Model),
+            ("NAV", Self::Nav),
+            ("ON", Self::On),
+            ("PARTITION", Self::Partition),
+            ("REFERENCE", Self::Reference),
+            ("RETURN", Self::Return),
+            ("ROWS", Self::Rows),
+            ("SINGLE", Self::Single),
+            ("UNIQUE", Self::Unique),
+            ("UPDATED", Self::Updated),
+        ]
+        .into_iter()
+        .find_map(|(candidate, word)| value.eq_ignore_ascii_case(candidate).then_some(word))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueryToken {
     kind: QueryTokenKind,
     keyword: Keyword,
-    is_model_word: bool,
-    is_model_clause_follower: bool,
+    model_word: Option<ModelWord>,
     depth: usize,
     matching_left_parenthesis: Option<usize>,
+    matching_right_parenthesis: Option<usize>,
     span: SqlSpan,
 }
 
@@ -70,27 +115,15 @@ impl QueryTokenIndex {
             if matches!(token.token, Token::RParen) {
                 depth = depth.saturating_sub(1);
             }
-            let (keyword, is_model_word, is_model_clause_follower) = match &token.token {
+            let (keyword, model_word) = match &token.token {
                 Token::Word(word) => (
                     word.keyword,
-                    word.quote_style.is_none() && word.value.eq_ignore_ascii_case("MODEL"),
-                    word.quote_style.is_none()
-                        && [
-                            "RETURN",
-                            "DIMENSION",
-                            "MEASURES",
-                            "RULES",
-                            "REFERENCE",
-                            "IGNORE",
-                            "KEEP",
-                            "UNIQUE",
-                            "AUTOMATIC",
-                            "SEQUENTIAL",
-                        ]
-                        .iter()
-                        .any(|candidate| word.value.eq_ignore_ascii_case(candidate)),
+                    word.quote_style
+                        .is_none()
+                        .then(|| ModelWord::from_unquoted(&word.value))
+                        .flatten(),
                 ),
-                _ => (Keyword::NoKeyword, false, false),
+                _ => (Keyword::NoKeyword, None),
             };
             let kind = match &token.token {
                 Token::Comma => QueryTokenKind::Comma,
@@ -110,12 +143,15 @@ impl QueryTokenIndex {
             tokens.push(QueryToken {
                 kind,
                 keyword,
-                is_model_word,
-                is_model_clause_follower,
+                model_word,
                 depth,
                 matching_left_parenthesis,
+                matching_right_parenthesis: None,
                 span: source_map.span(token.span)?,
             });
+            if let Some(opening) = matching_left_parenthesis {
+                tokens[opening].matching_right_parenthesis = Some(token_index);
+            }
             if matches!(token.token, Token::LParen) {
                 depth = depth.saturating_add(1);
                 open_parentheses.push(token_index);
@@ -225,16 +261,109 @@ impl QueryTokenIndex {
     }
 
     fn model_clause_span(&self) -> Option<SqlSpan> {
-        self.tokens.windows(2).find_map(|pair| {
-            let [model, follower] = pair else {
-                return None;
-            };
+        self.tokens.iter().enumerate().find_map(|(index, model)| {
             (model.depth == 0
-                && model.is_model_word
-                && follower.depth == 0
-                && follower.is_model_clause_follower)
-                .then_some(model.span)
+                && model.model_word == Some(ModelWord::Model)
+                && self.model_can_start_clause(index)
+                && self.has_model_clause_prefix(index + 1, model.depth))
+            .then_some(model.span)
         })
+    }
+
+    fn model_can_start_clause(&self, model_index: usize) -> bool {
+        let Some(previous_index) = model_index.checked_sub(1) else {
+            return true;
+        };
+        let Some(previous) = self.tokens.get(previous_index) else {
+            return true;
+        };
+        !matches!(previous.kind, QueryTokenKind::Comma | QueryTokenKind::Dot)
+            && !matches!(
+                previous.keyword,
+                Keyword::FROM | Keyword::JOIN | Keyword::AS
+            )
+    }
+
+    fn has_model_clause_prefix(&self, start: usize, depth: usize) -> bool {
+        if self.has_main_model_dimension_prefix(start, depth) {
+            return true;
+        }
+
+        match self.model_word_at(start, depth) {
+            Some(ModelWord::Return) => {
+                matches!(
+                    self.model_word_at(start + 1, depth),
+                    Some(ModelWord::All | ModelWord::Updated)
+                ) && self.model_word_at(start + 2, depth) == Some(ModelWord::Rows)
+            }
+            Some(ModelWord::Ignore | ModelWord::Keep) => {
+                self.model_word_at(start + 1, depth) == Some(ModelWord::Nav)
+            }
+            Some(ModelWord::Unique) => {
+                self.model_word_at(start + 1, depth) == Some(ModelWord::Dimension)
+                    || (self.model_word_at(start + 1, depth) == Some(ModelWord::Single)
+                        && self.model_word_at(start + 2, depth) == Some(ModelWord::Reference))
+            }
+            Some(ModelWord::Reference) => {
+                self.model_identifier_at(start + 1, depth)
+                    && self.model_word_at(start + 2, depth) == Some(ModelWord::On)
+                    && self.model_kind_at(start + 3, depth) == Some(QueryTokenKind::LeftParenthesis)
+            }
+            _ => false,
+        }
+    }
+
+    fn has_main_model_dimension_prefix(&self, start: usize, depth: usize) -> bool {
+        let mut index = start;
+        if self.model_word_at(index, depth) == Some(ModelWord::Main) {
+            if !self.model_identifier_at(index + 1, depth) {
+                return false;
+            }
+            index += 2;
+        }
+
+        if self.model_word_at(index, depth) == Some(ModelWord::Partition) {
+            if self.model_word_at(index + 1, depth) != Some(ModelWord::By) {
+                return false;
+            }
+            let Some(partition_end) = self.model_parenthesized_end(index + 2, depth) else {
+                return false;
+            };
+            index = partition_end + 1;
+        }
+
+        self.model_word_at(index, depth) == Some(ModelWord::Dimension)
+            && self.model_word_at(index + 1, depth) == Some(ModelWord::By)
+            && self.model_kind_at(index + 2, depth) == Some(QueryTokenKind::LeftParenthesis)
+    }
+
+    fn model_word_at(&self, index: usize, depth: usize) -> Option<ModelWord> {
+        self.tokens
+            .get(index)
+            .filter(|token| token.depth == depth)
+            .and_then(|token| token.model_word)
+    }
+
+    fn model_kind_at(&self, index: usize, depth: usize) -> Option<QueryTokenKind> {
+        self.tokens
+            .get(index)
+            .filter(|token| token.depth == depth)
+            .map(|token| token.kind)
+    }
+
+    fn model_identifier_at(&self, index: usize, depth: usize) -> bool {
+        self.model_kind_at(index, depth) == Some(QueryTokenKind::Word)
+    }
+
+    fn model_parenthesized_end(&self, index: usize, depth: usize) -> Option<usize> {
+        let opening = self.tokens.get(index).filter(|token| {
+            token.depth == depth && token.kind == QueryTokenKind::LeftParenthesis
+        })?;
+        let closing_index = opening.matching_right_parenthesis?;
+        self.tokens
+            .get(closing_index)
+            .filter(|token| token.depth == depth && token.kind == QueryTokenKind::RightParenthesis)
+            .map(|_| closing_index)
     }
 
     fn window_clause_span(&self) -> Option<SqlSpan> {
@@ -1481,6 +1610,92 @@ mod tests {
         };
         assert_eq!(alias.as_str(), "OVER");
         assert_eq!(alias.span(), SqlSpan::new(11, 15).unwrap());
+    }
+
+    #[test]
+    fn model_clause_words_remain_valid_implicit_aliases_without_their_grammar_paths() {
+        for alias in [
+            "RULES",
+            "MEASURES",
+            "MAIN",
+            "PARTITION",
+            "DIMENSION",
+            "RETURN",
+            "REFERENCE",
+            "IGNORE",
+            "KEEP",
+            "UNIQUE",
+            "AUTOMATIC",
+            "SEQUENTIAL",
+        ] {
+            let sql = format!("SELECT MODEL {alias} FROM T");
+            assert!(preflight_only(&sql).is_ok(), "raw preflight rejected {sql}");
+
+            let query = parse_query(&sql)
+                .unwrap_or_else(|error| panic!("query conversion rejected {sql}: {error:?}"));
+            let SelectItem::Expr {
+                expr,
+                alias: Some(actual_alias),
+                ..
+            } = &query.projection[0]
+            else {
+                panic!("expected MODEL with implicit alias {alias}: {query:?}");
+            };
+            assert_column(expr, &["MODEL"], SqlSpan::new(7, 12).unwrap());
+            assert_eq!(actual_alias.as_str(), alias);
+            assert_eq!(
+                actual_alias.span(),
+                SqlSpan::new(13, 13 + alias.len()).unwrap()
+            );
+        }
+
+        let qualified = parse_query("SELECT T.MODEL RULES FROM T").unwrap();
+        let SelectItem::Expr {
+            expr,
+            alias: Some(alias),
+            ..
+        } = &qualified.projection[0]
+        else {
+            panic!("expected qualified MODEL with RULES alias: {qualified:?}");
+        };
+        assert_column(expr, &["T", "MODEL"], SqlSpan::new(7, 14).unwrap());
+        assert_eq!(alias.as_str(), "RULES");
+    }
+
+    #[test]
+    fn raw_preflight_recognizes_structured_oracle_model_clause_prefixes() {
+        for (family, sql) in [
+            (
+                "model main",
+                "SELECT A FROM T MODEL MAIN FORECAST DIMENSION BY (D)",
+            ),
+            (
+                "model partition",
+                "SELECT A FROM T MODEL PARTITION BY (P, COALESCE(Q, 0)) DIMENSION BY (D)",
+            ),
+            (
+                "model main partition",
+                "SELECT A FROM T MODEL MAIN FORECAST PARTITION BY (P) DIMENSION BY (D)",
+            ),
+            ("model dimension", "SELECT A FROM T MODEL DIMENSION BY (D)"),
+        ] {
+            assert_unsupported_at(preflight_only(sql), family, 16);
+        }
+
+        for (family, sql, model_offset) in [
+            (
+                "model after RULES alias",
+                "SELECT MODEL RULES FROM T MODEL DIMENSION BY (D)",
+                26,
+            ),
+            (
+                "model after MEASURES alias",
+                "SELECT MODEL MEASURES FROM T MODEL DIMENSION BY (D)",
+                29,
+            ),
+        ] {
+            assert_unsupported_at(preflight_only(sql), family, model_offset);
+        }
     }
 
     #[test]
