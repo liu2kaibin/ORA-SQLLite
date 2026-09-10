@@ -1,15 +1,72 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use crate::sql::bound::BoundStatement;
 
 use super::{ColumnMetadata, ParameterMetadata};
 
 /// An immutable prepared statement and its stable public metadata.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Statement {
     bound: Arc<BoundStatement>,
     parameters: Box<[ParameterMetadata]>,
     columns: Box<[ColumnMetadata]>,
+}
+
+impl fmt::Debug for Statement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Statement")
+            .field("parameters", &PublicParameters(&self.parameters))
+            .field("columns", &PublicColumns(&self.columns))
+            .finish()
+    }
+}
+
+struct PublicParameters<'a>(&'a [ParameterMetadata]);
+
+impl fmt::Debug for PublicParameters<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(PublicParameter))
+            .finish()
+    }
+}
+
+struct PublicParameter<'a>(&'a ParameterMetadata);
+
+impl fmt::Debug for PublicParameter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParameterMetadata")
+            .field("identifier", self.0.identifier())
+            .field("data_type", &self.0.data_type())
+            .finish()
+    }
+}
+
+struct PublicColumns<'a>(&'a [ColumnMetadata]);
+
+impl fmt::Debug for PublicColumns<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(PublicColumn))
+            .finish()
+    }
+}
+
+struct PublicColumn<'a>(&'a ColumnMetadata);
+
+impl fmt::Debug for PublicColumn<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ColumnMetadata")
+            .field("name", &self.0.name())
+            .field("data_type", &self.0.data_type())
+            .field("nullable", &self.0.nullable())
+            .finish()
+    }
 }
 
 impl Statement {
@@ -44,6 +101,7 @@ impl Statement {
 #[cfg(test)]
 mod tests {
     use crate::{
+        Value,
         api::{ColumnMetadata, DataType, ParameterIdentifier, ParameterMetadata},
         sql::{
             SqlSpan, SqlType,
@@ -107,5 +165,32 @@ mod tests {
         assert_eq!(statement.parameters()[0].data_type(), Some(DataType::Int64));
         assert_eq!(statement.columns()[0].name(), "ID");
         assert_eq!(statement.columns()[0].data_type(), DataType::Int64);
+    }
+
+    #[test]
+    fn statement_debug_exposes_metadata_but_not_bound_ir() {
+        let mut bound = fixture_bound_select();
+        bound.kind = BoundStatementKind::Query {
+            projection: vec![BoundExpr {
+                kind: BoundExprKind::Literal(Value::Int64(987_654_321)),
+                sql_type: SqlType::Int64,
+                nullable: false,
+                span: SqlSpan::new(17, 26).unwrap(),
+            }],
+        };
+
+        let rendered = format!("{:?}", Statement::from_bound(bound));
+        assert!(rendered.contains("parameters"), "{rendered}");
+        assert!(rendered.contains("columns"), "{rendered}");
+        for private in [
+            "BoundStatement",
+            "database_uuid",
+            "table_id",
+            "column_id",
+            "span",
+            "987654321",
+        ] {
+            assert!(!rendered.contains(private), "leaked {private}: {rendered}");
+        }
     }
 }
