@@ -27,18 +27,8 @@ pub(super) fn tokenize(sql: &str, limits: &SqlLimits) -> Result<Vec<TokenWithSpa
                 })
                 .unwrap_or_else(|mapping_error| mapping_error)
         })?;
-    let (tokens, parameters) = rewrite_oracle_binds(sql, &source_map, raw_tokens)?;
-
-    let token_count = tokens
-        .iter()
-        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
-        .count();
-    if token_count > limits.max_tokens() as usize {
-        return Err(DbError::new(
-            ErrorCode::Syntax,
-            "SQL text exceeds the configured token limit",
-        ));
-    }
+    let (tokens, parameters) =
+        rewrite_oracle_binds(sql, &source_map, raw_tokens, limits.max_tokens() as usize)?;
 
     validate_parameter_sequence(&parameters)?;
     Ok(tokens)
@@ -48,14 +38,17 @@ fn rewrite_oracle_binds(
     sql: &str,
     source_map: &SourceMap<'_>,
     raw_tokens: Vec<TokenWithSpan>,
+    max_tokens: usize,
 ) -> Result<(Vec<TokenWithSpan>, Vec<ParameterKey>)> {
     let mut tokens = Vec::with_capacity(raw_tokens.len());
     let mut parameters = Vec::new();
+    let mut token_count = 0;
     let mut index = 0;
 
     while index < raw_tokens.len() {
         let token = &raw_tokens[index];
         if token.token != Token::Colon {
+            charge_token(&token.token, &mut token_count, max_tokens)?;
             tokens.push(token.clone());
             index += 1;
             continue;
@@ -66,7 +59,9 @@ fn rewrite_oracle_binds(
         let mut next_index = index + 1;
         while let Some(next) = raw_tokens.get(next_index) {
             let next_span = source_map.span(next.span)?;
-            if next_span.start() != candidate_end || !is_bind_body_token(&next.token) {
+            if next_span.start() != candidate_end
+                || !is_bind_body_token(sql, next_span, &next.token)
+            {
                 break;
             }
             candidate_end = next_span.end();
@@ -74,6 +69,7 @@ fn rewrite_oracle_binds(
         }
 
         if next_index == index + 1 {
+            charge_token(&token.token, &mut token_count, max_tokens)?;
             tokens.push(token.clone());
             index += 1;
             continue;
@@ -81,6 +77,7 @@ fn rewrite_oracle_binds(
 
         let span = SqlSpan::new(colon_span.start(), candidate_end)?;
         let text = &sql[span.start()..span.end()];
+        charge_non_whitespace(&mut token_count, max_tokens)?;
         let parameter = ParameterKey::parse(text, span)?;
         let upstream_span = Span::new(token.span.start, raw_tokens[next_index - 1].span.end);
         tokens.push(TokenWithSpan::new(
@@ -94,12 +91,43 @@ fn rewrite_oracle_binds(
     Ok((tokens, parameters))
 }
 
-fn is_bind_body_token(token: &Token) -> bool {
+fn is_bind_body_token(sql: &str, span: SqlSpan, token: &Token) -> bool {
     match token {
         Token::Number(_, _) => true,
         Token::Word(word) => word.quote_style.is_none(),
-        _ => false,
+        Token::Whitespace(_) => false,
+        _ => sql[span.start()..span.end()]
+            .chars()
+            .all(is_owned_bind_character),
     }
+}
+
+fn is_owned_bind_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '$' | '#')
+        || !character.is_ascii()
+}
+
+fn charge_token(token: &Token, count: &mut usize, max_tokens: usize) -> Result<()> {
+    if matches!(token, Token::Whitespace(_)) {
+        return Ok(());
+    }
+    charge_non_whitespace(count, max_tokens)
+}
+
+fn charge_non_whitespace(count: &mut usize, max_tokens: usize) -> Result<()> {
+    *count = count.checked_add(1).ok_or_else(token_limit_error)?;
+    if *count > max_tokens {
+        return Err(token_limit_error());
+    }
+    Ok(())
+}
+
+fn token_limit_error() -> DbError {
+    DbError::new(
+        ErrorCode::Syntax,
+        "SQL text exceeds the configured token limit",
+    )
 }
 
 fn validate_parameter_sequence(parameters: &[ParameterKey]) -> Result<()> {
@@ -171,6 +199,15 @@ mod tests {
         let limits = SqlLimits::default().with_max_tokens(3).unwrap();
         assert_eq!(
             tokenize("SELECT A FROM T", &limits).unwrap_err().code(),
+            ErrorCode::Syntax
+        );
+    }
+
+    #[test]
+    fn token_limit_stops_before_later_bind_validation() {
+        let limits = SqlLimits::default().with_max_tokens(1).unwrap();
+        assert_eq!(
+            tokenize("SELECT A, :0", &limits).unwrap_err().code(),
             ErrorCode::Syntax
         );
     }
@@ -257,5 +294,24 @@ mod tests {
                 ErrorCode::Bind
             );
         }
+    }
+
+    #[test]
+    fn owned_bind_grammar_accepts_underscore_and_combining_scalars_whole() {
+        for bind in [":_name", ":i\u{307}x"] {
+            let sql = format!("SELECT {bind} FROM T");
+            let tokens = tokenize(&sql, &SqlLimits::default()).unwrap();
+            assert_eq!(placeholder_texts(&tokens), vec![bind]);
+        }
+    }
+
+    #[test]
+    fn invalid_owned_bind_candidate_is_not_rewritten_as_a_valid_prefix() {
+        assert_eq!(
+            tokenize("SELECT :1\u{307}x FROM T", &SqlLimits::default())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
     }
 }

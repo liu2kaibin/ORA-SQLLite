@@ -1,3 +1,6 @@
+#[cfg(test)]
+use std::cell::Cell;
+
 use sqlparser::tokenizer::{Location, Span};
 
 use crate::error::SqlLocation;
@@ -7,19 +10,36 @@ use crate::{DbError, ErrorCode, Result};
 pub(super) struct SourceMap<'sql> {
     sql: &'sql str,
     line_starts: Vec<usize>,
+    line_columns: Vec<Vec<usize>>,
+    #[cfg(test)]
+    lookup_scalar_visits: Cell<usize>,
 }
 
 impl<'sql> SourceMap<'sql> {
     pub(super) fn new(sql: &'sql str) -> Result<Self> {
         let mut line_starts = vec![0];
-        for (offset, byte) in sql.bytes().enumerate() {
-            if byte == b'\n' {
-                line_starts.push(offset.checked_add(1).ok_or_else(|| {
-                    DbError::new(ErrorCode::Internal, "SQL source offset overflow")
-                })?);
+        let mut line_columns = vec![vec![0]];
+        for (offset, character) in sql.char_indices() {
+            let next_offset = offset
+                .checked_add(character.len_utf8())
+                .ok_or_else(|| DbError::new(ErrorCode::Internal, "SQL source offset overflow"))?;
+            if character == '\n' {
+                line_starts.push(next_offset);
+                line_columns.push(vec![next_offset]);
+            } else {
+                line_columns
+                    .last_mut()
+                    .ok_or_else(invalid_source_location)?
+                    .push(next_offset);
             }
         }
-        Ok(Self { sql, line_starts })
+        Ok(Self {
+            sql,
+            line_starts,
+            line_columns,
+            #[cfg(test)]
+            lookup_scalar_visits: Cell::new(0),
+        })
     }
 
     pub(super) fn location(&self, byte_offset: usize) -> Result<SqlLocation> {
@@ -32,13 +52,12 @@ impl<'sql> SourceMap<'sql> {
             .partition_point(|line_start| *line_start <= byte_offset)
             .checked_sub(1)
             .ok_or_else(invalid_source_location)?;
-        let line_start = self.line_starts[line_index];
         let line = line_index
             .checked_add(1)
             .ok_or_else(invalid_source_location)?;
-        let column = self.sql[line_start..byte_offset]
-            .chars()
-            .count()
+        let column = self.line_columns[line_index]
+            .binary_search(&byte_offset)
+            .map_err(|_| invalid_source_location())?
             .checked_add(1)
             .ok_or_else(invalid_source_location)?;
         SqlLocation::new(byte_offset, line, column)
@@ -59,33 +78,26 @@ impl<'sql> SourceMap<'sql> {
         let column = usize::try_from(location.column).map_err(|_| invalid_source_location())?;
         let line_index = line.checked_sub(1).ok_or_else(invalid_source_location)?;
         let column_index = column.checked_sub(1).ok_or_else(invalid_source_location)?;
-        let line_start = *self
-            .line_starts
+        let columns = self
+            .line_columns
             .get(line_index)
             .ok_or_else(invalid_source_location)?;
-        let is_last_line = line_index + 1 == self.line_starts.len();
-        let line_end = self
-            .line_starts
-            .get(line_index + 1)
+        #[cfg(test)]
+        self.lookup_scalar_visits.set(
+            self.lookup_scalar_visits
+                .get()
+                .checked_add(1)
+                .expect("test lookup counter must not overflow"),
+        );
+        columns
+            .get(column_index)
             .copied()
-            .unwrap_or(self.sql.len());
-        let line_text = &self.sql[line_start..line_end];
-
-        if column_index == 0 {
-            return Ok(line_start);
-        }
-
-        let character_count = line_text.chars().count();
-        if column_index > character_count || (!is_last_line && column_index == character_count) {
-            return Err(invalid_source_location());
-        }
-
-        line_text
-            .char_indices()
-            .nth(column_index)
-            .map(|(offset, _)| line_start + offset)
-            .or_else(|| is_last_line.then_some(line_end))
             .ok_or_else(invalid_source_location)
+    }
+
+    #[cfg(test)]
+    fn lookup_scalar_visits(&self) -> usize {
+        self.lookup_scalar_visits.get()
     }
 }
 
@@ -123,5 +135,18 @@ mod tests {
         let map = SourceMap::new("一x\ny").unwrap();
         let upstream = Span::new(Location::new(1, 2), Location::new(2, 2));
         assert_eq!(map.span(upstream).unwrap(), SqlSpan::new(3, 6).unwrap());
+    }
+
+    #[test]
+    fn source_map_does_not_rescan_scalar_prefixes_for_span_lookups() {
+        let sql = "界".repeat(256);
+        let map = SourceMap::new(&sql).unwrap();
+
+        for column in 1..=256 {
+            let span = Span::new(Location::new(1, column), Location::new(1, column + 1));
+            map.span(span).unwrap();
+        }
+
+        assert_eq!(map.lookup_scalar_visits(), 512);
     }
 }
