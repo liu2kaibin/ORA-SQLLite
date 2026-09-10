@@ -36,7 +36,7 @@ pub(crate) struct PagerConfig {
 }
 
 impl PagerConfig {
-    pub(super) fn new(page_size: u32, uuid: [u8; 16]) -> Result<Self> {
+    pub(crate) fn new(page_size: u32, uuid: [u8; 16]) -> Result<Self> {
         DatabaseHeader::new(page_size, uuid)?;
         Ok(Self {
             page_size,
@@ -46,6 +46,20 @@ impl PagerConfig {
             checkpoint_wal_bytes: 64 * 1024 * 1024,
             max_wal_bytes: super::wal::DEFAULT_MAX_WAL_BYTES,
         })
+    }
+
+    pub(crate) const fn with_runtime_limits(
+        mut self,
+        max_database_bytes: u64,
+        cache_pages: usize,
+        checkpoint_wal_bytes: u64,
+        max_wal_bytes: u64,
+    ) -> Self {
+        self.max_database_bytes = max_database_bytes;
+        self.cache_pages = cache_pages;
+        self.checkpoint_wal_bytes = checkpoint_wal_bytes;
+        self.max_wal_bytes = max_wal_bytes;
+        self
     }
 
     fn validate_wal_limits(&self) -> Result<()> {
@@ -115,7 +129,7 @@ impl Pager {
         super::checkpoint::run(&self.inner)
     }
 
-    pub(super) fn create(path: &Path, config: PagerConfig) -> Result<Self> {
+    pub(crate) fn create(path: &Path, config: PagerConfig) -> Result<Self> {
         Self::create_with_faults(path, config, Arc::new(crate::fault::NoFaults))
     }
 
@@ -150,7 +164,7 @@ impl Pager {
         )
     }
 
-    pub(super) fn open(path: &Path, mode: OpenMode, config: PagerConfig) -> Result<Self> {
+    pub(crate) fn open(path: &Path, mode: OpenMode, config: PagerConfig) -> Result<Self> {
         config.validate_wal_limits()?;
         let file = DatabaseFile::open_for_recovery(path, mode, config.max_database_bytes)?;
         let header = file.header();

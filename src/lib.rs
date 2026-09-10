@@ -18,7 +18,10 @@ mod sql;
 mod storage;
 mod value;
 
-pub use api::{ColumnMetadata, DataType, ParameterIdentifier, ParameterMetadata, Statement};
+pub use api::{
+    AccessMode, ColumnMetadata, DataType, Database, Options, ParameterIdentifier,
+    ParameterMetadata, Statement,
+};
 pub use datetime::{OracleDate, OracleTimestamp};
 pub use decimal::Decimal;
 pub use error::{DbError, ErrorCode, Result};

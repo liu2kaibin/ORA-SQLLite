@@ -21,11 +21,12 @@ mod wal;
 pub(crate) mod test_support;
 
 pub(crate) use file::OpenMode;
+pub(crate) use pager::{Pager, PagerConfig};
 #[allow(
     unused_imports,
-    reason = "crate-private storage bridge is consumed by subsequent Phase 4B API tasks"
+    reason = "transaction wrappers consume these crate-private handles in Task 11"
 )]
-pub(crate) use pager::{Pager, PagerConfig, ReadSnapshot, WriteBatch};
+pub(crate) use pager::{ReadSnapshot, WriteBatch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct PageId(pub(super) u64);
