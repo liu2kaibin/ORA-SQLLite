@@ -1,3 +1,5 @@
+#![deny(clippy::redundant_clone)]
+
 use sqlparser::ast::{
     BinaryOperator as ParserBinaryOp, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, ObjectNamePart, Spanned, UnaryOperator as ParserUnaryOp, Value,
@@ -6,6 +8,9 @@ use sqlparser::ast::{
 use sqlparser::dialect::OracleDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, Tokenizer};
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use super::AstBudget;
 use super::source::SourceMap;
@@ -16,9 +21,10 @@ use crate::sql::{Identifier, ParameterKey, SqlSpan};
 use crate::{DbError, ErrorCode, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SourceToken {
+struct SourceToken {
     kind: SourceTokenKind,
     span: SqlSpan,
+    matching_right_parenthesis: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,11 +40,31 @@ enum SourceTokenKind {
     Other,
 }
 
-fn source_tokens<'a>(
-    budget: &'a mut AstBudget,
-    source_map: &SourceMap<'_>,
-) -> Result<&'a [SourceToken]> {
-    if budget.source_tokens.is_none() {
+const SOURCE_TOKEN_KIND_COUNT: usize = 9;
+
+impl SourceTokenKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::LeftParenthesis => 0,
+            Self::RightParenthesis => 1,
+            Self::Plus => 2,
+            Self::Minus => 3,
+            Self::Star => 4,
+            Self::Not => 5,
+            Self::Is => 6,
+            Self::Null => 7,
+            Self::Other => 8,
+        }
+    }
+}
+
+pub(super) struct SourceTokenIndex {
+    tokens: Vec<SourceToken>,
+    kind_indices: [Vec<usize>; SOURCE_TOKEN_KIND_COUNT],
+}
+
+impl SourceTokenIndex {
+    fn new(source_map: &SourceMap<'_>) -> Result<Self> {
         let raw_tokens = Tokenizer::new(&OracleDialect, source_map.sql())
             .tokenize_with_location()
             .map_err(|error| {
@@ -49,19 +75,149 @@ fn source_tokens<'a>(
                     })
                     .unwrap_or_else(|mapping_error| mapping_error)
             })?;
-        let mut tokens = Vec::new();
+        let mut index = Self {
+            tokens: Vec::new(),
+            kind_indices: std::array::from_fn(|_| Vec::new()),
+        };
+        let mut open_parentheses = Vec::new();
         for token in raw_tokens {
+            record_source_token_probe();
             if matches!(token.token, Token::Whitespace(_)) {
                 continue;
             }
-            tokens.push(SourceToken {
-                kind: source_token_kind(&token.token),
+            let kind = source_token_kind(&token.token);
+            let token_index = index.tokens.len();
+            index.kind_indices[kind.index()].push(token_index);
+            index.tokens.push(SourceToken {
+                kind,
                 span: source_map.span(token.span)?,
+                matching_right_parenthesis: None,
             });
+            match kind {
+                SourceTokenKind::LeftParenthesis => open_parentheses.push(token_index),
+                SourceTokenKind::RightParenthesis => {
+                    let opening = open_parentheses.pop().ok_or_else(|| {
+                        source_shape_error(index.tokens[token_index].span.start(), source_map)
+                    })?;
+                    index.tokens[opening].matching_right_parenthesis = Some(token_index);
+                }
+                _ => {}
+            }
         }
-        budget.source_tokens = Some(tokens);
+        if let Some(opening) = open_parentheses.pop() {
+            return Err(source_shape_error(
+                index.tokens[opening].span.start(),
+                source_map,
+            ));
+        }
+        Ok(index)
     }
-    budget.source_tokens.as_deref().ok_or_else(|| {
+
+    fn token_before(
+        &self,
+        boundary: usize,
+        expected: SourceTokenKind,
+        source_map: &SourceMap<'_>,
+    ) -> Result<SourceToken> {
+        let index = lower_bound_by(&self.tokens, |token| token.span.end() <= boundary);
+        index
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .copied()
+            .filter(|token| token.kind == expected)
+            .ok_or_else(|| source_shape_error(boundary, source_map))
+    }
+
+    fn token_after(
+        &self,
+        boundary: usize,
+        expected: SourceTokenKind,
+        source_map: &SourceMap<'_>,
+    ) -> Result<SourceToken> {
+        let index = lower_bound_by(&self.tokens, |token| token.span.start() < boundary);
+        self.tokens
+            .get(index)
+            .copied()
+            .filter(|token| token.kind == expected)
+            .ok_or_else(|| source_shape_error(boundary, source_map))
+    }
+
+    fn token_between(
+        &self,
+        start: usize,
+        end: usize,
+        expected: SourceTokenKind,
+        source_map: &SourceMap<'_>,
+    ) -> Result<SourceToken> {
+        let indices = &self.kind_indices[expected.index()];
+        let position = lower_bound_by(indices, |index| self.tokens[*index].span.start() < start);
+        indices
+            .get(position)
+            .and_then(|index| self.tokens.get(*index))
+            .copied()
+            .filter(|token| token.span.end() <= end)
+            .ok_or_else(|| source_shape_error(start, source_map))
+    }
+
+    fn matching_right_parenthesis(
+        &self,
+        opening: SourceToken,
+        source_map: &SourceMap<'_>,
+    ) -> Result<SourceToken> {
+        record_source_token_probe();
+        opening
+            .matching_right_parenthesis
+            .and_then(|index| self.tokens.get(index))
+            .copied()
+            .filter(|token| token.kind == SourceTokenKind::RightParenthesis)
+            .ok_or_else(|| source_shape_error(opening.span.start(), source_map))
+    }
+}
+
+fn lower_bound_by<T>(values: &[T], mut is_before_boundary: impl FnMut(&T) -> bool) -> usize {
+    let mut left = 0;
+    let mut right = values.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        record_source_token_probe();
+        if is_before_boundary(&values[middle]) {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    left
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOURCE_TOKEN_PROBES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_source_token_probes() {
+    SOURCE_TOKEN_PROBES.set(0);
+}
+
+#[cfg(test)]
+fn source_token_probes() -> usize {
+    SOURCE_TOKEN_PROBES.get()
+}
+
+#[inline]
+fn record_source_token_probe() {
+    #[cfg(test)]
+    SOURCE_TOKEN_PROBES.set(SOURCE_TOKEN_PROBES.get() + 1);
+}
+
+fn source_token_index<'a>(
+    budget: &'a mut AstBudget,
+    source_map: &SourceMap<'_>,
+) -> Result<&'a SourceTokenIndex> {
+    if budget.source_tokens.is_none() {
+        budget.source_tokens = Some(SourceTokenIndex::new(source_map)?);
+    }
+    budget.source_tokens.as_ref().ok_or_else(|| {
         DbError::new(
             ErrorCode::Internal,
             "SQL source token index was not initialized",
@@ -89,13 +245,7 @@ fn token_before(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<SourceToken> {
-    source_tokens(budget, source_map)?
-        .iter()
-        .rev()
-        .find(|token| token.span.end() <= boundary)
-        .copied()
-        .filter(|token| token.kind == expected)
-        .ok_or_else(|| source_shape_error(boundary, source_map))
+    source_token_index(budget, source_map)?.token_before(boundary, expected, source_map)
 }
 
 fn token_after(
@@ -104,12 +254,7 @@ fn token_after(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<SourceToken> {
-    source_tokens(budget, source_map)?
-        .iter()
-        .find(|token| token.span.start() >= boundary)
-        .copied()
-        .filter(|token| token.kind == expected)
-        .ok_or_else(|| source_shape_error(boundary, source_map))
+    source_token_index(budget, source_map)?.token_after(boundary, expected, source_map)
 }
 
 fn token_between(
@@ -119,13 +264,7 @@ fn token_between(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<SourceToken> {
-    source_tokens(budget, source_map)?
-        .iter()
-        .find(|token| {
-            token.span.start() >= start && token.span.end() <= end && token.kind == expected
-        })
-        .copied()
-        .ok_or_else(|| source_shape_error(start, source_map))
+    source_token_index(budget, source_map)?.token_between(start, end, expected, source_map)
 }
 
 fn matching_right_parenthesis(
@@ -133,25 +272,7 @@ fn matching_right_parenthesis(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<SourceToken> {
-    let mut depth = 0usize;
-    for token in source_tokens(budget, source_map)?
-        .iter()
-        .filter(|token| token.span.start() >= opening.span.start())
-    {
-        match token.kind {
-            SourceTokenKind::LeftParenthesis => depth = depth.saturating_add(1),
-            SourceTokenKind::RightParenthesis => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| source_shape_error(token.span.start(), source_map))?;
-                if depth == 0 {
-                    return Ok(*token);
-                }
-            }
-            _ => {}
-        }
-    }
-    Err(source_shape_error(opening.span.start(), source_map))
+    source_token_index(budget, source_map)?.matching_right_parenthesis(opening, source_map)
 }
 
 fn source_shape_error(offset: usize, source_map: &SourceMap<'_>) -> DbError {
@@ -165,8 +286,32 @@ fn source_shape_error(offset: usize, source_map: &SourceMap<'_>) -> DbError {
     }
 }
 
+struct MoveOnlyParserExpr(Expr);
+
+impl MoveOnlyParserExpr {
+    const fn new(expr: Expr) -> Self {
+        Self(expr)
+    }
+
+    fn span(&self) -> sqlparser::tokenizer::Span {
+        self.0.span()
+    }
+
+    fn into_inner(self) -> Expr {
+        self.0
+    }
+}
+
 pub(super) fn convert_expr(
     expr: Expr,
+    source_map: &SourceMap<'_>,
+    budget: &mut AstBudget,
+) -> Result<AstExpr> {
+    convert_move_only_expr(MoveOnlyParserExpr::new(expr), source_map, budget)
+}
+
+fn convert_move_only_expr(
+    expr: MoveOnlyParserExpr,
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<AstExpr> {
@@ -182,13 +327,13 @@ pub(super) fn convert_expr(
 }
 
 fn convert_expr_inner(
-    expr: Expr,
+    expr: MoveOnlyParserExpr,
     upstream_span: sqlparser::tokenizer::Span,
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<AstExpr> {
     let partial_span = source_map.span(upstream_span);
-    match expr {
+    match expr.into_inner() {
         Expr::Identifier(ident) => {
             let identifier = convert_identifier(ident, source_map)?;
             Ok(AstExpr {
@@ -219,7 +364,11 @@ fn convert_expr_inner(
         Expr::UnaryOp { op, expr } => {
             let (op, source_kind) = convert_unary_op(op)
                 .ok_or_else(|| unsupported(source_map, partial_span.as_ref().ok()))?;
-            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
+            let expr = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*expr),
+                source_map,
+                budget,
+            )?);
             let operator = token_before(expr.span.start(), source_kind, source_map, budget)?;
             Ok(AstExpr {
                 span: SqlSpan::new(operator.span.start(), expr.span.end())?,
@@ -229,24 +378,44 @@ fn convert_expr_inner(
         Expr::BinaryOp { left, op, right } => {
             let op = convert_binary_op(&op)
                 .ok_or_else(|| unsupported(source_map, partial_span.as_ref().ok()))?;
-            let left = Box::new(convert_expr(*left, source_map, budget)?);
-            let right = Box::new(convert_expr(*right, source_map, budget)?);
+            let left = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*left),
+                source_map,
+                budget,
+            )?);
+            let right = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*right),
+                source_map,
+                budget,
+            )?);
             Ok(AstExpr {
                 span: SqlSpan::new(left.span.start(), right.span.end())?,
                 kind: AstExprKind::Binary { left, op, right },
             })
         }
-        Expr::IsNull(expr) => convert_is_null(*expr, false, source_map, budget),
-        Expr::IsNotNull(expr) => convert_is_null(*expr, true, source_map, budget),
+        Expr::IsNull(expr) => {
+            convert_is_null(MoveOnlyParserExpr::new(*expr), false, source_map, budget)
+        }
+        Expr::IsNotNull(expr) => {
+            convert_is_null(MoveOnlyParserExpr::new(*expr), true, source_map, budget)
+        }
         Expr::InList {
             expr,
             list,
             negated,
         } if !list.is_empty() => {
-            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
+            let expr = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*expr),
+                source_map,
+                budget,
+            )?);
             let mut values = Vec::new();
             for value in list {
-                values.push(convert_expr(value, source_map, budget)?);
+                values.push(convert_move_only_expr(
+                    MoveOnlyParserExpr::new(value),
+                    source_map,
+                    budget,
+                )?);
             }
             let Some(first) = values.first() else {
                 return Err(source_shape_error(expr.span.end(), source_map));
@@ -274,9 +443,21 @@ fn convert_expr_inner(
             low,
             high,
         } => {
-            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
-            let low = Box::new(convert_expr(*low, source_map, budget)?);
-            let high = Box::new(convert_expr(*high, source_map, budget)?);
+            let expr = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*expr),
+                source_map,
+                budget,
+            )?);
+            let low = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*low),
+                source_map,
+                budget,
+            )?);
+            let high = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*high),
+                source_map,
+                budget,
+            )?);
             Ok(AstExpr {
                 span: SqlSpan::new(expr.span.start(), high.span.end())?,
                 kind: AstExprKind::Between {
@@ -294,8 +475,16 @@ fn convert_expr_inner(
             pattern,
             escape_char: None,
         } => {
-            let expr = Box::new(convert_expr(*expr, source_map, budget)?);
-            let pattern = Box::new(convert_expr(*pattern, source_map, budget)?);
+            let expr = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*expr),
+                source_map,
+                budget,
+            )?);
+            let pattern = Box::new(convert_move_only_expr(
+                MoveOnlyParserExpr::new(*pattern),
+                source_map,
+                budget,
+            )?);
             Ok(AstExpr {
                 span: SqlSpan::new(expr.span.start(), pattern.span.end())?,
                 kind: AstExprKind::Like {
@@ -306,7 +495,8 @@ fn convert_expr_inner(
             })
         }
         Expr::Nested(expr) => {
-            let mut expr = convert_expr(*expr, source_map, budget)?;
+            let mut expr =
+                convert_move_only_expr(MoveOnlyParserExpr::new(*expr), source_map, budget)?;
             let opening = token_before(
                 expr.span.start(),
                 SourceTokenKind::LeftParenthesis,
@@ -328,12 +518,12 @@ fn convert_expr_inner(
 }
 
 fn convert_is_null(
-    expr: Expr,
+    expr: MoveOnlyParserExpr,
     negated: bool,
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<AstExpr> {
-    let expr = Box::new(convert_expr(expr, source_map, budget)?);
+    let expr = Box::new(convert_move_only_expr(expr, source_map, budget)?);
     let is = token_after(expr.span.end(), SourceTokenKind::Is, source_map, budget)?;
     let end = if negated {
         let not = token_after(is.span.end(), SourceTokenKind::Not, source_map, budget)?;
@@ -523,21 +713,22 @@ fn convert_aggregate(
         (Some(FunctionArg::Unnamed(argument)), None) => argument,
         _ => return Err(unsupported(source_map, function_span.as_ref())),
     };
-    let argument = match argument {
-        FunctionArgExpr::Wildcard => AggregateArgument::Wildcard(
-            token_after(
-                opening.span.end(),
-                SourceTokenKind::Star,
-                source_map,
-                budget,
-            )?
-            .span,
-        ),
-        FunctionArgExpr::Expr(expr) => {
-            AggregateArgument::Expr(Box::new(convert_expr(expr, source_map, budget)?))
-        }
-        _ => return Err(unsupported(source_map, function_span.as_ref())),
-    };
+    let argument =
+        match argument {
+            FunctionArgExpr::Wildcard => AggregateArgument::Wildcard(
+                token_after(
+                    opening.span.end(),
+                    SourceTokenKind::Star,
+                    source_map,
+                    budget,
+                )?
+                .span,
+            ),
+            FunctionArgExpr::Expr(expr) => AggregateArgument::Expr(Box::new(
+                convert_move_only_expr(MoveOnlyParserExpr::new(expr), source_map, budget)?,
+            )),
+            _ => return Err(unsupported(source_map, function_span.as_ref())),
+        };
     Ok(AstExpr {
         span: SqlSpan::new(name_span.start(), closing.span.end())?,
         kind: AstExprKind::Aggregate { function, argument },
@@ -956,6 +1147,89 @@ mod tests {
                 function: AggregateFunction::Sum,
                 argument: AggregateArgument::Expr(expr),
             } if matches!(expr.kind, AstExprKind::Binary { .. })
+        ));
+    }
+
+    #[test]
+    fn source_token_navigation_is_bounded_for_deep_balanced_aggregates() {
+        let mut fragment = String::from("A");
+        for _ in 0..16 {
+            fragment = format!("SUM(/*l*/{fragment}/*r*/)");
+        }
+        let limits = SqlLimits::default().with_max_nesting(256).unwrap();
+
+        reset_source_token_probes();
+        let expression = parse_expr_fragment(&fragment, &limits).unwrap();
+        let probes = source_token_probes();
+
+        assert_eq!(expression.span, SqlSpan::new(7, 248).unwrap());
+        assert!(
+            probes <= 250,
+            "source token navigation used {probes} probes"
+        );
+    }
+
+    #[test]
+    fn source_token_index_uses_logarithmic_boundary_lookups_at_limit_scale() {
+        let mut index = SourceTokenIndex {
+            tokens: Vec::with_capacity(100_000),
+            kind_indices: std::array::from_fn(|_| Vec::new()),
+        };
+        for position in 0..100_000 {
+            let kind = match position {
+                1 => SourceTokenKind::LeftParenthesis,
+                50_000 => SourceTokenKind::Plus,
+                99_998 => SourceTokenKind::RightParenthesis,
+                _ => SourceTokenKind::Other,
+            };
+            let token = SourceToken {
+                kind,
+                span: SqlSpan::new(position * 2, position * 2 + 1).unwrap(),
+                matching_right_parenthesis: (position == 1).then_some(99_998),
+            };
+            index.kind_indices[kind.index()].push(position);
+            index.tokens.push(token);
+        }
+        let source_map = SourceMap::new("X").unwrap();
+
+        reset_source_token_probes();
+        let before = index
+            .token_before(200_000, SourceTokenKind::Other, &source_map)
+            .unwrap();
+        let after = index
+            .token_after(199_998, SourceTokenKind::Other, &source_map)
+            .unwrap();
+        let between = index
+            .token_between(100_000, 100_001, SourceTokenKind::Plus, &source_map)
+            .unwrap();
+        let closing = index
+            .matching_right_parenthesis(index.tokens[1], &source_map)
+            .unwrap();
+
+        assert_eq!(before.span, SqlSpan::new(199_998, 199_999).unwrap());
+        assert_eq!(after.span, SqlSpan::new(199_998, 199_999).unwrap());
+        assert_eq!(between.span, SqlSpan::new(100_000, 100_001).unwrap());
+        assert_eq!(closing.span, SqlSpan::new(199_996, 199_997).unwrap());
+        assert!(source_token_probes() <= 40);
+    }
+
+    #[test]
+    fn recursive_conversion_boundary_is_move_only() {
+        trait AmbiguousIfClone<Marker> {
+            fn marker() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct ImplementsClone;
+        impl<T: Clone> AmbiguousIfClone<ImplementsClone> for T {}
+
+        let _ = <MoveOnlyParserExpr as AmbiguousIfClone<_>>::marker;
+        let aggregate = parse_expr_fragment("SUM(A)", &SqlLimits::default()).unwrap();
+        assert!(matches!(
+            aggregate.kind,
+            AstExprKind::Aggregate {
+                argument: AggregateArgument::Expr(_),
+                ..
+            }
         ));
     }
 }

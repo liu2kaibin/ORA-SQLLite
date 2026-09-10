@@ -9,7 +9,7 @@ use crate::{DbError, ErrorCode, Result};
 pub(super) struct AstBudget {
     remaining_nodes: u32,
     remaining_depth: u16,
-    source_tokens: Option<Vec<expr::SourceToken>>,
+    source_tokens: Option<expr::SourceTokenIndex>,
 }
 
 impl AstBudget {
