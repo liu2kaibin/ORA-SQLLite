@@ -12,7 +12,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::OracleDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Token, TokenWithSpan};
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
 use super::AstBudget;
 use super::expr::convert_expr;
@@ -27,10 +27,26 @@ use crate::sql::ast::{
 use crate::sql::{Identifier, SqlLimits, SqlSpan};
 use crate::{DbError, ErrorCode, Result};
 
+#[cfg(test)]
+std::thread_local! {
+    static STATEMENT_SOURCE_MAP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<AstStatement> {
+    if sql.len() > limits.max_sql_bytes() as usize {
+        return Err(DbError::new(
+            ErrorCode::Syntax,
+            "SQL text exceeds the configured byte limit",
+        ));
+    }
+    #[cfg(test)]
+    STATEMENT_SOURCE_MAP_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let source_map = SourceMap::new(sql)?;
     let tokens = tokenize(sql, limits)?;
     let token_index = StatementTokenIndex::new(&tokens, &source_map)?;
+    if let Some(span) = token_index.anonymous_block_span() {
+        return Err(unsupported(&source_map, Some(span)));
+    }
     let statement_span = token_index.require_exactly_one_statement(&source_map)?;
 
     if token_index.starts_with_keyword(Keyword::SELECT) {
@@ -42,7 +58,7 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
         .with_recursion_limit(limits.max_nesting() as usize)
         .with_tokens_with_locations(parser_tokens)
         .parse_statements()
-        .map_err(parser_error)?;
+        .map_err(|error| parser_error(error, &source_map))?;
     let mut statements = statements.into_iter();
     let statement = match (statements.next(), statements.next()) {
         (Some(statement), None) => statement,
@@ -66,14 +82,31 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
     )
 }
 
-fn parser_error(error: ParserError) -> DbError {
-    let message = match error {
-        ParserError::TokenizerError(message) | ParserError::ParserError(message) => message,
-        ParserError::RecursionLimitExceeded => {
-            "SQL statement exceeds the configured parser nesting limit".to_owned()
+fn parser_error(error: ParserError, source_map: &SourceMap<'_>) -> DbError {
+    let (message, upstream_location) = match error {
+        ParserError::TokenizerError(message) | ParserError::ParserError(message) => {
+            let location = parser_message_location(&message);
+            (message, location)
         }
+        ParserError::RecursionLimitExceeded => (
+            "SQL statement exceeds the configured parser nesting limit".to_owned(),
+            None,
+        ),
     };
-    DbError::new(ErrorCode::Syntax, message)
+    let error = DbError::new(ErrorCode::Syntax, message);
+    let location = upstream_location
+        .and_then(|location| source_map.sqlparser_location(location).ok())
+        .or_else(|| source_map.location(0).ok());
+    match location {
+        Some(location) => error.with_sql_location(location),
+        None => error,
+    }
+}
+
+fn parser_message_location(message: &str) -> Option<Location> {
+    let (_, location) = message.rsplit_once(" at Line: ")?;
+    let (line, column) = location.split_once(", Column: ")?;
+    Some(Location::new(line.parse().ok()?, column.parse().ok()?))
 }
 
 fn convert_statement(
@@ -380,15 +413,13 @@ fn convert_assignment(
             return Err(unsupported(source_map, partial));
         }
     };
-    let value_partial = source_map.span(value.span()).ok();
-    let assignment_span = SqlSpan::new(
-        column.span().start(),
-        value_partial.map_or(column.span().end(), |span| span.end()),
-    )?;
-    with_ast_node(assignment_span, source_map, budget, |budget| {
+    let assignment_anchor = column.span();
+    with_ast_node(assignment_anchor, source_map, budget, |budget| {
+        let value = convert_expr(value, source_map, budget)?;
+        let assignment_span = SqlSpan::new(column.span().start(), value.span().end())?;
         Ok(Assignment {
             column,
-            value: convert_expr(value, source_map, budget)?,
+            value,
             span: assignment_span,
         })
     })
@@ -763,10 +794,9 @@ fn convert_type_declaration(
             source_map,
         ));
     };
-    let name = identifier_from_word(word, name_token.span, source_map)?;
     let depth = name_token.depth;
     let mut cursor = start + 1;
-    let mut arguments = Vec::new();
+    let mut argument_bounds = None;
     let mut end = name_token.span.end();
     if cursor < boundary && tokens.kind(cursor) == IndexedTokenKind::LeftParen {
         let opening = cursor;
@@ -774,15 +804,15 @@ fn convert_type_declaration(
             .matching_right(opening)
             .filter(|closing| *closing < boundary)
             .ok_or_else(|| source_shape_error(tokens.span(opening).start(), source_map))?;
-        arguments = tokens.type_arguments(opening, closing, source_map)?;
+        argument_bounds = Some((opening, closing));
         end = tokens.span(closing).end();
         cursor = closing + 1;
     }
 
-    let mut modifiers = Vec::new();
+    let mut modifier = None;
     if cursor < boundary && tokens.keyword(cursor) == Keyword::WITH {
         let modifier_start = cursor;
-        let modifier = if tokens.keyword(cursor + 1) == Keyword::LOCAL
+        let converted = if tokens.keyword(cursor + 1) == Keyword::LOCAL
             && tokens.keyword(cursor + 2) == Keyword::TIME
             && tokens.keyword(cursor + 3) == Keyword::ZONE
             && tokens.same_depth_range(cursor, cursor + 4, depth)
@@ -804,11 +834,21 @@ fn convert_type_declaration(
         } else {
             return Err(unsupported(source_map, Some(tokens.span(cursor))));
         };
-        end = modifier.span().end();
-        modifiers.push(modifier);
+        end = converted.span().end();
+        modifier = Some(converted);
     }
-    let type_span = SqlSpan::new(name.span().start(), end)?;
-    with_ast_node(type_span, source_map, budget, |_| {
+    let type_span = SqlSpan::new(name_token.span.start(), end)?;
+    with_ast_node(type_span, source_map, budget, |budget| {
+        let name = identifier_from_word(word, name_token.span, source_map)?;
+        let arguments = argument_bounds
+            .map(|(opening, closing)| tokens.type_arguments(opening, closing, source_map, budget))
+            .transpose()?
+            .unwrap_or_default();
+        let mut modifiers = Vec::new();
+        if let Some(modifier) = modifier {
+            let modifier = with_ast_node(modifier.span(), source_map, budget, |_| Ok(modifier))?;
+            modifiers.push(modifier);
+        }
         Ok((
             TypeDeclaration {
                 name,
@@ -932,6 +972,9 @@ fn convert_column_constraint(
                 return Err(source_shape_error(table_span.start(), source_map));
             }
             let referenced_table = convert_single_name(foreign_table, source_map)?;
+            if referred_columns.is_empty() {
+                return Err(unsupported(source_map, Some(table_span)));
+            }
             let opening = tokens
                 .first_kind_after(referenced_table.span().end(), IndexedTokenKind::LeftParen)
                 .filter(|opening| *opening < boundary)
@@ -941,9 +984,6 @@ fn convert_column_constraint(
                 .filter(|closing| *closing < boundary)
                 .ok_or_else(|| source_shape_error(tokens.span(opening).start(), source_map))?;
             let referenced_columns = convert_identifier_list(referred_columns, source_map)?;
-            if referenced_columns.is_empty() {
-                return Err(unsupported(source_map, Some(table_span)));
-            }
             let end = closing + 1;
             let span = SqlSpan::new(tokens.span(start).start(), tokens.span(closing).end())?;
             (
@@ -1031,6 +1071,18 @@ fn convert_table_constraint(
     tokens: &StatementTokenIndex,
     budget: &mut AstBudget,
 ) -> Result<Constraint> {
+    if !matches!(
+        &constraint,
+        TableConstraint::PrimaryKey(_)
+            | TableConstraint::Unique(_)
+            | TableConstraint::Check(_)
+            | TableConstraint::ForeignKey(_)
+    ) {
+        return Err(unsupported(
+            source_map,
+            source_map.span(constraint.span()).ok(),
+        ));
+    }
     let anchor = table_constraint_anchor(&constraint, source_map)?;
     let (start, end) = tokens.table_item_bounds(table_opening, table_closing, anchor)?;
     let constraint_span = tokens.range_span(start, end)?;
@@ -1583,6 +1635,35 @@ impl StatementTokenIndex {
         )
     }
 
+    fn anonymous_block_span(&self) -> Option<SqlSpan> {
+        let [begin, body @ .., end, trailing_semicolon] = self.tokens.as_slice() else {
+            return None;
+        };
+        let first_body = body.first()?;
+        if begin.keyword != Keyword::BEGIN
+            || end.keyword != Keyword::END
+            || trailing_semicolon.kind != IndexedTokenKind::Semicolon
+            || first_body.kind == IndexedTokenKind::Semicolon
+            || body.last()?.kind != IndexedTokenKind::Semicolon
+            || matches!(
+                first_body.keyword,
+                Keyword::TRANSACTION
+                    | Keyword::WORK
+                    | Keyword::TRAN
+                    | Keyword::DEFERRED
+                    | Keyword::IMMEDIATE
+                    | Keyword::EXCLUSIVE
+                    | Keyword::TRY
+                    | Keyword::CATCH
+                    | Keyword::ISOLATION
+                    | Keyword::READ
+            )
+        {
+            return None;
+        }
+        SqlSpan::new(begin.span.start(), trailing_semicolon.span.end()).ok()
+    }
+
     fn normalize_local_time_zone(
         &self,
         tokens: &[TokenWithSpan],
@@ -1740,6 +1821,7 @@ impl StatementTokenIndex {
         opening: usize,
         closing: usize,
         source_map: &SourceMap<'_>,
+        budget: &mut AstBudget,
     ) -> Result<Vec<TypeArgument>> {
         let argument_depth = self.tokens[opening].depth.saturating_add(1);
         let mut arguments = Vec::new();
@@ -1757,10 +1839,13 @@ impl StatementTokenIndex {
                 ));
             }
             let span = self.range_span(start, boundary)?;
-            arguments.push(TypeArgument {
-                text: source_map.sql()[span.start()..span.end()].trim().to_owned(),
-                span,
-            });
+            let argument = with_ast_node(span, source_map, budget, |_| {
+                Ok(TypeArgument {
+                    text: source_map.sql()[span.start()..span.end()].trim().to_owned(),
+                    span,
+                })
+            })?;
+            arguments.push(argument);
             start = boundary + 1;
         }
         Ok(arguments)
@@ -1795,7 +1880,14 @@ impl StatementTokenIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_statement;
+    use sqlparser::ast::{Statement as ParserStatement, TableConstraint as ParserTableConstraint};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    use super::{
+        AstBudget, IndexedTokenKind, STATEMENT_SOURCE_MAP_BUILDS, SourceMap, StatementTokenIndex,
+        convert_table_constraint, parse_statement, tokenize,
+    };
     use crate::ErrorCode;
     use crate::error::SqlLocation;
     use crate::sql::ast::{AstExprKind, AstStatement, Constraint, TypeModifier};
@@ -1804,6 +1896,18 @@ mod tests {
     fn authored_span(sql: &str, authored: &str) -> SqlSpan {
         let start = sql.find(authored).expect("authored fragment must exist");
         SqlSpan::new(start, start + authored.len()).unwrap()
+    }
+
+    #[test]
+    fn sql_byte_limit_precedes_statement_source_mapping() {
+        STATEMENT_SOURCE_MAP_BUILDS.with(|builds| builds.set(0));
+        let limits = SqlLimits::default().with_max_sql_bytes(5).unwrap();
+
+        let error = parse_statement("SELECT", &limits).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Syntax);
+        assert_eq!(error.sql_location(), None);
+        STATEMENT_SOURCE_MAP_BUILDS.with(|builds| assert_eq!(builds.get(), 0));
     }
 
     #[test]
@@ -1895,6 +1999,39 @@ mod tests {
     }
 
     #[test]
+    fn update_assignment_spans_end_at_the_owned_rhs_boundary() {
+        for (sql, assignment_text, rhs_text) in [
+            ("UPDATE T SET A = B IS NULL", "A = B IS NULL", "B IS NULL"),
+            (
+                "UPDATE T SET A = B IN (1, 2)",
+                "A = B IN (1, 2)",
+                "B IN (1, 2)",
+            ),
+            (
+                "UPDATE T SET A = (B + 1) * (C - 2)",
+                "A = (B + 1) * (C - 2)",
+                "(B + 1) * (C - 2)",
+            ),
+        ] {
+            let AstStatement::Update(update) = parse_statement(sql, &SqlLimits::default()).unwrap()
+            else {
+                panic!("expected UPDATE");
+            };
+            assert_eq!(update.assignments.len(), 1, "{sql}");
+            assert_eq!(
+                update.assignments[0].span,
+                authored_span(sql, assignment_text),
+                "{sql}"
+            );
+            assert_eq!(
+                update.assignments[0].value.span(),
+                authored_span(sql, rhs_text),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn exactly_one_statement_is_required() {
         for sql in [
             "",
@@ -1908,6 +2045,32 @@ mod tests {
                     .unwrap_err()
                     .code(),
                 ErrorCode::Syntax
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_blocks_are_unsupported_without_weakening_statement_counting() {
+        assert_eq!(
+            parse_statement("BEGIN NULL; END;", &SqlLimits::default())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+
+        for sql in [
+            "BEGIN; END;",
+            "BEGIN TRANSACTION; END;",
+            "BEGIN IMMEDIATE; END;",
+            "BEGIN READ ONLY; END;",
+            "BEGIN NULL; END; SELECT A FROM T;",
+        ] {
+            assert_eq!(
+                parse_statement(sql, &SqlLimits::default())
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Syntax,
+                "{sql}"
             );
         }
     }
@@ -1958,6 +2121,48 @@ mod tests {
                 SqlSpan::new(29, 49).unwrap()
             )]
         );
+    }
+
+    #[test]
+    fn type_arguments_and_modifiers_are_budgeted_beneath_the_declaration() {
+        for (sql, exact_nodes) in [
+            ("CREATE TABLE T (N NUMBER(10,2))", 5),
+            ("CREATE TABLE T (TS TIMESTAMP WITH LOCAL TIME ZONE)", 4),
+        ] {
+            let insufficient_nodes = SqlLimits::default()
+                .with_max_ast_nodes(exact_nodes - 1)
+                .unwrap();
+            assert_eq!(
+                parse_statement(sql, &insufficient_nodes)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Syntax,
+                "node boundary for {sql}"
+            );
+
+            let exact_nodes = SqlLimits::default()
+                .with_max_ast_nodes(exact_nodes)
+                .unwrap();
+            assert!(
+                parse_statement(sql, &exact_nodes).is_ok(),
+                "exact node boundary for {sql}"
+            );
+
+            let insufficient_depth = SqlLimits::default().with_max_nesting(3).unwrap();
+            assert_eq!(
+                parse_statement(sql, &insufficient_depth)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Syntax,
+                "depth boundary for {sql}"
+            );
+
+            let exact_depth = SqlLimits::default().with_max_nesting(4).unwrap();
+            assert!(
+                parse_statement(sql, &exact_depth).is_ok(),
+                "exact depth boundary for {sql}"
+            );
+        }
     }
 
     #[test]
@@ -2055,6 +2260,72 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_constraint_shapes_never_leak_internal_errors() {
+        for sql in [
+            "CREATE TABLE T (P_ID INT64 REFERENCES P)",
+            "CREATE TABLE T (ID INT64, PRIMARY KEY USING INDEX T_I)",
+            "CREATE TABLE T (ID INT64, UNIQUE USING INDEX T_I)",
+        ] {
+            assert_eq!(
+                parse_statement(sql, &SqlLimits::default())
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Unsupported,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_only_table_constraint_variants_are_project_unsupported() {
+        for sql in [
+            "CREATE TABLE T (ID INT, INDEX T_I (ID))",
+            "CREATE TABLE T (ID INT, FULLTEXT INDEX T_I (ID))",
+        ] {
+            let mut statements = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
+            let ParserStatement::CreateTable(create) = statements.remove(0) else {
+                panic!("expected dependency CREATE TABLE");
+            };
+            assert_eq!(create.constraints.len(), 1, "{sql}");
+            let constraint = create.constraints.into_iter().next().unwrap();
+            assert!(
+                matches!(
+                    &constraint,
+                    ParserTableConstraint::Index(_) | ParserTableConstraint::FulltextOrSpatial(_)
+                ),
+                "{sql}"
+            );
+
+            let limits = SqlLimits::default();
+            let source_map = SourceMap::new(sql).unwrap();
+            let source_tokens = tokenize(sql, &limits).unwrap();
+            let token_index = StatementTokenIndex::new(&source_tokens, &source_map).unwrap();
+            let opening = token_index
+                .tokens
+                .iter()
+                .position(|token| token.kind == IndexedTokenKind::LeftParen)
+                .unwrap();
+            let closing = token_index.matching_right(opening).unwrap();
+            let mut budget = AstBudget::new(&limits);
+
+            assert_eq!(
+                convert_table_constraint(
+                    constraint,
+                    opening,
+                    closing,
+                    &source_map,
+                    &token_index,
+                    &mut budget,
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::Unsupported,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_supported_families_are_syntax_errors() {
         for sql in [
             "SELECT",
@@ -2073,6 +2344,34 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_parser_errors_map_the_upstream_location() {
+        let sql = "UPDATE T\nSET 名 = 1 ID";
+
+        let error = parse_statement(sql, &SqlLimits::default()).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Syntax);
+        assert_eq!(
+            error.sql_location(),
+            Some(SqlLocation::new(21, 2, 11).unwrap()),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn parser_recursion_limit_uses_a_controlled_source_fallback() {
+        let sql = "SELECT (((((((A))))))) FROM T";
+        let limits = SqlLimits::default().with_max_nesting(1).unwrap();
+
+        let error = parse_statement(sql, &limits).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Syntax);
+        assert_eq!(
+            error.sql_location(),
+            Some(SqlLocation::new(0, 1, 1).unwrap())
+        );
     }
 
     #[test]
