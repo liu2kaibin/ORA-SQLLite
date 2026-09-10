@@ -9,34 +9,29 @@ use crate::{DbError, ErrorCode, Result};
 
 pub(super) struct SourceMap<'sql> {
     sql: &'sql str,
-    line_starts: Vec<usize>,
-    line_columns: Vec<Vec<usize>>,
+    line_boundary_starts: Vec<usize>,
+    scalar_boundaries: Vec<usize>,
     #[cfg(test)]
     lookup_scalar_visits: Cell<usize>,
 }
 
 impl<'sql> SourceMap<'sql> {
     pub(super) fn new(sql: &'sql str) -> Result<Self> {
-        let mut line_starts = vec![0];
-        let mut line_columns = vec![vec![0]];
+        let mut line_boundary_starts = vec![0];
+        let mut scalar_boundaries = vec![0];
         for (offset, character) in sql.char_indices() {
             let next_offset = offset
                 .checked_add(character.len_utf8())
                 .ok_or_else(|| DbError::new(ErrorCode::Internal, "SQL source offset overflow"))?;
             if character == '\n' {
-                line_starts.push(next_offset);
-                line_columns.push(vec![next_offset]);
-            } else {
-                line_columns
-                    .last_mut()
-                    .ok_or_else(invalid_source_location)?
-                    .push(next_offset);
+                line_boundary_starts.push(scalar_boundaries.len());
             }
+            scalar_boundaries.push(next_offset);
         }
         Ok(Self {
             sql,
-            line_starts,
-            line_columns,
+            line_boundary_starts,
+            scalar_boundaries,
             #[cfg(test)]
             lookup_scalar_visits: Cell::new(0),
         })
@@ -48,14 +43,17 @@ impl<'sql> SourceMap<'sql> {
         }
 
         let line_index = self
-            .line_starts
-            .partition_point(|line_start| *line_start <= byte_offset)
+            .line_boundary_starts
+            .partition_point(|boundary_start| {
+                self.scalar_boundaries[*boundary_start] <= byte_offset
+            })
             .checked_sub(1)
             .ok_or_else(invalid_source_location)?;
         let line = line_index
             .checked_add(1)
             .ok_or_else(invalid_source_location)?;
-        let column = self.line_columns[line_index]
+        let column = self
+            .line_boundaries(line_index)?
             .binary_search(&byte_offset)
             .map_err(|_| invalid_source_location())?
             .checked_add(1)
@@ -78,10 +76,7 @@ impl<'sql> SourceMap<'sql> {
         let column = usize::try_from(location.column).map_err(|_| invalid_source_location())?;
         let line_index = line.checked_sub(1).ok_or_else(invalid_source_location)?;
         let column_index = column.checked_sub(1).ok_or_else(invalid_source_location)?;
-        let columns = self
-            .line_columns
-            .get(line_index)
-            .ok_or_else(invalid_source_location)?;
+        let columns = self.line_boundaries(line_index)?;
         #[cfg(test)]
         self.lookup_scalar_visits.set(
             self.lookup_scalar_visits
@@ -95,9 +90,30 @@ impl<'sql> SourceMap<'sql> {
             .ok_or_else(invalid_source_location)
     }
 
+    fn line_boundaries(&self, line_index: usize) -> Result<&[usize]> {
+        let start = *self
+            .line_boundary_starts
+            .get(line_index)
+            .ok_or_else(invalid_source_location)?;
+        let end = self
+            .line_boundary_starts
+            .get(line_index + 1)
+            .copied()
+            .unwrap_or(self.scalar_boundaries.len());
+        self.scalar_boundaries
+            .get(start..end)
+            .ok_or_else(invalid_source_location)
+    }
+
     #[cfg(test)]
     fn lookup_scalar_visits(&self) -> usize {
         self.lookup_scalar_visits.get()
+    }
+
+    #[cfg(test)]
+    fn growable_buffer_count(&self) -> usize {
+        usize::from(self.line_boundary_starts.capacity() != 0)
+            + usize::from(self.scalar_boundaries.capacity() != 0)
     }
 }
 
@@ -148,5 +164,17 @@ mod tests {
         }
 
         assert_eq!(map.lookup_scalar_visits(), 512);
+    }
+
+    #[test]
+    fn source_map_storage_does_not_allocate_a_buffer_per_line() {
+        let sql = "\n".repeat(256);
+        let map = SourceMap::new(&sql).unwrap();
+
+        assert!(
+            map.growable_buffer_count() <= 3,
+            "expected at most 3 growable buffers, got {}",
+            map.growable_buffer_count()
+        );
     }
 }
