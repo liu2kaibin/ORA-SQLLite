@@ -26,7 +26,7 @@ use crate::{DbError, ErrorCode, Result};
 
 use crate::fault::FaultInjector;
 
-pub(super) struct PagerConfig {
+pub(crate) struct PagerConfig {
     pub(super) page_size: u32,
     pub(super) uuid: [u8; 16],
     pub(super) max_database_bytes: u64,
@@ -57,7 +57,7 @@ impl PagerConfig {
 }
 
 #[derive(Clone)]
-pub(super) struct Pager {
+pub(crate) struct Pager {
     inner: Arc<PagerInner>,
 }
 
@@ -91,7 +91,7 @@ pub(super) enum WriteState {
     NeedsRecovery,
 }
 
-pub(super) struct ReadSnapshot {
+pub(crate) struct ReadSnapshot {
     pager: Pager,
     lsn: Lsn,
     state: CommitState,
@@ -243,7 +243,11 @@ impl Pager {
         })
     }
 
-    pub(super) fn begin_read(&self) -> Result<ReadSnapshot> {
+    pub(crate) fn database_uuid(&self) -> Result<[u8; 16]> {
+        Ok(self.published_read()?.checkpoint.uuid())
+    }
+
+    pub(crate) fn begin_read(&self) -> Result<ReadSnapshot> {
         let published = self.published_read()?;
         let lsn = published.latest_lsn;
         let state = published.wal_index.state_at(&published.checkpoint, lsn)?;
@@ -259,7 +263,7 @@ impl Pager {
         })
     }
 
-    pub(super) fn begin_write(&self) -> Result<WriteBatch<'_>> {
+    pub(crate) fn begin_write(&self) -> Result<WriteBatch<'_>> {
         if self.inner.mode == OpenMode::ReadOnly {
             return Err(DbError::new(
                 ErrorCode::Unsupported,
@@ -585,6 +589,10 @@ pub(super) trait PageSource {
 }
 
 impl ReadSnapshot {
+    pub(crate) fn catalog_reader(&mut self) -> Result<super::catalog::CatalogReader> {
+        super::catalog::CatalogReader::open_empty_or_v1(self)
+    }
+
     pub(super) const fn lsn(&self) -> Lsn {
         self.lsn
     }
@@ -718,7 +726,7 @@ fn snapshot_catalog_reachability(
     Ok(Some((root, report.all_live_pages())))
 }
 
-pub(super) struct WriteBatch<'a> {
+pub(crate) struct WriteBatch<'a> {
     pager: &'a Pager,
     _writer: MutexGuard<'a, ()>,
     base_lsn: Lsn,
@@ -755,6 +763,12 @@ pub(super) struct WriteBatchCheckpoint {
 }
 
 impl WriteBatch<'_> {
+    pub(crate) fn catalog_reader(&mut self) -> Result<super::catalog::CatalogReader> {
+        self.require_active()?;
+        self.require_catalog_finished()?;
+        super::catalog::CatalogReader::open_empty_or_v1_batch(self)
+    }
+
     pub(super) const fn catalog_root(&self) -> PageId {
         self.current_header().catalog_root()
     }
@@ -1029,7 +1043,7 @@ impl WriteBatch<'_> {
         self.allocate_reused(root_reference.page_id(), generation, page_type)
     }
 
-    pub(super) fn rollback(&mut self) -> Result<()> {
+    pub(crate) fn rollback(&mut self) -> Result<()> {
         self.require_active()?;
         self.finish();
         Ok(())
@@ -1190,7 +1204,7 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
-    pub(super) fn commit(mut self) -> Result<()> {
+    pub(crate) fn commit(mut self) -> Result<()> {
         self.require_active()?;
         // Reject before preparing releases or materializing a header-only change,
         // so unfinished writers always produce Transaction and never reach WAL I/O.

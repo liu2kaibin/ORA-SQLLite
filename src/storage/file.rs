@@ -21,7 +21,7 @@ pub(super) const DEFAULT_MAX_DATABASE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const FORMAT_1_MAGIC: &[u8; 16] = b"ORA-SQLLITE\0\0\0\0\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OpenMode {
+pub(crate) enum OpenMode {
     ReadOnly,
     ReadWrite,
 }

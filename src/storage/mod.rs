@@ -18,9 +18,14 @@ mod validate;
 mod wal;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
-use file::OpenMode;
+pub(crate) use file::OpenMode;
+#[allow(
+    unused_imports,
+    reason = "crate-private storage bridge is consumed by subsequent Phase 4B API tasks"
+)]
+pub(crate) use pager::{Pager, PagerConfig, ReadSnapshot, WriteBatch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct PageId(pub(super) u64);

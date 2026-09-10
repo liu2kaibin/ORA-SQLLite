@@ -203,6 +203,28 @@ impl CatalogReader {
         Self::open_validated(snapshot, &tree, report)
     }
 
+    pub(super) fn open_empty_or_v1_batch(batch: &mut WriteBatch<'_>) -> Result<Self> {
+        let feature_bits = batch.feature_bits();
+        validate_feature_bits(feature_bits)?;
+        if feature_bits & CATALOG_V1 == 0 {
+            if batch.catalog_root().0 != 0 {
+                return Err(unsupported_legacy());
+            }
+            return Ok(Self {
+                image: CatalogImage::empty(),
+            });
+        }
+        let (tree, report) = batch
+            .catalog_tree_with_report(TreeKind::Table)?
+            .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
+        batch.require_current_catalog_root(tree.root())?;
+        let reader = Self::open_validated(batch, &tree, report)?;
+        for table in reader.image.tables.values() {
+            batch.require_current_catalog_root(table.root())?;
+        }
+        Ok(reader)
+    }
+
     /// Validate an unpublished candidate; its current root can differ from the header.
     pub(super) fn open_candidate(
         batch: &mut WriteBatch<'_>,
