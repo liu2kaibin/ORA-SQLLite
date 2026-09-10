@@ -3,6 +3,12 @@ mod ast;
 #[allow(
     dead_code,
     unused_imports,
+    reason = "later Phase 4B binders consume catalog binding scopes"
+)]
+pub(crate) mod bind;
+#[allow(
+    dead_code,
+    unused_imports,
     reason = "later Phase 4B binders and Phase 4C execution consume the bound IR"
 )]
 pub(crate) mod bound;
