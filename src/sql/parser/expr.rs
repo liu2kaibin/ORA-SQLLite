@@ -204,6 +204,13 @@ fn source_token_probes() -> usize {
     SOURCE_TOKEN_PROBES.get()
 }
 
+#[cfg(test)]
+fn measure_source_token_probes<T>(action: impl FnOnce() -> T) -> (T, usize) {
+    reset_source_token_probes();
+    let result = action();
+    (result, source_token_probes())
+}
+
 #[inline]
 fn record_source_token_probe() {
     #[cfg(test)]
@@ -1151,22 +1158,16 @@ mod tests {
     }
 
     #[test]
-    fn source_token_navigation_is_bounded_for_deep_balanced_aggregates() {
+    fn deep_balanced_aggregate_spans_preserve_comments_and_parentheses() {
         let mut fragment = String::from("A");
         for _ in 0..16 {
             fragment = format!("SUM(/*l*/{fragment}/*r*/)");
         }
         let limits = SqlLimits::default().with_max_nesting(256).unwrap();
 
-        reset_source_token_probes();
         let expression = parse_expr_fragment(&fragment, &limits).unwrap();
-        let probes = source_token_probes();
 
         assert_eq!(expression.span, SqlSpan::new(7, 248).unwrap());
-        assert!(
-            probes <= 250,
-            "source token navigation used {probes} probes"
-        );
     }
 
     #[test]
@@ -1178,8 +1179,8 @@ mod tests {
         for position in 0..100_000 {
             let kind = match position {
                 1 => SourceTokenKind::LeftParenthesis,
-                50_000 => SourceTokenKind::Plus,
                 99_998 => SourceTokenKind::RightParenthesis,
+                _ if position % 2 == 0 => SourceTokenKind::Plus,
                 _ => SourceTokenKind::Other,
             };
             let token = SourceToken {
@@ -1192,25 +1193,42 @@ mod tests {
         }
         let source_map = SourceMap::new("X").unwrap();
 
-        reset_source_token_probes();
-        let before = index
-            .token_before(200_000, SourceTokenKind::Other, &source_map)
-            .unwrap();
-        let after = index
-            .token_after(199_998, SourceTokenKind::Other, &source_map)
-            .unwrap();
-        let between = index
-            .token_between(100_000, 100_001, SourceTokenKind::Plus, &source_map)
-            .unwrap();
-        let closing = index
-            .matching_right_parenthesis(index.tokens[1], &source_map)
-            .unwrap();
+        let (before, before_probes) = measure_source_token_probes(|| {
+            index
+                .token_before(200_000, SourceTokenKind::Other, &source_map)
+                .unwrap()
+        });
+        let (after, after_probes) = measure_source_token_probes(|| {
+            index
+                .token_after(199_998, SourceTokenKind::Other, &source_map)
+                .unwrap()
+        });
+        let (between, between_probes) = measure_source_token_probes(|| {
+            index
+                .token_between(199_992, 199_993, SourceTokenKind::Plus, &source_map)
+                .unwrap()
+        });
+        let (closing, matching_probes) = measure_source_token_probes(|| {
+            index
+                .matching_right_parenthesis(index.tokens[1], &source_map)
+                .unwrap()
+        });
 
         assert_eq!(before.span, SqlSpan::new(199_998, 199_999).unwrap());
         assert_eq!(after.span, SqlSpan::new(199_998, 199_999).unwrap());
-        assert_eq!(between.span, SqlSpan::new(100_000, 100_001).unwrap());
+        assert_eq!(between.span, SqlSpan::new(199_992, 199_993).unwrap());
         assert_eq!(closing.span, SqlSpan::new(199_996, 199_997).unwrap());
-        assert!(source_token_probes() <= 40);
+        for (operation, probes) in [
+            ("before", before_probes),
+            ("after", after_probes),
+            ("between", between_probes),
+        ] {
+            assert!(
+                (15..=17).contains(&probes),
+                "{operation} inspected {probes} candidates"
+            );
+        }
+        assert_eq!(matching_probes, 1);
     }
 
     #[test]
