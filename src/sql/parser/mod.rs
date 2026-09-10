@@ -1,7 +1,14 @@
 mod expr;
 mod query;
 mod source;
+mod statement;
 mod tokens;
+
+#[allow(
+    unused_imports,
+    reason = "the binder task consumes the top-level statement parser"
+)]
+pub(super) use statement::parse_statement;
 
 use crate::error::SqlLocation;
 use crate::sql::SqlLimits;
