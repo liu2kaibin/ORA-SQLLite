@@ -1,4 +1,5 @@
 mod expr;
+mod query;
 mod source;
 mod tokens;
 
