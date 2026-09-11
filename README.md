@@ -33,6 +33,11 @@ Phase 4A provides V1 system catalog persistence, stable object IDs,
 snapshot-visible table and column definitions, hidden ROWID allocation, and
 canonical row encoding. These physical catalog and row-storage APIs are internal.
 
+Phase 4B provides real create, open, connect, transaction, and prepare APIs.
+Preparation uses an owned SQL parser and AST, snapshot catalog binding, static
+type checking, and stable parameter/result metadata without executing SQL or
+writing the database or WAL.
+
 Creation synchronizes the main/WAL files and their parent directory entries before
 publishing the format-2 initialization marker. Unix uses a directory file sync;
 Windows uses a writable directory handle with `FILE_FLAG_BACKUP_SEMANTICS` and
@@ -46,9 +51,10 @@ Index publication is a constant-size state swap after WAL synchronization; prepa
 that swap currently copies the total in-memory index before each commit. This is an
 explicit Phase 3 performance/memory tradeoff, not a persistent-index implementation.
 
-SQL parsing and binding, the public database/connection/statement API, DDL/DML
-execution, indexes, and constraint enforcement remain unimplemented. These are
-Phase 4B and Phase 4C work; Phase 4A APIs are crate-internal storage boundaries.
+SQL execution, user-row CRUD, index maintenance, and constraint enforcement
+remain Phase 4C work. Oracle-specific type declarations, functions, `DUAL`,
+`ROWNUM`, pagination, and other compatibility behavior remain Phase 5 work.
+Phase 4B is prepare-only; Phase 4A APIs remain crate-internal storage boundaries.
 Phase 3 supports multiple readers and one writer only within one process; a second
 process opening the same database receives `Busy`.
 

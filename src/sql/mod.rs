@@ -40,3 +40,16 @@ pub(crate) use name::{Identifier, ParameterKey, ParameterStyle};
     reason = "later SQL frontend layers import these shared type primitives"
 )]
 pub(crate) use types::{SqlSpan, SqlType};
+
+use crate::{Result, storage::catalog::CatalogReader};
+
+/// Parses and binds one SQL statement against an immutable catalog image.
+pub(crate) fn bind_sql(
+    sql: &str,
+    limits: &SqlLimits,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+) -> Result<bound::BoundStatement> {
+    let statement = parser::parse_statement(sql, limits)?;
+    bind::bind_statement(&statement, catalog, database_uuid)
+}

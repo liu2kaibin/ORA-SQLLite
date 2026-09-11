@@ -1,6 +1,10 @@
 use std::{fmt, sync::Arc};
 
-use crate::{Result, sql::bound::BoundStatement, storage::catalog::CatalogReader};
+use crate::{
+    DbError, ErrorCode, Result, SqlLimits,
+    sql::{bind_sql, bound::BoundStatement},
+    storage::catalog::CatalogReader,
+};
 
 use super::{ColumnMetadata, ParameterMetadata};
 
@@ -70,10 +74,6 @@ impl fmt::Debug for PublicColumn<'_> {
 }
 
 impl Statement {
-    #[allow(
-        dead_code,
-        reason = "the Phase 4B prepare pipeline is added in a later task"
-    )]
     pub(crate) fn from_bound(bound: BoundStatement) -> Self {
         let parameters = bound.parameters().to_vec().into_boxed_slice();
         let columns = bound.columns().to_vec().into_boxed_slice();
@@ -105,6 +105,23 @@ impl Statement {
     ) -> Result<()> {
         self.bound.validate_schema(database_uuid, catalog)
     }
+}
+
+/// Runs the single prepare pipeline shared by connection and transaction APIs.
+pub(crate) fn prepare_with_catalog(
+    sql: &str,
+    limits: &SqlLimits,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+) -> Result<Statement> {
+    let bound = bind_sql(sql, limits, catalog, database_uuid)?;
+    if bound.parameters().len() > usize::from(limits.max_parameters()) {
+        return Err(DbError::new(
+            ErrorCode::Bind,
+            "SQL statement exceeds the configured logical parameter limit",
+        ));
+    }
+    Ok(Statement::from_bound(bound))
 }
 
 #[cfg(test)]

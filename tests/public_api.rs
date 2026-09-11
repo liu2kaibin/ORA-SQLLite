@@ -84,3 +84,25 @@ fn unfinished_write_transaction_rolls_back_and_read_only_rejects_writes() {
         ErrorCode::Unsupported
     );
 }
+
+#[test]
+fn public_prepare_accepts_create_table_on_a_new_empty_database() {
+    // Production break caught: a public prepare path that bypasses the empty
+    // catalog bridge or attempts execution cannot prepare this DDL read-only.
+    let paths = TempPaths::new("public-prepare-create-table");
+    let db = Database::create(paths.main(), Options::default()).unwrap();
+    drop(db);
+    let before_main = std::fs::read(paths.main()).unwrap();
+    let before_wal = std::fs::read(paths.wal()).unwrap();
+
+    let statement = {
+        let db = Database::open(paths.main(), Options::default()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.prepare("CREATE TABLE T (ID INT64)").unwrap()
+    };
+
+    assert!(statement.parameters().is_empty());
+    assert!(statement.columns().is_empty());
+    assert_eq!(std::fs::read(paths.main()).unwrap(), before_main);
+    assert_eq!(std::fs::read(paths.wal()).unwrap(), before_wal);
+}

@@ -2,15 +2,11 @@ use std::{cell::Cell, fmt, marker::PhantomData};
 
 use crate::{Result, SqlLimits, storage::Pager};
 
-use super::{ReadTransaction, WriteTransaction};
+use super::{ReadTransaction, Statement, WriteTransaction, statement::prepare_with_catalog};
 
 /// A single database session used to start transactions.
 pub struct Connection {
     pager: Pager,
-    #[allow(
-        dead_code,
-        reason = "connection SQL limits are consumed by later statement-binding tasks"
-    )]
     sql_limits: SqlLimits,
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -22,6 +18,14 @@ impl Connection {
             sql_limits,
             _not_sync: PhantomData,
         }
+    }
+
+    /// Prepares one SQL statement against a short-lived current catalog snapshot.
+    pub fn prepare(&self, sql: &str) -> Result<Statement> {
+        let database_uuid = self.pager.database_uuid()?;
+        let mut snapshot = self.pager.begin_read()?;
+        let catalog = snapshot.catalog_reader()?;
+        prepare_with_catalog(sql, &self.sql_limits, &catalog, database_uuid)
     }
 
     /// Starts a read transaction at the current committed snapshot.
@@ -39,12 +43,22 @@ impl Connection {
     /// }
     /// ```
     pub fn begin_read(&mut self) -> Result<ReadTransaction<'_>> {
-        Ok(ReadTransaction::new(self.pager.begin_read()?))
+        let database_uuid = self.pager.database_uuid()?;
+        Ok(ReadTransaction::new(
+            self.pager.begin_read()?,
+            self.sql_limits,
+            database_uuid,
+        ))
     }
 
     /// Starts an exclusive write transaction.
     pub fn begin_write(&mut self) -> Result<WriteTransaction<'_>> {
-        Ok(WriteTransaction::new(self.pager.begin_write()?))
+        let database_uuid = self.pager.database_uuid()?;
+        Ok(WriteTransaction::new(
+            self.pager.begin_write()?,
+            self.sql_limits,
+            database_uuid,
+        ))
     }
 }
 
