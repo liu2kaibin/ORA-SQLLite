@@ -402,6 +402,22 @@ fn apply_expected(
     expected: SqlType,
     context: &mut ParameterCollector,
 ) -> Result<()> {
+    if matches!(
+        &expression.kind,
+        BoundExprKind::Unary {
+            op: BoundUnaryOp::Positive | BoundUnaryOp::Negative,
+            ..
+        } | BoundExprKind::Binary {
+            op: BoundBinaryOp::Add
+                | BoundBinaryOp::Subtract
+                | BoundBinaryOp::Multiply
+                | BoundBinaryOp::Divide
+                | BoundBinaryOp::Modulo,
+            ..
+        }
+    ) {
+        require_numeric_or_indeterminate(expected)?;
+    }
     let common = expression.sql_type.unify(expected)?;
     match &mut expression.kind {
         BoundExprKind::Parameter(identifier) => {
@@ -974,6 +990,26 @@ mod tests {
                 .expression
                 .nullable
         );
+    }
+
+    #[test]
+    fn nonnumeric_contexts_cannot_retype_arithmetic_or_unary_signs() {
+        // Production break caught: applying an outer Bool or Text expectation
+        // after numeric validation must not turn Unknown arithmetic leaves into
+        // nonnumeric parameters and make an invalid expression prepare.
+        for invalid in [
+            ":x + :y",
+            "(:x + :y) = NAME",
+            "(:x + :y) LIKE 'x'",
+            "+:x",
+            "+:x LIKE 'x'",
+        ] {
+            assert_eq!(
+                bind_where(invalid, mixed_fixture()).unwrap_err().code(),
+                ErrorCode::Type,
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
