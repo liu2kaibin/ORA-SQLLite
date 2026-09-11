@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use sqlparser::dialect::OracleDialect;
 pub(super) use sqlparser::tokenizer::TokenWithSpan;
@@ -7,6 +7,8 @@ use sqlparser::tokenizer::{Span, Token, Tokenizer};
 use super::source::SourceMap;
 use crate::sql::{ParameterKey, ParameterStyle, SqlLimits, SqlSpan};
 use crate::{DbError, ErrorCode, Result};
+
+type ParameterOccurrence = (ParameterKey, SqlSpan);
 
 pub(super) fn tokenize(sql: &str, limits: &SqlLimits) -> Result<Vec<TokenWithSpan>> {
     if sql.len() > limits.max_sql_bytes() as usize {
@@ -30,7 +32,7 @@ pub(super) fn tokenize(sql: &str, limits: &SqlLimits) -> Result<Vec<TokenWithSpa
     let (tokens, parameters) =
         rewrite_oracle_binds(sql, &source_map, raw_tokens, limits.max_tokens() as usize)?;
 
-    validate_parameter_sequence(&parameters)?;
+    validate_parameter_sequence(&parameters, limits.max_parameters() as usize, &source_map)?;
     Ok(tokens)
 }
 
@@ -39,7 +41,7 @@ fn rewrite_oracle_binds(
     source_map: &SourceMap<'_>,
     raw_tokens: Vec<TokenWithSpan>,
     max_tokens: usize,
-) -> Result<(Vec<TokenWithSpan>, Vec<ParameterKey>)> {
+) -> Result<(Vec<TokenWithSpan>, Vec<ParameterOccurrence>)> {
     let mut tokens = Vec::with_capacity(raw_tokens.len());
     let mut parameters = Vec::new();
     let mut token_count = 0;
@@ -69,6 +71,18 @@ fn rewrite_oracle_binds(
         }
 
         if next_index == index + 1 {
+            if let Some(next) = raw_tokens.get(next_index) {
+                let next_span = source_map.span(next.span)?;
+                if next_span.start() == colon_span.end()
+                    && matches!(&next.token, Token::Word(word) if word.quote_style.is_some())
+                {
+                    return Err(DbError::new(
+                        ErrorCode::Bind,
+                        "parameter name must be an unquoted identifier",
+                    )
+                    .with_sql_location(source_map.location(colon_span.start())?));
+                }
+            }
             charge_token(&token.token, &mut token_count, max_tokens)?;
             tokens.push(token.clone());
             index += 1;
@@ -84,7 +98,7 @@ fn rewrite_oracle_binds(
             Token::Placeholder(text.to_owned()),
             upstream_span,
         ));
-        parameters.push(parameter);
+        parameters.push((parameter, span));
         index = next_index;
     }
 
@@ -130,14 +144,18 @@ fn token_limit_error() -> DbError {
     )
 }
 
-fn validate_parameter_sequence(parameters: &[ParameterKey]) -> Result<()> {
+fn validate_parameter_sequence(
+    parameters: &[ParameterOccurrence],
+    max_parameters: usize,
+    source_map: &SourceMap<'_>,
+) -> Result<()> {
     let Some(first) = parameters.first() else {
         return Ok(());
     };
-    let style = first.style();
+    let style = first.0.style();
     if parameters
         .iter()
-        .any(|parameter| parameter.style() != style)
+        .any(|(parameter, _)| parameter.style() != style)
     {
         return Err(DbError::new(
             ErrorCode::Bind,
@@ -148,7 +166,7 @@ fn validate_parameter_sequence(parameters: &[ParameterKey]) -> Result<()> {
     if style == ParameterStyle::Positional {
         let positions = parameters
             .iter()
-            .filter_map(|parameter| match parameter {
+            .filter_map(|(parameter, _)| match parameter {
                 ParameterKey::Position(position) => Some(position.get()),
                 ParameterKey::Name(_) => None,
             })
@@ -163,6 +181,17 @@ fn validate_parameter_sequence(parameters: &[ParameterKey]) -> Result<()> {
                 ErrorCode::Bind,
                 "positional parameters must be contiguous starting at :1",
             ));
+        }
+    }
+
+    let mut distinct = HashSet::new();
+    for (parameter, span) in parameters {
+        if distinct.insert(parameter) && distinct.len() > max_parameters {
+            return Err(DbError::new(
+                ErrorCode::Bind,
+                "SQL statement exceeds the configured logical parameter limit",
+            )
+            .with_sql_location(source_map.location(span.start())?));
         }
     }
 

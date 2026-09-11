@@ -14,11 +14,11 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
-use super::AstBudget;
 use super::expr::convert_expr;
 use super::query::{convert_query, preflight_unparsed_query_syntax};
 use super::source::SourceMap;
 use super::tokens::tokenize;
+use super::{AstBudget, unquoted_identifier};
 use crate::sql::ast::{
     Assignment, AstStatement, ColumnDefinition, Constraint, CreateIndex, CreateTable, Delete,
     DropObject, ForeignKey, Insert, NamedColumns, NotNull, TypeArgument, TypeDeclaration,
@@ -48,6 +48,11 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
         return Err(unsupported(&source_map, Some(span)));
     }
     let statement_span = token_index.require_exactly_one_statement(&source_map)?;
+    if token_index.starts_with_keyword(Keyword::CREATE)
+        && token_index.keyword(1) == Keyword::TABLESPACE
+    {
+        return Err(unsupported(&source_map, Some(token_index.span(1))));
+    }
 
     if token_index.starts_with_keyword(Keyword::SELECT) {
         preflight_unparsed_query_syntax(&tokens, &source_map)?;
@@ -1456,7 +1461,7 @@ fn convert_single_name(name: ObjectName, source_map: &SourceMap<'_>) -> Result<I
 fn convert_identifier(identifier: Ident, source_map: &SourceMap<'_>) -> Result<Identifier> {
     let span = source_map.span(identifier.span)?;
     match identifier.quote_style {
-        None => Identifier::unquoted(identifier.value, span),
+        None => unquoted_identifier(identifier.value, span, source_map),
         Some('"') => Identifier::quoted(identifier.value, span),
         _ => Err(unsupported(source_map, Some(span))),
     }
@@ -1468,7 +1473,7 @@ fn identifier_from_word(
     source_map: &SourceMap<'_>,
 ) -> Result<Identifier> {
     match word.quote_style {
-        None => Identifier::unquoted(word.value.clone(), span),
+        None => unquoted_identifier(&word.value, span, source_map),
         Some('"') => Identifier::quoted(word.value.clone(), span),
         _ => Err(unsupported(source_map, Some(span))),
     }

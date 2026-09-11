@@ -1,7 +1,24 @@
 mod common;
 
 use common::TempPaths;
-use ora_sqllite::{AccessMode, Database, ErrorCode, Options, SqlLimits};
+use ora_sqllite::{
+    AccessMode, Database, ErrorCode, Options, ReadTransaction, SqlLimits, Statement,
+    WriteTransaction,
+};
+
+fn prepare_read_transaction<'connection>(
+    transaction: &mut ReadTransaction<'connection>,
+    sql: &str,
+) -> ora_sqllite::Result<Statement> {
+    transaction.prepare(sql)
+}
+
+fn prepare_write_transaction<'connection>(
+    transaction: &mut WriteTransaction<'connection>,
+    sql: &str,
+) -> ora_sqllite::Result<Statement> {
+    transaction.prepare(sql)
+}
 
 #[test]
 fn create_is_exclusive_and_open_never_creates() {
@@ -105,4 +122,27 @@ fn public_prepare_accepts_create_table_on_a_new_empty_database() {
     assert!(statement.columns().is_empty());
     assert_eq!(std::fs::read(paths.main()).unwrap(), before_main);
     assert_eq!(std::fs::read(paths.wal()).unwrap(), before_wal);
+}
+
+#[test]
+fn public_transaction_prepare_methods_have_the_required_mutable_receivers() {
+    // Production break caught: making either transaction prepare method
+    // crate-private, changing its mutable receiver, or returning a non-public
+    // statement type makes this external-crate integration contract fail.
+    let paths = TempPaths::new("public-transaction-prepare");
+    let db = Database::create(paths.main(), Options::default()).unwrap();
+
+    let mut connection = db.connect().unwrap();
+    let mut read = connection.begin_read().unwrap();
+    let read_statement = prepare_read_transaction(&mut read, "CREATE TABLE T (ID INT64)").unwrap();
+    assert!(read_statement.parameters().is_empty());
+    assert!(read_statement.columns().is_empty());
+    drop(read);
+
+    let mut write = connection.begin_write().unwrap();
+    let write_statement =
+        prepare_write_transaction(&mut write, "CREATE TABLE T (ID INT64)").unwrap();
+    assert!(write_statement.parameters().is_empty());
+    assert!(write_statement.columns().is_empty());
+    write.rollback().unwrap();
 }

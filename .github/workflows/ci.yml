@@ -53,15 +53,11 @@ jobs:
       - name: Install Rust 1.85
         run: rustup toolchain install 1.85.0 --profile minimal
       - name: Run deterministic SQL corpus
-        run: rustup run 1.85.0 cargo test phase_4b_sql_corpus -- --exact --nocapture
-      - name: Run module-qualified deterministic SQL corpus
         run: >-
           rustup run 1.85.0 cargo test
           sql::bind::test_support::phase_4b_sql_corpus
           -- --exact --nocapture
       - name: Run deterministic SQL no-panic model
-        run: rustup run 1.85.0 cargo test phase_4b_random_sql_never_panics -- --exact
-      - name: Run module-qualified deterministic SQL no-panic model
         run: >-
           rustup run 1.85.0 cargo test
           sql::bind::test_support::phase_4b_random_sql_never_panics

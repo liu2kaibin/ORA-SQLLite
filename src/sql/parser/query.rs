@@ -8,9 +8,9 @@ use sqlparser::dialect::OracleDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
-use super::AstBudget;
 use super::expr::convert_expr;
 use super::source::SourceMap;
+use super::{AstBudget, unquoted_identifier};
 use crate::sql::ast::{
     AggregateArgument, AstExpr, AstExprKind, AstQuery, Join, JoinKind, NullPlacement,
     OrderDirection, OrderItem, SelectItem, TableSource,
@@ -1149,7 +1149,7 @@ fn convert_single_name(name: ObjectName, source_map: &SourceMap<'_>) -> Result<I
 fn convert_identifier(identifier: Ident, source_map: &SourceMap<'_>) -> Result<Identifier> {
     let span = source_map.span(identifier.span)?;
     match identifier.quote_style {
-        None => Identifier::unquoted(identifier.value, span),
+        None => unquoted_identifier(identifier.value, span, source_map),
         Some('"') => Identifier::quoted(identifier.value, span),
         _ => Err(unsupported(source_map, Some(span))),
     }

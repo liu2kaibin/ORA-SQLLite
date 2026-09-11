@@ -11,8 +11,38 @@ mod tokens;
 pub(super) use statement::parse_statement;
 
 use crate::error::SqlLocation;
-use crate::sql::SqlLimits;
+use crate::sql::{Identifier, SqlLimits, SqlSpan};
 use crate::{DbError, ErrorCode, Result};
+
+fn unquoted_identifier(
+    value: impl AsRef<str>,
+    span: SqlSpan,
+    source_map: &source::SourceMap<'_>,
+) -> Result<Identifier> {
+    use sqlparser::keywords::{ALL_KEYWORDS, ALL_KEYWORDS_INDEX, RESERVED_FOR_IDENTIFIER};
+
+    let value = value.as_ref();
+    if value.contains('@') {
+        return Err(DbError::new(
+            ErrorCode::Unsupported,
+            "database-link identifiers are outside the Phase 4B SQL surface",
+        )
+        .with_sql_location(source_map.location(span.start())?));
+    }
+    let normalized = value.to_ascii_uppercase();
+    let reserved = ALL_KEYWORDS
+        .binary_search(&normalized.as_str())
+        .ok()
+        .is_some_and(|index| RESERVED_FOR_IDENTIFIER.contains(&ALL_KEYWORDS_INDEX[index]));
+    if reserved {
+        return Err(DbError::new(
+            ErrorCode::Bind,
+            "reserved word must be quoted when used as an identifier",
+        )
+        .with_sql_location(source_map.location(span.start())?));
+    }
+    Identifier::unquoted(value, span)
+}
 
 pub(super) struct AstBudget {
     remaining_nodes: u32,

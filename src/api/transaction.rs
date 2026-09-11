@@ -114,3 +114,42 @@ impl Drop for WriteTransaction<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Database, ErrorCode, Options,
+        storage::{
+            catalog::types::ColumnType,
+            test_support::{phase_4b_add_table, phase_4b_catalog_fixture},
+        },
+    };
+
+    #[test]
+    fn read_transaction_prepare_reuses_original_catalog_snapshot() {
+        // Production break caught: opening a fresh snapshot inside prepare would
+        // let an already-open read transaction observe a later catalog commit.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let writer_pager = db.pager.clone();
+        let mut connection = db.connect().unwrap();
+        let mut old_read = connection.begin_read().unwrap();
+
+        phase_4b_add_table(
+            &writer_pager,
+            "NEW_TABLE",
+            &[("ID", ColumnType::Int64, false)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            old_read
+                .prepare("SELECT ID FROM NEW_TABLE")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+        drop(old_read);
+        assert!(connection.prepare("SELECT ID FROM NEW_TABLE").is_ok());
+    }
+}

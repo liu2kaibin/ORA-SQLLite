@@ -210,6 +210,19 @@ fn insert_phase_4b_table(
     Ok(table_id)
 }
 
+pub(crate) fn phase_4b_add_table(
+    pager: &Pager,
+    name: &str,
+    columns: &[(&str, ColumnType, bool)],
+) -> Result<TableId> {
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    let table_id = insert_phase_4b_table(&mut writer, &mut batch, name, columns)?;
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+    Ok(table_id)
+}
+
 #[test]
 fn phase_4b_bridge_reads_uuid_and_real_catalog_from_both_transaction_kinds() {
     let fixture = phase_4b_catalog_fixture(4096);

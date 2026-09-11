@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use crate::{
-    DbError, ErrorCode, Result, SqlLimits,
+    Result, SqlLimits,
     sql::{bind_sql, bound::BoundStatement},
     storage::catalog::CatalogReader,
 };
@@ -115,12 +115,6 @@ pub(crate) fn prepare_with_catalog(
     database_uuid: [u8; 16],
 ) -> Result<Statement> {
     let bound = bind_sql(sql, limits, catalog, database_uuid)?;
-    if bound.parameters().len() > usize::from(limits.max_parameters()) {
-        return Err(DbError::new(
-            ErrorCode::Bind,
-            "SQL statement exceeds the configured logical parameter limit",
-        ));
-    }
     Ok(Statement::from_bound(bound))
 }
 

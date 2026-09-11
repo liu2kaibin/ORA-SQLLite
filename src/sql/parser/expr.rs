@@ -12,8 +12,8 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 #[cfg(test)]
 use std::cell::Cell;
 
-use super::AstBudget;
 use super::source::SourceMap;
+use super::{AstBudget, unquoted_identifier};
 use crate::sql::ast::{
     AggregateArgument, AggregateFunction, AstExpr, AstExprKind, BinaryOp, UnaryOp,
 };
@@ -551,7 +551,7 @@ fn convert_is_null(
 fn convert_identifier(ident: Ident, source_map: &SourceMap<'_>) -> Result<Identifier> {
     let span = source_map.span(ident.span)?;
     match ident.quote_style {
-        None => Identifier::unquoted(ident.value, span),
+        None => unquoted_identifier(ident.value, span, source_map),
         Some('"') => Identifier::quoted(ident.value, span),
         _ => Err(unsupported(source_map, Some(&span))),
     }

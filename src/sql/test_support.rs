@@ -86,11 +86,34 @@ fn prepare_returns_metadata_without_writing_database_or_wal() {
 }
 
 #[test]
-fn prepare_rejects_first_logical_parameter_over_limit() {
-    // Production break caught: retaining max_parameters as configuration-only
-    // state lets a statement allocate and expose more logical binds than allowed.
+fn write_transaction_prepare_leaves_an_empty_batch_unmodified() {
+    // Production break caught: any prepare-time batch mutation would make an
+    // otherwise empty commit publish different database or WAL bytes.
     let fixture = phase_4b_catalog_fixture(4096);
-    let limits = SqlLimits::default().with_max_parameters(1).unwrap();
+    let before_main = std::fs::read(fixture.main_path()).unwrap();
+    let before_wal = std::fs::read(fixture.wal_path()).unwrap();
+
+    {
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut write = connection.begin_write().unwrap();
+        write
+            .prepare("SELECT ID, NAME FROM USERS WHERE ID = :1")
+            .unwrap();
+        write.commit().unwrap();
+    }
+
+    assert_eq!(std::fs::read(fixture.main_path()).unwrap(), before_main);
+    assert_eq!(std::fs::read(fixture.wal_path()).unwrap(), before_wal);
+}
+
+#[test]
+fn prepare_rejects_first_logical_parameter_over_limit() {
+    // Production break caught: checking the limit after catalog binding both
+    // allocates all logical parameters and lets an unrelated catalog error hide
+    // the first excess normalized parameter and its source location.
+    let fixture = phase_4b_catalog_fixture(4096);
+    let limits = SqlLimits::default().with_max_parameters(2).unwrap();
     let db = Database::open(
         fixture.main_path(),
         Options::default().with_sql_limits(limits),
@@ -98,19 +121,22 @@ fn prepare_rejects_first_logical_parameter_over_limit() {
     .unwrap();
     let conn = db.connect().unwrap();
 
-    assert_eq!(
-        conn.prepare("SELECT :only FROM USERS")
-            .unwrap()
-            .parameters()
-            .len(),
-        1
-    );
-    assert_eq!(
-        conn.prepare("SELECT :first, :second FROM USERS")
-            .unwrap_err()
-            .code(),
-        ErrorCode::Bind
-    );
+    let below = conn.prepare("SELECT :first, :FIRST FROM USERS").unwrap();
+    assert_eq!(below.parameters().len(), 1);
+
+    let exact = conn
+        .prepare("SELECT :first, :FIRST, :second FROM USERS")
+        .unwrap();
+    assert_eq!(exact.parameters().len(), 2);
+
+    let above = "SELECT :first, :FIRST, :second,\n  :third FROM MISSING";
+    let error = conn.prepare(above).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Bind);
+    let location = error
+        .sql_location()
+        .expect("the first excess logical parameter has a source location");
+    assert_eq!(location.byte_offset(), above.find(":third").unwrap());
+    assert_eq!((location.line(), location.column()), (2, 3));
 }
 
 fn public_prepare_with_limits(
@@ -144,7 +170,12 @@ fn phase_4b_sql_corpus() {
         "SELECT USER_ID, COUNT(*), SUM(ID), AVG(ID), MIN(ID), MAX(ID) FROM ORDERS GROUP BY USER_ID HAVING COUNT(*) > 0 ORDER BY 1",
         "SELECT NULL, TRUE, 1, 1.5, 1E2, 'A''B', X'ABCD' FROM USERS",
         "SELECT ID FROM USERS WHERE NOT (ID BETWEEN 1 AND 10) OR (NAME LIKE 'A%' AND ID IN (1, 2) AND NAME IS NOT NULL)",
+        "SELECT +ID, -ID, ID + 1, ID - 1, ID * 2, ID / 2, ID % 2 FROM USERS WHERE ID <> 0 AND ID != 1 AND ID < 10 AND ID <= 10 AND ID > -1 AND ID >= 0 AND ID IS NOT NULL AND ID NOT IN (3) AND ID NOT BETWEEN 4 AND 5 AND NAME NOT LIKE 'Z%'",
+        "SELECT :1, :1 FROM USERS",
+        "SELECT :name, :NAME, :NaMe FROM USERS",
+        "SELECT :2, :1 FROM USERS",
         "INSERT INTO USERS (ID, NAME) VALUES (:id, :name)",
+        "INSERT INTO USERS VALUES (:id, :name, :amount, :float_col)",
         "UPDATE USERS U SET NAME = U.NAME, ID = ID + :delta WHERE U.ID = :id",
         "DELETE FROM USERS U WHERE U.ID = :id",
         "CREATE TABLE CHILD (ID INT64 PRIMARY KEY, USER_ID INT64 REFERENCES USERS (ID), NAME TEXT NOT NULL, AMOUNT DECIMAL, SCORE FLOAT64, RAW_VALUE BLOB, CREATED DATE, UPDATED TIMESTAMP, ENABLED BOOL, CONSTRAINT CHILD_CK CHECK (ID > 0), UNIQUE (NAME))",
@@ -159,19 +190,66 @@ fn phase_4b_sql_corpus() {
             .unwrap_or_else(|error| panic!("accepted corpus rejected {sql:?}: {error}"));
     }
 
+    for (sql, logical_parameters) in [
+        ("SELECT :1, :1 FROM USERS", 1),
+        ("SELECT :name, :NAME, :NaMe FROM USERS", 1),
+        ("SELECT :2, :1 FROM USERS", 2),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().parameters().len(),
+            logical_parameters,
+            "wrong normalized logical-parameter count for {sql:?}"
+        );
+    }
+
+    for (bytes, accepted) in [(127, true), (128, true), (129, false)] {
+        let identifier = "A".repeat(bytes);
+        let sql = format!("CREATE TABLE {identifier} (ID INT64)");
+        let result = conn.prepare(&sql);
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "wrong public-prepare result for a {bytes}-byte identifier: {result:?}"
+        );
+        if !accepted {
+            assert_eq!(result.unwrap_err().code(), ErrorCode::Bind);
+        }
+    }
+
     let rejected = [
         ("", ErrorCode::Syntax),
         ("SELECT ID FROM USERS; DELETE FROM USERS", ErrorCode::Syntax),
         ("SELECT FROM USERS", ErrorCode::Syntax),
+        (
+            "SELECT /* outer /* nested */ still outer */ ID FROM USERS",
+            ErrorCode::Syntax,
+        ),
+        ("SELECT ID FROM [USERS]", ErrorCode::Syntax),
+        ("SELECT ID FROM `USERS`", ErrorCode::Syntax),
+        ("CREATE TABLE \"\" (ID INT64)", ErrorCode::Bind),
+        ("CREATE TABLE EXISTS (ID INT64)", ErrorCode::Bind),
         ("SELECT ID FROM USERS U WHERE USERS.ID = 1", ErrorCode::Bind),
+        (
+            "SELECT X.ID FROM USERS X INNER JOIN ORDERS X ON X.ID = X.USER_ID",
+            ErrorCode::Bind,
+        ),
+        (
+            "SELECT ID FROM USERS U INNER JOIN ORDERS O ON O.USER_ID = U.ID",
+            ErrorCode::Bind,
+        ),
         (
             "SELECT ID FROM USERS U INNER JOIN ORDERS O ON O.ID = U.ID",
             ErrorCode::Bind,
         ),
         ("SELECT MISSING FROM USERS", ErrorCode::Bind),
         ("SELECT USERS.ID.VALUE FROM USERS", ErrorCode::Unsupported),
+        ("SELECT ID FROM APP.USERS", ErrorCode::Unsupported),
+        ("SELECT ID FROM USERS@REMOTE", ErrorCode::Unsupported),
         ("SELECT :1, :name FROM USERS", ErrorCode::Bind),
+        ("SELECT :0 FROM USERS", ErrorCode::Bind),
         ("SELECT :01 FROM USERS", ErrorCode::Bind),
+        ("SELECT :65536 FROM USERS", ErrorCode::Bind),
+        ("SELECT :\"name\" FROM USERS", ErrorCode::Bind),
         ("SELECT :1, :3 FROM USERS", ErrorCode::Bind),
         (
             "SELECT ID FROM (SELECT ID FROM USERS) X",
@@ -186,6 +264,14 @@ fn phase_4b_sql_corpus() {
             ErrorCode::Unsupported,
         ),
         (
+            "SELECT ID FROM USERS INTERSECT SELECT ID FROM ORDERS",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "SELECT ID FROM USERS MINUS SELECT ID FROM ORDERS",
+            ErrorCode::Unsupported,
+        ),
+        (
             "SELECT U.ID FROM USERS U RIGHT JOIN ORDERS O ON O.USER_ID = U.ID",
             ErrorCode::Unsupported,
         ),
@@ -193,26 +279,78 @@ fn phase_4b_sql_corpus() {
             "SELECT U.ID FROM USERS U CROSS JOIN ORDERS O",
             ErrorCode::Unsupported,
         ),
+        (
+            "SELECT U.ID FROM USERS U FULL JOIN ORDERS O ON O.USER_ID = U.ID",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "SELECT U.ID FROM USERS U NATURAL JOIN ORDERS O",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "SELECT U.ID FROM USERS U INNER JOIN ORDERS O USING (ID)",
+            ErrorCode::Unsupported,
+        ),
         ("SELECT ID FROM USERS LIMIT 1", ErrorCode::Unsupported),
+        ("SELECT ID FROM USERS OFFSET 1 ROWS", ErrorCode::Unsupported),
+        (
+            "SELECT ID FROM USERS FETCH FIRST 1 ROWS ONLY",
+            ErrorCode::Unsupported,
+        ),
         (
             "SELECT ID FROM USERS WHERE ROWNUM <= 1",
             ErrorCode::Unsupported,
         ),
         ("SELECT SUM(ID) OVER () FROM USERS", ErrorCode::Unsupported),
         (
+            "SELECT ID FROM USERS QUALIFY ID = 1",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "SELECT * FROM USERS PIVOT (SUM(ID) FOR NAME IN ('A'))",
+            ErrorCode::Unsupported,
+        ),
+        (
             "SELECT ID FROM USERS MODEL RETURN UPDATED ROWS",
             ErrorCode::Unsupported,
         ),
+        (
+            "SELECT ID FROM USERS CONNECT BY PRIOR ID = ID",
+            ErrorCode::Unsupported,
+        ),
+        ("SELECT ID FROM USERS FOR UPDATE", ErrorCode::Unsupported),
+        ("SELECT ID FROM DUAL", ErrorCode::Bind),
         (
             "SELECT CASE WHEN ID = 1 THEN 1 ELSE 0 END FROM USERS",
             ErrorCode::Unsupported,
         ),
         ("SELECT CAST(ID AS TEXT) FROM USERS", ErrorCode::Unsupported),
+        ("SELECT ABS(ID) FROM USERS", ErrorCode::Unsupported),
+        (
+            "SELECT ID FROM USERS WHERE ID IN (SELECT ID FROM ORDERS)",
+            ErrorCode::Unsupported,
+        ),
         ("SELECT NAME || NAME FROM USERS", ErrorCode::Unsupported),
         ("SELECT ID + NAME FROM USERS", ErrorCode::Type),
         ("CREATE TABLE USERS (ID INT64)", ErrorCode::Bind),
         (
             "CREATE TABLE ORACLE_TYPES (N NUMBER(10,2))",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "CREATE TABLE ORACLE_VARCHAR (V VARCHAR2(10))",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "CREATE TABLE ORACLE_CHAR (V CHAR(10))",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "CREATE TABLE ORACLE_RAW (V RAW(10))",
+            ErrorCode::Unsupported,
+        ),
+        (
+            "CREATE TABLE ORACLE_TIME (V TIMESTAMP WITH TIME ZONE)",
             ErrorCode::Unsupported,
         ),
         (
@@ -226,10 +364,18 @@ fn phase_4b_sql_corpus() {
             ErrorCode::Unsupported,
         ),
         ("TRUNCATE TABLE USERS", ErrorCode::Unsupported),
+        ("GRANT SELECT ON USERS TO APP", ErrorCode::Unsupported),
+        ("CREATE USER APP PASSWORD = 'x'", ErrorCode::Unsupported),
+        ("CREATE SCHEMA APP", ErrorCode::Unsupported),
+        ("CREATE TABLESPACE APP DATAFILE 'x'", ErrorCode::Unsupported),
+        ("BEGIN NULL; END;", ErrorCode::Unsupported),
         ("BEGIN TRANSACTION", ErrorCode::Unsupported),
     ];
     for (sql, expected) in rejected {
-        let error = conn.prepare(sql).unwrap_err();
+        let error = match conn.prepare(sql) {
+            Err(error) => error,
+            Ok(statement) => panic!("rejected corpus accepted {sql:?}: {statement:?}"),
+        };
         assert_eq!(
             error.code(),
             expected,
