@@ -4,7 +4,7 @@ use crate::{
     DbError, Decimal, ErrorCode, Result, Value,
     api::{ParameterIdentifier, ParameterMetadata},
     sql::{
-        ParameterKey, SqlType,
+        ParameterKey, SqlSpan, SqlType,
         ast::{AggregateArgument, AggregateFunction, AstExpr, AstExprKind, BinaryOp, UnaryOp},
         bound::{BoundAggregateFunction, BoundBinaryOp, BoundExpr, BoundExprKind, BoundUnaryOp},
     },
@@ -73,163 +73,300 @@ pub(crate) fn bind_expr(
     expected: Option<SqlType>,
     context: &mut ParameterCollector,
 ) -> Result<BoundExpr> {
-    let mut bound = bind_expr_without_expected(expr, scope, context)?;
+    let mut work = vec![BindFrame::Visit(expr)];
+    let mut values = Vec::new();
+    while let Some(frame) = work.pop() {
+        match frame {
+            BindFrame::Visit(expr) => match &expr.kind {
+                AstExprKind::Null => values.push(BoundExpr::new(
+                    BoundExprKind::Literal(Value::Null),
+                    SqlType::Null,
+                    true,
+                    expr.span,
+                )),
+                AstExprKind::Bool(value) => values.push(BoundExpr::new(
+                    BoundExprKind::Literal(Value::Bool(*value)),
+                    SqlType::Bool,
+                    false,
+                    expr.span,
+                )),
+                AstExprKind::Integer(value) => {
+                    let (value, sql_type) = parse_integer(value)?;
+                    values.push(BoundExpr::new(
+                        BoundExprKind::Literal(value),
+                        sql_type,
+                        false,
+                        expr.span,
+                    ));
+                }
+                AstExprKind::Decimal(value) => values.push(BoundExpr::new(
+                    BoundExprKind::Literal(Value::Decimal(parse_decimal(value)?)),
+                    SqlType::Decimal,
+                    false,
+                    expr.span,
+                )),
+                AstExprKind::Float(value) => values.push(BoundExpr::new(
+                    BoundExprKind::Literal(Value::Float64(parse_float(value)?)),
+                    SqlType::Float64,
+                    false,
+                    expr.span,
+                )),
+                AstExprKind::Text(value) => values.push(BoundExpr::new(
+                    BoundExprKind::Literal(Value::Text(value.clone())),
+                    SqlType::Text,
+                    false,
+                    expr.span,
+                )),
+                AstExprKind::Blob(value) => values.push(BoundExpr::new(
+                    BoundExprKind::Literal(Value::Blob(value.clone())),
+                    SqlType::Blob,
+                    false,
+                    expr.span,
+                )),
+                AstExprKind::Column(parts) => {
+                    let column = scope.resolve_column(parts)?;
+                    values.push(BoundExpr::new(
+                        BoundExprKind::Column {
+                            table_id: column.table_id,
+                            column_id: column.column_id,
+                            ordinal: column.ordinal,
+                        },
+                        column.sql_type,
+                        column.nullable,
+                        expr.span,
+                    ));
+                }
+                AstExprKind::Parameter(key) => {
+                    let sql_type = context.constrain(key, SqlType::Unknown)?;
+                    values.push(BoundExpr::new(
+                        BoundExprKind::Parameter(parameter_identifier(key)),
+                        sql_type,
+                        true,
+                        expr.span,
+                    ));
+                }
+                AstExprKind::Unary { op, expr: operand } => {
+                    work.push(BindFrame::FinishUnary {
+                        span: expr.span,
+                        op: *op,
+                    });
+                    work.push(BindFrame::Visit(operand));
+                }
+                AstExprKind::Binary { left, op, right } => {
+                    work.push(BindFrame::FinishBinary {
+                        span: expr.span,
+                        op: *op,
+                    });
+                    work.push(BindFrame::Visit(right));
+                    work.push(BindFrame::Visit(left));
+                }
+                AstExprKind::IsNull {
+                    expr: operand,
+                    negated,
+                } => {
+                    work.push(BindFrame::FinishIsNull {
+                        span: expr.span,
+                        negated: *negated,
+                    });
+                    work.push(BindFrame::Visit(operand));
+                }
+                AstExprKind::InList {
+                    expr: operand,
+                    values: list,
+                    negated,
+                } => {
+                    work.push(BindFrame::FinishInList {
+                        span: expr.span,
+                        value_count: list.len(),
+                        negated: *negated,
+                    });
+                    for value in list.iter().rev() {
+                        work.push(BindFrame::Visit(value));
+                    }
+                    work.push(BindFrame::Visit(operand));
+                }
+                AstExprKind::Between {
+                    expr: operand,
+                    low,
+                    high,
+                    negated,
+                } => {
+                    work.push(BindFrame::FinishBetween {
+                        span: expr.span,
+                        negated: *negated,
+                    });
+                    work.push(BindFrame::Visit(high));
+                    work.push(BindFrame::Visit(low));
+                    work.push(BindFrame::Visit(operand));
+                }
+                AstExprKind::Like {
+                    expr: operand,
+                    pattern,
+                    negated,
+                } => {
+                    work.push(BindFrame::FinishLike {
+                        span: expr.span,
+                        negated: *negated,
+                    });
+                    work.push(BindFrame::Visit(pattern));
+                    work.push(BindFrame::Visit(operand));
+                }
+                AstExprKind::Aggregate { function, argument } => match argument {
+                    AggregateArgument::Wildcard(_) => {
+                        values.push(finish_aggregate(expr.span, *function, None)?)
+                    }
+                    AggregateArgument::Expr(argument) => {
+                        work.push(BindFrame::FinishAggregate {
+                            span: expr.span,
+                            function: *function,
+                        });
+                        work.push(BindFrame::Visit(argument));
+                    }
+                },
+            },
+            BindFrame::FinishUnary { span, op } => {
+                let mut operand = pop_bound(&mut values)?;
+                if op == UnaryOp::Not {
+                    apply_expected(&mut operand, SqlType::Bool, context)?;
+                }
+                let (kind, sql_type, nullable) = bind_unary(op, operand)?;
+                values.push(BoundExpr::new(kind, sql_type, nullable, span));
+            }
+            BindFrame::FinishBinary { span, op } => {
+                let right = pop_bound(&mut values)?;
+                let left = pop_bound(&mut values)?;
+                values.push(finish_binary(span, left, op, right, context)?);
+            }
+            BindFrame::FinishIsNull { span, negated } => {
+                let operand = pop_bound(&mut values)?;
+                values.push(BoundExpr::new(
+                    BoundExprKind::IsNull {
+                        expr: Box::new(operand),
+                        negated,
+                    },
+                    SqlType::Bool,
+                    false,
+                    span,
+                ));
+            }
+            BindFrame::FinishInList {
+                span,
+                value_count,
+                negated,
+            } => {
+                let mut expressions = take_bound(&mut values, value_count.saturating_add(1))?;
+                apply_common_type(&mut expressions, context)?;
+                let operand = expressions.remove(0);
+                let nullable = operand.nullable || expressions.iter().any(|value| value.nullable);
+                values.push(BoundExpr::new(
+                    BoundExprKind::InList {
+                        expr: Box::new(operand),
+                        values: expressions,
+                        negated,
+                    },
+                    SqlType::Bool,
+                    nullable,
+                    span,
+                ));
+            }
+            BindFrame::FinishBetween { span, negated } => {
+                let mut expressions = take_bound(&mut values, 3)?;
+                let common = apply_common_type(&mut expressions, context)?;
+                if common == SqlType::Blob {
+                    return Err(type_error("Blob supports only equality comparisons"));
+                }
+                let operand = expressions.remove(0);
+                let low = expressions.remove(0);
+                let high = expressions.remove(0);
+                let nullable = operand.nullable || low.nullable || high.nullable;
+                values.push(BoundExpr::new(
+                    BoundExprKind::Between {
+                        expr: Box::new(operand),
+                        low: Box::new(low),
+                        high: Box::new(high),
+                        negated,
+                    },
+                    SqlType::Bool,
+                    nullable,
+                    span,
+                ));
+            }
+            BindFrame::FinishLike { span, negated } => {
+                let mut pattern = pop_bound(&mut values)?;
+                let mut operand = pop_bound(&mut values)?;
+                apply_expected(&mut operand, SqlType::Text, context)?;
+                apply_expected(&mut pattern, SqlType::Text, context)?;
+                let nullable = operand.nullable || pattern.nullable;
+                values.push(BoundExpr::new(
+                    BoundExprKind::Like {
+                        expr: Box::new(operand),
+                        pattern: Box::new(pattern),
+                        negated,
+                    },
+                    SqlType::Bool,
+                    nullable,
+                    span,
+                ));
+            }
+            BindFrame::FinishAggregate { span, function } => {
+                let argument = pop_bound(&mut values)?;
+                values.push(finish_aggregate(span, function, Some(argument))?);
+            }
+        }
+    }
+    if values.len() != 1 {
+        return Err(bind_internal_error());
+    }
+    let mut bound = pop_bound(&mut values)?;
     if let Some(expected) = expected {
         apply_expected(&mut bound, expected, context)?;
     }
     Ok(bound)
 }
 
-fn bind_expr_without_expected(
-    expr: &AstExpr,
-    scope: &BindingScope,
-    context: &mut ParameterCollector,
-) -> Result<BoundExpr> {
-    let (kind, sql_type, nullable) = match &expr.kind {
-        AstExprKind::Null => (BoundExprKind::Literal(Value::Null), SqlType::Null, true),
-        AstExprKind::Bool(value) => (
-            BoundExprKind::Literal(Value::Bool(*value)),
-            SqlType::Bool,
-            false,
-        ),
-        AstExprKind::Integer(value) => {
-            let (value, sql_type) = parse_integer(value)?;
-            (BoundExprKind::Literal(value), sql_type, false)
-        }
-        AstExprKind::Decimal(value) => (
-            BoundExprKind::Literal(Value::Decimal(parse_decimal(value)?)),
-            SqlType::Decimal,
-            false,
-        ),
-        AstExprKind::Float(value) => (
-            BoundExprKind::Literal(Value::Float64(parse_float(value)?)),
-            SqlType::Float64,
-            false,
-        ),
-        AstExprKind::Text(value) => (
-            BoundExprKind::Literal(Value::Text(value.clone())),
-            SqlType::Text,
-            false,
-        ),
-        AstExprKind::Blob(value) => (
-            BoundExprKind::Literal(Value::Blob(value.clone())),
-            SqlType::Blob,
-            false,
-        ),
-        AstExprKind::Column(parts) => {
-            let column = scope.resolve_column(parts)?;
-            (
-                BoundExprKind::Column {
-                    table_id: column.table_id,
-                    column_id: column.column_id,
-                    ordinal: column.ordinal,
-                },
-                column.sql_type,
-                column.nullable,
-            )
-        }
-        AstExprKind::Parameter(key) => {
-            let sql_type = context.constrain(key, SqlType::Unknown)?;
-            (
-                BoundExprKind::Parameter(parameter_identifier(key)),
-                sql_type,
-                true,
-            )
-        }
-        AstExprKind::Unary { op, expr: operand } => {
-            let operand = bind_expr(operand, scope, unary_expected(*op), context)?;
-            bind_unary(*op, operand)?
-        }
-        AstExprKind::Binary { left, op, right } => {
-            return bind_binary(expr, left, *op, right, scope, context);
-        }
-        AstExprKind::IsNull {
-            expr: operand,
-            negated,
-        } => {
-            let operand = bind_expr(operand, scope, None, context)?;
-            (
-                BoundExprKind::IsNull {
-                    expr: Box::new(operand),
-                    negated: *negated,
-                },
-                SqlType::Bool,
-                false,
-            )
-        }
-        AstExprKind::Aggregate { function, argument } => {
-            return bind_aggregate(expr, *function, argument, scope, context);
-        }
-        AstExprKind::InList {
-            expr: operand,
-            values,
-            negated,
-        } => {
-            let mut expressions = Vec::with_capacity(values.len().saturating_add(1));
-            expressions.push(operand.as_ref());
-            expressions.extend(values.iter());
-            let mut expressions = bind_common_type(expressions, scope, context)?;
-            let operand = expressions.remove(0);
-            let nullable = operand.nullable || expressions.iter().any(|value| value.nullable);
-            (
-                BoundExprKind::InList {
-                    expr: Box::new(operand),
-                    values: expressions,
-                    negated: *negated,
-                },
-                SqlType::Bool,
-                nullable,
-            )
-        }
-        AstExprKind::Between {
-            expr: operand,
-            low,
-            high,
-            negated,
-        } => {
-            let mut expressions = bind_common_type(
-                vec![operand.as_ref(), low.as_ref(), high.as_ref()],
-                scope,
-                context,
-            )?;
-            if expressions[0].sql_type == SqlType::Blob {
-                return Err(type_error("Blob supports only equality comparisons"));
-            }
-            let operand = expressions.remove(0);
-            let low = expressions.remove(0);
-            let high = expressions.remove(0);
-            let nullable = operand.nullable || low.nullable || high.nullable;
-            (
-                BoundExprKind::Between {
-                    expr: Box::new(operand),
-                    low: Box::new(low),
-                    high: Box::new(high),
-                    negated: *negated,
-                },
-                SqlType::Bool,
-                nullable,
-            )
-        }
-        AstExprKind::Like {
-            expr: operand,
-            pattern,
-            negated,
-        } => {
-            let operand = bind_expr(operand, scope, Some(SqlType::Text), context)?;
-            let pattern = bind_expr(pattern, scope, Some(SqlType::Text), context)?;
-            let nullable = operand.nullable || pattern.nullable;
-            (
-                BoundExprKind::Like {
-                    expr: Box::new(operand),
-                    pattern: Box::new(pattern),
-                    negated: *negated,
-                },
-                SqlType::Bool,
-                nullable,
-            )
-        }
-    };
-    Ok(BoundExpr::new(kind, sql_type, nullable, expr.span))
+enum BindFrame<'a> {
+    Visit(&'a AstExpr),
+    FinishUnary {
+        span: SqlSpan,
+        op: UnaryOp,
+    },
+    FinishBinary {
+        span: SqlSpan,
+        op: BinaryOp,
+    },
+    FinishIsNull {
+        span: SqlSpan,
+        negated: bool,
+    },
+    FinishInList {
+        span: SqlSpan,
+        value_count: usize,
+        negated: bool,
+    },
+    FinishBetween {
+        span: SqlSpan,
+        negated: bool,
+    },
+    FinishLike {
+        span: SqlSpan,
+        negated: bool,
+    },
+    FinishAggregate {
+        span: SqlSpan,
+        function: AggregateFunction,
+    },
+}
+
+fn pop_bound(values: &mut Vec<BoundExpr>) -> Result<BoundExpr> {
+    values.pop().ok_or_else(bind_internal_error)
+}
+
+fn take_bound(values: &mut Vec<BoundExpr>, count: usize) -> Result<Vec<BoundExpr>> {
+    let start = values
+        .len()
+        .checked_sub(count)
+        .ok_or_else(bind_internal_error)?;
+    Ok(values.split_off(start))
 }
 
 fn bind_unary(op: UnaryOp, operand: BoundExpr) -> Result<(BoundExprKind, SqlType, bool)> {
@@ -268,17 +405,16 @@ fn bind_unary(op: UnaryOp, operand: BoundExpr) -> Result<(BoundExprKind, SqlType
     }
 }
 
-fn bind_binary(
-    source: &AstExpr,
-    left: &AstExpr,
+fn finish_binary(
+    span: SqlSpan,
+    mut left: BoundExpr,
     op: BinaryOp,
-    right: &AstExpr,
-    scope: &BindingScope,
+    mut right: BoundExpr,
     context: &mut ParameterCollector,
 ) -> Result<BoundExpr> {
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
-        let left = bind_expr(left, scope, Some(SqlType::Bool), context)?;
-        let right = bind_expr(right, scope, Some(SqlType::Bool), context)?;
+        apply_expected(&mut left, SqlType::Bool, context)?;
+        apply_expected(&mut right, SqlType::Bool, context)?;
         let nullable = left.nullable || right.nullable;
         return Ok(BoundExpr::new(
             BoundExprKind::Binary {
@@ -288,13 +424,10 @@ fn bind_binary(
             },
             SqlType::Bool,
             nullable,
-            source.span,
+            span,
         ));
     }
 
-    let mut left = bind_expr(left, scope, None, context)?;
-    let right_expected = concrete_hint(left.sql_type);
-    let mut right = bind_expr(right, scope, right_expected, context)?;
     let common = left.sql_type.unify(right.sql_type)?;
     apply_expected(&mut left, common, context)?;
     apply_expected(&mut right, common, context)?;
@@ -329,28 +462,21 @@ fn bind_binary(
         },
         sql_type,
         nullable,
-        source.span,
+        span,
     ))
 }
 
-fn bind_aggregate(
-    source: &AstExpr,
+fn finish_aggregate(
+    span: SqlSpan,
     function: AggregateFunction,
-    argument: &AggregateArgument,
-    scope: &BindingScope,
-    context: &mut ParameterCollector,
+    argument: Option<BoundExpr>,
 ) -> Result<BoundExpr> {
-    let argument = match argument {
-        AggregateArgument::Wildcard(_) if function == AggregateFunction::Count => None,
-        AggregateArgument::Wildcard(_) => {
-            return Err(type_error("only COUNT accepts a wildcard argument"));
-        }
-        AggregateArgument::Expr(expr) => Some(Box::new(bind_expr(expr, scope, None, context)?)),
-    };
     let (sql_type, nullable) = match function {
         AggregateFunction::Count => (SqlType::Int64, false),
         AggregateFunction::Sum | AggregateFunction::Avg => {
-            let input = argument.as_ref().expect("SUM and AVG have an expression");
+            let input = argument
+                .as_ref()
+                .ok_or_else(|| type_error("only COUNT accepts a wildcard argument"))?;
             match input.sql_type {
                 SqlType::Int64 | SqlType::Decimal => (SqlType::Decimal, true),
                 SqlType::Float64 => (SqlType::Float64, true),
@@ -358,7 +484,9 @@ fn bind_aggregate(
             }
         }
         AggregateFunction::Min | AggregateFunction::Max => {
-            let input = argument.as_ref().expect("MIN and MAX have an expression");
+            let input = argument
+                .as_ref()
+                .ok_or_else(|| type_error("only COUNT accepts a wildcard argument"))?;
             (input.sql_type, true)
         }
     };
@@ -371,30 +499,26 @@ fn bind_aggregate(
                 AggregateFunction::Min => BoundAggregateFunction::Min,
                 AggregateFunction::Max => BoundAggregateFunction::Max,
             },
-            argument,
+            argument: argument.map(Box::new),
         },
         sql_type,
         nullable,
-        source.span,
+        span,
     ))
 }
 
-fn bind_common_type(
-    expressions: Vec<&AstExpr>,
-    scope: &BindingScope,
+fn apply_common_type(
+    expressions: &mut [BoundExpr],
     context: &mut ParameterCollector,
-) -> Result<Vec<BoundExpr>> {
+) -> Result<SqlType> {
     let mut common = SqlType::Unknown;
-    let mut bound = Vec::with_capacity(expressions.len());
-    for expression in expressions {
-        let current = bind_expr(expression, scope, concrete_hint(common), context)?;
-        common = common.unify(current.sql_type)?;
-        bound.push(current);
+    for expression in expressions.iter() {
+        common = common.unify(expression.sql_type)?;
     }
-    for expression in &mut bound {
+    for expression in expressions {
         apply_expected(expression, common, context)?;
     }
-    Ok(bound)
+    Ok(common)
 }
 
 fn apply_expected(
@@ -402,56 +526,61 @@ fn apply_expected(
     expected: SqlType,
     context: &mut ParameterCollector,
 ) -> Result<()> {
-    if matches!(
-        &expression.kind,
-        BoundExprKind::Unary {
-            op: BoundUnaryOp::Positive | BoundUnaryOp::Negative,
-            ..
-        } | BoundExprKind::Binary {
-            op: BoundBinaryOp::Add
-                | BoundBinaryOp::Subtract
-                | BoundBinaryOp::Multiply
-                | BoundBinaryOp::Divide
-                | BoundBinaryOp::Modulo,
-            ..
+    let mut work = vec![(expression, expected)];
+    while let Some((expression, expected)) = work.pop() {
+        if matches!(
+            &expression.kind,
+            BoundExprKind::Unary {
+                op: BoundUnaryOp::Positive | BoundUnaryOp::Negative,
+                ..
+            } | BoundExprKind::Binary {
+                op: BoundBinaryOp::Add
+                    | BoundBinaryOp::Subtract
+                    | BoundBinaryOp::Multiply
+                    | BoundBinaryOp::Divide
+                    | BoundBinaryOp::Modulo,
+                ..
+            }
+        ) {
+            require_numeric_or_indeterminate(expected)?;
         }
-    ) {
-        require_numeric_or_indeterminate(expected)?;
+        let common = expression.sql_type.unify(expected)?;
+        if expression.sql_type == common {
+            continue;
+        }
+        expression.sql_type = common;
+        match &mut expression.kind {
+            BoundExprKind::Parameter(identifier) => {
+                expression.sql_type = context.constrain_identifier(identifier.clone(), common)?;
+            }
+            BoundExprKind::Unary {
+                op: BoundUnaryOp::Positive | BoundUnaryOp::Negative,
+                expr,
+            } => {
+                work.push((expr, common));
+            }
+            BoundExprKind::Binary {
+                left,
+                op:
+                    BoundBinaryOp::Add
+                    | BoundBinaryOp::Subtract
+                    | BoundBinaryOp::Multiply
+                    | BoundBinaryOp::Divide
+                    | BoundBinaryOp::Modulo,
+                right,
+            } => {
+                work.push((right, common));
+                work.push((left, common));
+            }
+            BoundExprKind::Aggregate {
+                function: BoundAggregateFunction::Min | BoundAggregateFunction::Max,
+                argument: Some(argument),
+            } => {
+                work.push((argument, common));
+            }
+            _ => {}
+        }
     }
-    let common = expression.sql_type.unify(expected)?;
-    match &mut expression.kind {
-        BoundExprKind::Parameter(identifier) => {
-            expression.sql_type = context.constrain_identifier(identifier.clone(), common)?;
-            return Ok(());
-        }
-        BoundExprKind::Unary {
-            op: BoundUnaryOp::Positive | BoundUnaryOp::Negative,
-            expr,
-        } => {
-            apply_expected(expr, common, context)?;
-        }
-        BoundExprKind::Binary {
-            left,
-            op:
-                BoundBinaryOp::Add
-                | BoundBinaryOp::Subtract
-                | BoundBinaryOp::Multiply
-                | BoundBinaryOp::Divide
-                | BoundBinaryOp::Modulo,
-            right,
-        } => {
-            apply_expected(left, common, context)?;
-            apply_expected(right, common, context)?;
-        }
-        BoundExprKind::Aggregate {
-            function: BoundAggregateFunction::Min | BoundAggregateFunction::Max,
-            argument: Some(argument),
-        } => {
-            apply_expected(argument, common, context)?;
-        }
-        _ => {}
-    }
-    expression.sql_type = common;
     Ok(())
 }
 
@@ -521,20 +650,6 @@ fn parameter_identifier(key: &ParameterKey) -> ParameterIdentifier {
     }
 }
 
-const fn concrete_hint(sql_type: SqlType) -> Option<SqlType> {
-    match sql_type {
-        SqlType::Null | SqlType::Unknown => None,
-        value => Some(value),
-    }
-}
-
-const fn unary_expected(op: UnaryOp) -> Option<SqlType> {
-    match op {
-        UnaryOp::Not => Some(SqlType::Bool),
-        UnaryOp::Positive | UnaryOp::Negative => None,
-    }
-}
-
 fn require_numeric_or_indeterminate(sql_type: SqlType) -> Result<()> {
     if matches!(
         sql_type,
@@ -566,6 +681,13 @@ const fn map_binary_op(op: BinaryOp) -> BoundBinaryOp {
 
 fn type_error(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Type, message)
+}
+
+fn bind_internal_error() -> DbError {
+    DbError::new(
+        ErrorCode::Internal,
+        "expression binder work stack is inconsistent",
+    )
 }
 
 #[cfg(test)]
@@ -1078,5 +1200,46 @@ mod tests {
                 ErrorCode::Bind
             );
         }
+    }
+
+    #[test]
+    fn deeply_nested_owned_arithmetic_binds_without_process_stack_recursion() {
+        // Production break caught: recursive AST binding or expected-type
+        // propagation would overflow the test thread stack for an expression
+        // depth accepted by the public u16 nesting limit.
+        const DEPTH: usize = 16_384;
+        let limits = SqlLimits::default().with_max_nesting(DEPTH).unwrap();
+        let statement = parse_statement("SELECT ID FROM USERS", &limits).unwrap();
+        let AstStatement::Query(query) = statement else {
+            unreachable!("test SQL is a query")
+        };
+        let scope = BindingScope::from_query_sources(&real_catalog(), &query).unwrap();
+        let span = SqlSpan::new(0, 1).unwrap();
+        let key = ParameterKey::parse(":deep", span).unwrap();
+        let mut expression = AstExpr {
+            kind: AstExprKind::Parameter(key),
+            span,
+        };
+        for _ in 0..DEPTH {
+            expression = AstExpr {
+                kind: AstExprKind::Binary {
+                    left: Box::new(expression),
+                    op: crate::sql::ast::BinaryOp::Add,
+                    right: Box::new(literal_ast(AstExprKind::Integer("1".to_owned()))),
+                },
+                span,
+            };
+        }
+
+        let mut parameters = ParameterCollector::default();
+        let bound =
+            bind_expr(&expression, &scope, Some(SqlType::Decimal), &mut parameters).unwrap();
+        assert_eq!(bound.sql_type, SqlType::Decimal);
+        assert_eq!(parameters.finish()[0].data_type(), Some(DataType::Decimal));
+
+        // These intentionally leaked test trees avoid measuring recursive Drop;
+        // this regression isolates the two binder traversals under review.
+        std::mem::forget(bound);
+        std::mem::forget(expression);
     }
 }
