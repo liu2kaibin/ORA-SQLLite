@@ -24,7 +24,8 @@ use crate::{
 };
 
 use super::{
-    BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_expr, bind_query,
+    BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_assignment_expr,
+    bind_expr, bind_query,
 };
 
 /// Binds one parsed statement to an immutable catalog image.
@@ -100,6 +101,17 @@ impl BoundParts {
     }
 }
 
+/// INSERT VALUES has no old target row from which a column may be read.
+struct NoColumnScope;
+
+impl ColumnResolver for NoColumnScope {
+    fn resolve_column(&self, _parts: &[Identifier]) -> Result<ResolvedColumn> {
+        Err(bind_error(
+            "INSERT VALUES cannot reference a target-row column",
+        ))
+    }
+}
+
 fn bind_insert(
     insert: &Insert,
     catalog: &CatalogReader,
@@ -123,9 +135,10 @@ fn bind_insert(
         ));
     }
 
+    let value_scope = NoColumnScope;
     let mut values = Vec::with_capacity(insert.values.len());
     for (value, target) in insert.values.iter().zip(&targets) {
-        let value = bind_expr(value, &scope, Some(target.sql_type), parameters)?;
+        let value = bind_assignment_expr(value, &value_scope, target.sql_type, parameters)?;
         require_scalar(&value, "INSERT VALUES")?;
         values.push(value);
     }
@@ -157,7 +170,7 @@ fn bind_update(
             return Err(bind_error("UPDATE target column is repeated"));
         }
         let target = bound_column(&resolved, assignment.column.span());
-        let value = bind_expr(&assignment.value, &scope, Some(target.sql_type), parameters)?;
+        let value = bind_assignment_expr(&assignment.value, &scope, target.sql_type, parameters)?;
         require_scalar(&value, "UPDATE assignment")?;
         assignments.push(BoundAssignment {
             target,
@@ -222,9 +235,16 @@ fn bind_create_table(
     }
 
     let mut columns = bind_column_definitions(create)?;
+    let mut primary_key_seen = false;
     for constraint in create_constraints(create) {
         match constraint {
             Constraint::PrimaryKey(named) => {
+                if primary_key_seen {
+                    return Err(bind_error(
+                        "CREATE TABLE contains multiple PRIMARY KEY constraints",
+                    ));
+                }
+                primary_key_seen = true;
                 for ordinal in resolve_local_columns(&columns, &named.columns)? {
                     columns[usize::from(ordinal)].nullable = false;
                 }
@@ -295,6 +315,12 @@ fn bind_column_definitions(create: &CreateTable) -> Result<Vec<BoundColumnDefini
 }
 
 fn bind_column_type(declaration: &TypeDeclaration) -> Result<ColumnType> {
+    if declaration.name.is_quoted() {
+        return Err(DbError::new(
+            ErrorCode::Unsupported,
+            "quoted SQL type declarations are not supported by catalog V1",
+        ));
+    }
     if !declaration.arguments.is_empty() || !declaration.modifiers.is_empty() {
         return Err(DbError::new(
             ErrorCode::Unsupported,
@@ -799,7 +825,7 @@ mod tests {
         storage::{
             catalog::{
                 CatalogReader, add_unrelated_table, bump_users_schema_version,
-                drop_and_recreate_users,
+                drop_and_recreate_users, replace_users_id_column_id,
             },
             test_support::Phase4bCatalogFixture,
         },
@@ -884,6 +910,85 @@ mod tests {
                 Some(DataType::Float64),
             ]
         );
+    }
+
+    #[test]
+    fn insert_values_do_not_see_the_target_row() {
+        // Production break caught: INSERT has no old target row, so resolving
+        // these references would read an arbitrary pre-insert value.
+        for sql in [
+            "INSERT INTO USERS (ID) VALUES (ID)",
+            "INSERT INTO USERS (ID) VALUES (USERS.ID)",
+        ] {
+            assert_eq!(
+                prepare_fixture(sql).unwrap_err().code(),
+                ErrorCode::Bind,
+                "{sql}"
+            );
+        }
+        assert!(prepare_fixture("INSERT INTO USERS (ID) VALUES (:id)").is_ok());
+        assert!(prepare_fixture("INSERT INTO USERS (ID) VALUES (1)").is_ok());
+    }
+
+    #[test]
+    fn dml_assignments_reject_narrowing_and_keep_safe_target_contexts() {
+        // Production break caught: symmetric type unification lets a Decimal
+        // assignment silently narrow into an INT64 storage column.
+        for sql in [
+            "INSERT INTO USERS (ID) VALUES (1.5)",
+            "UPDATE USERS SET ID = 1.5",
+        ] {
+            assert_eq!(
+                prepare_fixture(sql).unwrap_err().code(),
+                ErrorCode::Type,
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "INSERT INTO USERS (AMOUNT) VALUES (1)",
+            "UPDATE USERS SET AMOUNT = 1",
+            "INSERT INTO USERS (ID) VALUES (NULL)",
+            "UPDATE USERS SET ID = NULL",
+        ] {
+            assert!(prepare_fixture(sql).is_ok(), "{sql}");
+        }
+
+        let insert_parameter =
+            prepare_fixture("INSERT INTO USERS (AMOUNT) VALUES (:amount)").unwrap();
+        assert_eq!(
+            insert_parameter.parameters()[0].data_type(),
+            Some(DataType::Decimal)
+        );
+        let update_parameter = prepare_fixture("UPDATE USERS SET ID = :id").unwrap();
+        assert_eq!(
+            update_parameter.parameters()[0].data_type(),
+            Some(DataType::Int64)
+        );
+    }
+
+    #[test]
+    fn repeated_dml_parameter_uses_the_narrow_safe_assignment_type() {
+        // Production break caught: a shared parameter between an INT64 and a
+        // DECIMAL target must remain INT64 (which can widen for DECIMAL),
+        // regardless of target-list order. Broadening it to DECIMAL would
+        // make its INT64 assignment a silent narrowing conversion.
+        for sql in [
+            "INSERT INTO USERS (ID, AMOUNT) VALUES (:shared, :shared)",
+            "INSERT INTO USERS (AMOUNT, ID) VALUES (:shared, :shared)",
+            "UPDATE USERS SET ID = :shared, AMOUNT = :shared",
+            "UPDATE USERS SET AMOUNT = :shared, ID = :shared",
+            "UPDATE USERS SET ID = +:shared, AMOUNT = +:shared",
+            "UPDATE USERS SET AMOUNT = +:shared, ID = +:shared",
+            "UPDATE USERS SET ID = :shared WHERE AMOUNT = :shared",
+        ] {
+            let statement = prepare_fixture(sql).unwrap();
+            assert_eq!(
+                statement.parameters()[0].data_type(),
+                Some(DataType::Int64),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -1113,6 +1218,60 @@ mod tests {
     }
 
     #[test]
+    fn create_table_rejects_multiple_primary_key_constraints() {
+        // Production break caught: accepting two primary keys creates an
+        // unexecutable DDL contract before Phase 4C maintains constraints.
+        for sql in [
+            "CREATE TABLE INLINE_AND_TABLE (ID INT64 PRIMARY KEY, OTHER INT64, PRIMARY KEY (OTHER))",
+            "CREATE TABLE TWO_TABLE (ID INT64, OTHER INT64, PRIMARY KEY (ID), PRIMARY KEY (OTHER))",
+        ] {
+            assert_eq!(
+                prepare_fixture(sql).unwrap_err().code(),
+                ErrorCode::Bind,
+                "{sql}"
+            );
+        }
+        assert!(prepare_fixture("CREATE TABLE ONE_PRIMARY (ID INT64 PRIMARY KEY)").is_ok());
+    }
+
+    #[test]
+    fn create_table_rejects_quoted_core_type_names() {
+        // Production break caught: quoted text is a custom type name, not an
+        // alternate spelling of one of the eight Phase 4B core declarations.
+        for data_type in [
+            "INT64",
+            "DECIMAL",
+            "FLOAT64",
+            "TEXT",
+            "BLOB",
+            "DATE",
+            "TIMESTAMP",
+            "BOOL",
+            "int64",
+        ] {
+            let quoted = format!("CREATE TABLE QUOTED_{data_type} (VALUE \"{data_type}\")");
+            assert_eq!(
+                prepare_fixture(&quoted).unwrap_err().code(),
+                ErrorCode::Unsupported,
+                "{quoted}"
+            );
+        }
+        for data_type in [
+            "INT64",
+            "DECIMAL",
+            "FLOAT64",
+            "TEXT",
+            "BLOB",
+            "DATE",
+            "TIMESTAMP",
+            "BOOL",
+        ] {
+            let unquoted = format!("CREATE TABLE UNQUOTED_{data_type} (VALUE {data_type})");
+            assert!(prepare_fixture(&unquoted).is_ok(), "{unquoted}");
+        }
+    }
+
+    #[test]
     fn create_and_drop_bind_real_catalog_object_identities() {
         // Production break caught: DDL that carries only a name can silently
         // target a same-named replacement object after prepare.
@@ -1237,5 +1396,69 @@ mod tests {
         );
         let changed = add_unrelated_table(&fixture.pager()).unwrap();
         assert!(statement.validate_schema(database_uuid, &changed).is_ok());
+    }
+
+    #[test]
+    fn schema_validation_ignores_new_table_check_column_markers() {
+        // Production break caught: treating a CREATE TABLE CHECK's local,
+        // not-yet-persisted column marker as a catalog identity makes a valid
+        // prepared CREATE fail validation before its table can exist.
+        let fixture = crate::storage::test_support::phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let database_uuid = pager.database_uuid().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let ast = parse_statement(
+            "CREATE TABLE CHECK_CHILD (ID INT64, CHECK (ID > 0))",
+            &SqlLimits::default(),
+        )
+        .unwrap();
+        let statement = bind_statement(&ast, &catalog, database_uuid).unwrap();
+
+        assert!(statement.validate_schema(database_uuid, &catalog).is_ok());
+        let changed = add_unrelated_table(&pager).unwrap();
+        assert!(statement.validate_schema(database_uuid, &changed).is_ok());
+    }
+
+    #[test]
+    fn schema_validation_rejects_a_replaced_same_table_column_identity() {
+        // Production break caught: retaining only a table version lets a raw
+        // same-table column-ID replacement satisfy old query/DML/DDL bindings.
+        let fixture = crate::storage::test_support::phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let database_uuid = pager.database_uuid().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let sqls = [
+            "SELECT ID FROM USERS",
+            "INSERT INTO USERS (ID) VALUES (:id)",
+            "UPDATE USERS SET NAME = NAME WHERE ID = 1",
+            "DELETE FROM USERS WHERE ID = 1",
+            "CREATE INDEX USERS_ID_IDX ON USERS (ID)",
+            "CREATE TABLE FK_CHILD (USER_ID INT64 REFERENCES USERS (ID))",
+        ];
+        let statements = sqls
+            .iter()
+            .map(|sql| {
+                let statement = parse_statement(sql, &SqlLimits::default())?;
+                bind_statement(&statement, &catalog, database_uuid)
+            })
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        for statement in &statements {
+            assert!(statement.validate_schema(database_uuid, &catalog).is_ok());
+        }
+
+        let replaced = replace_users_id_column_id(&pager).unwrap();
+        for (sql, statement) in sqls.iter().zip(&statements) {
+            assert_eq!(
+                statement
+                    .validate_schema(database_uuid, &replaced)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::SchemaChanged,
+                "{sql}"
+            );
+        }
     }
 }

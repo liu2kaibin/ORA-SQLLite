@@ -343,6 +343,10 @@ impl CatalogReader {
             .and_then(|id| self.image.columns.get(id))
     }
 
+    pub(crate) fn find_column_by_id(&self, id: ColumnId) -> Option<&ColumnDef> {
+        self.image.columns.get(&id)
+    }
+
     /// Returns whether a persisted V1 object has this exact typed identity.
     ///
     /// Index and constraint records deliberately return false until their V1
@@ -745,6 +749,71 @@ pub(crate) fn drop_and_recreate_users(pager: &super::Pager) -> Result<CatalogRea
         }
     }
     Ok(replacement)
+}
+
+#[cfg(test)]
+pub(crate) fn replace_users_id_column_id(pager: &super::Pager) -> Result<CatalogReader> {
+    let (table, columns) = users_for_test_mutation(pager)?;
+    let id_name = CatalogName::new("ID")?;
+    let old_column = columns
+        .iter()
+        .find(|column| column.name() == &id_name)
+        .cloned()
+        .ok_or_else(|| corruption("test catalog is missing USERS.ID"))?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+
+    writer.mutate(&mut batch, |tree, batch| {
+        require_matching_table_record(tree, batch, &table)?;
+        require_matching_column_record(tree, batch, &old_column)?;
+        delete_required_record(
+            tree,
+            batch,
+            &key::column_name_key(old_column.table_id(), old_column.name())?,
+        )?;
+        delete_required_record(
+            tree,
+            batch,
+            &key::column_ordinal_key(old_column.table_id(), old_column.ordinal()),
+        )?;
+        delete_required_record(tree, batch, &key::column_definition_key(old_column.id()))
+    })?;
+
+    let replacement = ColumnDef::new(
+        ColumnId::new(writer.allocate_object_id(&mut batch)?.get())?,
+        old_column.table_id(),
+        old_column.ordinal(),
+        old_column.column_type(),
+        old_column.nullable(),
+        old_column.name().clone(),
+    )?;
+    writer.insert_column_definition(&mut batch, &replacement)?;
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+
+    let reader = open_catalog_for_test(pager)?;
+    let replaced_column = reader
+        .find_column_by_name(table.id(), &id_name)
+        .ok_or_else(|| corruption("test replacement USERS.ID is missing"))?;
+    if replaced_column.id() == old_column.id()
+        || replaced_column.id() != replacement.id()
+        || replaced_column.table_id() != old_column.table_id()
+        || replaced_column.ordinal() != old_column.ordinal()
+        || replaced_column.column_type() != old_column.column_type()
+        || replaced_column.nullable() != old_column.nullable()
+        || table.schema_version()
+            != reader
+                .find_table_by_id(table.id())
+                .ok_or_else(|| {
+                    corruption("test USERS table disappeared during column replacement")
+                })?
+                .schema_version()
+    {
+        return Err(corruption(
+            "test replacement USERS.ID was not cross-checked",
+        ));
+    }
+    Ok(reader)
 }
 
 #[cfg(test)]

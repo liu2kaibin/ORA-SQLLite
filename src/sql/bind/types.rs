@@ -16,18 +16,28 @@ use super::ColumnResolver;
 pub(crate) struct ParameterCollector {
     entries: Vec<ParameterEntry>,
     positions: HashMap<ParameterIdentifier, usize>,
+    // Assignment paths are discovered before normal binding reaches each
+    // parameter leaf. Keep their caps pending to preserve actual SQL
+    // first-occurrence ordering in `entries`.
+    pending_assignment_caps: HashMap<ParameterIdentifier, SqlType>,
 }
 
 #[derive(Debug)]
 struct ParameterEntry {
     identifier: ParameterIdentifier,
     sql_type: SqlType,
+    // The narrowest source type that remains safe for every DML assignment.
+    assignment_cap: Option<SqlType>,
 }
 
 impl ParameterCollector {
     pub(crate) fn constrain(&mut self, key: &ParameterKey, constraint: SqlType) -> Result<SqlType> {
         let identifier = parameter_identifier(key);
         self.constrain_identifier(identifier, constraint)
+    }
+
+    fn constrain_assignment(&mut self, key: &ParameterKey, target: SqlType) -> Result<()> {
+        self.constrain_assignment_identifier(parameter_identifier(key), target)
     }
 
     fn constrain_identifier(
@@ -37,16 +47,51 @@ impl ParameterCollector {
     ) -> Result<SqlType> {
         if let Some(index) = self.positions.get(&identifier).copied() {
             let entry = &mut self.entries[index];
-            entry.sql_type = entry.sql_type.unify(constraint)?;
+            let inferred = entry.sql_type.unify(constraint)?;
+            entry.sql_type = match entry.assignment_cap {
+                Some(assignment_cap) => {
+                    parameter_type_with_assignment_cap(inferred, assignment_cap)?
+                }
+                None => inferred,
+            };
             return Ok(entry.sql_type);
         }
+        let assignment_cap = self.pending_assignment_caps.remove(&identifier);
+        let sql_type = match assignment_cap {
+            Some(assignment_cap) => parameter_type_with_assignment_cap(constraint, assignment_cap)?,
+            None => constraint,
+        };
         self.positions
             .insert(identifier.clone(), self.entries.len());
         self.entries.push(ParameterEntry {
             identifier,
-            sql_type: constraint,
+            sql_type,
+            assignment_cap,
         });
-        Ok(constraint)
+        Ok(sql_type)
+    }
+
+    fn constrain_assignment_identifier(
+        &mut self,
+        identifier: ParameterIdentifier,
+        target: SqlType,
+    ) -> Result<()> {
+        if let Some(index) = self.positions.get(&identifier).copied() {
+            let entry = &mut self.entries[index];
+            let assignment_cap = match entry.assignment_cap {
+                Some(current) => shared_assignment_parameter_type(current, target)?,
+                None => target,
+            };
+            entry.assignment_cap = Some(assignment_cap);
+            entry.sql_type = parameter_type_with_assignment_cap(entry.sql_type, assignment_cap)?;
+            return Ok(());
+        }
+        if let Some(current) = self.pending_assignment_caps.get_mut(&identifier) {
+            *current = shared_assignment_parameter_type(*current, target)?;
+        } else {
+            self.pending_assignment_caps.insert(identifier, target);
+        }
+        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Vec<ParameterMetadata> {
@@ -322,6 +367,116 @@ pub(crate) fn bind_expr(
         apply_expected(&mut bound, expected, context)?;
     }
     Ok(bound)
+}
+
+/// Binds an expression that will be stored in a known target column.
+///
+/// Common-type inference is symmetric for comparisons and arithmetic, but a
+/// storage assignment is directional: it may widen INT64 into DECIMAL but it
+/// must not narrow DECIMAL into INT64.
+pub(crate) fn bind_assignment_expr(
+    expr: &AstExpr,
+    scope: &impl ColumnResolver,
+    target: SqlType,
+    context: &mut ParameterCollector,
+) -> Result<BoundExpr> {
+    register_assignment_parameter_caps(expr, target, context)?;
+    let mut expression = bind_expr(expr, scope, None, context)?;
+    if !assignment_type_is_compatible(expression.sql_type, target) {
+        return Err(type_error(
+            "assignment expression is not compatible with the target column type",
+        ));
+    }
+    apply_expected(&mut expression, target, context)?;
+    Ok(expression)
+}
+
+fn assignment_type_is_compatible(source: SqlType, target: SqlType) -> bool {
+    matches!(source, SqlType::Null | SqlType::Unknown)
+        || source == target
+        || matches!((source, target), (SqlType::Int64, SqlType::Decimal))
+}
+
+fn shared_assignment_parameter_type(source: SqlType, target: SqlType) -> Result<SqlType> {
+    if assignment_type_is_compatible(source, target) {
+        return Ok(source);
+    }
+    if assignment_type_is_compatible(target, source) {
+        return Ok(target);
+    }
+    Err(type_error(
+        "parameter does not have one type safe for every assignment target",
+    ))
+}
+
+fn parameter_type_with_assignment_cap(
+    inferred: SqlType,
+    assignment_cap: SqlType,
+) -> Result<SqlType> {
+    if matches!(inferred, SqlType::Null | SqlType::Unknown) {
+        return Ok(assignment_cap);
+    }
+    if assignment_type_is_compatible(inferred, assignment_cap) {
+        return Ok(inferred);
+    }
+    if assignment_type_is_compatible(assignment_cap, inferred) {
+        return Ok(assignment_cap);
+    }
+    Err(type_error(
+        "parameter does not have one type safe for every assignment target",
+    ))
+}
+
+/// Records only parameter paths whose expression type receives the target
+/// assignment context. Other expression forms infer their own input types.
+fn register_assignment_parameter_caps(
+    expression: &AstExpr,
+    target: SqlType,
+    context: &mut ParameterCollector,
+) -> Result<()> {
+    let mut work = vec![expression];
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            AstExprKind::Parameter(key) => context.constrain_assignment(key, target)?,
+            AstExprKind::Unary {
+                op: UnaryOp::Positive | UnaryOp::Negative,
+                expr,
+            } => work.push(expr),
+            AstExprKind::Binary {
+                left,
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo,
+                right,
+            } => {
+                work.push(right);
+                work.push(left);
+            }
+            AstExprKind::Aggregate {
+                function: AggregateFunction::Min | AggregateFunction::Max,
+                argument: AggregateArgument::Expr(argument),
+            } => work.push(argument),
+            AstExprKind::Null
+            | AstExprKind::Bool(_)
+            | AstExprKind::Integer(_)
+            | AstExprKind::Decimal(_)
+            | AstExprKind::Float(_)
+            | AstExprKind::Text(_)
+            | AstExprKind::Blob(_)
+            | AstExprKind::Column(_)
+            | AstExprKind::Unary { .. }
+            | AstExprKind::Binary { .. }
+            | AstExprKind::IsNull { .. }
+            | AstExprKind::InList { .. }
+            | AstExprKind::Between { .. }
+            | AstExprKind::Like { .. }
+            | AstExprKind::Aggregate { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 enum BindFrame<'a> {

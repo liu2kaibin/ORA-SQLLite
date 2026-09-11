@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::super::SqlSpan;
-use super::BoundExpr;
+use super::{BoundExpr, BoundExprKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundStatement {
@@ -81,6 +81,8 @@ impl BoundStatement {
             }
         }
 
+        self.validate_column_identities(catalog)?;
+
         for created_name in &self.created_names {
             if catalog.object_name_exists(created_name.object_kind, &created_name.name) {
                 return Err(schema_changed(
@@ -90,6 +92,131 @@ impl BoundStatement {
         }
         Ok(())
     }
+
+    fn validate_column_identities(&self, catalog: &CatalogReader) -> Result<()> {
+        let mut columns = Vec::new();
+        let mut expressions = Vec::new();
+        match &self.kind {
+            BoundStatementKind::Query { projection } => expressions.extend(projection.iter()),
+            BoundStatementKind::Insert {
+                targets, values, ..
+            } => {
+                columns.extend(targets.iter());
+                expressions.extend(values.iter());
+            }
+            BoundStatementKind::Update {
+                assignments,
+                selection,
+                ..
+            } => {
+                for assignment in assignments {
+                    columns.push(&assignment.target);
+                    expressions.push(&assignment.value);
+                }
+                if let Some(selection) = selection {
+                    expressions.push(selection);
+                }
+            }
+            BoundStatementKind::Delete { selection, .. } => {
+                if let Some(selection) = selection {
+                    expressions.push(selection);
+                }
+            }
+            BoundStatementKind::CreateTable { constraints, .. } => {
+                for constraint in constraints {
+                    match constraint {
+                        BoundConstraint::Check { expression, .. } => expressions.push(expression),
+                        BoundConstraint::ForeignKey {
+                            referenced_columns, ..
+                        } => columns.extend(referenced_columns.iter()),
+                        BoundConstraint::PrimaryKey { .. }
+                        | BoundConstraint::Unique { .. }
+                        | BoundConstraint::NotNull { .. } => {}
+                    }
+                }
+            }
+            BoundStatementKind::CreateIndex { columns: index, .. } => {
+                columns.extend(index.iter());
+            }
+            BoundStatementKind::DropTable { .. }
+            | BoundStatementKind::DropIndex { .. }
+            | BoundStatementKind::Begin
+            | BoundStatementKind::Commit
+            | BoundStatementKind::Rollback => {}
+        }
+
+        for column in columns {
+            validate_column_identity(catalog, column.table_id, column.column_id)?;
+        }
+        validate_expression_columns(catalog, expressions)
+    }
+}
+
+fn validate_expression_columns(catalog: &CatalogReader, roots: Vec<&BoundExpr>) -> Result<()> {
+    let mut work = roots;
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            BoundExprKind::Column {
+                table_id,
+                column_id,
+                ..
+            } => validate_column_identity(catalog, *table_id, *column_id)?,
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+                work.push(expr);
+            }
+            BoundExprKind::Binary { left, right, .. } => {
+                work.push(left);
+                work.push(right);
+            }
+            BoundExprKind::InList { expr, values, .. } => {
+                work.push(expr);
+                work.extend(values.iter());
+            }
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => {
+                work.push(expr);
+                work.push(low);
+                work.push(high);
+            }
+            BoundExprKind::Like { expr, pattern, .. } => {
+                work.push(expr);
+                work.push(pattern);
+            }
+            BoundExprKind::Aggregate {
+                argument: Some(argument),
+                ..
+            } => work.push(argument),
+            BoundExprKind::Literal(_)
+            | BoundExprKind::NewTableColumn { .. }
+            | BoundExprKind::Parameter(_)
+            | BoundExprKind::Aggregate { argument: None, .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_column_identity(
+    catalog: &CatalogReader,
+    table_id: TableId,
+    column_id: ColumnId,
+) -> Result<()> {
+    if !catalog.object_id_exists(ObjectKind::Column, column_id.into()) {
+        return Err(schema_changed(
+            "prepared column identity is no longer present",
+        ));
+    }
+    let Some(column) = catalog.find_column_by_id(column_id) else {
+        return Err(schema_changed(
+            "prepared column identity is no longer present",
+        ));
+    };
+    if column.table_id() != table_id {
+        return Err(schema_changed(
+            "prepared column identity belongs to another table",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
