@@ -25,6 +25,10 @@ impl BoundStatement {
     pub(crate) fn columns(&self) -> &[ColumnMetadata] {
         &self.columns
     }
+
+    pub(crate) fn dependencies(&self) -> &[SchemaDependency] {
+        &self.dependencies
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

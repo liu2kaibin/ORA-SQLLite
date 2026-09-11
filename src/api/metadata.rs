@@ -81,6 +81,22 @@ pub struct ColumnMetadata {
 }
 
 impl ColumnMetadata {
+    pub(crate) fn new(
+        name: String,
+        data_type: DataType,
+        nullable: bool,
+        source_table_id: Option<TableId>,
+        source_column_id: Option<ColumnId>,
+    ) -> Self {
+        Self {
+            name,
+            data_type,
+            nullable,
+            source_table_id,
+            source_column_id,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
