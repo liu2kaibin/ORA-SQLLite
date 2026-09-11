@@ -167,6 +167,7 @@ fn phase_4b_sql_corpus() {
         "SELECT U.*, O.USER_ID FROM USERS U INNER JOIN ORDERS O ON O.USER_ID = U.ID",
         "SELECT U.ID, O.ID FROM USERS U LEFT OUTER JOIN ORDERS O ON O.USER_ID = U.ID",
         "SELECT DISTINCT NAME FROM USERS WHERE NAME IS NOT NULL ORDER BY NAME",
+        "SELECT NAME AS DISPLAY_NAME FROM USERS ORDER BY DISPLAY_NAME",
         "SELECT USER_ID, COUNT(*), SUM(ID), AVG(ID), MIN(ID), MAX(ID) FROM ORDERS GROUP BY USER_ID HAVING COUNT(*) > 0 ORDER BY 1",
         "SELECT NULL, TRUE, 1, 1.5, 1E2, 'A''B', X'ABCD' FROM USERS",
         "SELECT ID FROM USERS WHERE NOT (ID BETWEEN 1 AND 10) OR (NAME LIKE 'A%' AND ID IN (1, 2) AND NAME IS NOT NULL)",
@@ -179,6 +180,7 @@ fn phase_4b_sql_corpus() {
         "UPDATE USERS U SET NAME = U.NAME, ID = ID + :delta WHERE U.ID = :id",
         "DELETE FROM USERS U WHERE U.ID = :id",
         "CREATE TABLE CHILD (ID INT64 PRIMARY KEY, USER_ID INT64 REFERENCES USERS (ID), NAME TEXT NOT NULL, AMOUNT DECIMAL, SCORE FLOAT64, RAW_VALUE BLOB, CREATED DATE, UPDATED TIMESTAMP, ENABLED BOOL, CONSTRAINT CHILD_CK CHECK (ID > 0), UNIQUE (NAME))",
+        "CREATE INDEX USERS_NAME_IDX ON USERS (NAME)",
         "CREATE UNIQUE INDEX USERS_NAME_UK ON USERS (NAME)",
         "DROP TABLE ORDERS",
         "BEGIN",
@@ -210,6 +212,29 @@ fn phase_4b_sql_corpus() {
             result.is_ok(),
             accepted,
             "wrong public-prepare result for a {bytes}-byte identifier: {result:?}"
+        );
+        if !accepted {
+            assert_eq!(result.unwrap_err().code(), ErrorCode::Bind);
+        }
+    }
+
+    let utf8_identifier_cases = [
+        (format!("{}A", "名".repeat(42)), 127, true),
+        (format!("{}AA", "名".repeat(42)), 128, true),
+        ("名".repeat(43), 129, false),
+    ];
+    for (identifier, expected_bytes, accepted) in utf8_identifier_cases {
+        assert_eq!(
+            identifier.len(),
+            expected_bytes,
+            "test construction must hit the intended UTF-8 byte boundary"
+        );
+        let sql = format!("CREATE TABLE {identifier} (ID INT64)");
+        let result = conn.prepare(&sql);
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "wrong public-prepare result for a {expected_bytes}-byte non-ASCII identifier: {result:?}"
         );
         if !accepted {
             assert_eq!(result.unwrap_err().code(), ErrorCode::Bind);
