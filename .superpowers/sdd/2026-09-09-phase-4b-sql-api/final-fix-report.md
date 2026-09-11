@@ -129,4 +129,5 @@ Isolation checks: production sqlparser references remain confined to `src/sql/pa
 
 ## Commits
 
-Implementation and this verified report are committed together. The implementation commit SHA will be recorded here in a report-only follow-up commit, avoiding a self-referential hash.
+- Implementation/tests/verified report: **4658df1a065dae8c21b39c9d6548c7aef07f1d2c** (`fix: address phase 4b final SQL review findings`).
+- This report-only follow-up records that implementation SHA. It changes no production/test source and therefore retains the final gate evidence above; its own SHA is returned in the completion handoff rather than embedded self-referentially.
