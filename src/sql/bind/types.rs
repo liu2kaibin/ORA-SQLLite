@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     DbError, Decimal, ErrorCode, Result, Value,
@@ -12,7 +12,7 @@ use crate::{
 
 use super::ColumnResolver;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ParameterCollector {
     entries: Vec<ParameterEntry>,
     positions: HashMap<ParameterIdentifier, usize>,
@@ -20,6 +20,37 @@ pub(crate) struct ParameterCollector {
     // parameter leaf. Keep their caps pending to preserve actual SQL
     // first-occurrence ordering in `entries`.
     pending_assignment_caps: HashMap<ParameterIdentifier, SqlType>,
+    parents: Vec<usize>,
+    ranks: Vec<u8>,
+    numeric_aggregate_links: HashSet<(usize, usize)>,
+    finalized: bool,
+    statement_constraints: bool,
+    budget: BindingBudget,
+}
+
+#[derive(Debug)]
+struct BindingBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl Default for ParameterCollector {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            positions: HashMap::new(),
+            pending_assignment_caps: HashMap::new(),
+            parents: Vec::new(),
+            ranks: Vec::new(),
+            numeric_aggregate_links: HashSet::new(),
+            finalized: false,
+            statement_constraints: false,
+            budget: BindingBudget {
+                limit: crate::SqlLimits::default().max_ast_nodes() as usize,
+                used: 0,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -28,9 +59,36 @@ struct ParameterEntry {
     sql_type: SqlType,
     // The narrowest source type that remains safe for every DML assignment.
     assignment_cap: Option<SqlType>,
+    first_offset: usize,
 }
 
 impl ParameterCollector {
+    pub(crate) fn defers_grouping(&self) -> bool {
+        self.statement_constraints && !self.finalized && !self.entries.is_empty()
+    }
+    pub(crate) fn with_node_limit(limit: usize) -> Self {
+        Self {
+            statement_constraints: true,
+            budget: BindingBudget { limit, used: 0 },
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn charge_nodes(&mut self, count: usize) -> Result<()> {
+        let used = self
+            .budget
+            .used
+            .checked_add(count)
+            .filter(|used| *used <= self.budget.limit)
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Bind,
+                    "SQL binding exceeds the configured node/expansion budget",
+                )
+            })?;
+        self.budget.used = used;
+        Ok(())
+    }
     pub(crate) fn constrain(&mut self, key: &ParameterKey, constraint: SqlType) -> Result<SqlType> {
         let identifier = parameter_identifier(key);
         self.constrain_identifier(identifier, constraint)
@@ -63,10 +121,13 @@ impl ParameterCollector {
         };
         self.positions
             .insert(identifier.clone(), self.entries.len());
+        self.parents.push(self.entries.len());
+        self.ranks.push(0);
         self.entries.push(ParameterEntry {
             identifier,
             sql_type,
             assignment_cap,
+            first_offset: usize::MAX,
         });
         Ok(sql_type)
     }
@@ -104,11 +165,170 @@ impl ParameterCollector {
                 ParameterIdentifier::Position(position) => position,
                 ParameterIdentifier::Name(_) => unreachable!("all entries are positional"),
             });
+        } else {
+            self.entries.sort_by_key(|entry| entry.first_offset);
         }
         self.entries
             .into_iter()
             .map(|entry| ParameterMetadata::inferred(entry.identifier, entry.sql_type))
             .collect()
+    }
+
+    fn root(&mut self, index: usize) -> usize {
+        let mut root = index;
+        while self.parents[root] != root {
+            root = self.parents[root];
+        }
+        let mut at = index;
+        while self.parents[at] != at {
+            let next = self.parents[at];
+            self.parents[at] = root;
+            at = next;
+        }
+        root
+    }
+
+    fn link_common<'a>(
+        &mut self,
+        expressions: impl IntoIterator<Item = &'a BoundExpr>,
+    ) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        let mut first = None;
+        let mut derived = Vec::new();
+        let mut work: Vec<_> = expressions.into_iter().map(|expr| (expr, false)).collect();
+        while let Some((expression, aggregate_result)) = work.pop() {
+            match &expression.kind {
+                BoundExprKind::Parameter(identifier) => {
+                    let index = self.positions[identifier];
+                    if aggregate_result {
+                        derived.push(index);
+                        continue;
+                    }
+                    let mut right = self.root(index);
+                    if let Some(first) = first {
+                        let mut left = self.root(first);
+                        if left != right {
+                            if self.ranks[left] < self.ranks[right] {
+                                std::mem::swap(&mut left, &mut right);
+                            }
+                            self.parents[right] = left;
+                            if self.ranks[left] == self.ranks[right] {
+                                self.ranks[left] += 1;
+                            }
+                        }
+                    } else {
+                        first = Some(index);
+                    }
+                }
+                BoundExprKind::Unary {
+                    op: BoundUnaryOp::Positive | BoundUnaryOp::Negative,
+                    expr,
+                } => work.push((expr, aggregate_result)),
+                BoundExprKind::Binary {
+                    op:
+                        BoundBinaryOp::Add
+                        | BoundBinaryOp::Subtract
+                        | BoundBinaryOp::Multiply
+                        | BoundBinaryOp::Divide
+                        | BoundBinaryOp::Modulo,
+                    left,
+                    right,
+                } => {
+                    work.push((left, aggregate_result));
+                    work.push((right, aggregate_result));
+                }
+                BoundExprKind::Aggregate {
+                    function: BoundAggregateFunction::Min | BoundAggregateFunction::Max,
+                    argument: Some(argument),
+                } => work.push((argument, aggregate_result)),
+                BoundExprKind::Aggregate {
+                    function: BoundAggregateFunction::Sum | BoundAggregateFunction::Avg,
+                    argument: Some(argument),
+                } => work.push((argument, true)),
+                _ => {}
+            }
+        }
+        if let Some(target) = first {
+            for source in derived {
+                if !self.numeric_aggregate_links.contains(&(source, target)) {
+                    if self.numeric_aggregate_links.len() >= self.budget.limit {
+                        return Err(DbError::new(
+                            ErrorCode::Bind,
+                            "SQL parameter constraints exceed the binding budget",
+                        ));
+                    }
+                    self.numeric_aggregate_links.insert((source, target));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Solve linked parameter constraints once, then finalize by binding every
+    /// expression again with the solution, rechecking operator domains and DML
+    /// assignment direction and rebuilding all public output metadata.
+    pub(crate) fn solve(&mut self) -> Result<bool> {
+        if self.entries.is_empty() {
+            return Ok(false);
+        }
+        let mut common = vec![SqlType::Unknown; self.entries.len()];
+        let mut caps = vec![None; self.entries.len()];
+        for index in 0..self.entries.len() {
+            let root = self.root(index);
+            common[root] = common[root].unify(self.entries[index].sql_type)?;
+            if let Some(cap) = self.entries[index].assignment_cap {
+                caps[root] = Some(match caps[root] {
+                    Some(current) => shared_assignment_parameter_type(current, cap)?,
+                    None => cap,
+                });
+            }
+        }
+        // SUM/AVG output types are directed constraints, not equality links:
+        // an INT64 input has a DECIMAL result. A worklist propagates these across
+        // query clauses before final binding so earlier outputs cannot stay stale.
+        let mut outgoing = vec![Vec::new(); self.entries.len()];
+        let links: Vec<_> = self.numeric_aggregate_links.iter().copied().collect();
+        for (source, target) in links {
+            let source = self.root(source);
+            let target = self.root(target);
+            outgoing[source].push(target);
+        }
+        let mut queue: VecDeque<_> = (0..self.entries.len()).collect();
+        let mut queued = vec![true; self.entries.len()];
+        while let Some(source) = queue.pop_front() {
+            queued[source] = false;
+            if outgoing[source].is_empty() {
+                continue;
+            }
+            let result = match common[source] {
+                SqlType::Int64 | SqlType::Decimal => SqlType::Decimal,
+                SqlType::Float64 => SqlType::Float64,
+                SqlType::Null | SqlType::Unknown => continue,
+                _ => return Err(type_error("SUM and AVG require a numeric input")),
+            };
+            for &target in &outgoing[source] {
+                let inferred = common[target].unify(result)?;
+                if inferred != common[target] {
+                    common[target] = inferred;
+                    if !queued[target] {
+                        queue.push_back(target);
+                        queued[target] = true;
+                    }
+                }
+            }
+        }
+        for index in 0..self.entries.len() {
+            let root = self.root(index);
+            self.entries[index].sql_type = match caps[root] {
+                Some(cap) => parameter_type_with_assignment_cap(common[root], cap)?,
+                None => common[root],
+            };
+        }
+        self.finalized = true;
+        self.budget.used = 0;
+        Ok(true)
     }
 }
 
@@ -122,153 +342,160 @@ pub(crate) fn bind_expr(
     let mut values = Vec::new();
     while let Some(frame) = work.pop() {
         match frame {
-            BindFrame::Visit(expr) => match &expr.kind {
-                AstExprKind::Null => values.push(BoundExpr::new(
-                    BoundExprKind::Literal(Value::Null),
-                    SqlType::Null,
-                    true,
-                    expr.span,
-                )),
-                AstExprKind::Bool(value) => values.push(BoundExpr::new(
-                    BoundExprKind::Literal(Value::Bool(*value)),
-                    SqlType::Bool,
-                    false,
-                    expr.span,
-                )),
-                AstExprKind::Integer(value) => {
-                    let (value, sql_type) = parse_integer(value)?;
-                    values.push(BoundExpr::new(
-                        BoundExprKind::Literal(value),
-                        sql_type,
-                        false,
-                        expr.span,
-                    ));
-                }
-                AstExprKind::Decimal(value) => values.push(BoundExpr::new(
-                    BoundExprKind::Literal(Value::Decimal(parse_decimal(value)?)),
-                    SqlType::Decimal,
-                    false,
-                    expr.span,
-                )),
-                AstExprKind::Float(value) => values.push(BoundExpr::new(
-                    BoundExprKind::Literal(Value::Float64(parse_float(value)?)),
-                    SqlType::Float64,
-                    false,
-                    expr.span,
-                )),
-                AstExprKind::Text(value) => values.push(BoundExpr::new(
-                    BoundExprKind::Literal(Value::Text(value.clone())),
-                    SqlType::Text,
-                    false,
-                    expr.span,
-                )),
-                AstExprKind::Blob(value) => values.push(BoundExpr::new(
-                    BoundExprKind::Literal(Value::Blob(value.clone())),
-                    SqlType::Blob,
-                    false,
-                    expr.span,
-                )),
-                AstExprKind::Column(parts) => {
-                    let column = scope.resolve_column(parts)?;
-                    values.push(BoundExpr::new(
-                        BoundExprKind::Column {
-                            table_id: column.table_id,
-                            column_id: column.column_id,
-                            ordinal: column.ordinal,
-                        },
-                        column.sql_type,
-                        column.nullable,
-                        expr.span,
-                    ));
-                }
-                AstExprKind::Parameter(key) => {
-                    let sql_type = context.constrain(key, SqlType::Unknown)?;
-                    values.push(BoundExpr::new(
-                        BoundExprKind::Parameter(parameter_identifier(key)),
-                        sql_type,
+            BindFrame::Visit(expr) => {
+                context.charge_nodes(1)?;
+                match &expr.kind {
+                    AstExprKind::Null => values.push(BoundExpr::new(
+                        BoundExprKind::Literal(Value::Null),
+                        SqlType::Null,
                         true,
                         expr.span,
-                    ));
-                }
-                AstExprKind::Unary { op, expr: operand } => {
-                    work.push(BindFrame::FinishUnary {
-                        span: expr.span,
-                        op: *op,
-                    });
-                    work.push(BindFrame::Visit(operand));
-                }
-                AstExprKind::Binary { left, op, right } => {
-                    work.push(BindFrame::FinishBinary {
-                        span: expr.span,
-                        op: *op,
-                    });
-                    work.push(BindFrame::Visit(right));
-                    work.push(BindFrame::Visit(left));
-                }
-                AstExprKind::IsNull {
-                    expr: operand,
-                    negated,
-                } => {
-                    work.push(BindFrame::FinishIsNull {
-                        span: expr.span,
-                        negated: *negated,
-                    });
-                    work.push(BindFrame::Visit(operand));
-                }
-                AstExprKind::InList {
-                    expr: operand,
-                    values: list,
-                    negated,
-                } => {
-                    work.push(BindFrame::FinishInList {
-                        span: expr.span,
-                        value_count: list.len(),
-                        negated: *negated,
-                    });
-                    for value in list.iter().rev() {
-                        work.push(BindFrame::Visit(value));
+                    )),
+                    AstExprKind::Bool(value) => values.push(BoundExpr::new(
+                        BoundExprKind::Literal(Value::Bool(*value)),
+                        SqlType::Bool,
+                        false,
+                        expr.span,
+                    )),
+                    AstExprKind::Integer(value) => {
+                        let (value, sql_type) = parse_integer(value)?;
+                        values.push(BoundExpr::new(
+                            BoundExprKind::Literal(value),
+                            sql_type,
+                            false,
+                            expr.span,
+                        ));
                     }
-                    work.push(BindFrame::Visit(operand));
-                }
-                AstExprKind::Between {
-                    expr: operand,
-                    low,
-                    high,
-                    negated,
-                } => {
-                    work.push(BindFrame::FinishBetween {
-                        span: expr.span,
-                        negated: *negated,
-                    });
-                    work.push(BindFrame::Visit(high));
-                    work.push(BindFrame::Visit(low));
-                    work.push(BindFrame::Visit(operand));
-                }
-                AstExprKind::Like {
-                    expr: operand,
-                    pattern,
-                    negated,
-                } => {
-                    work.push(BindFrame::FinishLike {
-                        span: expr.span,
-                        negated: *negated,
-                    });
-                    work.push(BindFrame::Visit(pattern));
-                    work.push(BindFrame::Visit(operand));
-                }
-                AstExprKind::Aggregate { function, argument } => match argument {
-                    AggregateArgument::Wildcard(_) => {
-                        values.push(finish_aggregate(expr.span, *function, None)?)
+                    AstExprKind::Decimal(value) => values.push(BoundExpr::new(
+                        BoundExprKind::Literal(Value::Decimal(parse_decimal(value)?)),
+                        SqlType::Decimal,
+                        false,
+                        expr.span,
+                    )),
+                    AstExprKind::Float(value) => values.push(BoundExpr::new(
+                        BoundExprKind::Literal(Value::Float64(parse_float(value)?)),
+                        SqlType::Float64,
+                        false,
+                        expr.span,
+                    )),
+                    AstExprKind::Text(value) => values.push(BoundExpr::new(
+                        BoundExprKind::Literal(Value::Text(value.clone())),
+                        SqlType::Text,
+                        false,
+                        expr.span,
+                    )),
+                    AstExprKind::Blob(value) => values.push(BoundExpr::new(
+                        BoundExprKind::Literal(Value::Blob(value.clone())),
+                        SqlType::Blob,
+                        false,
+                        expr.span,
+                    )),
+                    AstExprKind::Column(parts) => {
+                        let column = scope.resolve_column(parts)?;
+                        values.push(BoundExpr::new(
+                            BoundExprKind::Column {
+                                source_id: column.source_id,
+                                table_id: column.table_id,
+                                column_id: column.column_id,
+                                ordinal: column.ordinal,
+                            },
+                            column.sql_type,
+                            column.nullable,
+                            expr.span,
+                        ));
                     }
-                    AggregateArgument::Expr(argument) => {
-                        work.push(BindFrame::FinishAggregate {
+                    AstExprKind::Parameter(key) => {
+                        let sql_type = context.constrain(key, SqlType::Unknown)?;
+                        let index = context.positions[&parameter_identifier(key)];
+                        context.entries[index].first_offset =
+                            context.entries[index].first_offset.min(expr.span.start());
+                        values.push(BoundExpr::new(
+                            BoundExprKind::Parameter(parameter_identifier(key)),
+                            sql_type,
+                            true,
+                            expr.span,
+                        ));
+                    }
+                    AstExprKind::Unary { op, expr: operand } => {
+                        work.push(BindFrame::FinishUnary {
                             span: expr.span,
-                            function: *function,
+                            op: *op,
                         });
-                        work.push(BindFrame::Visit(argument));
+                        work.push(BindFrame::Visit(operand));
                     }
-                },
-            },
+                    AstExprKind::Binary { left, op, right } => {
+                        work.push(BindFrame::FinishBinary {
+                            span: expr.span,
+                            op: *op,
+                        });
+                        work.push(BindFrame::Visit(right));
+                        work.push(BindFrame::Visit(left));
+                    }
+                    AstExprKind::IsNull {
+                        expr: operand,
+                        negated,
+                    } => {
+                        work.push(BindFrame::FinishIsNull {
+                            span: expr.span,
+                            negated: *negated,
+                        });
+                        work.push(BindFrame::Visit(operand));
+                    }
+                    AstExprKind::InList {
+                        expr: operand,
+                        values: list,
+                        negated,
+                    } => {
+                        work.push(BindFrame::FinishInList {
+                            span: expr.span,
+                            value_count: list.len(),
+                            negated: *negated,
+                        });
+                        for value in list.iter().rev() {
+                            work.push(BindFrame::Visit(value));
+                        }
+                        work.push(BindFrame::Visit(operand));
+                    }
+                    AstExprKind::Between {
+                        expr: operand,
+                        low,
+                        high,
+                        negated,
+                    } => {
+                        work.push(BindFrame::FinishBetween {
+                            span: expr.span,
+                            negated: *negated,
+                        });
+                        work.push(BindFrame::Visit(high));
+                        work.push(BindFrame::Visit(low));
+                        work.push(BindFrame::Visit(operand));
+                    }
+                    AstExprKind::Like {
+                        expr: operand,
+                        pattern,
+                        negated,
+                    } => {
+                        work.push(BindFrame::FinishLike {
+                            span: expr.span,
+                            negated: *negated,
+                        });
+                        work.push(BindFrame::Visit(pattern));
+                        work.push(BindFrame::Visit(operand));
+                    }
+                    AstExprKind::Aggregate { function, argument } => match argument {
+                        AggregateArgument::Wildcard(_) => {
+                            values.push(finish_aggregate(expr.span, *function, None, false)?)
+                        }
+                        AggregateArgument::Expr(argument) => {
+                            work.push(BindFrame::FinishAggregate {
+                                span: expr.span,
+                                function: *function,
+                            });
+                            work.push(BindFrame::Visit(argument));
+                        }
+                    },
+                }
+            }
             BindFrame::FinishUnary { span, op } => {
                 let mut operand = pop_bound(&mut values)?;
                 if op == UnaryOp::Not {
@@ -355,7 +582,12 @@ pub(crate) fn bind_expr(
             }
             BindFrame::FinishAggregate { span, function } => {
                 let argument = pop_bound(&mut values)?;
-                values.push(finish_aggregate(span, function, Some(argument))?);
+                values.push(finish_aggregate(
+                    span,
+                    function,
+                    Some(argument),
+                    context.statement_constraints && !context.finalized,
+                )?);
             }
         }
     }
@@ -583,6 +815,7 @@ fn finish_binary(
         ));
     }
 
+    context.link_common([&left, &right])?;
     let common = left.sql_type.unify(right.sql_type)?;
     apply_expected(&mut left, common, context)?;
     apply_expected(&mut right, common, context)?;
@@ -625,6 +858,7 @@ fn finish_aggregate(
     span: SqlSpan,
     function: AggregateFunction,
     argument: Option<BoundExpr>,
+    defer_unknown: bool,
 ) -> Result<BoundExpr> {
     let (sql_type, nullable) = match function {
         AggregateFunction::Count => (SqlType::Int64, false),
@@ -635,6 +869,7 @@ fn finish_aggregate(
             match input.sql_type {
                 SqlType::Int64 | SqlType::Decimal => (SqlType::Decimal, true),
                 SqlType::Float64 => (SqlType::Float64, true),
+                SqlType::Unknown if defer_unknown => (SqlType::Unknown, true),
                 _ => return Err(type_error("SUM and AVG require a numeric input")),
             }
         }
@@ -666,6 +901,7 @@ fn apply_common_type(
     expressions: &mut [BoundExpr],
     context: &mut ParameterCollector,
 ) -> Result<SqlType> {
+    context.link_common(expressions.iter())?;
     let mut common = SqlType::Unknown;
     for expression in expressions.iter() {
         common = common.unify(expression.sql_type)?;
@@ -1361,9 +1597,10 @@ mod tests {
     fn deeply_nested_owned_arithmetic_binds_without_process_stack_recursion() {
         // Production break caught: recursive AST binding or expected-type
         // propagation would overflow the test thread stack for an expression
-        // depth accepted by the public u16 nesting limit.
+        // supplied directly to the internal binder. Public parsing has a smaller
+        // implementation bound and is exercised separately in subprocesses.
         const DEPTH: usize = 16_384;
-        let limits = SqlLimits::default().with_max_nesting(DEPTH).unwrap();
+        let limits = SqlLimits::default();
         let statement = parse_statement("SELECT ID FROM USERS", &limits).unwrap();
         let AstStatement::Query(query) = statement else {
             unreachable!("test SQL is a query")
@@ -1392,9 +1629,7 @@ mod tests {
         assert_eq!(bound.sql_type, SqlType::Decimal);
         assert_eq!(parameters.finish()[0].data_type(), Some(DataType::Decimal));
 
-        // These intentionally leaked test trees avoid measuring recursive Drop;
-        // this regression isolates the two binder traversals under review.
-        std::mem::forget(bound);
-        std::mem::forget(expression);
+        drop(bound);
+        drop(expression);
     }
 }

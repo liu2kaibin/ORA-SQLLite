@@ -1039,62 +1039,11 @@ fn convert_query_expr(
     source_map: &SourceMap<'_>,
     budget: &mut AstBudget,
 ) -> Result<AstExpr> {
-    let mut converted = convert_expr(expression, source_map, budget)?;
-    normalize_query_boolean_literals(&mut converted);
+    let converted = convert_expr(expression, source_map, budget)?;
     if let Some(span) = rownum_span(&converted) {
         return Err(unsupported(source_map, Some(span)));
     }
     Ok(converted)
-}
-
-fn normalize_query_boolean_literals(expression: &mut AstExpr) {
-    match &mut expression.kind {
-        AstExprKind::Column(parts) if matches!(parts.as_slice(), [part] if !part.is_quoted() && matches!(part.as_str(), "TRUE" | "FALSE")) =>
-        {
-            expression.kind = AstExprKind::Bool(parts[0].as_str() == "TRUE");
-        }
-        AstExprKind::Unary { expr, .. } | AstExprKind::IsNull { expr, .. } => {
-            normalize_query_boolean_literals(expr);
-        }
-        AstExprKind::Binary { left, right, .. } => {
-            normalize_query_boolean_literals(left);
-            normalize_query_boolean_literals(right);
-        }
-        AstExprKind::InList { expr, values, .. } => {
-            normalize_query_boolean_literals(expr);
-            for value in values {
-                normalize_query_boolean_literals(value);
-            }
-        }
-        AstExprKind::Between {
-            expr, low, high, ..
-        } => {
-            normalize_query_boolean_literals(expr);
-            normalize_query_boolean_literals(low);
-            normalize_query_boolean_literals(high);
-        }
-        AstExprKind::Like { expr, pattern, .. } => {
-            normalize_query_boolean_literals(expr);
-            normalize_query_boolean_literals(pattern);
-        }
-        AstExprKind::Aggregate {
-            argument: AggregateArgument::Expr(expr),
-            ..
-        } => normalize_query_boolean_literals(expr),
-        AstExprKind::Null
-        | AstExprKind::Bool(_)
-        | AstExprKind::Integer(_)
-        | AstExprKind::Decimal(_)
-        | AstExprKind::Float(_)
-        | AstExprKind::Text(_)
-        | AstExprKind::Blob(_)
-        | AstExprKind::Parameter(_)
-        | AstExprKind::Column(_)
-        | AstExprKind::Aggregate {
-            argument: AggregateArgument::Wildcard(_),
-            ..
-        } => {}
-    }
 }
 
 fn rownum_span(expression: &AstExpr) -> Option<SqlSpan> {

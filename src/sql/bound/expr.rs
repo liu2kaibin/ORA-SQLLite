@@ -28,12 +28,55 @@ impl BoundExpr {
             span,
         }
     }
+
+    fn detach_children(&mut self, work: &mut Vec<Self>) {
+        match std::mem::replace(&mut self.kind, BoundExprKind::Literal(Value::Null)) {
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+                work.push(*expr)
+            }
+            BoundExprKind::Binary { left, right, .. } => {
+                work.push(*left);
+                work.push(*right);
+            }
+            BoundExprKind::InList { expr, values, .. } => {
+                work.push(*expr);
+                work.extend(values);
+            }
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => {
+                work.push(*expr);
+                work.push(*low);
+                work.push(*high);
+            }
+            BoundExprKind::Like { expr, pattern, .. } => {
+                work.push(*expr);
+                work.push(*pattern);
+            }
+            BoundExprKind::Aggregate {
+                argument: Some(expr),
+                ..
+            } => work.push(*expr),
+            _ => {}
+        }
+    }
+}
+
+impl Drop for BoundExpr {
+    fn drop(&mut self) {
+        let mut work = Vec::new();
+        self.detach_children(&mut work);
+        while let Some(mut child) = work.pop() {
+            child.detach_children(&mut work);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BoundExprKind {
     Literal(Value),
     Column {
+        source_id: super::SourceId,
         table_id: TableId,
         column_id: ColumnId,
         ordinal: u16,

@@ -144,16 +144,28 @@ mod tests {
 
         BoundStatement {
             kind: BoundStatementKind::Query {
-                projection: vec![BoundExpr {
-                    kind: BoundExprKind::Column {
-                        table_id,
-                        column_id,
-                        ordinal: 0,
-                    },
-                    sql_type: SqlType::Int64,
-                    nullable: false,
-                    span: SqlSpan::new(7, 9).unwrap(),
-                }],
+                query: crate::sql::bound::BoundQuery {
+                    projection: vec![BoundExpr {
+                        kind: BoundExprKind::Column {
+                            source_id: crate::sql::bound::SourceId(0),
+                            table_id,
+                            column_id,
+                            ordinal: 0,
+                        },
+                        sql_type: SqlType::Int64,
+                        nullable: false,
+                        span: SqlSpan::new(7, 9).unwrap(),
+                    }],
+                    distinct: false,
+                    sources: Vec::new(),
+                    joins: Vec::new(),
+                    selection: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    order_by: Vec::new(),
+                    columns: Vec::new(),
+                    dependencies: Vec::new(),
+                },
             },
             database_uuid: [7; 16],
             dependencies: vec![SchemaDependency {
@@ -193,14 +205,15 @@ mod tests {
     #[test]
     fn statement_debug_exposes_metadata_but_not_bound_ir() {
         let mut bound = fixture_bound_select();
-        bound.kind = BoundStatementKind::Query {
-            projection: vec![BoundExpr {
-                kind: BoundExprKind::Literal(Value::Int64(987_654_321)),
-                sql_type: SqlType::Int64,
-                nullable: false,
-                span: SqlSpan::new(17, 26).unwrap(),
-            }],
+        let BoundStatementKind::Query { query } = &mut bound.kind else {
+            panic!("query");
         };
+        query.projection = vec![BoundExpr {
+            kind: BoundExprKind::Literal(Value::Int64(987_654_321)),
+            sql_type: SqlType::Int64,
+            nullable: false,
+            span: SqlSpan::new(17, 26).unwrap(),
+        }];
 
         let rendered = format!("{:?}", Statement::from_bound(bound));
         assert!(rendered.contains("parameters"), "{rendered}");

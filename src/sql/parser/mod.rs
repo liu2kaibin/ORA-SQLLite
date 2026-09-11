@@ -1,3 +1,4 @@
+mod dialect;
 mod expr;
 mod query;
 mod source;

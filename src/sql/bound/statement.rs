@@ -97,7 +97,19 @@ impl BoundStatement {
         let mut columns = Vec::new();
         let mut expressions = Vec::new();
         match &self.kind {
-            BoundStatementKind::Query { projection } => expressions.extend(projection.iter()),
+            BoundStatementKind::Query { query } => {
+                expressions.extend(query.projection.iter());
+                expressions.extend(query.joins.iter().map(|join| &join.condition));
+                expressions.extend(query.selection.iter());
+                expressions.extend(query.group_by.iter());
+                expressions.extend(query.having.iter());
+                expressions.extend(query.order_by.iter().filter_map(
+                    |item| match &item.expression {
+                        super::BoundOrderExpression::Expression(expression) => Some(expression),
+                        super::BoundOrderExpression::Projection(_) => None,
+                    },
+                ));
+            }
             BoundStatementKind::Insert {
                 targets, values, ..
             } => {
@@ -222,7 +234,7 @@ fn validate_column_identity(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BoundStatementKind {
     Query {
-        projection: Vec<BoundExpr>,
+        query: super::BoundQuery,
     },
     Insert {
         table: BoundTable,

@@ -12,44 +12,8 @@ use crate::{
 };
 
 use super::{BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_expr};
-
-/// Owned, name-free semantics for one relational query.
-#[derive(Debug, PartialEq)]
-pub(crate) struct BoundQuery {
-    pub(crate) distinct: bool,
-    pub(crate) join_conditions: Vec<BoundExpr>,
-    pub(crate) selection: Option<BoundExpr>,
-    pub(crate) group_by: Vec<BoundExpr>,
-    pub(crate) having: Option<BoundExpr>,
-    pub(crate) projection: Vec<BoundExpr>,
-    pub(crate) order_by: Vec<BoundOrderItem>,
-    pub(crate) columns: Vec<ColumnMetadata>,
-    pub(crate) dependencies: Vec<SchemaDependency>,
-}
-
-/// A bound ORDER BY item, including its parsed direction and NULL placement.
-#[derive(Debug, PartialEq)]
-pub(crate) struct BoundOrderItem {
-    pub(crate) expression: BoundOrderExpression,
-    pub(crate) direction: OrderDirection,
-    pub(crate) nulls: NullPlacement,
-}
-
-/// An ORDER BY expression owned directly or referenced by completed projection index.
-#[derive(Debug, PartialEq)]
-pub(crate) enum BoundOrderExpression {
-    Projection(usize),
-    Expression(BoundExpr),
-}
-
-impl BoundOrderExpression {
-    fn expression<'a>(&'a self, projection: &'a [BoundExpr]) -> &'a BoundExpr {
-        match self {
-            Self::Projection(index) => &projection[*index],
-            Self::Expression(expression) => expression,
-        }
-    }
-}
+use crate::sql::bound::{BoundJoin, BoundSource, SourceId};
+pub(crate) use crate::sql::bound::{BoundOrderExpression, BoundOrderItem, BoundQuery};
 
 #[derive(Clone, Copy)]
 enum AliasIndex {
@@ -108,12 +72,25 @@ pub(crate) fn bind_query(
     let scope = join_scope.clone().with_left_join_null_extension(query);
     let dependencies = dependencies_for_scope(&scope, database_uuid)?;
 
-    let mut join_conditions = Vec::with_capacity(query.joins.len());
+    let sources = scope
+        .source_identities()
+        .enumerate()
+        .map(|(index, identity)| BoundSource {
+            source_id: SourceId(index),
+            table_id: identity.table_id,
+            schema_version: identity.schema_version,
+        })
+        .collect();
+    let mut joins = Vec::with_capacity(query.joins.len());
     for (index, join) in query.joins.iter().enumerate() {
         let condition_scope = join_scope.scope_for_join_condition(query, index)?;
         let condition = bind_condition(&join.condition, &condition_scope, parameters)?;
         reject_aggregate(&condition, "JOIN ON")?;
-        join_conditions.push(condition);
+        joins.push(BoundJoin {
+            kind: join.kind,
+            source_id: SourceId(index + 1),
+            condition,
+        });
     }
 
     let selection = query
@@ -160,7 +137,8 @@ pub(crate) fn bind_query(
                 projection.push(bound);
             }
             SelectItem::Wildcard { qualifier, span } => {
-                for column in scope.expand_star(qualifier.as_ref())? {
+                parameters.charge_nodes(scope.star_count(qualifier.as_ref())?)?;
+                for column in scope.star_columns(qualifier.as_ref())? {
                     projection.push(bound_column(&column, *span));
                     columns.push(column_metadata(
                         column.name.clone(),
@@ -201,7 +179,8 @@ pub(crate) fn bind_query(
         .try_fold(false, |found, aggregate| {
             aggregate.map(|aggregate| found || aggregate)
         })?;
-    if !group_by.is_empty() || has_aggregate || having.is_some() {
+    if (!group_by.is_empty() || has_aggregate || having.is_some()) && !parameters.defers_grouping()
+    {
         let group_index = GroupIndex::new(&group_by);
         if let Some(having) = &having {
             validate_having_grouping(having, &group_index)?;
@@ -216,7 +195,8 @@ pub(crate) fn bind_query(
 
     Ok(BoundQuery {
         distinct: query.distinct,
-        join_conditions,
+        sources,
+        joins,
         selection,
         group_by,
         having,
@@ -258,6 +238,7 @@ fn dependencies_for_scope(
 fn bound_column(column: &ResolvedColumn, span: crate::sql::SqlSpan) -> BoundExpr {
     BoundExpr::new(
         BoundExprKind::Column {
+            source_id: column.source_id,
             table_id: column.table_id,
             column_id: column.column_id,
             ordinal: column.ordinal,
@@ -519,11 +500,13 @@ fn structural_key(root: &BoundExpr) -> u64 {
                 hash_value(&mut hasher, value);
             }
             BoundExprKind::Column {
+                source_id,
                 table_id,
                 column_id,
                 ordinal,
             } => {
                 hasher.write_byte(1);
+                hasher.write_u64(source_id.0 as u64);
                 hasher.write_u64(table_id.get());
                 hasher.write_u64(column_id.get());
                 hasher.write_u64(u64::from(*ordinal));
@@ -764,16 +747,19 @@ fn structurally_equal(left: &BoundExpr, right: &BoundExpr) -> bool {
             (BoundExprKind::Literal(left), BoundExprKind::Literal(right)) if left == right => {}
             (
                 BoundExprKind::Column {
+                    source_id: left_source,
                     table_id: left_table,
                     column_id: left_column,
                     ordinal: left_ordinal,
                 },
                 BoundExprKind::Column {
+                    source_id: right_source,
                     table_id: right_table,
                     column_id: right_column,
                     ordinal: right_ordinal,
                 },
-            ) if left_table == right_table
+            ) if left_source == right_source
+                && left_table == right_table
                 && left_column == right_column
                 && left_ordinal == right_ordinal => {}
             (
@@ -1349,9 +1335,8 @@ mod tests {
                 .all(|order| matches!(&order.expression, BoundOrderExpression::Projection(0)))
         );
 
-        // This test isolates iterative binder behavior rather than recursive Drop.
-        std::mem::forget(bound);
-        std::mem::forget(query);
+        drop(bound);
+        drop(query);
     }
 
     #[test]

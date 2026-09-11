@@ -66,12 +66,20 @@ impl SqlLimits {
         Ok(self)
     }
 
+    /// Bounds owned AST nodes and, independently, retained bound-expression nodes
+    /// (including every column produced by wildcard expansion).
     pub fn with_max_ast_nodes(mut self, value: usize) -> Result<Self> {
         self.max_ast_nodes = checked_u32_limit(value, "maximum AST node count")?;
         Ok(self)
     }
 
+    /// Sets the shared parser/AST nesting limit, from 1 through the hard maximum 256.
     pub fn with_max_nesting(mut self, value: usize) -> Result<Self> {
+        // The upstream parser and conversion adapter have bounded recursive frames.
+        // Larger values would no longer be covered by the parser stack guarantee.
+        if value > 256 {
+            return Err(invalid_limit("maximum nesting"));
+        }
         self.max_nesting = checked_u16_limit(value, "maximum nesting")?;
         Ok(self)
     }
@@ -227,14 +235,14 @@ mod tests {
         );
         assert_eq!(
             SqlLimits::default()
-                .with_max_nesting(u16::MAX as usize)
+                .with_max_nesting(256)
                 .unwrap()
                 .max_nesting(),
-            u16::MAX
+            256
         );
         assert_eq!(
             SqlLimits::default()
-                .with_max_nesting(u16_overflow)
+                .with_max_nesting(257)
                 .unwrap_err()
                 .code(),
             ErrorCode::Internal

@@ -10,6 +10,50 @@ impl AstExpr {
     pub(crate) const fn span(&self) -> SqlSpan {
         self.span
     }
+
+    pub(crate) fn take_kind(&mut self) -> AstExprKind {
+        std::mem::replace(&mut self.kind, AstExprKind::Null)
+    }
+
+    fn detach_children(&mut self, work: &mut Vec<Self>) {
+        match self.take_kind() {
+            AstExprKind::Unary { expr, .. } | AstExprKind::IsNull { expr, .. } => work.push(*expr),
+            AstExprKind::Binary { left, right, .. } => {
+                work.push(*left);
+                work.push(*right);
+            }
+            AstExprKind::InList { expr, values, .. } => {
+                work.push(*expr);
+                work.extend(values);
+            }
+            AstExprKind::Between {
+                expr, low, high, ..
+            } => {
+                work.push(*expr);
+                work.push(*low);
+                work.push(*high);
+            }
+            AstExprKind::Like { expr, pattern, .. } => {
+                work.push(*expr);
+                work.push(*pattern);
+            }
+            AstExprKind::Aggregate {
+                argument: AggregateArgument::Expr(expr),
+                ..
+            } => work.push(*expr),
+            _ => {}
+        }
+    }
+}
+
+impl Drop for AstExpr {
+    fn drop(&mut self) {
+        let mut work = Vec::new();
+        self.detach_children(&mut work);
+        while let Some(mut child) = work.pop() {
+            child.detach_children(&mut work);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

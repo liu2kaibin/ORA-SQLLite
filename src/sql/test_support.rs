@@ -19,6 +19,542 @@ pub(crate) fn prepare_fixture(sql: &str) -> Result<BoundStatement> {
 }
 
 #[test]
+fn final_fix_retains_query_semantics_at_public_statement_boundary() {
+    // Dropping WHERE/JOIN/DISTINCT/GROUP/ORDER at Statement must change this result.
+    let fixture = phase_4b_catalog_fixture(4096);
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let conn = db.connect().unwrap();
+    for (left, right) in [
+        (
+            "SELECT ID FROM USERS WHERE ID = 1",
+            "SELECT ID FROM USERS WHERE ID = 2",
+        ),
+        ("SELECT ID FROM USERS", "SELECT DISTINCT ID FROM USERS"),
+        (
+            "SELECT U.ID FROM USERS U INNER JOIN ORDERS O ON U.ID = O.USER_ID",
+            "SELECT U.ID FROM USERS U LEFT JOIN ORDERS O ON U.ID = O.USER_ID",
+        ),
+        (
+            "SELECT COUNT(*) FROM USERS GROUP BY ID HAVING COUNT(*) > 1",
+            "SELECT COUNT(*) FROM USERS GROUP BY NAME HAVING COUNT(*) > 2",
+        ),
+        (
+            "SELECT ID FROM USERS ORDER BY NAME ASC NULLS FIRST",
+            "SELECT ID FROM USERS ORDER BY NAME DESC NULLS LAST",
+        ),
+    ] {
+        assert_ne!(
+            conn.prepare(left).unwrap().bound().kind,
+            conn.prepare(right).unwrap().bound().kind,
+            "{left} lost semantics"
+        );
+    }
+}
+
+#[test]
+fn final_fix_self_join_grouping_distinguishes_source_occurrences() {
+    assert_eq!(
+        prepare_fixture("SELECT M.ID FROM USERS U INNER JOIN USERS M ON U.ID = M.ID GROUP BY U.ID")
+            .unwrap_err()
+            .code(),
+        ErrorCode::Bind
+    );
+    let bound = prepare_fixture(
+        "SELECT U.ID, M.ID FROM USERS U INNER JOIN USERS M ON U.ID = M.ID GROUP BY U.ID, M.ID",
+    )
+    .unwrap();
+    assert_eq!(bound.dependencies.len(), 1);
+    let crate::sql::bound::BoundStatementKind::Query { query } = &bound.kind else {
+        panic!("query");
+    };
+    assert_eq!(query.sources.len(), 2);
+    assert_eq!(query.sources[0].table_id, query.sources[1].table_id);
+    assert_ne!(query.sources[0].source_id, query.sources[1].source_id);
+    let ids = query
+        .projection
+        .iter()
+        .map(|expr| match expr.kind {
+            crate::sql::bound::BoundExprKind::Column { source_id, .. } => source_id,
+            _ => panic!("column"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            crate::sql::bound::SourceId(0),
+            crate::sql::bound::SourceId(1)
+        ]
+    );
+}
+
+#[test]
+fn final_fix_schema_validation_visits_every_retained_query_clause() {
+    use crate::sql::{
+        ast::{JoinKind, NullPlacement, OrderDirection},
+        bound::{BoundExpr, BoundExprKind, BoundOrderExpression, BoundStatementKind},
+    };
+    fn replace_column(expr: &mut BoundExpr) {
+        let mut work = vec![expr];
+        while let Some(expr) = work.pop() {
+            match &mut expr.kind {
+                BoundExprKind::Column { column_id, .. } => {
+                    *column_id = crate::storage::catalog::types::ColumnId::new(1_000_000).unwrap();
+                    return;
+                }
+                BoundExprKind::Binary { left, right, .. } => {
+                    work.push(left);
+                    work.push(right);
+                }
+                _ => {}
+            }
+        }
+        panic!("fixture clause has no column");
+    }
+    let fixture = phase_4b_catalog_fixture(4096);
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let statement = db.connect().unwrap().prepare("SELECT DISTINCT U.ID, COUNT(O.ID) C FROM USERS U LEFT JOIN ORDERS O ON U.ID = O.USER_ID WHERE U.ID > 0 GROUP BY U.ID HAVING U.ID > 0 ORDER BY U.ID DESC NULLS FIRST, C").unwrap();
+    drop(db);
+    let pager = fixture.pager();
+    let mut read = pager.begin_read().unwrap();
+    let catalog = read.catalog_reader().unwrap();
+    let uuid = pager.database_uuid().unwrap();
+    let BoundStatementKind::Query { query } = &statement.bound().kind else {
+        panic!("query");
+    };
+    assert!(query.distinct);
+    assert_eq!(query.sources.len(), 2);
+    assert_eq!(query.joins.len(), 1);
+    assert_eq!(query.joins[0].kind, JoinKind::Left);
+    assert_eq!(query.joins[0].source_id, query.sources[1].source_id);
+    assert_eq!(query.order_by[0].direction, OrderDirection::Descending);
+    assert_eq!(query.order_by[0].nulls, NullPlacement::First);
+    assert_eq!(
+        query.order_by[1].expression,
+        BoundOrderExpression::Projection(1)
+    );
+    statement.validate_schema(uuid, &catalog).unwrap();
+    for clause in 0..6 {
+        let mut invalid = statement.bound().clone();
+        let BoundStatementKind::Query { query } = &mut invalid.kind else {
+            panic!("query");
+        };
+        let expression = match clause {
+            0 => &mut query.projection[0],
+            1 => &mut query.joins[0].condition,
+            2 => query.selection.as_mut().unwrap(),
+            3 => &mut query.group_by[0],
+            4 => query.having.as_mut().unwrap(),
+            5 => match &mut query.order_by[0].expression {
+                BoundOrderExpression::Expression(expression) => expression,
+                _ => panic!("expression order"),
+            },
+            _ => unreachable!(),
+        };
+        replace_column(expression);
+        assert_eq!(
+            invalid.validate_schema(uuid, &catalog).unwrap_err().code(),
+            ErrorCode::SchemaChanged,
+            "clause {clause}"
+        );
+    }
+}
+
+#[test]
+fn final_fix_parameters_finalize_earlier_outputs() {
+    let statement = prepare_fixture("SELECT :p, :p + 1 FROM USERS").unwrap();
+    assert_eq!(statement.columns[0].data_type(), DataType::Int64);
+    assert_eq!(statement.columns[1].data_type(), DataType::Int64);
+}
+
+#[test]
+fn final_fix_parameter_finalization_precedes_grouping_validation() {
+    let bound =
+        prepare_fixture("SELECT ID + :p FROM USERS GROUP BY ID + :p HAVING :p = 1.5").unwrap();
+    assert_eq!(bound.columns[0].data_type(), DataType::Decimal);
+}
+
+#[test]
+fn final_fix_parameter_solver_propagates_derived_aggregate_output_constraints() {
+    let bound =
+        prepare_fixture("SELECT :q, :r, SUM(:p) = :q, SUM(:q) = :r, :p + 1 FROM USERS").unwrap();
+    assert_eq!(bound.columns[0].data_type(), DataType::Decimal);
+    assert_eq!(bound.columns[1].data_type(), DataType::Decimal);
+    assert_eq!(
+        bound
+            .parameters
+            .iter()
+            .map(|p| p.data_type())
+            .collect::<Vec<_>>(),
+        [
+            Some(DataType::Decimal),
+            Some(DataType::Decimal),
+            Some(DataType::Int64)
+        ]
+    );
+}
+
+#[test]
+fn final_fix_parameter_solver_keeps_single_parameter_aggregate_self_links() {
+    // Skipping constraint collection for one distinct parameter leaves the first
+    // output INT64 while a later SUM/AVG comparison widens its metadata.
+    for function in ["SUM", "AVG"] {
+        let sql = format!("SELECT :p, {function}(:p) = :p, :p + 1 FROM USERS");
+        let bound = prepare_fixture(&sql).unwrap();
+        assert_eq!(bound.columns[0].data_type(), DataType::Decimal, "{sql}");
+        assert_eq!(bound.columns[2].data_type(), DataType::Decimal, "{sql}");
+        assert_eq!(bound.parameters[0].data_type(), Some(DataType::Decimal));
+    }
+}
+
+#[test]
+fn final_fix_depth_preflight_preserves_qualified_keyword_spans() {
+    let sql = "SELECT T . UNION FROM T UNION SELECT U . UNION FROM U";
+    let error = parse_statement(sql, &SqlLimits::default()).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Unsupported);
+    assert_eq!(error.sql_location().unwrap().byte_offset(), 24);
+}
+
+#[test]
+fn final_fix_parameter_solution_reaches_every_retained_expression_family() {
+    for (sql, expected) in [
+        (
+            "SELECT :a, :b, :a = :b, :b = :c, :c + 1 FROM USERS",
+            vec![
+                DataType::Int64,
+                DataType::Int64,
+                DataType::Bool,
+                DataType::Bool,
+                DataType::Int64,
+            ],
+        ),
+        (
+            "SELECT SUM(:a), :a + 1 FROM USERS",
+            vec![DataType::Decimal, DataType::Int64],
+        ),
+        (
+            "SELECT MIN(:p), :p + 1 FROM USERS",
+            vec![DataType::Int64, DataType::Int64],
+        ),
+        (
+            "SELECT :a IN (:b, :c), :c + 1, :b FROM USERS",
+            vec![DataType::Bool, DataType::Int64, DataType::Int64],
+        ),
+    ] {
+        let bound = prepare_fixture(sql).unwrap();
+        assert_eq!(
+            bound
+                .columns
+                .iter()
+                .map(|column| column.data_type())
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}"
+        );
+        assert!(
+            bound
+                .parameters
+                .iter()
+                .all(|parameter| parameter.data_type() == Some(DataType::Int64)),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT SUM(:p), :p = 'x' FROM USERS",
+        "SELECT :a BETWEEN :b AND :c, :c = X'AB' FROM USERS",
+        "SELECT :a IN (:b), :a = 1, :b = 'x' FROM USERS",
+        "UPDATE USERS SET ID = :p WHERE :p = :q AND :q = 'x'",
+        "CREATE TABLE FLAGS (B BOOL CHECK (:a = :b AND :a = TRUE AND :b = 1))",
+    ] {
+        assert_eq!(
+            prepare_fixture(sql).unwrap_err().code(),
+            ErrorCode::Type,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn final_fix_parameters_revalidate_linked_types_and_domains() {
+    for sql in [
+        "SELECT ID FROM USERS WHERE :a = :b AND :a = 1 AND :b = 'x'",
+        "SELECT :a + :b, :a = 'x' FROM USERS",
+        "SELECT :a < :b, :a = X'AB' FROM USERS",
+    ] {
+        assert_eq!(
+            prepare_fixture(sql).unwrap_err().code(),
+            ErrorCode::Type,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn final_fix_parameter_metadata_is_lexical_through_public_prepare() {
+    let fixture = phase_4b_catalog_fixture(4096);
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let conn = db.connect().unwrap();
+    let statement = conn.prepare("SELECT :projection FROM USERS U INNER JOIN ORDERS O ON O.ID = :joined WHERE U.ID = :filter ORDER BY :ordered, :PROJECTION").unwrap();
+    assert_eq!(
+        statement
+            .parameters()
+            .iter()
+            .map(|p| p.identifier().clone())
+            .collect::<Vec<_>>(),
+        ["PROJECTION", "JOINED", "FILTER", "ORDERED"]
+            .map(|name| ParameterIdentifier::Name(name.to_owned()))
+    );
+}
+
+#[test]
+fn final_fix_boolean_literals_use_common_expression_conversion() {
+    for sql in [
+        "INSERT INTO USERS (ID) VALUES (TRUE)",
+        "UPDATE USERS SET ID = FALSE",
+    ] {
+        assert_eq!(
+            prepare_fixture(sql).unwrap_err().code(),
+            ErrorCode::Type,
+            "Bool versus INT64: {sql}"
+        );
+    }
+    for sql in [
+        "SELECT TRUE, FALSE FROM USERS WHERE TRUE",
+        "UPDATE USERS SET ID = 1 WHERE FALSE",
+        "DELETE FROM USERS WHERE TRUE",
+        "CREATE TABLE FLAGS (B BOOL CHECK (B = TRUE), CHECK (FALSE OR B))",
+    ] {
+        prepare_fixture(sql).unwrap();
+    }
+    for sql in [
+        "SELECT \"TRUE\" FROM USERS",
+        "SELECT U.TRUE FROM USERS U",
+        "DELETE FROM USERS WHERE \"FALSE\"",
+    ] {
+        assert_eq!(
+            prepare_fixture(sql).unwrap_err().code(),
+            ErrorCode::Bind,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn final_fix_wildcard_expansion_obeys_bound_node_budget() {
+    let fixture = phase_4b_catalog_fixture(4096);
+    for (limit, accepted) in [(11, false), (12, true), (13, true)] {
+        let limits = SqlLimits::default().with_max_ast_nodes(limit).unwrap();
+        let result = public_prepare_with_limits(&fixture, limits, "SELECT *, U.*, * FROM USERS U");
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "twelve output nodes with limit {limit}"
+        );
+        if let Ok(statement) = result {
+            assert_eq!(statement.columns().len(), 12);
+        }
+    }
+}
+
+#[test]
+fn final_fix_wide_catalog_expansion_stops_at_default_budget_without_writes() {
+    use crate::storage::{catalog::types::ColumnType, test_support::phase_4b_add_table};
+    let fixture = phase_4b_catalog_fixture(4096);
+    let pager = fixture.pager();
+    let names = (0..1000).map(|i| format!("C{i}")).collect::<Vec<_>>();
+    let definitions = names
+        .iter()
+        .map(|name| (name.as_str(), ColumnType::Int64, true))
+        .collect::<Vec<_>>();
+    phase_4b_add_table(&pager, "WIDE", &definitions).unwrap();
+    drop(pager);
+    let before_main = std::fs::read(fixture.main_path()).unwrap();
+    let before_wal = std::fs::read(fixture.wal_path()).unwrap();
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let conn = db.connect().unwrap();
+    for (stars, columns) in [
+        (99, Some(99_000)),
+        (100, Some(100_000)),
+        (101, None),
+        (5000, None),
+    ] {
+        let sql = format!("SELECT {} FROM WIDE", vec!["*"; stars].join(","));
+        let result = conn.prepare(&sql);
+        if let Some(columns) = columns {
+            assert_eq!(result.unwrap().columns().len(), columns);
+        } else {
+            assert_eq!(result.unwrap_err().code(), ErrorCode::Bind);
+        }
+    }
+    drop(conn);
+    drop(db);
+    assert_eq!(std::fs::read(fixture.main_path()).unwrap(), before_main);
+    assert_eq!(std::fs::read(fixture.wal_path()).unwrap(), before_wal);
+}
+
+#[test]
+fn final_fix_boolean_dml_and_quoted_columns_bind_against_real_catalog() {
+    use crate::storage::{catalog::types::ColumnType, test_support::phase_4b_add_table};
+    let fixture = phase_4b_catalog_fixture(4096);
+    let pager = fixture.pager();
+    phase_4b_add_table(
+        &pager,
+        "FLAGS",
+        &[
+            ("B", ColumnType::Bool, true),
+            ("TRUE", ColumnType::Int64, true),
+        ],
+    )
+    .unwrap();
+    drop(pager);
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let conn = db.connect().unwrap();
+    for sql in [
+        "INSERT INTO FLAGS (B) VALUES (TRUE)",
+        "UPDATE FLAGS SET B = FALSE WHERE TRUE",
+        "DELETE FROM FLAGS WHERE B = FALSE",
+    ] {
+        conn.prepare(sql).unwrap();
+    }
+    let statement = conn
+        .prepare("SELECT \"TRUE\", F.TRUE, TRUE FROM FLAGS F")
+        .unwrap();
+    assert_eq!(
+        statement
+            .columns()
+            .iter()
+            .map(|column| column.data_type())
+            .collect::<Vec<_>>(),
+        [DataType::Int64, DataType::Int64, DataType::Bool]
+    );
+    assert!(statement.columns()[0].source_column_id().is_some());
+    assert!(statement.columns()[1].source_column_id().is_some());
+    assert!(statement.columns()[2].source_column_id().is_none());
+}
+
+#[test]
+fn final_fix_safety_subprocess() {
+    const CHILD: &str = "ORA_SQL_FINAL_FIX_SAFETY_CASE";
+    if let Ok(case) = std::env::var(CHILD) {
+        match case.as_str() {
+            "flat" | "rejected" => {
+                let mut sql = format!("SELECT {} FROM USERS", vec!["1"; 10_000].join("+"));
+                if case == "rejected" {
+                    sql.push_str(" WHERE (");
+                }
+                assert!(parse_statement(&sql, &SqlLimits::default()).is_err());
+            }
+            "nested" => {
+                let sql = format!(
+                    "SELECT {}1{} FROM USERS",
+                    "(".repeat(10_000),
+                    ")".repeat(10_000)
+                );
+                assert!(parse_statement(&sql, &SqlLimits::default()).is_err());
+            }
+            "owned_drop" => {
+                use crate::sql::{
+                    SqlSpan,
+                    ast::{AstExpr, AstExprKind, UnaryOp},
+                    bind::{BindingScope, ParameterCollector, bind_expr},
+                };
+                let span = SqlSpan::new(0, 1).unwrap();
+                let mut expr = AstExpr {
+                    kind: AstExprKind::Integer("1".to_owned()),
+                    span,
+                };
+                for _ in 0..30_000 {
+                    expr = AstExpr {
+                        kind: AstExprKind::Unary {
+                            op: UnaryOp::Positive,
+                            expr: Box::new(expr),
+                        },
+                        span,
+                    };
+                }
+                let fixture = phase_4b_catalog_fixture(4096);
+                let pager = fixture.pager();
+                let mut read = pager.begin_read().unwrap();
+                let catalog = read.catalog_reader().unwrap();
+                let parsed =
+                    parse_statement("SELECT ID FROM USERS", &SqlLimits::default()).unwrap();
+                let crate::sql::ast::AstStatement::Query(query) = parsed else {
+                    panic!("query");
+                };
+                let scope = BindingScope::from_query_sources(&catalog, &query).unwrap();
+                let bound =
+                    bind_expr(&expr, &scope, None, &mut ParameterCollector::default()).unwrap();
+                drop(bound);
+                drop(expr);
+            }
+            "normal_drop" => {
+                let sql = format!("SELECT {} FROM USERS", vec!["1"; 120].join("+"));
+                drop(prepare_fixture(&sql).unwrap());
+                assert!(SqlLimits::default().with_max_nesting(65_535).is_err());
+            }
+            "configured_boundaries" => {
+                for limit in [128, 255, 256] {
+                    let limits = SqlLimits::default().with_max_nesting(limit).unwrap();
+                    for (leaves, accepted) in
+                        [(limit - 3, true), (limit - 2, true), (limit - 1, false)]
+                    {
+                        let sql = format!("SELECT {} FROM USERS", vec!["1"; leaves].join("+"));
+                        assert_eq!(
+                            parse_statement(&sql, &limits).is_ok(),
+                            accepted,
+                            "depth {limit}, leaves {leaves}"
+                        );
+                    }
+                    let sql = format!("SELECT {} + FROM USERS", vec!["1"; limit - 2].join("+"));
+                    assert!(parse_statement(&sql, &limits).is_err());
+                }
+                assert!(SqlLimits::default().with_max_nesting(257).is_err());
+            }
+            "unsupported_chains" => {
+                for sql in [
+                    format!("SELECT 1{} FROM USERS", "::INT".repeat(10_000)),
+                    format!("SELECT {}TRUE FROM USERS", "NOT ".repeat(10_000)),
+                    vec!["SELECT 1 FROM USERS"; 10_000].join(" UNION "),
+                ] {
+                    assert!(parse_statement(&sql, &SqlLimits::default()).is_err());
+                }
+            }
+            _ => panic!("unknown child case"),
+        }
+        return;
+    }
+    let mut failures = Vec::new();
+    for case in [
+        "flat",
+        "rejected",
+        "nested",
+        "owned_drop",
+        "normal_drop",
+        "configured_boundaries",
+        "unsupported_chains",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sql::bind::test_support::final_fix_safety_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        if !output.status.success() || !String::from_utf8_lossy(&output.stdout).contains("1 passed")
+        {
+            failures.push(format!(
+                "case {case}: status {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn prepare_returns_metadata_without_writing_database_or_wal() {
     // Production break caught: omitting any public prepare entry point, using a
     // different catalog view, or publishing prepare-time storage changes would

@@ -9,7 +9,6 @@ use sqlparser::ast::{
     TableConstraint, TableFactor, TableObject, TableWithJoins,
     UniqueConstraint as ParserUniqueConstraint, Update as ParserUpdate,
 };
-use sqlparser::dialect::OracleDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
@@ -41,6 +40,28 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
     }
     #[cfg(test)]
     STATEMENT_SOURCE_MAP_BUILDS.with(|builds| builds.set(builds.get() + 1));
+    // The dependency and adapter use recursive frames. A bounded private stack
+    // makes the documented 128 (hard maximum 256) independent of caller stack
+    // size; no third-party tree ever leaves this worker, including error Drop.
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("sql-parser".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn_scoped(scope, || parse_statement_inner(sql, limits))
+            .map_err(|error| {
+                DbError::new(
+                    ErrorCode::Io,
+                    format!("cannot create SQL parser worker: {error}"),
+                )
+            })?;
+        match worker.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+fn parse_statement_inner(sql: &str, limits: &SqlLimits) -> Result<AstStatement> {
     let source_map = SourceMap::new(sql)?;
     let tokens = tokenize(sql, limits)?;
     let token_index = StatementTokenIndex::new(&tokens, &source_map)?;
@@ -48,6 +69,35 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
         return Err(unsupported(&source_map, Some(span)));
     }
     let statement_span = token_index.require_exactly_one_statement(&source_map)?;
+    let mut depth = 0usize;
+    let mut previous_is_period = false;
+    for token in &tokens {
+        if matches!(token.token, Token::Whitespace(_)) {
+            continue;
+        }
+        match &token.token {
+            Token::LParen => {
+                depth += 1;
+                if depth > usize::from(limits.max_nesting()) {
+                    return Err(super::ast_limit_error(
+                        source_map.sqlparser_location(token.span.start)?,
+                    ));
+                }
+            }
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Word(word)
+                if matches!(
+                    word.keyword,
+                    Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT | Keyword::MINUS
+                ) && word.quote_style.is_none()
+                    && !previous_is_period =>
+            {
+                return Err(unsupported(&source_map, source_map.span(token.span).ok()));
+            }
+            _ => {}
+        }
+        previous_is_period = token.token == Token::Period;
+    }
     if token_index.starts_with_keyword(Keyword::CREATE)
         && token_index.keyword(1) == Keyword::TABLESPACE
     {
@@ -59,7 +109,10 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
     }
 
     let parser_tokens = token_index.normalize_local_time_zone(&tokens, &source_map)?;
-    let statements = Parser::new(&OracleDialect)
+    let dialect = super::dialect::BoundedOracle {
+        max_depth: usize::from(limits.max_nesting()),
+    };
+    let statements = Parser::new(&dialect)
         .with_recursion_limit(limits.max_nesting() as usize)
         .with_tokens_with_locations(parser_tokens)
         .parse_statements()
@@ -88,6 +141,10 @@ pub(in crate::sql) fn parse_statement(sql: &str, limits: &SqlLimits) -> Result<A
 }
 
 fn parser_error(error: ParserError, source_map: &SourceMap<'_>) -> DbError {
+    if matches!(&error, ParserError::ParserError(message) if message == "ORA-SQLLite unsupported infix input")
+    {
+        return unsupported(source_map, None);
+    }
     let (message, upstream_location) = match error {
         ParserError::TokenizerError(message) | ParserError::ParserError(message) => {
             let location = parser_message_location(&message);
@@ -1587,10 +1644,10 @@ impl StatementTokenIndex {
                 span: source_map.span(token.span)?,
                 matching_right: None,
             });
-            if matches!(token.token, Token::RParen)
-                && let Some(opening) = openings.pop()
-            {
-                indexed[opening].matching_right = Some(index);
+            if matches!(token.token, Token::RParen) {
+                if let Some(opening) = openings.pop() {
+                    indexed[opening].matching_right = Some(index);
+                }
             }
             if matches!(token.token, Token::LParen) {
                 openings.push(index);
@@ -2366,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_recursion_limit_uses_a_controlled_source_fallback() {
+    fn lexical_nesting_limit_reports_first_excess_parenthesis() {
         let sql = "SELECT (((((((A))))))) FROM T";
         let limits = SqlLimits::default().with_max_nesting(1).unwrap();
 
@@ -2375,7 +2432,7 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::Syntax);
         assert_eq!(
             error.sql_location(),
-            Some(SqlLocation::new(0, 1, 1).unwrap())
+            Some(SqlLocation::new(8, 1, 9).unwrap())
         );
     }
 

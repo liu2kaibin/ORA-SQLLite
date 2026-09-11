@@ -1,5 +1,46 @@
 mod common;
 
+#[test]
+fn prepared_check_parameters_are_solved_and_owned_without_execution() {
+    use ora_sqllite::{DataType, ParameterIdentifier};
+    let paths = TempPaths::new("public-final-constraints");
+    let db = Database::create(paths.main(), Options::default()).unwrap();
+    let conn = db.connect().unwrap();
+    let statement = conn
+        .prepare("CREATE TABLE FLAGS (B BOOL CHECK (:first = :second AND :second = TRUE))")
+        .unwrap();
+    assert_eq!(
+        statement
+            .parameters()
+            .iter()
+            .map(|p| p.identifier().clone())
+            .collect::<Vec<_>>(),
+        [
+            ParameterIdentifier::Name("FIRST".to_owned()),
+            ParameterIdentifier::Name("SECOND".to_owned())
+        ]
+    );
+    assert!(
+        statement
+            .parameters()
+            .iter()
+            .all(|p| p.data_type() == Some(DataType::Bool))
+    );
+    assert_eq!(
+        conn.prepare("CREATE TABLE FLAGS (B BOOL CHECK (:a = :b AND :a = TRUE AND :b = 1))")
+            .unwrap_err()
+            .code(),
+        ErrorCode::Type
+    );
+    // CREATE was only prepared, so the same name is still available.
+    conn.prepare("CREATE TABLE FLAGS (B BOOL)").unwrap();
+    drop(conn);
+    drop(db);
+    let cloned = statement.clone();
+    drop(statement);
+    assert_eq!(cloned.parameters().len(), 2);
+}
+
 use common::TempPaths;
 use ora_sqllite::{
     AccessMode, Database, ErrorCode, Options, ReadTransaction, SqlLimits, Statement,

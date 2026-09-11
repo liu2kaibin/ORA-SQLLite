@@ -14,6 +14,7 @@ const MAX_AST_JOINS: u16 = u16::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedColumn {
+    pub(crate) source_id: crate::sql::bound::SourceId,
     pub(crate) table_id: TableId,
     pub(crate) schema_version: SchemaVersion,
     pub(crate) column_id: ColumnId,
@@ -115,7 +116,7 @@ impl BindingScope {
         }
 
         let mut tables = Vec::with_capacity(sources.len());
-        for source in sources {
+        for (index, source) in sources.iter().enumerate() {
             let table_name = checked_catalog_name(&source.table)?;
             let table = catalog
                 .find_table_by_name(&table_name)
@@ -130,7 +131,13 @@ impl BindingScope {
 
             let columns = catalog
                 .columns_for_table(table.id())
-                .map(|column| resolved_column(table.schema_version(), column))
+                .map(|column| {
+                    resolved_column(
+                        crate::sql::bound::SourceId(index),
+                        table.schema_version(),
+                        column,
+                    )
+                })
                 .collect();
             tables.push(BoundTable {
                 visible_name: visible.as_str().to_owned(),
@@ -153,20 +160,45 @@ impl BindingScope {
         &self,
         qualifier: Option<&Identifier>,
     ) -> Result<Vec<ResolvedColumn>> {
-        if let Some(qualifier) = qualifier {
-            return self
-                .tables
-                .iter()
-                .find(|table| table.visible_name == qualifier.as_str())
-                .map(expanded_table_columns)
-                .ok_or_else(|| bind_error("star qualifier is not present in the query scope"));
-        }
+        Ok(self.star_columns(qualifier)?.collect())
+    }
 
-        Ok(self
-            .tables
+    fn star_tables(&self, qualifier: Option<&Identifier>) -> Result<&[BoundTable]> {
+        match qualifier {
+            Some(qualifier) => {
+                let index = self
+                    .tables
+                    .iter()
+                    .position(|table| table.visible_name == qualifier.as_str())
+                    .ok_or_else(|| {
+                        bind_error("star qualifier is not present in the query scope")
+                    })?;
+                Ok(&self.tables[index..index + 1])
+            }
+            None => Ok(&self.tables),
+        }
+    }
+
+    pub(crate) fn star_count(&self, qualifier: Option<&Identifier>) -> Result<usize> {
+        self.star_tables(qualifier)?
             .iter()
-            .flat_map(expanded_table_columns)
-            .collect())
+            .try_fold(0usize, |count, table| {
+                count
+                    .checked_add(table.columns.len())
+                    .ok_or_else(|| bind_error("star column count overflow"))
+            })
+    }
+
+    pub(crate) fn star_columns(
+        &self,
+        qualifier: Option<&Identifier>,
+    ) -> Result<impl Iterator<Item = ResolvedColumn> + '_> {
+        Ok(self.star_tables(qualifier)?.iter().flat_map(|table| {
+            table
+                .columns
+                .iter()
+                .map(|column| resolve_for_table(column, table.null_extended))
+        }))
     }
 
     pub(crate) fn source_identities(&self) -> impl Iterator<Item = SourceIdentity> + '_ {
@@ -245,20 +277,6 @@ fn resolve_for_table(column: &ResolvedColumn, null_extended: bool) -> ResolvedCo
     resolved
 }
 
-fn expanded_table_columns(table: &BoundTable) -> Vec<ResolvedColumn> {
-    table
-        .columns
-        .iter()
-        .map(|column| {
-            let mut column = column.clone();
-            if table.null_extended {
-                column.nullable = true;
-            }
-            column
-        })
-        .collect()
-}
-
 fn checked_catalog_name(identifier: &Identifier) -> Result<CatalogName> {
     if identifier.as_str().is_empty() || identifier.as_str().len() > 128 {
         return Err(bind_error(
@@ -269,8 +287,13 @@ fn checked_catalog_name(identifier: &Identifier) -> Result<CatalogName> {
         .map_err(|_| bind_error("SQL identifier cannot be represented as a catalog name"))
 }
 
-fn resolved_column(schema_version: SchemaVersion, column: &ColumnDef) -> ResolvedColumn {
+fn resolved_column(
+    source_id: crate::sql::bound::SourceId,
+    schema_version: SchemaVersion,
+    column: &ColumnDef,
+) -> ResolvedColumn {
     ResolvedColumn {
+        source_id,
         table_id: column.table_id(),
         schema_version,
         column_id: column.id(),

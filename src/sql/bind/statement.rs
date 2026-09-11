@@ -34,30 +34,58 @@ pub(crate) fn bind_statement(
     catalog: &CatalogReader,
     database_uuid: [u8; 16],
 ) -> Result<BoundStatement> {
-    let mut parameters = ParameterCollector::default();
+    bind_statement_with_limits(
+        statement,
+        catalog,
+        database_uuid,
+        &crate::SqlLimits::default(),
+    )
+}
+
+pub(crate) fn bind_statement_with_limits(
+    statement: &AstStatement,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+    limits: &crate::SqlLimits,
+) -> Result<BoundStatement> {
+    let mut parameters = ParameterCollector::with_node_limit(limits.max_ast_nodes() as usize);
+    let mut parts = bind_parts(statement, catalog, database_uuid, &mut parameters)?;
+    if parameters.solve()? {
+        drop(parts);
+        parts = bind_parts(statement, catalog, database_uuid, &mut parameters)?;
+    }
+    Ok(BoundStatement {
+        kind: parts.kind,
+        database_uuid,
+        dependencies: parts.dependencies,
+        created_names: parts.created_names,
+        parameters: parameters.finish(),
+        columns: parts.columns,
+        span: statement.span(),
+    })
+}
+
+fn bind_parts(
+    statement: &AstStatement,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+    parameters: &mut ParameterCollector,
+) -> Result<BoundParts> {
     let parts = match statement {
         AstStatement::Query(query) => {
-            let bound = bind_query(query, catalog, database_uuid, &mut parameters)?;
+            let bound = bind_query(query, catalog, database_uuid, parameters)?;
             BoundParts {
-                kind: BoundStatementKind::Query {
-                    projection: bound.projection,
-                },
-                dependencies: bound.dependencies,
+                dependencies: bound.dependencies.clone(),
                 created_names: Vec::new(),
-                columns: bound.columns,
+                columns: bound.columns.clone(),
+                kind: BoundStatementKind::Query { query: bound },
             }
         }
-        AstStatement::Insert(insert) => {
-            bind_insert(insert, catalog, database_uuid, &mut parameters)?
-        }
-        AstStatement::Update(update) => {
-            bind_update(update, catalog, database_uuid, &mut parameters)?
-        }
-        AstStatement::Delete(delete) => {
-            bind_delete(delete, catalog, database_uuid, &mut parameters)?
-        }
+        AstStatement::Insert(insert) => bind_insert(insert, catalog, database_uuid, parameters)?,
+        AstStatement::Update(update) => bind_update(update, catalog, database_uuid, parameters)?,
+        AstStatement::Delete(delete) => bind_delete(delete, catalog, database_uuid, parameters)?,
         AstStatement::CreateTable(create) => {
-            bind_create_table(create, catalog, database_uuid, &mut parameters)?
+            bind_create_table(create, catalog, database_uuid, parameters)?
         }
         AstStatement::DropTable(drop) => bind_drop_table(&drop.name, catalog, database_uuid)?,
         AstStatement::CreateIndex(create) => bind_create_index(create, catalog, database_uuid)?,
@@ -72,15 +100,7 @@ pub(crate) fn bind_statement(
         AstStatement::Rollback(_) => BoundParts::empty(BoundStatementKind::Rollback),
     };
 
-    Ok(BoundStatement {
-        kind: parts.kind,
-        database_uuid,
-        dependencies: parts.dependencies,
-        created_names: parts.created_names,
-        parameters: parameters.finish(),
-        columns: parts.columns,
-        span: statement.span(),
-    })
+    Ok(parts)
 }
 
 struct BoundParts {
@@ -668,12 +688,12 @@ fn checked_constraint_name(
     }
     .map(checked_catalog_name)
     .transpose()?;
-    if let Some(name) = &name
-        && !names.insert(name.as_str().to_owned())
-    {
-        return Err(bind_error(
-            "CREATE TABLE contains a duplicate constraint name",
-        ));
+    if let Some(name) = &name {
+        if !names.insert(name.as_str().to_owned()) {
+            return Err(bind_error(
+                "CREATE TABLE contains a duplicate constraint name",
+            ));
+        }
     }
     Ok(name)
 }
@@ -717,6 +737,7 @@ impl NewTableScope {
             let column_id = ColumnId::new(u64::MAX - u64::from(column.ordinal))
                 .map_err(|_| bind_error("new table column binding marker is invalid"))?;
             resolved.push(ResolvedColumn {
+                source_id: crate::sql::bound::SourceId(0),
                 table_id,
                 schema_version,
                 column_id,

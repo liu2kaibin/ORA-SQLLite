@@ -342,6 +342,15 @@ fn convert_expr_inner(
     let partial_span = source_map.span(upstream_span);
     match expr.into_inner() {
         Expr::Identifier(ident) => {
+            if ident.quote_style.is_none()
+                && (ident.value.eq_ignore_ascii_case("true")
+                    || ident.value.eq_ignore_ascii_case("false"))
+            {
+                return Ok(AstExpr {
+                    span: source_map.span(ident.span)?,
+                    kind: AstExprKind::Bool(ident.value.eq_ignore_ascii_case("true")),
+                });
+            }
             let identifier = convert_identifier(ident, source_map)?;
             Ok(AstExpr {
                 span: identifier.span(),
@@ -889,7 +898,7 @@ mod tests {
         assert!(matches!(blob.kind, AstExprKind::Blob(ref value) if value == &[0x00, 0xaf]));
 
         let column = parse_expr_fragment("T.\"Mixed\"", &SqlLimits::default()).unwrap();
-        let AstExprKind::Column(parts) = column.kind else {
+        let AstExprKind::Column(parts) = &column.kind else {
             panic!("expected a column expression");
         };
         assert_eq!(parts.len(), 2);
@@ -1087,7 +1096,7 @@ mod tests {
         let not = parse_expr_fragment("NOT A", &SqlLimits::default()).unwrap();
         assert_eq!(not.span, SqlSpan::new(7, 12).unwrap());
         assert!(matches!(
-            not.kind,
+            &not.kind,
             AstExprKind::Unary {
                 op: UnaryOp::Not,
                 expr,
@@ -1097,7 +1106,7 @@ mod tests {
         let negative = parse_expr_fragment("-A", &SqlLimits::default()).unwrap();
         assert_eq!(negative.span, SqlSpan::new(7, 9).unwrap());
         assert!(matches!(
-            negative.kind,
+            &negative.kind,
             AstExprKind::Unary {
                 op: UnaryOp::Negative,
                 expr,
@@ -1107,7 +1116,7 @@ mod tests {
         let is_not_null = parse_expr_fragment("A IS NOT NULL", &SqlLimits::default()).unwrap();
         assert_eq!(is_not_null.span, SqlSpan::new(7, 20).unwrap());
         assert!(matches!(
-            is_not_null.kind,
+            &is_not_null.kind,
             AstExprKind::IsNull {
                 negated: true,
                 expr,
@@ -1117,7 +1126,7 @@ mod tests {
         let nested = parse_expr_fragment("(A + 1)", &SqlLimits::default()).unwrap();
         assert_eq!(nested.span, SqlSpan::new(7, 14).unwrap());
         assert!(matches!(
-            nested.kind,
+            &nested.kind,
             AstExprKind::Binary { left, right, .. }
                 if left.span == SqlSpan::new(8, 9).unwrap()
                     && right.span == SqlSpan::new(12, 13).unwrap()
@@ -1149,7 +1158,7 @@ mod tests {
         let aggregate = parse_expr_fragment("SUM(A + B)", &exact).unwrap();
         assert_eq!(aggregate.span, SqlSpan::new(7, 17).unwrap());
         assert!(matches!(
-            aggregate.kind,
+            &aggregate.kind,
             AstExprKind::Aggregate {
                 function: AggregateFunction::Sum,
                 argument: AggregateArgument::Expr(expr),

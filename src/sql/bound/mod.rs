@@ -1,5 +1,10 @@
 mod expr;
+mod query;
 mod statement;
+
+pub(crate) use query::{
+    BoundJoin, BoundOrderExpression, BoundOrderItem, BoundQuery, BoundSource, SourceId,
+};
 
 pub(crate) use expr::{
     BoundAggregateFunction, BoundBinaryOp, BoundExpr, BoundExprKind, BoundUnaryOp,

@@ -51,5 +51,5 @@ pub(crate) fn bind_sql(
     database_uuid: [u8; 16],
 ) -> Result<bound::BoundStatement> {
     let statement = parser::parse_statement(sql, limits)?;
-    bind::bind_statement(&statement, catalog, database_uuid)
+    bind::bind_statement_with_limits(&statement, catalog, database_uuid, limits)
 }
