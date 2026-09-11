@@ -16,10 +16,6 @@ pub enum DataType {
 }
 
 impl DataType {
-    #[allow(
-        dead_code,
-        reason = "the Phase 4B type binder is added in a later task"
-    )]
     pub(crate) const fn from_sql_type(sql_type: crate::sql::SqlType) -> Self {
         match sql_type {
             crate::sql::SqlType::Null => Self::Null,
@@ -51,6 +47,20 @@ pub struct ParameterMetadata {
 }
 
 impl ParameterMetadata {
+    pub(crate) const fn inferred(
+        identifier: ParameterIdentifier,
+        sql_type: crate::sql::SqlType,
+    ) -> Self {
+        let data_type = match sql_type {
+            crate::sql::SqlType::Null | crate::sql::SqlType::Unknown => None,
+            value => Some(DataType::from_sql_type(value)),
+        };
+        Self {
+            identifier,
+            data_type,
+        }
+    }
+
     pub fn identifier(&self) -> &ParameterIdentifier {
         &self.identifier
     }

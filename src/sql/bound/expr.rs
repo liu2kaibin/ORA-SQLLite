@@ -14,6 +14,22 @@ pub(crate) struct BoundExpr {
     pub span: SqlSpan,
 }
 
+impl BoundExpr {
+    pub(crate) const fn new(
+        kind: BoundExprKind,
+        sql_type: SqlType,
+        nullable: bool,
+        span: SqlSpan,
+    ) -> Self {
+        Self {
+            kind,
+            sql_type,
+            nullable,
+            span,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BoundExprKind {
     Literal(Value),
