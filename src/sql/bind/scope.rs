@@ -53,6 +53,23 @@ pub(crate) struct JoinConditionScope<'scope, 'query> {
 }
 
 impl BindingScope {
+    /// Builds the single pre-mutation row scope used by DML target expressions.
+    pub(crate) fn for_target(
+        catalog: &CatalogReader,
+        table: &Identifier,
+        alias: Option<&Identifier>,
+    ) -> Result<Self> {
+        Self::from_sources(
+            catalog,
+            &[TableSource {
+                table: table.clone(),
+                alias: alias.cloned(),
+                span: table.span(),
+            }],
+            0,
+        )
+    }
+
     pub(crate) fn from_query_sources(catalog: &CatalogReader, query: &AstQuery) -> Result<Self> {
         Ok(Self::join_condition_scope(catalog, query)?.with_left_join_null_extension(query))
     }

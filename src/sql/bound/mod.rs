@@ -5,7 +5,8 @@ pub(crate) use expr::{
     BoundAggregateFunction, BoundBinaryOp, BoundExpr, BoundExprKind, BoundUnaryOp,
 };
 pub(crate) use statement::{
-    BoundStatement, BoundStatementKind, CreatedNameDependency, SchemaDependency,
+    BoundAssignment, BoundColumn, BoundColumnDefinition, BoundConstraint, BoundStatement,
+    BoundStatementKind, BoundTable, CreatedNameDependency, SchemaDependency,
 };
 
 #[cfg(test)]

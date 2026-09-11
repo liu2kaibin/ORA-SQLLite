@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use crate::sql::bound::BoundStatement;
+use crate::{Result, sql::bound::BoundStatement, storage::catalog::CatalogReader};
 
 use super::{ColumnMetadata, ParameterMetadata};
 
@@ -96,12 +96,21 @@ impl Statement {
     pub(crate) fn bound(&self) -> &BoundStatement {
         &self.bound
     }
+
+    #[allow(dead_code, reason = "execution is added in Phase 4C")]
+    pub(crate) fn validate_schema(
+        &self,
+        database_uuid: [u8; 16],
+        catalog: &CatalogReader,
+    ) -> Result<()> {
+        self.bound.validate_schema(database_uuid, catalog)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        Value,
+        ErrorCode, Value,
         api::{ColumnMetadata, DataType, ParameterIdentifier, ParameterMetadata},
         sql::{
             SqlSpan, SqlType,
@@ -109,7 +118,10 @@ mod tests {
                 BoundExpr, BoundExprKind, BoundStatement, BoundStatementKind, SchemaDependency,
             },
         },
-        storage::catalog::types::{ColumnId, SchemaVersion, TableId},
+        storage::{
+            catalog::types::{ColumnId, SchemaVersion, TableId},
+            test_support::phase_4b_catalog_fixture,
+        },
     };
 
     use super::Statement;
@@ -192,5 +204,28 @@ mod tests {
         ] {
             assert!(!rendered.contains(private), "leaked {private}: {rendered}");
         }
+    }
+
+    #[test]
+    fn statement_keeps_the_bound_schema_validation_contract() {
+        // Production break caught: an API statement that bypasses its retained
+        // bound identity could execute against a different database snapshot.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let database_uuid = [7; 16];
+        let statement = Statement::from_bound(fixture_bound_select());
+
+        assert!(statement.validate_schema(database_uuid, &catalog).is_ok());
+        let mut wrong_uuid = database_uuid;
+        wrong_uuid[0] ^= 0xff;
+        assert_eq!(
+            statement
+                .validate_schema(wrong_uuid, &catalog)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
     }
 }

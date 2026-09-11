@@ -496,7 +496,10 @@ fn validate_ungrouped_subtree(expression: &BoundExpr, group_index: &GroupIndex<'
 fn is_constant(root: &BoundExpr) -> bool {
     let mut work = vec![(root, false)];
     while let Some((expression, _)) = work.pop() {
-        if matches!(expression.kind, BoundExprKind::Column { .. }) {
+        if matches!(
+            expression.kind,
+            BoundExprKind::Column { .. } | BoundExprKind::NewTableColumn { .. }
+        ) {
             return false;
         }
         push_children(expression, false, &mut work);
@@ -523,6 +526,10 @@ fn structural_key(root: &BoundExpr) -> u64 {
                 hasher.write_byte(1);
                 hasher.write_u64(table_id.get());
                 hasher.write_u64(column_id.get());
+                hasher.write_u64(u64::from(*ordinal));
+            }
+            BoundExprKind::NewTableColumn { ordinal } => {
+                hasher.write_byte(10);
                 hasher.write_u64(u64::from(*ordinal));
             }
             BoundExprKind::Parameter(identifier) => {
@@ -769,6 +776,14 @@ fn structurally_equal(left: &BoundExpr, right: &BoundExpr) -> bool {
             ) if left_table == right_table
                 && left_column == right_column
                 && left_ordinal == right_ordinal => {}
+            (
+                BoundExprKind::NewTableColumn {
+                    ordinal: left_ordinal,
+                },
+                BoundExprKind::NewTableColumn {
+                    ordinal: right_ordinal,
+                },
+            ) if left_ordinal == right_ordinal => {}
             (BoundExprKind::Parameter(left), BoundExprKind::Parameter(right)) if left == right => {}
             (
                 BoundExprKind::Unary {
@@ -875,7 +890,10 @@ fn structurally_equal(left: &BoundExpr, right: &BoundExpr) -> bool {
 
 fn expression_child_count(expression: &BoundExpr) -> usize {
     match &expression.kind {
-        BoundExprKind::Literal(_) | BoundExprKind::Column { .. } | BoundExprKind::Parameter(_) => 0,
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Column { .. }
+        | BoundExprKind::NewTableColumn { .. }
+        | BoundExprKind::Parameter(_) => 0,
         BoundExprKind::Unary { .. } | BoundExprKind::IsNull { .. } => 1,
         BoundExprKind::Binary { .. } | BoundExprKind::Like { .. } => 2,
         BoundExprKind::InList { values, .. } => values.len().saturating_add(1),
@@ -920,6 +938,7 @@ fn push_children<'a>(
         } => work.push((argument, beneath_aggregate)),
         BoundExprKind::Literal(_)
         | BoundExprKind::Column { .. }
+        | BoundExprKind::NewTableColumn { .. }
         | BoundExprKind::Parameter(_)
         | BoundExprKind::Aggregate { argument: None, .. } => {}
     }
@@ -957,6 +976,7 @@ fn push_children_plain<'a>(expression: &'a BoundExpr, work: &mut Vec<GroupingFra
         } => work.push(GroupingFrame::Visit(argument)),
         BoundExprKind::Literal(_)
         | BoundExprKind::Column { .. }
+        | BoundExprKind::NewTableColumn { .. }
         | BoundExprKind::Parameter(_)
         | BoundExprKind::Aggregate { argument: None, .. } => {}
     }

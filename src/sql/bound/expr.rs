@@ -38,6 +38,13 @@ pub(crate) enum BoundExprKind {
         column_id: ColumnId,
         ordinal: u16,
     },
+    /// A column of the table being defined by a CREATE TABLE constraint.
+    ///
+    /// It has no catalog identity before Phase 4C persists the new definition;
+    /// the ordinal is scoped by its enclosing `BoundStatementKind::CreateTable`.
+    NewTableColumn {
+        ordinal: u16,
+    },
     Parameter(ParameterIdentifier),
     Unary {
         op: BoundUnaryOp,

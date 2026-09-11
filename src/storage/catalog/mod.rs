@@ -19,7 +19,9 @@ use super::{
 };
 use crate::{DbError, ErrorCode, Result};
 use key::DecodedCatalogKey;
-use types::{CatalogMeta, CatalogName, ColumnDef, ColumnId, ObjectId, RowId, TableDef, TableId};
+use types::{
+    CatalogMeta, CatalogName, ColumnDef, ColumnId, ObjectId, ObjectKind, RowId, TableDef, TableId,
+};
 
 /// A fully decoded and cross-checked image. No page source is retained.
 #[derive(Debug, PartialEq, Eq)]
@@ -340,6 +342,34 @@ impl CatalogReader {
             .and_then(|names| names.get(name.as_str()))
             .and_then(|id| self.image.columns.get(id))
     }
+
+    /// Returns whether a persisted V1 object has this exact typed identity.
+    ///
+    /// Index and constraint records deliberately return false until their V1
+    /// record families exist; callers must not substitute an untyped name.
+    pub(crate) fn object_id_exists(&self, kind: ObjectKind, object_id: ObjectId) -> bool {
+        match kind {
+            ObjectKind::Table => TableId::from_object(object_id, kind)
+                .ok()
+                .is_some_and(|id| self.image.tables.contains_key(&id)),
+            ObjectKind::Column => ColumnId::from_object(object_id, kind)
+                .ok()
+                .is_some_and(|id| self.image.columns.contains_key(&id)),
+            ObjectKind::Index | ObjectKind::Constraint => false,
+        }
+    }
+
+    /// Returns whether this object kind's persistent name namespace is occupied.
+    ///
+    /// V1 persists table names only. Index and constraint namespaces stay empty
+    /// here until their own record families are added rather than being inferred
+    /// from unrelated table records.
+    pub(crate) fn object_name_exists(&self, kind: ObjectKind, name: &CatalogName) -> bool {
+        match kind {
+            ObjectKind::Table => self.image.table_names.contains_key(name.as_str()),
+            ObjectKind::Column | ObjectKind::Index | ObjectKind::Constraint => false,
+        }
+    }
 }
 
 /// Batch-local directory identity. Mutations never retain a borrow of the batch.
@@ -625,6 +655,262 @@ fn unsupported_legacy() -> DbError {
         ErrorCode::Unsupported,
         "nonempty catalog without CATALOG_V1 is unsupported",
     )
+}
+
+#[cfg(test)]
+pub(crate) fn drop_and_recreate_users(pager: &super::Pager) -> Result<CatalogReader> {
+    let (old_table, old_columns) = users_for_test_mutation(pager)?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+
+    writer.mutate(&mut batch, |tree, batch| {
+        require_matching_table_record(tree, batch, &old_table)?;
+        for column in &old_columns {
+            require_matching_column_record(tree, batch, column)?;
+        }
+
+        for column in &old_columns {
+            delete_required_record(
+                tree,
+                batch,
+                &key::column_name_key(column.table_id(), column.name())?,
+            )?;
+            delete_required_record(
+                tree,
+                batch,
+                &key::column_ordinal_key(column.table_id(), column.ordinal()),
+            )?;
+            delete_required_record(tree, batch, &key::column_definition_key(column.id()))?;
+        }
+        delete_required_record(tree, batch, &key::table_name_key(old_table.name())?)?;
+        delete_required_record(tree, batch, &key::table_definition_key(old_table.id()))?;
+        batch.release_btree_later(old_table.root())?;
+        Ok(())
+    })?;
+
+    let new_table_id = TableId::new(writer.allocate_object_id(&mut batch)?.get())?;
+    if new_table_id == old_table.id() {
+        return Err(corruption("test replacement table must use a new identity"));
+    }
+    let new_root = BTree::create(&mut batch, TreeKind::Table)?.root();
+    let new_table = TableDef::new(
+        new_table_id,
+        old_table.schema_version(),
+        new_root,
+        old_table.next_rowid(),
+        old_table.column_count(),
+        old_table.name().clone(),
+    )?;
+    writer.insert_table_definition(&mut batch, &new_table)?;
+    for old_column in &old_columns {
+        let new_column = ColumnDef::new(
+            ColumnId::new(writer.allocate_object_id(&mut batch)?.get())?,
+            new_table_id,
+            old_column.ordinal(),
+            old_column.column_type(),
+            old_column.nullable(),
+            old_column.name().clone(),
+        )?;
+        writer.insert_column_definition(&mut batch, &new_column)?;
+    }
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+
+    let replacement = open_catalog_for_test(pager)?;
+    let users_name = CatalogName::new("USERS")?;
+    let replacement_users = replacement
+        .find_table_by_name(&users_name)
+        .ok_or_else(|| corruption("test replacement USERS definition is missing"))?;
+    if replacement_users.id() == old_table.id()
+        || replacement_users.schema_version() != old_table.schema_version()
+        || replacement_users.column_count() != old_table.column_count()
+    {
+        return Err(corruption(
+            "test replacement USERS definition is not cross-checked",
+        ));
+    }
+    for (replacement_column, old_column) in replacement
+        .columns_for_table(replacement_users.id())
+        .zip(old_columns.iter())
+    {
+        if replacement_column.ordinal() != old_column.ordinal()
+            || replacement_column.name() != old_column.name()
+            || replacement_column.column_type() != old_column.column_type()
+            || replacement_column.nullable() != old_column.nullable()
+            || replacement_column.id() == old_column.id()
+        {
+            return Err(corruption(
+                "test replacement USERS columns are not cross-checked",
+            ));
+        }
+    }
+    Ok(replacement)
+}
+
+#[cfg(test)]
+pub(crate) fn bump_users_schema_version(pager: &super::Pager) -> Result<CatalogReader> {
+    let (old_table, _) = users_for_test_mutation(pager)?;
+    let next_version = old_table
+        .schema_version()
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| DbError::new(ErrorCode::Type, "test schema version is exhausted"))?;
+    let updated = TableDef::new(
+        old_table.id(),
+        types::SchemaVersion::new(next_version)?,
+        old_table.root(),
+        old_table.next_rowid(),
+        old_table.column_count(),
+        old_table.name().clone(),
+    )?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    writer.mutate(&mut batch, |tree, batch| {
+        require_matching_table_record(tree, batch, &old_table)?;
+        replace_record(
+            tree,
+            batch,
+            &key::table_definition_key(old_table.id()),
+            &record::encode_table_definition(&updated),
+        )
+    })?;
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+
+    let reader = open_catalog_for_test(pager)?;
+    if reader
+        .find_table_by_id(old_table.id())
+        .is_none_or(|table| table.schema_version() != updated.schema_version())
+    {
+        return Err(corruption("test USERS schema version was not committed"));
+    }
+    Ok(reader)
+}
+
+#[cfg(test)]
+pub(crate) fn add_unrelated_table(pager: &super::Pager) -> Result<CatalogReader> {
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    let table_id = TableId::new(writer.allocate_object_id(&mut batch)?.get())?;
+    let root = BTree::create(&mut batch, TreeKind::Table)?.root();
+    let table = TableDef::new(
+        table_id,
+        types::SchemaVersion::new(1)?,
+        root,
+        RowId::new(1)?,
+        1,
+        CatalogName::new("OTHER")?,
+    )?;
+    writer.insert_table_definition(&mut batch, &table)?;
+    let column = ColumnDef::new(
+        ColumnId::new(writer.allocate_object_id(&mut batch)?.get())?,
+        table_id,
+        0,
+        types::ColumnType::Int64,
+        false,
+        CatalogName::new("ID")?,
+    )?;
+    writer.insert_column_definition(&mut batch, &column)?;
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+
+    let reader = open_catalog_for_test(pager)?;
+    if reader.find_table_by_name(table.name()) != Some(&table) {
+        return Err(corruption("test unrelated table was not committed"));
+    }
+    Ok(reader)
+}
+
+#[cfg(test)]
+fn users_for_test_mutation(pager: &super::Pager) -> Result<(TableDef, Vec<ColumnDef>)> {
+    let reader = open_catalog_for_test(pager)?;
+    let users_name = CatalogName::new("USERS")?;
+    let table = reader
+        .find_table_by_name(&users_name)
+        .cloned()
+        .ok_or_else(|| corruption("test catalog is missing USERS"))?;
+    let columns = reader
+        .columns_for_table(table.id())
+        .cloned()
+        .collect::<Vec<_>>();
+    if columns.len() != usize::from(table.column_count()) {
+        return Err(corruption("test USERS catalog columns are incomplete"));
+    }
+    Ok((table, columns))
+}
+
+#[cfg(test)]
+fn open_catalog_for_test(pager: &super::Pager) -> Result<CatalogReader> {
+    let mut snapshot = pager.begin_read()?;
+    CatalogReader::open_empty_or_v1(&mut snapshot)
+}
+
+#[cfg(test)]
+fn require_matching_table_record(
+    tree: &BTree,
+    batch: &mut WriteBatch<'_>,
+    expected: &TableDef,
+) -> Result<()> {
+    let bytes = tree
+        .get(batch, &key::table_definition_key(expected.id()))?
+        .ok_or_else(|| corruption("test table definition is missing before mutation"))?;
+    if record::decode_table_definition(expected.id(), &bytes)? != *expected {
+        return Err(corruption("test table definition differs before mutation"));
+    }
+    let name_bytes = tree
+        .get(batch, &key::table_name_key(expected.name())?)?
+        .ok_or_else(|| corruption("test table name mapping is missing before mutation"))?;
+    if record::decode_table_name_mapping(&name_bytes)? != expected.id() {
+        return Err(corruption(
+            "test table name mapping differs before mutation",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn require_matching_column_record(
+    tree: &BTree,
+    batch: &mut WriteBatch<'_>,
+    expected: &ColumnDef,
+) -> Result<()> {
+    let bytes = tree
+        .get(batch, &key::column_definition_key(expected.id()))?
+        .ok_or_else(|| corruption("test column definition is missing before mutation"))?;
+    if record::decode_column_definition(expected.id(), &bytes)? != *expected {
+        return Err(corruption("test column definition differs before mutation"));
+    }
+    let name_bytes = tree
+        .get(
+            batch,
+            &key::column_name_key(expected.table_id(), expected.name())?,
+        )?
+        .ok_or_else(|| corruption("test column name mapping is missing before mutation"))?;
+    if record::decode_column_name_mapping(&name_bytes)? != expected.id() {
+        return Err(corruption(
+            "test column name mapping differs before mutation",
+        ));
+    }
+    let ordinal_bytes = tree
+        .get(
+            batch,
+            &key::column_ordinal_key(expected.table_id(), expected.ordinal()),
+        )?
+        .ok_or_else(|| corruption("test column ordinal mapping is missing before mutation"))?;
+    if record::decode_column_ordinal_mapping(&ordinal_bytes)? != expected.id() {
+        return Err(corruption(
+            "test column ordinal mapping differs before mutation",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch<'_>, key: &[u8]) -> Result<()> {
+    if tree.delete(batch, key)?.is_none() {
+        return Err(corruption("test catalog record is missing during mutation"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
