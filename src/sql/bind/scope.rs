@@ -2,7 +2,7 @@ use crate::{
     DbError, ErrorCode, Result,
     sql::{
         Identifier, SqlType,
-        ast::{AstQuery, TableSource},
+        ast::{AstQuery, JoinKind, TableSource},
     },
     storage::catalog::{
         CatalogReader,
@@ -26,7 +26,16 @@ pub(crate) struct ResolvedColumn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundTable {
     visible_name: String,
+    table_id: TableId,
+    schema_version: SchemaVersion,
     columns: Vec<ResolvedColumn>,
+    null_extended: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SourceIdentity {
+    pub(crate) table_id: TableId,
+    pub(crate) schema_version: SchemaVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,10 +45,33 @@ pub(crate) struct BindingScope {
 
 impl BindingScope {
     pub(crate) fn from_query_sources(catalog: &CatalogReader, query: &AstQuery) -> Result<Self> {
+        Ok(Self::join_condition_scope(catalog, query)?.with_left_join_null_extension(query))
+    }
+
+    pub(crate) fn join_condition_scope(catalog: &CatalogReader, query: &AstQuery) -> Result<Self> {
         let mut sources = Vec::with_capacity(query.joins.len().saturating_add(1));
         sources.push(query.from.clone());
         sources.extend(query.joins.iter().map(|join| join.source.clone()));
         Self::from_sources(catalog, &sources, MAX_AST_JOINS)
+    }
+
+    pub(crate) fn scope_for_join_condition(&self, query: &AstQuery, index: usize) -> Result<Self> {
+        if index >= query.joins.len() {
+            return Err(bind_error("JOIN condition index is outside the query"));
+        }
+        let mut scope = self.clone();
+        scope.tables.truncate(index.saturating_add(2));
+        for (table, join) in scope.tables.iter_mut().skip(1).zip(&query.joins[..index]) {
+            table.null_extended = join.kind == JoinKind::Left;
+        }
+        Ok(scope)
+    }
+
+    pub(crate) fn with_left_join_null_extension(mut self, query: &AstQuery) -> Self {
+        for (table, join) in self.tables.iter_mut().skip(1).zip(&query.joins) {
+            table.null_extended = join.kind == JoinKind::Left;
+        }
+        self
     }
 
     fn from_sources(
@@ -74,7 +106,10 @@ impl BindingScope {
                 .collect();
             tables.push(BoundTable {
                 visible_name: visible.as_str().to_owned(),
+                table_id: table.id(),
+                schema_version: table.schema_version(),
                 columns,
+                null_extended: false,
             });
         }
         Ok(Self { tables })
@@ -95,7 +130,7 @@ impl BindingScope {
                 if matches.next().is_some() {
                     return Err(bind_error("unqualified column name is ambiguous"));
                 }
-                Ok(resolved.clone())
+                Ok(resolve_for_table(resolved, &self.tables))
             }
             [qualifier, column] => {
                 let table = self
@@ -109,7 +144,7 @@ impl BindingScope {
                     .columns
                     .iter()
                     .find(|candidate| candidate.name == column.as_str())
-                    .cloned()
+                    .map(|column| resolve_for_table(column, std::slice::from_ref(table)))
                     .ok_or_else(|| bind_error("column is not present on the qualified table"))
             }
             [] => Err(bind_error("column name must contain one or two parts")),
@@ -128,16 +163,51 @@ impl BindingScope {
                 .tables
                 .iter()
                 .find(|table| table.visible_name == qualifier.as_str())
-                .map(|table| table.columns.clone())
+                .map(expanded_table_columns)
                 .ok_or_else(|| bind_error("star qualifier is not present in the query scope"));
         }
 
         Ok(self
             .tables
             .iter()
-            .flat_map(|table| table.columns.iter().cloned())
+            .flat_map(expanded_table_columns)
             .collect())
     }
+
+    pub(crate) fn source_identities(&self) -> impl Iterator<Item = SourceIdentity> + '_ {
+        self.tables.iter().map(|table| SourceIdentity {
+            table_id: table.table_id,
+            schema_version: table.schema_version,
+        })
+    }
+}
+
+fn resolve_for_table(column: &ResolvedColumn, tables: &[BoundTable]) -> ResolvedColumn {
+    let mut resolved = column.clone();
+    if tables.iter().any(|table| {
+        table.null_extended
+            && table
+                .columns
+                .iter()
+                .any(|candidate| candidate.column_id == resolved.column_id)
+    }) {
+        resolved.nullable = true;
+    }
+    resolved
+}
+
+fn expanded_table_columns(table: &BoundTable) -> Vec<ResolvedColumn> {
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            let mut column = column.clone();
+            if table.null_extended {
+                column.nullable = true;
+            }
+            column
+        })
+        .collect()
 }
 
 fn checked_catalog_name(identifier: &Identifier) -> Result<CatalogName> {
