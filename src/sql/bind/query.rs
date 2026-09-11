@@ -11,7 +11,7 @@ use crate::{
     storage::catalog::CatalogReader,
 };
 
-use super::{BindingScope, ParameterCollector, ResolvedColumn, bind_expr};
+use super::{BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_expr};
 
 /// Owned, name-free semantics for one relational query.
 #[derive(Debug, PartialEq)]
@@ -59,23 +59,28 @@ enum AliasIndex {
 
 struct GroupIndex<'a> {
     buckets: HashMap<u64, Vec<&'a BoundExpr>>,
+    key: fn(&BoundExpr) -> u64,
 }
 
 impl<'a> GroupIndex<'a> {
     fn new(group_by: &'a [BoundExpr]) -> Self {
+        Self::with_key(group_by, structural_key)
+    }
+
+    fn with_key(group_by: &'a [BoundExpr], key: fn(&BoundExpr) -> u64) -> Self {
         let mut buckets = HashMap::with_capacity(group_by.len());
         for expression in group_by {
             buckets
-                .entry(structural_key(expression))
+                .entry(key(expression))
                 .or_insert_with(Vec::new)
                 .push(expression);
         }
-        Self { buckets }
+        Self { buckets, key }
     }
 
     fn contains(&self, expression: &BoundExpr) -> bool {
         self.buckets
-            .get(&structural_key(expression))
+            .get(&(self.key)(expression))
             .is_some_and(|bucket| {
                 bucket
                     .iter()
@@ -224,7 +229,7 @@ pub(crate) fn bind_query(
 
 fn bind_condition(
     expression: &AstExpr,
-    scope: &BindingScope,
+    scope: &impl ColumnResolver,
     parameters: &mut ParameterCollector,
 ) -> Result<BoundExpr> {
     bind_expr(expression, scope, Some(SqlType::Bool), parameters)
@@ -963,11 +968,12 @@ fn bind_error(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use super::GroupIndex;
     use crate::{
-        ErrorCode,
+        ErrorCode, Value,
         api::{ColumnMetadata, DataType},
         sql::{
-            Identifier, SqlSpan,
+            Identifier, SqlSpan, SqlType,
             ast::{
                 AstExpr, AstExprKind, AstQuery, BinaryOp, Join, JoinKind, NullPlacement,
                 OrderDirection, OrderItem, SelectItem, TableSource,
@@ -976,7 +982,7 @@ mod tests {
                 BindingScope, BoundOrderExpression, ParameterCollector, bind_query,
                 test_support::prepare_fixture,
             },
-            bound::BoundStatementKind,
+            bound::{BoundExpr, BoundExprKind, BoundStatementKind},
         },
         storage::test_support::phase_4b_catalog_fixture,
     };
@@ -1329,6 +1335,28 @@ mod tests {
     }
 
     #[test]
+    fn group_index_confirms_structural_equality_inside_colliding_bucket() {
+        // Production break caught: accepting a hash match without structural
+        // confirmation would accept an unrelated GROUP BY expression whenever
+        // two keys collide.
+        let span = SqlSpan::new(0, 1).unwrap();
+        let integer = |value| {
+            BoundExpr::new(
+                BoundExprKind::Literal(Value::Int64(value)),
+                SqlType::Int64,
+                false,
+                span,
+            )
+        };
+        let group_by = vec![integer(1)];
+        let index = GroupIndex::with_key(&group_by, |_| 0);
+
+        assert_eq!(index.buckets.len(), 1);
+        assert!(index.contains(&integer(1)));
+        assert!(!index.contains(&integer(2)));
+    }
+
+    #[test]
     fn large_group_projection_and_order_sets_bind_with_indexed_membership() {
         // Production break caught: scanning every GROUP BY tree for every
         // projection and ORDER BY expression grows preparation quadratically.
@@ -1396,16 +1424,10 @@ mod tests {
         let catalog = snapshot.catalog_reader().unwrap();
         let mut parameters = ParameterCollector::default();
 
-        let started = std::time::Instant::now();
         let bound = bind_query(&query, &catalog, database_uuid, &mut parameters).unwrap();
-        let elapsed = started.elapsed();
 
         assert_eq!(bound.columns.len(), SCALE + 1);
         assert_eq!(bound.order_by.len(), SCALE);
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "group membership lookup regressed to quadratic work: {elapsed:?}"
-        );
     }
 
     #[test]

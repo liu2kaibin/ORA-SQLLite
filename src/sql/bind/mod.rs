@@ -7,5 +7,5 @@ mod types;
 mod test_support;
 
 pub(crate) use query::{BoundOrderExpression, BoundOrderItem, BoundQuery, bind_query};
-pub(crate) use scope::{BindingScope, ResolvedColumn};
+pub(crate) use scope::{BindingScope, ColumnResolver, ResolvedColumn};
 pub(crate) use types::{ParameterCollector, bind_expr};

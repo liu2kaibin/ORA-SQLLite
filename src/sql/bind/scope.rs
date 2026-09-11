@@ -2,7 +2,7 @@ use crate::{
     DbError, ErrorCode, Result,
     sql::{
         Identifier, SqlType,
-        ast::{AstQuery, JoinKind, TableSource},
+        ast::{AstQuery, Join, JoinKind, TableSource},
     },
     storage::catalog::{
         CatalogReader,
@@ -38,9 +38,18 @@ pub(crate) struct SourceIdentity {
     pub(crate) schema_version: SchemaVersion,
 }
 
+pub(crate) trait ColumnResolver {
+    fn resolve_column(&self, parts: &[Identifier]) -> Result<ResolvedColumn>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BindingScope {
     tables: Vec<BoundTable>,
+}
+
+pub(crate) struct JoinConditionScope<'scope, 'query> {
+    tables: &'scope [BoundTable],
+    preceding_joins: &'query [Join],
 }
 
 impl BindingScope {
@@ -55,16 +64,18 @@ impl BindingScope {
         Self::from_sources(catalog, &sources, MAX_AST_JOINS)
     }
 
-    pub(crate) fn scope_for_join_condition(&self, query: &AstQuery, index: usize) -> Result<Self> {
+    pub(crate) fn scope_for_join_condition<'scope, 'query>(
+        &'scope self,
+        query: &'query AstQuery,
+        index: usize,
+    ) -> Result<JoinConditionScope<'scope, 'query>> {
         if index >= query.joins.len() {
             return Err(bind_error("JOIN condition index is outside the query"));
         }
-        let mut scope = self.clone();
-        scope.tables.truncate(index.saturating_add(2));
-        for (table, join) in scope.tables.iter_mut().skip(1).zip(&query.joins[..index]) {
-            table.null_extended = join.kind == JoinKind::Left;
-        }
-        Ok(scope)
+        Ok(JoinConditionScope {
+            tables: &self.tables[..index.saturating_add(2)],
+            preceding_joins: &query.joins[..index],
+        })
     }
 
     pub(crate) fn with_left_join_null_extension(mut self, query: &AstQuery) -> Self {
@@ -116,42 +127,9 @@ impl BindingScope {
     }
 
     pub(crate) fn resolve_column(&self, parts: &[Identifier]) -> Result<ResolvedColumn> {
-        match parts {
-            [column] => {
-                let mut matches = self.tables.iter().flat_map(|table| {
-                    table
-                        .columns
-                        .iter()
-                        .filter(move |candidate| candidate.name == column.as_str())
-                });
-                let resolved = matches
-                    .next()
-                    .ok_or_else(|| bind_error("column is not present in the query scope"))?;
-                if matches.next().is_some() {
-                    return Err(bind_error("unqualified column name is ambiguous"));
-                }
-                Ok(resolve_for_table(resolved, &self.tables))
-            }
-            [qualifier, column] => {
-                let table = self
-                    .tables
-                    .iter()
-                    .find(|table| table.visible_name == qualifier.as_str())
-                    .ok_or_else(|| {
-                        bind_error("table qualifier is not present in the query scope")
-                    })?;
-                table
-                    .columns
-                    .iter()
-                    .find(|candidate| candidate.name == column.as_str())
-                    .map(|column| resolve_for_table(column, std::slice::from_ref(table)))
-                    .ok_or_else(|| bind_error("column is not present on the qualified table"))
-            }
-            [] => Err(bind_error("column name must contain one or two parts")),
-            _ => Err(bind_error(
-                "column name must not contain more than two parts",
-            )),
-        }
+        resolve_column_in_tables(&self.tables, parts, |index| {
+            self.tables[index].null_extended
+        })
     }
 
     pub(crate) fn expand_star(
@@ -182,15 +160,69 @@ impl BindingScope {
     }
 }
 
-fn resolve_for_table(column: &ResolvedColumn, tables: &[BoundTable]) -> ResolvedColumn {
-    let mut resolved = column.clone();
-    if tables.iter().any(|table| {
-        table.null_extended
-            && table
+impl ColumnResolver for BindingScope {
+    fn resolve_column(&self, parts: &[Identifier]) -> Result<ResolvedColumn> {
+        self.resolve_column(parts)
+    }
+}
+
+impl ColumnResolver for JoinConditionScope<'_, '_> {
+    fn resolve_column(&self, parts: &[Identifier]) -> Result<ResolvedColumn> {
+        resolve_column_in_tables(self.tables, parts, |index| {
+            index > 0
+                && self
+                    .preceding_joins
+                    .get(index - 1)
+                    .is_some_and(|join| join.kind == JoinKind::Left)
+        })
+    }
+}
+
+fn resolve_column_in_tables(
+    tables: &[BoundTable],
+    parts: &[Identifier],
+    null_extended: impl Fn(usize) -> bool,
+) -> Result<ResolvedColumn> {
+    match parts {
+        [column] => {
+            let mut matches = tables.iter().enumerate().flat_map(|(index, table)| {
+                table
+                    .columns
+                    .iter()
+                    .filter(move |candidate| candidate.name == column.as_str())
+                    .map(move |candidate| (index, candidate))
+            });
+            let (index, resolved) = matches
+                .next()
+                .ok_or_else(|| bind_error("column is not present in the query scope"))?;
+            if matches.next().is_some() {
+                return Err(bind_error("unqualified column name is ambiguous"));
+            }
+            Ok(resolve_for_table(resolved, null_extended(index)))
+        }
+        [qualifier, column] => {
+            let (index, table) = tables
+                .iter()
+                .enumerate()
+                .find(|(_, table)| table.visible_name == qualifier.as_str())
+                .ok_or_else(|| bind_error("table qualifier is not present in the query scope"))?;
+            table
                 .columns
                 .iter()
-                .any(|candidate| candidate.column_id == resolved.column_id)
-    }) {
+                .find(|candidate| candidate.name == column.as_str())
+                .map(|column| resolve_for_table(column, null_extended(index)))
+                .ok_or_else(|| bind_error("column is not present on the qualified table"))
+        }
+        [] => Err(bind_error("column name must contain one or two parts")),
+        _ => Err(bind_error(
+            "column name must not contain more than two parts",
+        )),
+    }
+}
+
+fn resolve_for_table(column: &ResolvedColumn, null_extended: bool) -> ResolvedColumn {
+    let mut resolved = column.clone();
+    if null_extended {
         resolved.nullable = true;
     }
     resolved
@@ -500,6 +532,48 @@ mod tests {
         assert_eq!(
             all_names,
             ["ID", "USER_ID", "ID", "NAME", "AMOUNT", "FLOAT_COL"]
+        );
+    }
+
+    #[test]
+    fn join_condition_scope_borrows_its_visible_prefix() {
+        // Production break caught: copying the complete source scope for each
+        // JOIN ON copies later, not-yet-visible table columns. A condition view
+        // must borrow only its visible prefix while retaining prior LEFT JOIN
+        // null extension semantics.
+        let reader = real_catalog_with_users_and_orders();
+        let mut query = query(
+            source("USERS", Some("U")),
+            vec![
+                source("ORDERS", Some("O")),
+                source("USERS", Some("M")),
+                source("ORDERS", Some("L")),
+            ],
+        );
+        query.joins[0].kind = JoinKind::Left;
+        let scope = BindingScope::join_condition_scope(&reader, &query).unwrap();
+        let condition_scope = scope.scope_for_join_condition(&query, 1).unwrap();
+
+        assert_eq!(condition_scope.tables.len(), 3);
+        assert_eq!(condition_scope.tables.as_ptr(), scope.tables.as_ptr());
+        assert!(
+            condition_scope
+                .resolve_column(&idents(&["O", "ID"]))
+                .unwrap()
+                .nullable
+        );
+        assert!(
+            !condition_scope
+                .resolve_column(&idents(&["M", "ID"]))
+                .unwrap()
+                .nullable
+        );
+        assert_eq!(
+            condition_scope
+                .resolve_column(&idents(&["L", "ID"]))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
         );
     }
 }

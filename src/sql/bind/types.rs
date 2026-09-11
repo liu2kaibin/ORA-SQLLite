@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-use super::BindingScope;
+use super::ColumnResolver;
 
 #[derive(Debug, Default)]
 pub(crate) struct ParameterCollector {
@@ -69,7 +69,7 @@ impl ParameterCollector {
 
 pub(crate) fn bind_expr(
     expr: &AstExpr,
-    scope: &BindingScope,
+    scope: &impl ColumnResolver,
     expected: Option<SqlType>,
     context: &mut ParameterCollector,
 ) -> Result<BoundExpr> {
