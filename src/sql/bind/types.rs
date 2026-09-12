@@ -103,6 +103,19 @@ impl ParameterCollector {
         identifier: ParameterIdentifier,
         constraint: SqlType,
     ) -> Result<SqlType> {
+        if self.finalized {
+            let index = self.positions.get(&identifier).ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Internal,
+                    "parameter was not collected before solving",
+                )
+            })?;
+            let sql_type = self.entries[*index].sql_type;
+            // A context may promote INT64 to DECIMAL, but must never rewrite
+            // the solved parameter type retained by other occurrences.
+            sql_type.unify(constraint)?;
+            return Ok(sql_type);
+        }
         if let Some(index) = self.positions.get(&identifier).copied() {
             let entry = &mut self.entries[index];
             let inferred = entry.sql_type.unify(constraint)?;
@@ -137,6 +150,16 @@ impl ParameterCollector {
         identifier: ParameterIdentifier,
         target: SqlType,
     ) -> Result<()> {
+        if self.finalized {
+            let sql_type = self.constrain_identifier(identifier, SqlType::Unknown)?;
+            return if assignment_type_is_compatible(sql_type, target) {
+                Ok(())
+            } else {
+                Err(type_error(
+                    "solved parameter is not compatible with the assignment target",
+                ))
+            };
+        }
         if let Some(index) = self.positions.get(&identifier).copied() {
             let entry = &mut self.entries[index];
             let assignment_cap = match entry.assignment_cap {
@@ -270,20 +293,17 @@ impl ParameterCollector {
     /// expression again with the solution, rechecking operator domains and DML
     /// assignment direction and rebuilding all public output metadata.
     pub(crate) fn solve(&mut self) -> Result<bool> {
+        if self.finalized {
+            return Ok(!self.entries.is_empty());
+        }
         if self.entries.is_empty() {
+            self.finalized = true;
             return Ok(false);
         }
         let mut common = vec![SqlType::Unknown; self.entries.len()];
-        let mut caps = vec![None; self.entries.len()];
         for index in 0..self.entries.len() {
             let root = self.root(index);
             common[root] = common[root].unify(self.entries[index].sql_type)?;
-            if let Some(cap) = self.entries[index].assignment_cap {
-                caps[root] = Some(match caps[root] {
-                    Some(current) => shared_assignment_parameter_type(current, cap)?,
-                    None => cap,
-                });
-            }
         }
         // SUM/AVG output types are directed constraints, not equality links:
         // an INT64 input has a DECIMAL result. A worklist propagates these across
@@ -321,7 +341,9 @@ impl ParameterCollector {
         }
         for index in 0..self.entries.len() {
             let root = self.root(index);
-            self.entries[index].sql_type = match caps[root] {
+            // Links share expression context, not directional write restrictions.
+            // Apply only this identifier's own cap to the component solution.
+            self.entries[index].sql_type = match self.entries[index].assignment_cap {
                 Some(cap) => parameter_type_with_assignment_cap(common[root], cap)?,
                 None => common[root],
             };
@@ -406,9 +428,11 @@ pub(crate) fn bind_expr(
                     }
                     AstExprKind::Parameter(key) => {
                         let sql_type = context.constrain(key, SqlType::Unknown)?;
-                        let index = context.positions[&parameter_identifier(key)];
-                        context.entries[index].first_offset =
-                            context.entries[index].first_offset.min(expr.span.start());
+                        if !context.finalized {
+                            let index = context.positions[&parameter_identifier(key)];
+                            context.entries[index].first_offset =
+                                context.entries[index].first_offset.min(expr.span.start());
+                        }
                         values.push(BoundExpr::new(
                             BoundExprKind::Parameter(parameter_identifier(key)),
                             sql_type,

@@ -19,6 +19,229 @@ pub(crate) fn prepare_fixture(sql: &str) -> Result<BoundStatement> {
 }
 
 #[test]
+fn final_fix_exception_linked_write_parameters_keep_frozen_types() {
+    // A component-wide assignment cap plus mutable final binding leaves the
+    // earlier Q leaf INT64 while its public metadata becomes DECIMAL.
+    let fixture = phase_4b_catalog_fixture(4096);
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let sql = "UPDATE USERS SET ID = :p WHERE :p = :q AND :q = 1.5";
+    let statement = db.connect().unwrap().prepare(sql).unwrap();
+    assert_exception_parameter_types(
+        &statement,
+        &[
+            ("P", crate::sql::SqlType::Int64, DataType::Int64, 2),
+            ("Q", crate::sql::SqlType::Decimal, DataType::Decimal, 2),
+        ],
+    );
+}
+
+#[test]
+fn final_fix_exception_assignment_caps_stay_per_parameter() {
+    // Sharing a cap across linked identifiers changes Q's declared type; ignoring
+    // P's own cap or rewriting a promoted leaf breaks the retained/public match.
+    use crate::sql::SqlType::{Decimal, Int64};
+    let fixture = phase_4b_catalog_fixture(4096);
+    let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+    let connection = db.connect().unwrap();
+    for (sql, expected) in [
+        (
+            "UPDATE USERS SET ID = :p, AMOUNT = :q WHERE :p = :q AND :q = 1.5",
+            vec![
+                ("P", Int64, DataType::Int64, 2),
+                ("Q", Decimal, DataType::Decimal, 3),
+            ],
+        ),
+        (
+            "UPDATE USERS SET AMOUNT = :q, ID = :p WHERE :q = :p AND :q = 1.5",
+            vec![
+                ("Q", Decimal, DataType::Decimal, 3),
+                ("P", Int64, DataType::Int64, 2),
+            ],
+        ),
+        (
+            "UPDATE USERS SET ID = :q WHERE :p = :q AND :p = 1.5",
+            vec![
+                ("Q", Int64, DataType::Int64, 2),
+                ("P", Decimal, DataType::Decimal, 2),
+            ],
+        ),
+        (
+            "SELECT :p, :q FROM USERS WHERE :p = :q AND :q = 1.5",
+            vec![
+                ("P", Decimal, DataType::Decimal, 2),
+                ("Q", Decimal, DataType::Decimal, 3),
+            ],
+        ),
+        (
+            "UPDATE USERS SET ID = :p, AMOUNT = :p WHERE :p = 1.5",
+            vec![("P", Int64, DataType::Int64, 3)],
+        ),
+    ] {
+        let statement = connection.prepare(sql).unwrap();
+        assert_exception_parameter_types(&statement, &expected);
+    }
+    // Removing unification/domain or final assignment validation would accept
+    // incompatible linked writes or a Decimal expression into INT64.
+    for sql in [
+        "UPDATE USERS SET ID = :p WHERE :p = :q AND :q = 'x'",
+        "UPDATE USERS SET ID = :p, NAME = :q WHERE :p = :q",
+        "UPDATE USERS SET ID = :p + 1.5 WHERE :p = :q AND :q = 1",
+    ] {
+        assert_eq!(
+            connection.prepare(sql).unwrap_err().code(),
+            ErrorCode::Type,
+            "{sql}"
+        );
+    }
+    for function in ["SUM", "AVG"] {
+        let sql = format!("SELECT :p, {function}(:p) = :p, :p + 1 FROM USERS");
+        let statement = connection.prepare(&sql).unwrap();
+        assert_exception_parameter_types(&statement, &[("P", Decimal, DataType::Decimal, 4)]);
+    }
+}
+
+#[test]
+fn final_fix_exception_finalized_collector_cannot_widen_or_add_parameters() {
+    // Re-enabling collection after solve would widen P or create an uncollected Q.
+    use crate::sql::{ParameterKey, SqlSpan, SqlType, bind::ParameterCollector};
+    let key = ParameterKey::parse(":p", SqlSpan::new(0, 2).unwrap()).unwrap();
+    let missing = ParameterKey::parse(":q", SqlSpan::new(3, 5).unwrap()).unwrap();
+    let mut collector = ParameterCollector::default();
+    collector.constrain(&key, SqlType::Int64).unwrap();
+    assert!(collector.solve().unwrap());
+    assert_eq!(
+        collector.constrain(&key, SqlType::Decimal).unwrap(),
+        SqlType::Int64
+    );
+    assert_eq!(
+        collector.constrain(&key, SqlType::Text).unwrap_err().code(),
+        ErrorCode::Type
+    );
+    assert_eq!(
+        collector
+            .constrain(&missing, SqlType::Unknown)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Internal
+    );
+    let metadata = collector.finish();
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].data_type(), Some(DataType::Int64));
+}
+
+#[test]
+fn final_fix_exception_finalized_assignment_validates_without_retyping() {
+    // Re-running assignment inference would silently narrow a solved Decimal P
+    // into INT64, or widen a solved INT64 P for an otherwise legal Decimal write.
+    use crate::sql::{
+        ParameterKey, SqlSpan, SqlType,
+        ast::{AstExpr, AstExprKind, AstStatement},
+        bind::{BindingScope, ParameterCollector, bind_assignment_expr},
+    };
+    let fixture = phase_4b_catalog_fixture(4096);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().unwrap();
+    let catalog = snapshot.catalog_reader().unwrap();
+    let AstStatement::Query(query) =
+        parse_statement("SELECT ID FROM USERS", &SqlLimits::default()).unwrap()
+    else {
+        unreachable!()
+    };
+    let scope = BindingScope::from_query_sources(&catalog, &query).unwrap();
+    let span = SqlSpan::new(0, 2).unwrap();
+    let key = ParameterKey::parse(":p", span).unwrap();
+    let expression = AstExpr {
+        kind: AstExprKind::Parameter(key.clone()),
+        span,
+    };
+    for (source, target, accepted) in [
+        (SqlType::Decimal, SqlType::Int64, false),
+        (SqlType::Int64, SqlType::Decimal, true),
+    ] {
+        let mut collector = ParameterCollector::default();
+        collector.constrain(&key, source).unwrap();
+        collector.solve().unwrap();
+        let result = bind_assignment_expr(&expression, &scope, target, &mut collector);
+        if accepted {
+            assert_eq!(result.unwrap().sql_type, source);
+        } else {
+            assert_eq!(result.unwrap_err().code(), ErrorCode::Type);
+        }
+        assert_eq!(collector.constrain(&key, SqlType::Unknown).unwrap(), source);
+        assert_eq!(collector.finish().len(), 1);
+    }
+    let mut empty = ParameterCollector::default();
+    assert!(!empty.solve().unwrap());
+    assert_eq!(
+        bind_assignment_expr(&expression, &scope, SqlType::Int64, &mut empty)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Internal
+    );
+    assert!(empty.finish().is_empty());
+}
+
+fn assert_exception_parameter_types(
+    statement: &crate::Statement,
+    expected: &[(&str, crate::sql::SqlType, DataType, usize)],
+) {
+    use crate::sql::bound::{BoundExprKind, BoundStatementKind};
+    assert_eq!(statement.parameters().len(), expected.len());
+    for (metadata, &(name, _, public_type, _)) in statement.parameters().iter().zip(expected) {
+        assert_eq!(
+            metadata.identifier(),
+            &ParameterIdentifier::Name(name.to_owned())
+        );
+        assert_eq!(metadata.data_type(), Some(public_type));
+    }
+    let mut work = Vec::new();
+    match &statement.bound().kind {
+        BoundStatementKind::Update {
+            assignments,
+            selection,
+            ..
+        } => {
+            work.extend(assignments.iter().map(|assignment| &assignment.value));
+            work.extend(selection.iter());
+        }
+        BoundStatementKind::Query { query } => {
+            work.extend(query.projection.iter());
+            work.extend(query.selection.iter());
+        }
+        _ => panic!("exception fixture must be UPDATE or SELECT"),
+    }
+    let mut counts = vec![0; expected.len()];
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            BoundExprKind::Parameter(ParameterIdentifier::Name(name)) => {
+                let index = expected.iter().position(|entry| entry.0 == name).unwrap();
+                assert_eq!(
+                    expression.sql_type, expected[index].1,
+                    "{name} at {:?}",
+                    expression.span
+                );
+                counts[index] += 1;
+            }
+            BoundExprKind::Binary { left, right, .. } => {
+                work.push(left);
+                work.push(right);
+            }
+            BoundExprKind::Unary { expr, .. } => work.push(expr),
+            BoundExprKind::Aggregate {
+                argument: Some(argument),
+                ..
+            } => work.push(argument),
+            BoundExprKind::Literal(_) | BoundExprKind::Column { .. } => {}
+            _ => panic!("unexpected expression in exception fixture"),
+        }
+    }
+    assert_eq!(
+        counts,
+        expected.iter().map(|entry| entry.3).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn final_fix_retains_query_semantics_at_public_statement_boundary() {
     // Dropping WHERE/JOIN/DISTINCT/GROUP/ORDER at Statement must change this result.
     let fixture = phase_4b_catalog_fixture(4096);
