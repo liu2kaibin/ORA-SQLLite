@@ -18,9 +18,15 @@ mod validate;
 mod wal;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
-use file::OpenMode;
+pub(crate) use file::OpenMode;
+pub(crate) use pager::{Pager, PagerConfig};
+#[allow(
+    unused_imports,
+    reason = "transaction wrappers consume these crate-private handles in Task 11"
+)]
+pub(crate) use pager::{ReadSnapshot, WriteBatch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct PageId(pub(super) u64);

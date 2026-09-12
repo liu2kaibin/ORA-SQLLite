@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    Lsn, PageId, PageRef,
+    Lsn, PageId, PageRef, Pager, PagerConfig, ReadSnapshot, WriteBatch,
     btree::{BTree, TreeKind},
     catalog::{
         CatalogReader, CatalogWriter,
@@ -29,7 +29,7 @@ use super::{
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
-    pager::{PageSource, Pager, PagerConfig, ReadSnapshot, WriteBatch},
+    pager::PageSource,
     row::{RowCodec, decode_rowid_key, encode_rowid_key},
     validate::validate_tree,
     wal::{Wal, wal_path},
@@ -37,12 +37,12 @@ use super::{
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) struct TempDatabase {
+pub(crate) struct TempDatabase {
     path: PathBuf,
 }
 
 impl TempDatabase {
-    pub(super) fn new(label: &str) -> Self {
+    pub(crate) fn new(label: &str) -> Self {
         Self::new_with_sequence(label, || NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -60,7 +60,7 @@ impl TempDatabase {
         }
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -92,6 +92,250 @@ impl Drop for TempDatabase {
 pub(super) fn write_wal_fixture(database_path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(wal_path(database_path), bytes)
         .map_err(|error| DbError::new(ErrorCode::Io, format!("write WAL fixture: {error}")))
+}
+
+pub(crate) struct Phase4bCatalogFixture {
+    temp: TempDatabase,
+    wal_path: PathBuf,
+    page_size: u32,
+    users_id: TableId,
+    orders_id: TableId,
+}
+
+impl Phase4bCatalogFixture {
+    pub(crate) fn pager(&self) -> Pager {
+        Pager::open(
+            self.main_path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(self.page_size),
+        )
+        .expect("open the Phase 4B catalog fixture")
+    }
+
+    pub(crate) fn main_path(&self) -> &Path {
+        self.temp.path()
+    }
+
+    pub(crate) fn wal_path(&self) -> &Path {
+        &self.wal_path
+    }
+
+    pub(crate) const fn users_id(&self) -> TableId {
+        self.users_id
+    }
+
+    pub(crate) const fn orders_id(&self) -> TableId {
+        self.orders_id
+    }
+}
+
+pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
+    let temp = TempDatabase::new("phase4b-catalog");
+    let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))
+        .expect("create the Phase 4B catalog fixture");
+    let mut batch = pager
+        .begin_write()
+        .expect("begin the Phase 4B catalog fixture write");
+    let mut writer =
+        CatalogWriter::bootstrap(&mut batch).expect("bootstrap the Phase 4B catalog fixture");
+    let users_id = insert_phase_4b_table(
+        &mut writer,
+        &mut batch,
+        "USERS",
+        &[
+            ("ID", ColumnType::Int64, false),
+            ("NAME", ColumnType::Text, true),
+            ("AMOUNT", ColumnType::Decimal, true),
+            ("FLOAT_COL", ColumnType::Float64, true),
+        ],
+    )
+    .expect("insert USERS into the Phase 4B catalog fixture");
+    let orders_id = insert_phase_4b_table(
+        &mut writer,
+        &mut batch,
+        "ORDERS",
+        &[
+            ("ID", ColumnType::Int64, false),
+            ("USER_ID", ColumnType::Int64, false),
+        ],
+    )
+    .expect("insert ORDERS into the Phase 4B catalog fixture");
+    writer
+        .finish(&mut batch)
+        .expect("finish the Phase 4B catalog fixture");
+    batch.commit().expect("commit the Phase 4B catalog fixture");
+    drop(pager);
+
+    let fixture_wal_path = wal_path(temp.path());
+    Phase4bCatalogFixture {
+        temp,
+        wal_path: fixture_wal_path,
+        page_size,
+        users_id,
+        orders_id,
+    }
+}
+
+fn insert_phase_4b_table(
+    writer: &mut CatalogWriter,
+    batch: &mut WriteBatch<'_>,
+    name: &str,
+    columns: &[(&str, ColumnType, bool)],
+) -> Result<TableId> {
+    let table_id = TableId::new(writer.allocate_object_id(batch)?.get())?;
+    let table_root = BTree::create(batch, TreeKind::Table)?.root();
+    let table = TableDef::new(
+        table_id,
+        SchemaVersion::new(1)?,
+        table_root,
+        RowId::new(1)?,
+        u16::try_from(columns.len())
+            .map_err(|_| DbError::new(ErrorCode::Type, "fixture column count exceeds u16"))?,
+        CatalogName::new(name)?,
+    )?;
+    writer.insert_table_definition(batch, &table)?;
+    for (ordinal, (name, column_type, nullable)) in columns.iter().enumerate() {
+        let column_id = ColumnId::new(writer.allocate_object_id(batch)?.get())?;
+        let column = ColumnDef::new(
+            column_id,
+            table_id,
+            u16::try_from(ordinal)
+                .map_err(|_| DbError::new(ErrorCode::Type, "fixture ordinal exceeds u16"))?,
+            *column_type,
+            *nullable,
+            CatalogName::new(*name)?,
+        )?;
+        writer.insert_column_definition(batch, &column)?;
+    }
+    Ok(table_id)
+}
+
+pub(crate) fn phase_4b_add_table(
+    pager: &Pager,
+    name: &str,
+    columns: &[(&str, ColumnType, bool)],
+) -> Result<TableId> {
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    let table_id = insert_phase_4b_table(&mut writer, &mut batch, name, columns)?;
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+    Ok(table_id)
+}
+
+#[test]
+fn phase_4b_bridge_reads_uuid_and_real_catalog_from_both_transaction_kinds() {
+    let fixture = phase_4b_catalog_fixture(4096);
+    let pager = fixture.pager();
+    assert_ne!(pager.database_uuid().unwrap(), [0; 16]);
+
+    let mut read = pager.begin_read().unwrap();
+    assert!(
+        read.catalog_reader()
+            .unwrap()
+            .find_table_by_id(fixture.users_id())
+            .is_some()
+    );
+    drop(read);
+
+    let mut write = pager.begin_write().unwrap();
+    assert!(
+        write
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_id(fixture.users_id())
+            .is_some()
+    );
+    write.rollback().unwrap();
+}
+
+#[test]
+fn phase_4b_catalog_fixture_has_exact_checked_schema_and_paths() {
+    let fixture = phase_4b_catalog_fixture(4096);
+    assert!(fixture.main_path().is_file());
+    assert!(fixture.wal_path().is_file());
+
+    let mut read = fixture.pager().begin_read().unwrap();
+    let catalog = read.catalog_reader().unwrap();
+    let users = catalog.find_table_by_id(fixture.users_id()).unwrap();
+    let orders = catalog.find_table_by_id(fixture.orders_id()).unwrap();
+    assert_eq!(users.name().as_str(), "USERS");
+    assert_eq!(orders.name().as_str(), "ORDERS");
+
+    let users_columns = catalog
+        .columns_for_table(fixture.users_id())
+        .map(|column| {
+            (
+                column.name().as_str(),
+                column.column_type(),
+                column.nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users_columns,
+        vec![
+            ("ID", ColumnType::Int64, false),
+            ("NAME", ColumnType::Text, true),
+            ("AMOUNT", ColumnType::Decimal, true),
+            ("FLOAT_COL", ColumnType::Float64, true),
+        ]
+    );
+    let orders_columns = catalog
+        .columns_for_table(fixture.orders_id())
+        .map(|column| {
+            (
+                column.name().as_str(),
+                column.column_type(),
+                column.nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        orders_columns,
+        vec![
+            ("ID", ColumnType::Int64, false),
+            ("USER_ID", ColumnType::Int64, false),
+        ]
+    );
+}
+
+#[test]
+fn phase_4b_write_catalog_reader_rejects_a_pending_catalog_writer() {
+    let fixture = phase_4b_catalog_fixture(4096);
+    let pager = fixture.pager();
+    let mut write = pager.begin_write().unwrap();
+    let _writer = CatalogWriter::bootstrap(&mut write).unwrap();
+    assert_eq!(
+        write.catalog_reader().unwrap_err().code(),
+        ErrorCode::Transaction
+    );
+    write.rollback().unwrap();
+}
+
+#[test]
+fn phase_4b_catalog_bridge_preserves_an_uninitialized_empty_image() {
+    let (_temp, pager) = test_pager(4096).unwrap();
+    let absent = TableId::new(1).unwrap();
+
+    let mut read = pager.begin_read().unwrap();
+    assert!(
+        read.catalog_reader()
+            .unwrap()
+            .find_table_by_id(absent)
+            .is_none()
+    );
+    drop(read);
+
+    let mut write = pager.begin_write().unwrap();
+    assert!(
+        write
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_id(absent)
+            .is_none()
+    );
+    write.rollback().unwrap();
 }
 
 fn sanitized_label(label: &str) -> String {
