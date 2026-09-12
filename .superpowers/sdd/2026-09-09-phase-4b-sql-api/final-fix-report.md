@@ -131,3 +131,88 @@ Isolation checks: production sqlparser references remain confined to `src/sql/pa
 
 - Implementation/tests/verified report: **4658df1a065dae8c21b39c9d6548c7aef07f1d2c** (`fix: address phase 4b final SQL review findings`).
 - This report-only follow-up records that implementation SHA. It changes no production/test source and therefore retains the final gate evidence above; its own SHA is returned in the completion handoff rather than embedded self-referentially.
+
+## User-approved exception fix
+
+Exception base: `7ca690b82ed123119f56bde614d28dc03abe1a6c`. Scope is only the remaining linked-parameter assignment/finalization defect; the other seven findings are not reopened. This recovery implementer dispatched no further agents or reviewers.
+
+### Root-cause trace before editing production code
+
+For `UPDATE USERS SET ID = :p WHERE :p = :q AND :q = 1.5`, `register_assignment_parameter_caps` records P's own INT64 restriction. Collection binds P as Int64, links P/Q at their equality, and later constrains Q to Decimal. `solve` merges the component's inferred type to Decimal but also merges P's assignment cap into a component cap, incorrectly clamping both P and uncapped Q to Int64. The final `bind_parts` builds the first Q leaf with that Int64 snapshot. At the later Q=1.5 comparison, `apply_expected` calls `constrain_identifier`, which does not check `finalized` and re-widens cap-less Q to Decimal. Public Q metadata is then Decimal while the earlier retained Q leaf remains Int64. The final assignment registration path also still mutates caps/types.
+
+Required conservative result: P stays Int64 under its own write restriction; uncapped Q is Decimal from the component's comparison context. Comparing them can promote Int64 to Decimal without changing the parameter's declared type. Two different linked parameters must not inherit each other's directional write restrictions. The solved parameter mapping must be frozen; final binding validates compatible contexts and assignments against that mapping without introducing parameters or changing inferred types/caps.
+
+### Fresh regression RED (before production changes)
+
+The preserved `final_fix_exception_linked_write_parameters_keep_frozen_types` regression catches restoring component-wide caps together with mutable final constraint collection: public Q metadata becomes Decimal while an earlier retained Q leaf remains Int64. The recovered partial report contained only a root-cause trace and an intention to verify, not execution evidence; none was assumed.
+
+Command: `cargo test final_fix_exception_linked_write_parameters_keep_frozen_types --target-dir target/final-fix-exception -- --nocapture` (then `exit $LASTEXITCODE`). Observed process exit **101**, **0 passed, 1 failed, 0 ignored, 576 filtered**. Meaningful output:
+
+```text
+assertion `left == right` failed: Q at SqlSpan { start: 36, end: 38 }
+  left: Int64
+ right: Decimal
+```
+
+Expanded pre-fix command: `cargo test final_fix_exception_ --target-dir target/final-fix-exception -- --nocapture` (then `exit $LASTEXITCODE`): **0 passed, 4 failed, 0 ignored, 576 filtered**, exit **101**. In addition to the retained-Q mismatch:
+
+- `finalized_collector_cannot_widen_or_add_parameters`: a solved Int64 P returned Decimal after a Decimal comparison constraint (`left: Decimal`, `right: Int64`).
+- `finalized_assignment_validates_without_retyping`: a solved Decimal P assigned to Int64 returned `Ok(BoundExpr { ... sql_type: Int64 ... })` instead of Type.
+- `assignment_caps_stay_per_parameter`: the reversed one-capped case retained uncapped P as Int64 at span 31..33 instead of Decimal.
+
+### Minimal source-level implementation
+
+Only `src/sql/bind/types.rs` production code changes. `solve` still shares common expression constraints and the existing directed SUM/AVG worklist, but applies each entry's own assignment cap instead of a component-wide cap. Solving freezes even an empty mapping and repeated solving does not reopen it. Final constraint lookup rejects uncollected identifiers with Internal, validates type compatibility, and returns the unchanged solved type. Final assignment registration checks the solved type's directional compatibility without writing caps/types. Final leaf binding also leaves lexical offsets unchanged. Binding-budget accounting continues to run for the rebuilt tree.
+
+Tests remain in `src/sql/test_support.rs`. The preserved public-prepare counterexample inspects every retained P/Q occurrence and metadata; additional cases cover both linked parameters capped (including reversed target order), one capped in the other direction, neither capped, Int64-to-Decimal assignment, incompatible linked writes and Decimal-expression narrowing. SUM and AVG self-links check all four retained occurrences against public metadata. Direct real-collector/real-binder regressions exercise frozen lookup, missing parameters, successful promotion without retyping, rejected narrowing without retyping, and empty-solution assignment rejection. No mocks or SQL-specific production branches are used.
+
+### Focused GREEN and mutation self-review
+
+Initial focused GREEN: `cargo test final_fix_exception_ --target-dir target/final-fix-exception -- --nocapture`: **4 passed, 0 failed, 576 filtered**, exit **0**.
+
+Actual temporary mutation M1 restored the original component-cap array/merge and its solver lookup, leaving the finalized validation guards in place. `cargo test final_fix_exception_linked_write_parameters_keep_frozen_types --target-dir target/final-fix-exception -- --nocapture`: **0 passed, 1 failed, 579 filtered**, exit **101**. Public Q metadata was `Some(Int64)`, expected `Some(Decimal)`. Thus freezing alone cannot hide an incorrectly solved map. M1 was restored before the next mutation.
+
+Actual temporary mutation M2 disabled both finalized constraint/assignment guards while retaining per-identifier solving. `cargo test final_fix_exception_finalized_ --target-dir target/final-fix-exception -- --nocapture`: **0 passed, 2 failed, 578 filtered**, exit **101**. Direct final lookup widened Int64 to Decimal; final assignment silently narrowed solved Decimal to Int64. Both guards were restored immediately afterwards. These are executed behavioral mutations, not source-text assertions. Self-review also traced every state-writing path: finalized `link_common` is a no-op, missing identifiers cannot reach insertion/pending caps, repeated `solve` returns before mutation, and final leaf binding no longer updates lexical offsets. Existing arithmetic/operator and full-expression assignment validation remains active.
+
+### Final acceptance
+
+All commands below run after both mutations were restored, with no subsequent production/test source edits. Stable compiler: **rustc 1.98.0 (88d9e12ae 2026-08-18)**. Explicit MSRV compiler: **rustc 1.85.0 (4d91de4e4 2025-02-17)**. Commands run in the exception worktree and preserve process status with `exit $LASTEXITCODE`; the sequential focused gate stops after any nonzero status.
+
+- Restored `cargo test final_fix_exception_ --target-dir target/final-fix-exception -- --nocapture`: **4 passed**, 0 failed, 576 filtered, exit **0** (0.30 s).
+- `cargo fmt --check`: exit **0**, no formatting diff. `git diff --check`: exit **0**; only Git's pre-existing LF-to-CRLF working-copy notices, not whitespace errors.
+- `cargo test parameter --target-dir target/final-fix-exception -- --nocapture`: **24 unit + 1 public integration passed**, 0 failed, 556 unit/9 integration filtered, exit **0**.
+- `cargo test final_fix_ --target-dir target/final-fix-exception -- --skip final_fix_wide_catalog_expansion_stops_at_default_budget_without_writes`: **19 passed**, 0 failed, 561 filtered, exit **0**.
+- `cargo test sql:: --target-dir target/final-fix-exception -- --skip final_fix_wide_catalog_expansion_stops_at_default_budget_without_writes --skip phase_4b_random_sql_never_panics`: **157 passed**, 0 failed, 423 filtered, exit **0** (50.04 s).
+- `cargo test --test public_api --target-dir target/final-fix-exception -- --nocapture`: **10 passed**, 0 failed, 0 filtered, exit **0** (0.06 s).
+- `cargo clippy --all-targets --all-features --target-dir target/final-fix-exception -- -D warnings`: exit **0**, clean (22.96 s).
+
+The expensive 1,000-column expansion test and 10,000-input random corpus are omitted only from the short focused reruns; both are included without filters in each full acceptance gate below. A zero-test integration harness under a name filter is not counted as integration acceptance.
+
+The initial sandbox MSRV attempt printed the real compiler version but Cargo could not launch `rustc.exe -vV` (os error **5**, access denied), exit **101**; it is neither a source RED nor a successful MSRV gate. The approved out-of-sandbox retry uses the same explicit toolchain paths and isolated target directory.
+
+Full gates, each with no name filters or skips:
+
+- `cargo test --all-targets --all-features --target-dir target/final-fix-exception`: **572 unit tests passed**, 0 failed, **8 ignored**, 0 filtered (646.97 s), then **10 public integration tests passed**, 0 failed, 0 filtered (0.06 s); process exit **0**.
+- Explicit Rust 1.85 command below: **572 unit tests passed**, 0 failed, **8 ignored**, 0 filtered (658.64 s), then **10 public integration tests passed**, 0 failed, 0 filtered (0.04 s); process exit **0**.
+
+```powershell
+$env:RUSTC='C:\Users\liukaibin\.rustup\toolchains\1.85.0-x86_64-pc-windows-msvc\bin\rustc.exe'
+& $env:RUSTC --version
+& 'C:\Users\liukaibin\.rustup\toolchains\1.85.0-x86_64-pc-windows-msvc\bin\cargo.exe' test --all-targets --target-dir target/final-fix-exception-msrv185 2>&1 | Tee-Object -FilePath target/final-fix-exception-msrv185.log
+exit $LASTEXITCODE
+```
+
+The stable full command also piped combined output through `Tee-Object -FilePath target/final-fix-exception-stable.log`, followed by `exit $LASTEXITCODE`. Both logs are local ignored artifacts, not committed evidence files. Each full log confirms all **159 SQL tests**, including all **20 final-fix tests**, the completed 1,000-column expansion/no-write fixture, and the 10,000-input fixed-seed random corpus. The eight default-ignored entries are unchanged; ignored helper tests are still invoked by their existing parent subprocess tests where applicable. No dedicated heavy ignored crash/storage matrix is claimed as executed. The full runs used separate target directories and overlapped; their elapsed times are not a performance benchmark.
+
+### Changed files and remaining concerns
+
+- Production: `src/sql/bind/types.rs` only; no extra binder call-site was required.
+- Regression coverage: `src/sql/test_support.rs`, preserving and extending the recovered uncommitted regression.
+- Evidence: this report's exception section only. The other seven final findings are not reopened.
+- `src/storage`, `Cargo.toml`, and `Cargo.lock` have zero diff from exception base. No generated artifacts, DB/WAL files, or lockfile are staged.
+- No unresolved exception defect remains in the verified scope. Verification is Windows MSVC only; no Linux run is claimed. The user-approved omission of dedicated ignored storage/crash matrices remains in force because no storage code changed. The MSRV sandbox launch denial was resolved by an approved retry and is not an outstanding build concern.
+
+### Exception commits
+
+- Verified production fix and regressions: **ca61c620dd17b395e572390b9568c66c8a74c384** (`fix: freeze linked parameter assignment solutions`), directly based on `7ca690b82ed123119f56bde614d28dc03abe1a6c`.
+- The report-only follow-up records this SHA and all exception evidence above. It changes no production/test source; its own SHA is returned in the completion handoff rather than embedded self-referentially.
