@@ -63,17 +63,67 @@ impl Connection {
 
     /// Starts an exclusive write transaction.
     pub fn begin_write(&mut self) -> Result<WriteTransaction<'_>> {
-        let database_uuid = self.pager.database_uuid()?;
-        Ok(WriteTransaction::new(
-            self.pager.try_begin_write()?,
-            self.sql_limits,
-            database_uuid,
-        ))
+        let batch = self.pager.try_begin_write()?;
+        let database_uuid = batch.database_uuid();
+        Ok(WriteTransaction::new(batch, self.sql_limits, database_uuid))
     }
 }
 
 impl fmt::Debug for Connection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Connection").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::mpsc::{self, RecvTimeoutError},
+        time::Duration,
+    };
+
+    use crate::{Database, ErrorCode, Options, storage::test_support::TempDatabase};
+
+    #[test]
+    fn begin_write_returns_busy_without_waiting_for_published_state() {
+        let temp = TempDatabase::new("connection-immediate-busy");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut owner = db.connect().unwrap();
+        let mut contender = db.connect().unwrap();
+        let owner_write = owner.begin_write().unwrap();
+        let published = db.pager.hold_published_write_for_test();
+        let (starting_tx, starting_rx) = mpsc::sync_channel(0);
+        let (result_tx, result_rx) = mpsc::sync_channel(0);
+        let contender_thread = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            result_tx
+                .send(
+                    contender
+                        .begin_write()
+                        .map(|_| ())
+                        .map_err(|error| error.code()),
+                )
+                .unwrap();
+        });
+        starting_rx.recv().unwrap();
+
+        let outcome = result_rx.recv_timeout(Duration::from_secs(1));
+        drop(published);
+        let waited_for_published_state = matches!(outcome, Err(RecvTimeoutError::Timeout));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("contender returns after the publication lock is released"),
+            Err(RecvTimeoutError::Disconnected) => panic!("contender disconnected"),
+        };
+        owner_write.rollback().unwrap();
+        contender_thread.join().unwrap();
+
+        assert!(
+            !waited_for_published_state,
+            "public begin_write waited for published state before returning Busy"
+        );
+        assert_eq!(result, Err(ErrorCode::Busy));
     }
 }

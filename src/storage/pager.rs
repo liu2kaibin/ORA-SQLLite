@@ -102,6 +102,11 @@ struct WriterLease {
     active: bool,
 }
 
+#[cfg(test)]
+pub(crate) struct PublishedWriteGuardForTest<'a> {
+    _guard: std::sync::RwLockWriteGuard<'a, PublishedState>,
+}
+
 impl WriterCoordinator {
     fn try_acquire(self: &Arc<Self>) -> Result<WriterLease> {
         let mut active = self.active.try_lock().map_err(map_writer_try_lock)?;
@@ -451,6 +456,17 @@ impl Pager {
             .reused_page_count
             .lock()
             .expect("test-only reused page count mutex is poisoned")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_published_write_for_test(&self) -> PublishedWriteGuardForTest<'_> {
+        PublishedWriteGuardForTest {
+            _guard: self
+                .inner
+                .published
+                .write()
+                .expect("test-only published-state lock is poisoned"),
+        }
     }
 
     #[cfg(test)]
@@ -816,6 +832,10 @@ pub(super) struct WriteBatchCheckpoint {
 }
 
 impl WriteBatch {
+    pub(crate) const fn database_uuid(&self) -> [u8; 16] {
+        self.base_header.uuid()
+    }
+
     pub(crate) fn catalog_reader(&mut self) -> Result<super::catalog::CatalogReader> {
         self.require_active()?;
         self.require_catalog_finished()?;
