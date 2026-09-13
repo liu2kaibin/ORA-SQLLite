@@ -1,5 +1,6 @@
 //! Storage-independent runtime values and scalar expression evaluation.
 mod expr;
+mod join;
 mod memory;
 mod operator;
 mod params;

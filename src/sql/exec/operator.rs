@@ -1,4 +1,5 @@
 use crate::sql::{
+    ast::JoinKind,
     bound::SourceId,
     plan::{ExecExpr, QueryPlan},
 };
@@ -7,6 +8,7 @@ use crate::storage::relation::{Relation, RelationScan, StoredRow};
 use crate::storage::{ReadSnapshot, WriteBatch};
 use crate::{DbError, ErrorCode, Result, Row, Value};
 
+use super::join::NestedLoopJoin;
 use super::memory::{owned_values_bytes, resource_limit};
 use super::scan::{OneRow, TableScan};
 use super::{ParameterFrame, WorkMemory, eval};
@@ -24,30 +26,58 @@ pub(crate) enum OperatorFactory {
     OneRow,
     TableScan {
         source: SourceId,
-        table: TableId,
+        relation: Relation,
+        max_row_bytes: usize,
     },
     Filter {
         input: Box<OperatorFactory>,
         predicate: ExecExpr,
     },
+    Join {
+        left: Box<OperatorFactory>,
+        right: Box<OperatorFactory>,
+        on: ExecExpr,
+        kind: JoinKind,
+    },
 }
 
 impl OperatorFactory {
-    pub(crate) fn build(
-        self,
+    pub(crate) fn table_scan(
+        source: SourceId,
+        table: TableId,
         catalog: &CatalogReader,
         max_row_bytes: usize,
-    ) -> Result<Box<dyn Operator>> {
+    ) -> Result<Self> {
+        Ok(Self::TableScan {
+            source,
+            relation: Relation::open(catalog, table)?,
+            max_row_bytes,
+        })
+    }
+
+    pub(crate) fn build(&self) -> Result<Box<dyn Operator>> {
         Ok(match self {
             Self::OneRow => Box::new(OneRow::new()),
-            Self::TableScan { source, table } => Box::new(TableScan::new(
+            Self::TableScan {
                 source,
-                Relation::open(catalog, table)?.scan(max_row_bytes),
-            )),
+                relation,
+                max_row_bytes,
+            } => Box::new(TableScan::new(*source, relation.scan(*max_row_bytes))),
             Self::Filter { input, predicate } => Box::new(Filter {
-                input: input.build(catalog, max_row_bytes)?,
-                predicate,
+                input: input.build()?,
+                predicate: predicate.clone(),
             }),
+            Self::Join {
+                left,
+                right,
+                on,
+                kind,
+            } => Box::new(NestedLoopJoin::new(
+                left.build()?,
+                (**right).clone(),
+                on.clone(),
+                *kind,
+            )?),
         })
     }
 }
@@ -144,9 +174,15 @@ impl<'a> ExecutionContext<'a> {
     }
 }
 
+#[derive(Clone)]
+enum SourceValues {
+    Present(Box<[Value]>),
+    NullExtended,
+}
+
 #[derive(Default)]
 pub(crate) struct EvalRow {
-    sources: Box<[Option<Box<[Value]>>]>,
+    sources: Box<[Option<SourceValues>]>,
     aggregates: Box<[Value]>,
     memory_bytes: u64,
 }
@@ -159,7 +195,7 @@ impl EvalRow {
     ) -> Result<Self> {
         let count = source.0.checked_add(1).ok_or_else(resource_limit)?;
         let mut sources = vec![None; count].into_boxed_slice();
-        sources[source.0] = Some(values);
+        sources[source.0] = Some(SourceValues::Present(values));
         Ok(Self {
             sources,
             aggregates: Box::new([]),
@@ -172,10 +208,58 @@ impl EvalRow {
     }
 
     pub(crate) fn source_value(&self, source: SourceId, ordinal: u16) -> Option<&Value> {
-        self.sources
-            .get(source.0)
-            .and_then(Option::as_deref)
-            .and_then(|row| row.get(usize::from(ordinal)))
+        match self.sources.get(source.0)?.as_ref()? {
+            SourceValues::Present(row) => row.get(usize::from(ordinal)),
+            SourceValues::NullExtended => Some(&Value::Null),
+        }
+    }
+
+    pub(crate) fn null_extended(source: SourceId) -> Result<Self> {
+        let count = source.0.checked_add(1).ok_or_else(resource_limit)?;
+        let mut sources = vec![None; count].into_boxed_slice();
+        sources[source.0] = Some(SourceValues::NullExtended);
+        Ok(Self {
+            sources,
+            aggregates: Box::new([]),
+            memory_bytes: 0,
+        })
+    }
+
+    pub(crate) fn join_clone(&self, right: Self) -> Result<Self> {
+        let memory_bytes = self
+            .memory_bytes
+            .checked_add(right.memory_bytes)
+            .ok_or_else(resource_limit)?;
+        if !self.aggregates.is_empty() || !right.aggregates.is_empty() {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "JOIN input unexpectedly contains aggregate slots",
+            ));
+        }
+        let sources = merge_sources(self.sources.to_vec(), right.sources)?;
+        Ok(Self {
+            sources,
+            aggregates: Box::new([]),
+            memory_bytes,
+        })
+    }
+
+    pub(crate) fn join_owned(self, right: Self) -> Result<Self> {
+        let memory_bytes = self
+            .memory_bytes
+            .checked_add(right.memory_bytes)
+            .ok_or_else(resource_limit)?;
+        if !self.aggregates.is_empty() || !right.aggregates.is_empty() {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "JOIN input unexpectedly contains aggregate slots",
+            ));
+        }
+        Ok(Self {
+            sources: merge_sources(self.sources.into_vec(), right.sources)?,
+            aggregates: Box::new([]),
+            memory_bytes,
+        })
     }
 
     pub(crate) fn aggregate_value(&self, slot: u32) -> Result<Option<&Value>> {
@@ -193,7 +277,7 @@ impl EvalRow {
         Self {
             sources: sources
                 .iter()
-                .map(|source| Some(source.to_vec().into_boxed_slice()))
+                .map(|source| Some(SourceValues::Present(source.to_vec().into_boxed_slice())))
                 .collect(),
             aggregates: Box::new([]),
             memory_bytes: 0,
@@ -208,6 +292,29 @@ impl EvalRow {
             memory_bytes: 0,
         }
     }
+}
+
+fn merge_sources(
+    mut left: Vec<Option<SourceValues>>,
+    right: Box<[Option<SourceValues>]>,
+) -> Result<Box<[Option<SourceValues>]>> {
+    for (slot, source) in right.iter().enumerate() {
+        if source.is_some() && left.get(slot).is_some_and(Option::is_some) {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "JOIN inputs overlap one query source slot",
+            ));
+        }
+    }
+    if left.len() < right.len() {
+        left.resize_with(right.len(), || None);
+    }
+    for (slot, source) in right.into_vec().into_iter().enumerate() {
+        if source.is_some() {
+            left[slot] = source;
+        }
+    }
+    Ok(left.into_boxed_slice())
 }
 
 pub(crate) struct Filter {

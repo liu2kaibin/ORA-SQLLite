@@ -1,3 +1,4 @@
+use crate::sql::bound::BoundSource;
 use crate::sql::plan::{PlanKind, QueryPlan};
 use crate::storage::catalog::CatalogReader;
 use crate::{DbError, ErrorCode, Parameters, Result, Statement};
@@ -29,12 +30,12 @@ pub(crate) fn prepare_query(
             "query requires a row-producing statement",
         ));
     };
-    let factory = simple_factory(query)?;
+    validate_supported_operators(query)?;
     let mut memory = WorkMemory::new(max_query_memory_bytes)?;
     let params = ParameterFrame::bind(statement.parameters(), parameters, &mut memory)?;
     statement.validate_schema(database_uuid, catalog)?;
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
-    let input = factory.build(catalog, max_row_bytes)?;
+    let input = query_factory(query, catalog, max_row_bytes)?.build()?;
     Ok(QueryExecution {
         root: Box::new(Project::new(input, query)),
         params,
@@ -42,9 +43,8 @@ pub(crate) fn prepare_query(
     })
 }
 
-fn simple_factory(query: &QueryPlan) -> Result<OperatorFactory> {
-    if !query.joins().is_empty()
-        || !query.group_by().is_empty()
+fn validate_supported_operators(query: &QueryPlan) -> Result<()> {
+    if !query.group_by().is_empty()
         || !query.aggregates().is_empty()
         || query.having().is_some()
         || query.distinct()
@@ -55,19 +55,38 @@ fn simple_factory(query: &QueryPlan) -> Result<OperatorFactory> {
             "query requires an operator added by a later Phase 4C1 task",
         ));
     }
-    let input = match query.sources() {
-        [] => OperatorFactory::OneRow,
-        [source] => OperatorFactory::TableScan {
-            source: source.source_id,
-            table: source.table_id,
-        },
-        _ => {
-            return Err(DbError::new(
-                ErrorCode::Unsupported,
-                "multiple query sources require JOIN execution",
-            ));
-        }
+    Ok(())
+}
+
+fn query_factory(
+    query: &QueryPlan,
+    catalog: &CatalogReader,
+    max_row_bytes: usize,
+) -> Result<OperatorFactory> {
+    let mut input = match query.sources() {
+        [] if query.joins().is_empty() => OperatorFactory::OneRow,
+        [first, ..] => source_factory(first, catalog, max_row_bytes)?,
+        [] => return Err(invalid_join_plan()),
     };
+    if query.sources().len() != query.joins().len().saturating_add(1) && !query.sources().is_empty()
+    {
+        return Err(invalid_join_plan());
+    }
+    for (index, join) in query.joins().iter().enumerate() {
+        let source = query
+            .sources()
+            .get(index.saturating_add(1))
+            .ok_or_else(invalid_join_plan)?;
+        if source.source_id != join.source_id() {
+            return Err(invalid_join_plan());
+        }
+        input = OperatorFactory::Join {
+            left: Box::new(input),
+            right: Box::new(source_factory(source, catalog, max_row_bytes)?),
+            on: join.condition().clone(),
+            kind: join.kind(),
+        };
+    }
     Ok(match query.selection() {
         Some(predicate) => OperatorFactory::Filter {
             input: Box::new(input),
@@ -75,6 +94,21 @@ fn simple_factory(query: &QueryPlan) -> Result<OperatorFactory> {
         },
         None => input,
     })
+}
+
+fn source_factory(
+    source: &BoundSource,
+    catalog: &CatalogReader,
+    max_row_bytes: usize,
+) -> Result<OperatorFactory> {
+    OperatorFactory::table_scan(source.source_id, source.table_id, catalog, max_row_bytes)
+}
+
+fn invalid_join_plan() -> DbError {
+    DbError::new(
+        ErrorCode::Internal,
+        "query sources and JOIN steps are inconsistent",
+    )
 }
 
 #[cfg(test)]
@@ -161,16 +195,17 @@ mod tests {
     }
 
     #[test]
-    fn simple_query_rejects_operator_families_owned_by_later_tasks() {
+    fn query_rejects_operator_families_owned_by_later_tasks() {
         // Production break caught: silently partially executing a later-stage
         // node would return semantically incomplete query results.
         let fixture = query_relation_fixture(&[(1, "A"), (2, "B")]);
         let mut connection = fixture.database().connect().unwrap();
         for sql in [
-            "SELECT U.ID FROM USERS U INNER JOIN ORDERS O ON O.USER_ID = U.ID",
+            "SELECT ID FROM USERS GROUP BY ID",
             "SELECT COUNT(*) FROM USERS",
             "SELECT DISTINCT ID FROM USERS",
             "SELECT ID FROM USERS ORDER BY ID",
+            "SELECT A.ID FROM USERS A INNER JOIN USERS B ON A.ID = B.ID ORDER BY A.ID",
         ] {
             let statement = connection.prepare(sql).unwrap();
             assert_eq!(
