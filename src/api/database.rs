@@ -38,6 +38,7 @@ pub(crate) fn generate_database_uuid(source: &dyn UuidSource) -> Result<[u8; 16]
 pub struct Database {
     pub(super) pager: Pager,
     pub(super) sql_limits: SqlLimits,
+    pub(super) max_query_memory_bytes: u64,
 }
 
 impl fmt::Debug for Database {
@@ -66,12 +67,17 @@ impl Database {
         Ok(Self {
             pager,
             sql_limits: *options.sql_limits(),
+            max_query_memory_bytes: options.max_query_memory_bytes(),
         })
     }
 
     /// Creates an independent session for this database.
     pub fn connect(&self) -> Result<Connection> {
-        Ok(Connection::new(self.pager.clone(), self.sql_limits))
+        Ok(Connection::new(
+            self.pager.clone(),
+            self.sql_limits,
+            self.max_query_memory_bytes,
+        ))
     }
 
     pub(crate) fn create_with_uuid_source(
@@ -85,6 +91,7 @@ impl Database {
         Ok(Self {
             pager,
             sql_limits: *options.sql_limits(),
+            max_query_memory_bytes: options.max_query_memory_bytes(),
         })
     }
 

@@ -5,6 +5,7 @@ const DEFAULT_CACHE_PAGES: usize = 1024;
 const DEFAULT_MAX_DATABASE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CHECKPOINT_WAL_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_WAL_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_QUERY_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Access requested when opening a database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,6 +24,7 @@ pub struct Options {
     max_database_bytes: u64,
     checkpoint_wal_bytes: u64,
     max_wal_bytes: u64,
+    max_query_memory_bytes: u64,
     sql_limits: SqlLimits,
 }
 
@@ -35,6 +37,7 @@ impl Default for Options {
             max_database_bytes: DEFAULT_MAX_DATABASE_BYTES,
             checkpoint_wal_bytes: DEFAULT_CHECKPOINT_WAL_BYTES,
             max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
+            max_query_memory_bytes: DEFAULT_MAX_QUERY_MEMORY_BYTES,
             sql_limits: SqlLimits::default(),
         }
     }
@@ -64,6 +67,10 @@ impl Options {
 
     pub const fn max_wal_bytes(&self) -> u64 {
         self.max_wal_bytes
+    }
+
+    pub const fn max_query_memory_bytes(&self) -> u64 {
+        self.max_query_memory_bytes
     }
 
     pub const fn sql_limits(&self) -> &SqlLimits {
@@ -105,6 +112,11 @@ impl Options {
 
     pub const fn with_max_wal_bytes(mut self, max_wal_bytes: u64) -> Self {
         self.max_wal_bytes = max_wal_bytes;
+        self
+    }
+
+    pub const fn with_max_query_memory_bytes(mut self, max_query_memory_bytes: u64) -> Self {
+        self.max_query_memory_bytes = max_query_memory_bytes;
         self
     }
 

@@ -8,14 +8,24 @@ use super::{ReadTransaction, Statement, WriteTransaction, statement::prepare_wit
 pub struct Connection {
     pager: Pager,
     sql_limits: SqlLimits,
+    #[allow(
+        dead_code,
+        reason = "execution memory enforcement is consumed by later Phase 4C1 tasks"
+    )]
+    max_query_memory_bytes: u64,
     _not_sync: PhantomData<Cell<()>>,
 }
 
 impl Connection {
-    pub(super) const fn new(pager: Pager, sql_limits: SqlLimits) -> Self {
+    pub(super) const fn new(
+        pager: Pager,
+        sql_limits: SqlLimits,
+        max_query_memory_bytes: u64,
+    ) -> Self {
         Self {
             pager,
             sql_limits,
+            max_query_memory_bytes,
             _not_sync: PhantomData,
         }
     }

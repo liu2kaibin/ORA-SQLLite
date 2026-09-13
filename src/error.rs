@@ -13,6 +13,7 @@ pub enum ErrorCode {
     Busy = 1400,
     Transaction = 1500,
     Unsupported = 1600,
+    ResourceLimit = 1650,
     Corruption = 1700,
     Io = 1800,
     Internal = 1900,
