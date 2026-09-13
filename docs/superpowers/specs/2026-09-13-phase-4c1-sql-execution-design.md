@@ -34,7 +34,7 @@ Phase 4C1 明确不实现：
 - `ALTER TABLE`、`MERGE`、`TRUNCATE`、子查询、集合运算、窗口函数、`SAVEPOINT` 或嵌套事务；
 - 1000 万行或 10 GB 数据集作为每次 CI 的强制门槛。
 
-Phase 4B 已经能够绑定的索引或约束语句仍可保留为 `Statement`。Phase 4C1 执行此类语句时，在任何存储修改和写者获取之前返回 `Unsupported`。不得静默忽略、部分保存或声明一个尚未执行的约束。
+Phase 4B 已经能够绑定的索引或约束语句仍可保留为 `Statement`。Phase 4C1 执行此类语句时，在任何存储修改之前返回 `Unsupported`；自动提交执行还必须在获取写者之前返回。显式事务已经独立持有写者，不为此语句重新获取。不得静默忽略、部分保存或声明一个尚未执行的约束。
 
 ## 3. 已批准的核心选择
 
@@ -307,6 +307,7 @@ Connection 保存以下会话状态：
 Idle
 SqlWrite(Active WriteBatch)
 SqlWriteFailed(WriteBatch retained only for rollback)
+NeedsReopen
 ```
 
 - BEGIN 只允许从 Idle 进入 SqlWrite；
@@ -317,6 +318,7 @@ SqlWriteFailed(WriteBatch retained only for rollback)
 - ROLLBACK 可以结束 SqlWrite 或 SqlWriteFailed；
 - Idle 中的 COMMIT/ROLLBACK、重复 BEGIN 或任何嵌套尝试返回 Transaction；
 - Connection 被丢弃时，活动批次只释放内存修改并回滚。
+- 提交 I/O 失败消耗活动批次并进入 NeedsReopen；该 Connection 的后续 prepare/query/execute 和新事务请求均返回 Transaction，直到调用方关闭并重新打开数据库。
 
 ### 12.3 Rust 事务对象
 
