@@ -25,6 +25,12 @@ mod name;
 mod parser;
 #[allow(
     dead_code,
+    unused_imports,
+    reason = "subsequent Phase 4C1 execution tasks consume immutable rule plans"
+)]
+pub(crate) mod plan;
+#[allow(
+    dead_code,
     reason = "later SQL frontend layers consume checked type primitives"
 )]
 mod types;
