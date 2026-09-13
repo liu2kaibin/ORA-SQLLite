@@ -205,7 +205,7 @@ impl CatalogReader {
         Self::open_validated(snapshot, &tree, report)
     }
 
-    pub(super) fn open_empty_or_v1_batch(batch: &mut WriteBatch<'_>) -> Result<Self> {
+    pub(super) fn open_empty_or_v1_batch(batch: &mut WriteBatch) -> Result<Self> {
         let feature_bits = batch.feature_bits();
         validate_feature_bits(feature_bits)?;
         if feature_bits & CATALOG_V1 == 0 {
@@ -229,7 +229,7 @@ impl CatalogReader {
 
     /// Validate an unpublished candidate; its current root can differ from the header.
     pub(super) fn open_candidate(
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         tree: &BTree,
         feature_bits: u64,
     ) -> Result<Self> {
@@ -383,7 +383,7 @@ pub(super) struct CatalogWriter {
 }
 
 impl CatalogWriter {
-    pub(super) fn bootstrap(batch: &mut WriteBatch<'_>) -> Result<Self> {
+    pub(super) fn bootstrap(batch: &mut WriteBatch) -> Result<Self> {
         let checkpoint = batch.checkpoint_mutation()?;
         let result = (|| {
             // One outstanding writer per batch prevents a later open from finishing
@@ -419,20 +419,15 @@ impl CatalogWriter {
     }
 
     /// Restore the batch image and the writer's separately owned root together.
-    fn restore(
-        &mut self,
-        batch: &mut WriteBatch<'_>,
-        checkpoint: WriteBatchCheckpoint,
-        root: PageRef,
-    ) {
+    fn restore(&mut self, batch: &mut WriteBatch, checkpoint: WriteBatchCheckpoint, root: PageRef) {
         batch.restore_mutation(checkpoint);
         self.tree = BTree::from_root(TreeKind::Table, root);
     }
 
     fn mutate<T>(
         &mut self,
-        batch: &mut WriteBatch<'_>,
-        mutation: impl FnOnce(&mut BTree, &mut WriteBatch<'_>) -> Result<T>,
+        batch: &mut WriteBatch,
+        mutation: impl FnOnce(&mut BTree, &mut WriteBatch) -> Result<T>,
     ) -> Result<T> {
         let checkpoint = batch.checkpoint_mutation()?;
         let root = self.tree.root();
@@ -449,7 +444,7 @@ impl CatalogWriter {
         }
     }
 
-    pub(crate) fn allocate_object_id(&mut self, batch: &mut WriteBatch<'_>) -> Result<ObjectId> {
+    pub(crate) fn allocate_object_id(&mut self, batch: &mut WriteBatch) -> Result<ObjectId> {
         self.mutate(batch, |tree, batch| {
             let key = key::catalog_meta_key();
             let bytes = tree
@@ -468,7 +463,7 @@ impl CatalogWriter {
 
     pub(crate) fn insert_table_definition(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         table: &TableDef,
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
@@ -498,7 +493,7 @@ impl CatalogWriter {
 
     pub(crate) fn insert_column_definition(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         column: &ColumnDef,
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
@@ -534,7 +529,7 @@ impl CatalogWriter {
 
     pub(crate) fn update_table_root(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         table_id: TableId,
         root: PageRef,
     ) -> Result<()> {
@@ -552,7 +547,7 @@ impl CatalogWriter {
 
     pub(crate) fn allocate_rowid(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         table_id: TableId,
     ) -> Result<RowId> {
         self.mutate(batch, |tree, batch| {
@@ -576,7 +571,7 @@ impl CatalogWriter {
     }
 
     /// Publish only the fully validated current root; failure leaves commit gated.
-    pub(super) fn finish(self, batch: &mut WriteBatch<'_>) -> Result<()> {
+    pub(super) fn finish(self, batch: &mut WriteBatch) -> Result<()> {
         if self.dirty {
             CatalogReader::open_candidate(batch, &self.tree, batch.feature_bits())?;
             batch.track_tree(TreeKind::Table, self.tree.root())?;
@@ -586,11 +581,7 @@ impl CatalogWriter {
     }
 }
 
-fn read_table_definition(
-    tree: &BTree,
-    batch: &mut WriteBatch<'_>,
-    id: TableId,
-) -> Result<TableDef> {
+fn read_table_definition(tree: &BTree, batch: &mut WriteBatch, id: TableId) -> Result<TableDef> {
     let bytes = tree
         .get(batch, &key::table_definition_key(id))?
         .ok_or_else(|| {
@@ -602,7 +593,7 @@ fn read_table_definition(
     record::decode_table_definition(id, &bytes)
 }
 
-fn require_available_object(tree: &BTree, batch: &mut WriteBatch<'_>, id: ObjectId) -> Result<()> {
+fn require_available_object(tree: &BTree, batch: &mut WriteBatch, id: ObjectId) -> Result<()> {
     // V1 defines only table and column objects; their identities share one namespace.
     for key in [
         key::table_definition_key(TableId::new(id.get())?),
@@ -620,7 +611,7 @@ fn require_available_object(tree: &BTree, batch: &mut WriteBatch<'_>, id: Object
 
 fn require_available_key(
     tree: &BTree,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     key: &[u8],
     message: &'static str,
 ) -> Result<()> {
@@ -633,7 +624,7 @@ fn require_available_key(
 // Called only inside a logical mutation checkpoint, not as an independent upsert.
 fn replace_record(
     tree: &mut BTree,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     key: &[u8],
     value: &[u8],
 ) -> Result<()> {
@@ -917,7 +908,7 @@ fn open_catalog_for_test(pager: &super::Pager) -> Result<CatalogReader> {
 #[cfg(test)]
 fn require_matching_table_record(
     tree: &BTree,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     expected: &TableDef,
 ) -> Result<()> {
     let bytes = tree
@@ -940,7 +931,7 @@ fn require_matching_table_record(
 #[cfg(test)]
 fn require_matching_column_record(
     tree: &BTree,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     expected: &ColumnDef,
 ) -> Result<()> {
     let bytes = tree
@@ -975,7 +966,7 @@ fn require_matching_column_record(
 }
 
 #[cfg(test)]
-fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch<'_>, key: &[u8]) -> Result<()> {
+fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch, key: &[u8]) -> Result<()> {
     if tree.delete(batch, key)?.is_none() {
         return Err(corruption("test catalog record is missing during mutation"));
     }
@@ -1123,7 +1114,7 @@ mod tests {
         batch.commit().unwrap();
     }
 
-    fn current_records(writer: &CatalogWriter, batch: &mut WriteBatch<'_>) -> Records {
+    fn current_records(writer: &CatalogWriter, batch: &mut WriteBatch) -> Records {
         let mut cursor = writer
             .tree
             .scan(batch, Bound::Unbounded, Bound::Unbounded)
@@ -1320,7 +1311,7 @@ mod tests {
         }
     }
 
-    fn split_user_tree(tree: &mut BTree, batch: &mut WriteBatch<'_>) -> u64 {
+    fn split_user_tree(tree: &mut BTree, batch: &mut WriteBatch) -> u64 {
         let old_root = tree.root();
         for key in 0u64..200 {
             tree.insert(batch, &key.to_be_bytes(), &[7; 128]).unwrap();
@@ -1359,7 +1350,7 @@ mod tests {
         .with_faults(std::sync::Arc::new(NoWrites));
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::from_root(TreeKind::Table, root);
-        let mutate = |tree: &mut BTree, batch: &mut WriteBatch<'_>| {
+        let mutate = |tree: &mut BTree, batch: &mut WriteBatch| {
             if split {
                 split_user_tree(tree, batch);
             } else {
@@ -2320,7 +2311,7 @@ mod tests {
         }
     }
 
-    fn grow_catalog_for_split(writer: &mut CatalogWriter, batch: &mut WriteBatch<'_>) {
+    fn grow_catalog_for_split(writer: &mut CatalogWriter, batch: &mut WriteBatch) {
         for id in 10..50 {
             let root = BTree::create(batch, TreeKind::Table).unwrap().root();
             let table = TableDef::new(
@@ -2411,7 +2402,7 @@ mod tests {
         records
     }
 
-    fn raw_tree(batch: &mut WriteBatch<'_>, records: Records) -> BTree {
+    fn raw_tree(batch: &mut WriteBatch, records: Records) -> BTree {
         let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
         for (key, value) in records {
             tree.insert(batch, &key, &value).unwrap();
@@ -2420,7 +2411,7 @@ mod tests {
         tree
     }
 
-    fn publish(batch: &mut WriteBatch<'_>, tree: &BTree) {
+    fn publish(batch: &mut WriteBatch, tree: &BTree) {
         batch.enable_feature_bits(CATALOG_V1).unwrap();
         batch.set_catalog_root(tree.root()).unwrap();
     }
@@ -3193,7 +3184,7 @@ mod tests {
         );
     }
 
-    fn large_user_tree(batch: &mut WriteBatch<'_>) -> BTree {
+    fn large_user_tree(batch: &mut WriteBatch) -> BTree {
         let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
         for key in 0_u64..80 {
             tree.insert(batch, &key.to_be_bytes(), &[42; 700]).unwrap();
@@ -3202,7 +3193,7 @@ mod tests {
         tree
     }
 
-    fn copy_internal_root(batch: &mut WriteBatch<'_>, from: PageRef, to: PageRef) {
+    fn copy_internal_root(batch: &mut WriteBatch, from: PageRef, to: PageRef) {
         let source = batch.read(from).unwrap();
         let header = source.header();
         assert_eq!(header.page_type(), PageType::TableInternal);

@@ -46,14 +46,15 @@ impl fmt::Debug for ReadTransaction<'_> {
 
 /// An exclusive database write that rolls back unless explicitly committed.
 pub struct WriteTransaction<'connection> {
-    batch: Option<WriteBatch<'connection>>,
+    batch: Option<WriteBatch>,
     sql_limits: SqlLimits,
     database_uuid: [u8; 16],
+    _connection: PhantomData<&'connection mut Connection>,
 }
 
 impl<'connection> WriteTransaction<'connection> {
     pub(super) const fn new(
-        batch: WriteBatch<'connection>,
+        batch: WriteBatch,
         sql_limits: SqlLimits,
         database_uuid: [u8; 16],
     ) -> Self {
@@ -61,6 +62,7 @@ impl<'connection> WriteTransaction<'connection> {
             batch: Some(batch),
             sql_limits,
             database_uuid,
+            _connection: PhantomData,
         }
     }
 
@@ -80,7 +82,7 @@ impl<'connection> WriteTransaction<'connection> {
         self.take_batch()?.rollback()
     }
 
-    fn take_batch(&mut self) -> Result<WriteBatch<'connection>> {
+    fn take_batch(&mut self) -> Result<WriteBatch> {
         self.batch.take().ok_or_else(|| {
             DbError::new(
                 ErrorCode::Transaction,
@@ -89,7 +91,7 @@ impl<'connection> WriteTransaction<'connection> {
         })
     }
 
-    fn batch_mut(&mut self) -> Result<&mut WriteBatch<'connection>> {
+    fn batch_mut(&mut self) -> Result<&mut WriteBatch> {
         self.batch.as_mut().ok_or_else(|| {
             DbError::new(
                 ErrorCode::Transaction,

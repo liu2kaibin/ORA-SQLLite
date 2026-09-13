@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    fmt,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError},
 };
 
 use super::{
@@ -82,13 +83,73 @@ pub(super) struct PagerInner {
     pub(super) snapshots: SnapshotRegistry,
     pub(super) cache: Mutex<PageCache>,
     pub(super) cache_pages: usize,
-    writer: Mutex<()>,
+    writer: Arc<WriterCoordinator>,
     mode: OpenMode,
     max_database_bytes: u64,
     max_wal_bytes: u64,
     checkpoint_wal_bytes: u64,
     #[cfg(test)]
     reused_page_count: Mutex<u64>,
+}
+
+struct WriterCoordinator {
+    active: Mutex<bool>,
+    available: Condvar,
+}
+
+struct WriterLease {
+    coordinator: Arc<WriterCoordinator>,
+    active: bool,
+}
+
+impl WriterCoordinator {
+    fn try_acquire(self: &Arc<Self>) -> Result<WriterLease> {
+        let mut active = self.active.try_lock().map_err(map_writer_try_lock)?;
+        if *active {
+            return Err(DbError::new(
+                ErrorCode::Busy,
+                "another write batch is active",
+            ));
+        }
+        *active = true;
+        Ok(WriterLease {
+            coordinator: self.clone(),
+            active: true,
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<WriterLease> {
+        let mut active = self.active.lock().map_err(map_writer_poison)?;
+        while *active {
+            active = self.available.wait(active).map_err(map_writer_poison)?;
+        }
+        *active = true;
+        Ok(WriterLease {
+            coordinator: self.clone(),
+            active: true,
+        })
+    }
+}
+
+impl WriterLease {
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut active = match self.coordinator.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *active = false;
+        self.active = false;
+        self.coordinator.available.notify_one();
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 pub(super) struct PublishedState {
@@ -121,11 +182,7 @@ impl Pager {
                 "read-only pager cannot checkpoint",
             ));
         }
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| internal("pager writer mutex is poisoned"))?;
+        let _writer = self.inner.writer.acquire()?;
         super::checkpoint::run(&self.inner)
     }
 
@@ -246,7 +303,10 @@ impl Pager {
                 snapshots: SnapshotRegistry::default(),
                 cache: Mutex::new(cache),
                 cache_pages: config.cache_pages,
-                writer: Mutex::new(()),
+                writer: Arc::new(WriterCoordinator {
+                    active: Mutex::new(false),
+                    available: Condvar::new(),
+                }),
                 mode,
                 max_database_bytes: config.max_database_bytes,
                 max_wal_bytes: config.max_wal_bytes,
@@ -277,44 +337,29 @@ impl Pager {
         })
     }
 
-    pub(crate) fn begin_write(&self) -> Result<WriteBatch<'_>> {
+    pub(crate) fn begin_write(&self) -> Result<WriteBatch> {
         if self.inner.mode == OpenMode::ReadOnly {
             return Err(DbError::new(
                 ErrorCode::Unsupported,
                 "read-only pager cannot begin a write batch",
             ));
         }
-        let writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| internal("pager writer mutex is poisoned"))?;
-        self.begin_write_with_guard(writer)
+        let writer = self.inner.writer.acquire()?;
+        self.begin_write_with_lease(writer)
     }
 
-    pub(super) fn try_begin_write(&self) -> Result<WriteBatch<'_>> {
+    pub(crate) fn try_begin_write(&self) -> Result<WriteBatch> {
         if self.inner.mode == OpenMode::ReadOnly {
             return Err(DbError::new(
                 ErrorCode::Unsupported,
                 "read-only pager cannot begin a write batch",
             ));
         }
-        let writer = match self.inner.writer.try_lock() {
-            Ok(writer) => writer,
-            Err(TryLockError::WouldBlock) => {
-                return Err(DbError::new(
-                    ErrorCode::Busy,
-                    "another write batch is active",
-                ));
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(internal("pager writer mutex is poisoned"));
-            }
-        };
-        self.begin_write_with_guard(writer)
+        let writer = self.inner.writer.try_acquire()?;
+        self.begin_write_with_lease(writer)
     }
 
-    fn begin_write_with_guard<'a>(&'a self, writer: MutexGuard<'a, ()>) -> Result<WriteBatch<'a>> {
+    fn begin_write_with_lease(&self, writer: WriterLease) -> Result<WriteBatch> {
         let wal_len = self.wal_lock()?.len();
         if wal_len >= self.inner.checkpoint_wal_bytes {
             super::checkpoint::run(&self.inner)?;
@@ -351,7 +396,7 @@ impl Pager {
         drop(read);
 
         Ok(WriteBatch {
-            pager: self,
+            pager: self.clone(),
             _writer: writer,
             base_lsn,
             committed_state,
@@ -567,22 +612,16 @@ pub(super) fn checkpoint_after_writer_contention(
             "read-only pager cannot checkpoint",
         ));
     }
-    match pager.inner.writer.try_lock() {
+    match pager.inner.writer.try_acquire() {
         Ok(_writer) => {
             return Err(internal(
                 "checkpoint contention test requires an active writer",
             ));
         }
-        Err(TryLockError::WouldBlock) => on_contention(),
-        Err(TryLockError::Poisoned(_)) => {
-            return Err(internal("pager writer mutex is poisoned"));
-        }
+        Err(error) if error.code() == ErrorCode::Busy => on_contention(),
+        Err(error) => return Err(error),
     }
-    let _writer = pager
-        .inner
-        .writer
-        .lock()
-        .map_err(|_| internal("pager writer mutex is poisoned"))?;
+    let _writer = pager.inner.writer.acquire()?;
     super::checkpoint::run(&pager.inner)
 }
 
@@ -740,9 +779,9 @@ fn snapshot_catalog_reachability(
     Ok(Some((root, report.all_live_pages())))
 }
 
-pub(crate) struct WriteBatch<'a> {
-    pager: &'a Pager,
-    _writer: MutexGuard<'a, ()>,
+pub(crate) struct WriteBatch {
+    pager: Pager,
+    _writer: WriterLease,
     base_lsn: Lsn,
     committed_state: CommitState,
     base_header: DatabaseHeader,
@@ -776,7 +815,7 @@ pub(super) struct WriteBatchCheckpoint {
     catalog_validation_required: bool,
 }
 
-impl WriteBatch<'_> {
+impl WriteBatch {
     pub(crate) fn catalog_reader(&mut self) -> Result<super::catalog::CatalogReader> {
         self.require_active()?;
         self.require_catalog_finished()?;
@@ -1266,14 +1305,15 @@ impl WriteBatch<'_> {
         self.preflight_wal_limit(&frames)?;
         let publication_observer = self.pager.wal_lock()?.publication_observer();
         let versions = self.pager.wal_lock()?.projected_versions(&frames)?;
-        // The writer guard excludes both another commit and checkpoint. Prepare
+        // The writer lease excludes both another commit and checkpoint. Prepare
         // all validation, allocation and map changes before touching the WAL.
         let mut candidate_index = self.pager.published_read()?.wal_index.clone();
         candidate_index.publish(transaction_lsn, Some(candidate_state), &versions)?;
         // Verify write-lock health before durable I/O. Only this writer can
         // acquire a write guard until publication (read-guard panic cannot poison).
         drop(self.pager.published_write()?);
-        let mut wal = self.pager.wal_lock()?;
+        let wal_pager = self.pager.clone();
+        let mut wal = wal_pager.wal_lock()?;
         match wal.append_transaction(transaction_lsn, self.base_lsn, candidate_state, &frames) {
             Ok(_) => (),
             Err(error) => return self.fail_wal_commit(error),
@@ -1627,6 +1667,16 @@ impl WriteBatch<'_> {
         self.catalog_update_pending = false;
         self.catalog_validation_required = false;
         self.finished = true;
+        self._writer.release();
+    }
+}
+
+impl fmt::Debug for WriteBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteBatch")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1667,7 +1717,7 @@ fn validate_internal_page(frame: &mut PageFrame) -> Result<()> {
     Ok(())
 }
 
-impl PageSource for WriteBatch<'_> {
+impl PageSource for WriteBatch {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.read(reference)
     }
@@ -1723,6 +1773,17 @@ fn internal(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Internal, message)
 }
 
+fn map_writer_poison<T>(_: PoisonError<T>) -> DbError {
+    internal("pager writer mutex is poisoned")
+}
+
+fn map_writer_try_lock<T>(error: TryLockError<T>) -> DbError {
+    match error {
+        TryLockError::WouldBlock => DbError::new(ErrorCode::Busy, "another write batch is active"),
+        TryLockError::Poisoned(_) => internal("pager writer mutex is poisoned"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1731,7 +1792,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{PageSource, Pager, PagerConfig, copy_clean_frame};
+    use super::{PageSource, Pager, PagerConfig, WriteBatch, copy_clean_frame};
     use crate::{
         DbError, ErrorCode, Result,
         fault::{FaultInjector, FaultPoint},
@@ -1749,10 +1810,34 @@ mod tests {
         freelist::Freelist,
         page::{PageFrame, PageType},
         slotted::SlottedPage,
-        test_support::{TempDatabase, test_pager},
+        test_support::{TempDatabase, create_pager, durable_lengths, test_pager},
         validate::validate_tree,
         wal::{Wal, format::CommitState, wal_path},
     };
+
+    fn detached_batch(pager: Pager) -> Result<WriteBatch> {
+        pager.try_begin_write()
+    }
+
+    #[test]
+    fn write_batch_owns_its_writer_lease() {
+        let temp = TempDatabase::new("owned-writer-lease");
+        let pager = create_pager(&temp);
+        let mut batch = detached_batch(pager.clone()).unwrap();
+        assert_eq!(pager.try_begin_write().unwrap_err().code(), ErrorCode::Busy);
+        batch.rollback().unwrap();
+        assert!(pager.try_begin_write().is_ok());
+    }
+
+    #[test]
+    fn dropping_unfinished_owned_batch_releases_writer_without_wal_io() {
+        let temp = TempDatabase::new("owned-writer-drop");
+        let pager = create_pager(&temp);
+        let before = durable_lengths(&temp);
+        drop(detached_batch(pager.clone()).unwrap());
+        assert_eq!(durable_lengths(&temp), before);
+        assert!(pager.try_begin_write().is_ok());
+    }
 
     #[test]
     fn catalog_checkpoint_publishes_the_matching_snapshot_commit_state() {

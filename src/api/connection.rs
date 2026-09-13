@@ -65,7 +65,7 @@ impl Connection {
     pub fn begin_write(&mut self) -> Result<WriteTransaction<'_>> {
         let database_uuid = self.pager.database_uuid()?;
         Ok(WriteTransaction::new(
-            self.pager.begin_write()?,
+            self.pager.try_begin_write()?,
             self.sql_limits,
             database_uuid,
         ))

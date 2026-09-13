@@ -52,7 +52,7 @@ impl InternalNode {
 }
 
 impl BTree {
-    pub(in crate::storage) fn create(batch: &mut WriteBatch<'_>, kind: TreeKind) -> Result<Self> {
+    pub(in crate::storage) fn create(batch: &mut WriteBatch, kind: TreeKind) -> Result<Self> {
         let root = batch.allocate(kind.leaf_page_type())?;
         let frame = batch.modify(root)?;
         SlottedPage::open(frame, LEAF_METADATA_END)?;
@@ -1042,7 +1042,7 @@ mod tests {
         PageRef::new(PageId(page_id), generation).expect("page reference")
     }
 
-    fn write_leaf(batch: &mut WriteBatch<'_>, cells: &[(&[u8], &[u8])]) -> PageRef {
+    fn write_leaf(batch: &mut WriteBatch, cells: &[(&[u8], &[u8])]) -> PageRef {
         let reference = batch
             .allocate(PageType::TableLeaf)
             .expect("allocate leaf page");
@@ -1056,7 +1056,7 @@ mod tests {
         reference
     }
 
-    fn write_leaf_cell(batch: &mut WriteBatch<'_>, cell: LeafCell) -> PageRef {
+    fn write_leaf_cell(batch: &mut WriteBatch, cell: LeafCell) -> PageRef {
         let reference = batch
             .allocate(PageType::TableLeaf)
             .expect("allocate leaf page");
@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     fn write_internal(
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         leftmost: PageRef,
         cells: &[(&[u8], PageRef)],
     ) -> PageRef {
@@ -1122,7 +1122,7 @@ mod tests {
         }
     }
 
-    fn link_right_sibling(batch: &mut WriteBatch<'_>, leaf: PageRef, right: PageRef) {
+    fn link_right_sibling(batch: &mut WriteBatch, leaf: PageRef, right: PageRef) {
         let frame = batch.modify(leaf).expect("modify leaf page");
         frame
             .set_right_sibling(Some(right.page_id()))

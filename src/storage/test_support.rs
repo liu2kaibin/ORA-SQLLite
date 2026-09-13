@@ -77,6 +77,21 @@ pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
     Ok((temp, pager))
 }
 
+pub(super) fn create_pager(temp: &TempDatabase) -> Pager {
+    Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager")
+}
+
+pub(super) fn durable_lengths(temp: &TempDatabase) -> (u64, u64) {
+    (
+        fs::metadata(temp.path())
+            .expect("read database metadata")
+            .len(),
+        fs::metadata(wal_path(temp.path()))
+            .expect("read WAL metadata")
+            .len(),
+    )
+}
+
 impl Drop for TempDatabase {
     fn drop(&mut self) {
         for path in [&self.path, &wal_path(&self.path)] {
@@ -178,7 +193,7 @@ pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture 
 
 fn insert_phase_4b_table(
     writer: &mut CatalogWriter,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     name: &str,
     columns: &[(&str, ColumnType, bool)],
 ) -> Result<TableId> {
@@ -916,10 +931,7 @@ fn commit_multi_page_tree(faults: Arc<RecordingFaults>) -> Result<Vec<FaultPoint
     Ok(faults.observed())
 }
 
-fn insert_multi_page_fixture(
-    tree: &mut BTree,
-    batch: &mut super::pager::WriteBatch<'_>,
-) -> Result<()> {
+fn insert_multi_page_fixture(tree: &mut BTree, batch: &mut super::pager::WriteBatch) -> Result<()> {
     for index in 0..30u8 {
         tree.insert(batch, &index.to_be_bytes(), &[index; 400])?;
     }
@@ -1848,7 +1860,7 @@ fn model_definitions(id: u64, table: &ModelTable, root: PageRef) -> (TableDef, V
 
 fn phase4a_create_table(
     writer: &mut CatalogWriter,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     model: &CatalogModel,
     id: u64,
 ) -> Result<TableDef> {
@@ -1868,7 +1880,7 @@ fn phase4a_create_table(
 
 fn phase4a_insert_row(
     writer: &mut CatalogWriter,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     table: &TableDef,
     model: &CatalogModel,
     rowid: u64,
@@ -2193,7 +2205,7 @@ fn phase_4a_catalog_reserved_field_expectations() {
 
 fn assert_phase4a_catalog_mutation(
     reader: &CatalogReader,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     tree: &BTree,
     original: &TableDef,
     model: &CatalogModel,
