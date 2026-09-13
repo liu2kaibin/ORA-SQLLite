@@ -1189,11 +1189,11 @@ mod tests {
                 alias: None,
                 span,
             }],
-            from: TableSource {
+            from: Some(TableSource {
                 table: identifier("USERS"),
                 alias: Some(identifier("U0")),
                 span,
-            },
+            }),
             joins: (1..SOURCES)
                 .map(|index| {
                     let orders = index % 2 == 1;
@@ -1306,11 +1306,11 @@ mod tests {
                 alias: Some(identifier("DEEP")),
                 span,
             }],
-            from: TableSource {
+            from: Some(TableSource {
                 table: identifier("USERS"),
                 alias: Some(identifier("U")),
                 span,
-            },
+            }),
             joins: Vec::new(),
             selection: None,
             group_by: Vec::new(),
@@ -1403,11 +1403,11 @@ mod tests {
         let query = AstQuery {
             distinct: false,
             projection,
-            from: TableSource {
+            from: Some(TableSource {
                 table: identifier("USERS"),
                 alias: Some(identifier("U")),
                 span,
-            },
+            }),
             joins: Vec::new(),
             selection: None,
             group_by: (1..=SCALE).map(group_expression).collect(),

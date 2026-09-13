@@ -14,6 +14,6 @@ pub use metadata::{ColumnMetadata, DataType, ParameterIdentifier, ParameterMetad
 pub use options::{AccessMode, Options};
 pub use params::{ParameterValue, Parameters};
 pub use result::ExecutionResult;
-pub use row::Row;
+pub use row::{Row, Rows};
 pub use statement::Statement;
 pub use transaction::{ReadTransaction, WriteTransaction};

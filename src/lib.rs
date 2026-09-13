@@ -20,7 +20,7 @@ mod value;
 
 pub use api::{
     AccessMode, ColumnMetadata, Connection, DataType, Database, ExecutionResult, Options,
-    ParameterIdentifier, ParameterMetadata, ParameterValue, Parameters, ReadTransaction, Row,
+    ParameterIdentifier, ParameterMetadata, ParameterValue, Parameters, ReadTransaction, Row, Rows,
     Statement, WriteTransaction,
 };
 pub use datetime::{OracleDate, OracleTimestamp};

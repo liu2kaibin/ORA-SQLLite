@@ -42,7 +42,7 @@ fn final_fix_exception_assignment_caps_stay_per_parameter() {
     use crate::sql::SqlType::{Decimal, Int64};
     let fixture = phase_4b_catalog_fixture(4096);
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let connection = db.connect().unwrap();
+    let mut connection = db.connect().unwrap();
     for (sql, expected) in [
         (
             "UPDATE USERS SET ID = :p, AMOUNT = :q WHERE :p = :q AND :q = 1.5",
@@ -246,7 +246,7 @@ fn final_fix_retains_query_semantics_at_public_statement_boundary() {
     // Dropping WHERE/JOIN/DISTINCT/GROUP/ORDER at Statement must change this result.
     let fixture = phase_4b_catalog_fixture(4096);
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
     for (left, right) in [
         (
             "SELECT ID FROM USERS WHERE ID = 1",
@@ -515,7 +515,7 @@ fn final_fix_parameters_revalidate_linked_types_and_domains() {
 fn final_fix_parameter_metadata_is_lexical_through_public_prepare() {
     let fixture = phase_4b_catalog_fixture(4096);
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
     let statement = conn.prepare("SELECT :projection FROM USERS U INNER JOIN ORDERS O ON O.ID = :joined WHERE U.ID = :filter ORDER BY :ordered, :PROJECTION").unwrap();
     assert_eq!(
         statement
@@ -593,7 +593,7 @@ fn final_fix_wide_catalog_expansion_stops_at_default_budget_without_writes() {
     let before_main = std::fs::read(fixture.main_path()).unwrap();
     let before_wal = std::fs::read(fixture.wal_path()).unwrap();
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
     for (stars, columns) in [
         (99, Some(99_000)),
         (100, Some(100_000)),
@@ -630,7 +630,7 @@ fn final_fix_boolean_dml_and_quoted_columns_bind_against_real_catalog() {
     .unwrap();
     drop(pager);
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
     for sql in [
         "INSERT INTO FLAGS (B) VALUES (TRUE)",
         "UPDATE FLAGS SET B = FALSE WHERE TRUE",
@@ -789,7 +789,7 @@ fn prepare_returns_metadata_without_writing_database_or_wal() {
 
     let statement = {
         let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-        let conn = db.connect().unwrap();
+        let mut conn = db.connect().unwrap();
         conn.prepare(sql).unwrap()
     };
     assert_eq!(statement.parameters().len(), 1);
@@ -835,7 +835,7 @@ fn prepare_returns_metadata_without_writing_database_or_wal() {
 
     {
         let db = Database::open(fixture.main_path(), Options::default().read_only()).unwrap();
-        let conn = db.connect().unwrap();
+        let mut conn = db.connect().unwrap();
         let statement = conn.prepare(sql).unwrap();
         assert_eq!(statement.parameters().len(), 1);
         assert_eq!(statement.columns().len(), 2);
@@ -878,7 +878,7 @@ fn prepare_rejects_first_logical_parameter_over_limit() {
         Options::default().with_sql_limits(limits),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
 
     let below = conn.prepare("SELECT :first, :FIRST FROM USERS").unwrap();
     assert_eq!(below.parameters().len(), 1);
@@ -917,7 +917,7 @@ fn phase_4b_sql_corpus() {
     // result or an excluded statement's stable error classification.
     let fixture = phase_4b_catalog_fixture(4096);
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
 
     let accepted = [
         "SELECT ID, NAME FROM USERS WHERE ID = :1",
@@ -1239,7 +1239,7 @@ fn phase_4b_random_sql_never_panics() {
     // that panics for bounded arbitrary bytes or valid Unicode fails this model.
     let fixture = phase_4b_catalog_fixture(4096);
     let db = Database::open(fixture.main_path(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
     let mut state = 0x6a09_e667_f3bc_c909_u64;
 
     for case in 0..10_000 {

@@ -639,10 +639,10 @@ fn preflight_select(
     if !matches!(distinct, None | Some(Distinct::Distinct)) {
         return Err(unsupported(source_map, select_span));
     }
-    if projection.is_empty() || from.is_empty() {
+    if projection.is_empty() {
         return Err(unsupported(source_map, select_span));
     }
-    if from.len() != 1 {
+    if from.len() > 1 {
         let first_end = source_map.span(from[0].span())?.end();
         let second_start = source_map.span(from[1].span())?.start();
         return Err(unsupported(
@@ -680,15 +680,16 @@ fn preflight_select(
         return Err(unsupported(source_map, group_span.or(select_span)));
     }
 
-    let table_with_joins = &from[0];
-    if table_with_joins.joins.len() > limits.max_joins() as usize {
-        let excess_index = limits.max_joins() as usize;
-        let excess = &table_with_joins.joins[excess_index];
-        let relation_span = source_map.span(excess.relation.span())?;
-        let offset = token_index
-            .join_start_before(relation_span.start())
-            .unwrap_or(relation_span.start());
-        return Err(join_limit_error(offset, source_map));
+    if let Some(table_with_joins) = from.first() {
+        if table_with_joins.joins.len() > limits.max_joins() as usize {
+            let excess_index = limits.max_joins() as usize;
+            let excess = &table_with_joins.joins[excess_index];
+            let relation_span = source_map.span(excess.relation.span())?;
+            let offset = token_index
+                .join_start_before(relation_span.start())
+                .unwrap_or(relation_span.start());
+            return Err(join_limit_error(offset, source_map));
+        }
     }
     Ok(())
 }
@@ -728,19 +729,25 @@ fn convert_select(
         value_table_mode: _,
         flavor: _,
     } = select;
-    let table_with_joins = from
-        .pop()
-        .ok_or_else(|| source_shape_error(query_span.start(), source_map))?;
+    let table_with_joins = from.pop();
 
     let mut converted_projection = Vec::with_capacity(projection.len());
     for item in projection {
         converted_projection.push(convert_select_item(item, source_map, budget)?);
     }
 
-    let converted_from =
-        convert_table_source(table_with_joins.relation, source_map, budget, token_index)?;
-    let mut converted_joins = Vec::with_capacity(table_with_joins.joins.len());
-    for join in table_with_joins.joins {
+    let converted_from = table_with_joins
+        .as_ref()
+        .map(|source| {
+            convert_table_source(source.relation.clone(), source_map, budget, token_index)
+        })
+        .transpose()?;
+    let mut converted_joins = Vec::with_capacity(
+        table_with_joins
+            .as_ref()
+            .map_or(0, |source| source.joins.len()),
+    );
+    for join in table_with_joins.into_iter().flat_map(|source| source.joins) {
         let relation_start = source_map.span(join.relation.span())?.start();
         let start = token_index
             .join_start_before(relation_start)
@@ -1277,8 +1284,18 @@ mod tests {
 
         assert!(query.distinct);
         assert_eq!(query.projection.len(), 2);
-        assert_eq!(query.from.table.as_str(), "USERS");
-        assert_eq!(query.from.alias.as_ref().unwrap().as_str(), "U");
+        assert_eq!(query.from.as_ref().unwrap().table.as_str(), "USERS");
+        assert_eq!(
+            query
+                .from
+                .as_ref()
+                .unwrap()
+                .alias
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "U"
+        );
         assert_eq!(query.joins.len(), 1);
         assert_eq!(query.joins[0].kind, JoinKind::Left);
         assert_eq!(query.group_by.len(), 1);
@@ -1305,6 +1322,14 @@ mod tests {
             query.order_by[0].expr.kind,
             AstExprKind::Integer(ref value) if value == "1"
         ));
+    }
+
+    #[test]
+    fn source_free_query_has_no_synthetic_from_source() {
+        let query = parse_query("SELECT 1").unwrap();
+        assert!(query.from.is_none());
+        assert!(query.joins.is_empty());
+        assert_eq!(query.projection.len(), 1);
     }
 
     #[test]
@@ -1362,7 +1387,6 @@ mod tests {
             ("join without on", "SELECT A.ID FROM A INNER JOIN B", 19),
             ("table alias with as", "SELECT U.ID FROM USERS AS U", 23),
             ("multiple base tables", "SELECT A.ID FROM A, B", 18),
-            ("missing base table", "SELECT 1", 0),
             ("limit", "SELECT ID FROM A LIMIT 1", 17),
             ("offset", "SELECT ID FROM A OFFSET 1 ROWS", 17),
             ("fetch", "SELECT ID FROM A FETCH FIRST 1 ROWS ONLY", 17),
@@ -1706,7 +1730,10 @@ mod tests {
         assert_eq!(query.span(), SqlSpan::new(0, 109).unwrap());
         assert_eq!(query.projection[0].span(), SqlSpan::new(7, 10).unwrap());
         assert_eq!(query.projection[1].span(), SqlSpan::new(12, 24).unwrap());
-        assert_eq!(query.from.span(), SqlSpan::new(30, 37).unwrap());
+        assert_eq!(
+            query.from.as_ref().unwrap().span(),
+            SqlSpan::new(30, 37).unwrap()
+        );
         assert_eq!(query.joins[0].source.span(), SqlSpan::new(54, 62).unwrap());
         assert_eq!(query.joins[0].span(), SqlSpan::new(38, 82).unwrap());
         assert_eq!(query.order_by[0].span(), SqlSpan::new(92, 109).unwrap());
@@ -1756,10 +1783,16 @@ mod tests {
         assert_eq!(count_alias.span(), SqlSpan::new(48, 49).unwrap());
         assert_eq!(*count_item_span, SqlSpan::new(33, 49).unwrap());
 
-        assert_eq!(query.from.span(), SqlSpan::new(55, 62).unwrap());
-        assert_eq!(query.from.table.span(), SqlSpan::new(55, 60).unwrap());
         assert_eq!(
-            query.from.alias.as_ref().unwrap().span(),
+            query.from.as_ref().unwrap().span(),
+            SqlSpan::new(55, 62).unwrap()
+        );
+        assert_eq!(
+            query.from.as_ref().unwrap().table.span(),
+            SqlSpan::new(55, 60).unwrap()
+        );
+        assert_eq!(
+            query.from.as_ref().unwrap().alias.as_ref().unwrap().span(),
             SqlSpan::new(61, 62).unwrap()
         );
         assert_eq!(query.joins[0].span(), SqlSpan::new(63, 101).unwrap());

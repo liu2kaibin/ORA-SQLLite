@@ -17,6 +17,7 @@ use crate::{
     },
 };
 
+#[derive(Clone)]
 pub(crate) struct ExecExpr {
     kind: ExecExprKind,
     data_type: SqlType,
@@ -86,6 +87,7 @@ impl fmt::Debug for ExecExpr {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ExecExprKind {
     Literal(Value),
     Column {

@@ -1,13 +1,21 @@
 //! Storage-independent runtime values and scalar expression evaluation.
 mod expr;
 mod memory;
+mod operator;
 mod params;
+mod query;
+mod scan;
 
 pub(crate) use expr::{
-    EvalRow, TruthValue, eval, sql_equal, sql_group_equal, sql_total_cmp, validate_sql_float,
+    TruthValue, eval, sql_equal, sql_group_equal, sql_total_cmp, validate_sql_float,
 };
 pub(crate) use memory::WorkMemory;
+pub(crate) use operator::{
+    EvalRow, ExecutionContext, ExecutionStorage, OperatorFactory, OutputOperator, Project,
+    ProjectedRow,
+};
 pub(crate) use params::ParameterFrame;
+pub(crate) use query::{QueryExecution, prepare_query};
 
 #[cfg(test)]
 mod tests {

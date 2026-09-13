@@ -1,18 +1,11 @@
 use std::cmp::Ordering;
 
-use super::ParameterFrame;
+use super::{EvalRow, ParameterFrame};
 use crate::sql::{
     bound::{BoundBinaryOp, BoundUnaryOp},
     plan::{ExecExpr, ExecExprKind},
 };
 use crate::{DbError, Decimal, ErrorCode, OracleDate, Result, Value};
-
-/// Borrowed query-local source rows and already-computed aggregate slots.
-#[derive(Default)]
-pub(crate) struct EvalRow<'a> {
-    pub(crate) sources: &'a [&'a [Value]],
-    pub(crate) aggregates: &'a [Value],
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TruthValue {
@@ -67,7 +60,7 @@ impl From<bool> for TruthValue {
 }
 
 /// Explicit postorder stacks: neither normal evaluation nor errors recurse.
-pub(crate) fn eval(expr: &ExecExpr, row: &EvalRow<'_>, params: &ParameterFrame) -> Result<Value> {
+pub(crate) fn eval(expr: &ExecExpr, row: &EvalRow, params: &ParameterFrame) -> Result<Value> {
     let mut work = vec![(expr, false)];
     let mut values = Vec::new();
     while let Some((expr, ready)) = work.pop() {
@@ -119,22 +112,19 @@ pub(crate) fn eval(expr: &ExecExpr, row: &EvalRow<'_>, params: &ParameterFrame) 
 
 fn eval_ready(
     kind: &ExecExprKind,
-    row: &EvalRow<'_>,
+    row: &EvalRow,
     params: &ParameterFrame,
     values: &mut Vec<Value>,
 ) -> Result<Value> {
     match kind {
         ExecExprKind::Literal(value) => Ok(value.clone()),
         ExecExprKind::Column { source, ordinal } => row
-            .sources
-            .get(source.0)
-            .and_then(|row| row.get(usize::from(*ordinal)))
+            .source_value(*source, *ordinal)
             .cloned()
             .ok_or_else(invalid_eval),
         ExecExprKind::Parameter { slot } => Ok(params.checked_get(*slot)?.clone()),
         ExecExprKind::Aggregate { slot } => row
-            .aggregates
-            .get(usize::try_from(*slot).map_err(|_| invalid_eval())?)
+            .aggregate_value(*slot)?
             .cloned()
             .ok_or_else(invalid_eval),
         ExecExprKind::Unary { op, .. } => unary(*op, pop(values)?),
@@ -843,10 +833,7 @@ mod tests {
         let a = [Value::Int64(10)];
         let b = [Value::Int64(20)];
         let sources = [&a[..], &b[..]];
-        let row = EvalRow {
-            sources: &sources,
-            aggregates: &[],
-        };
+        let row = EvalRow::from_sources_for_test(&sources);
         let PlanKind::Query(query) = plan.kind() else {
             panic!("query")
         };
@@ -878,10 +865,7 @@ mod tests {
             Value::Decimal(Decimal::new(false, 0, 40).unwrap()),
             Value::Int64(3),
         ];
-        let row = EvalRow {
-            sources: &[],
-            aggregates: &aggregates,
-        };
+        let row = EvalRow::from_aggregates_for_test(&aggregates);
         for (expr, want) in query.projection().iter().zip(aggregates.iter()) {
             assert_eq!(eval(expr, &row, &empty_frame()).unwrap(), *want);
         }
@@ -998,10 +982,7 @@ mod tests {
             let plan = plan_sql("SELECT FLOAT_COL + 1e0 FROM USERS");
             let source = [Value::Null, Value::Null, Value::Null, Value::Float64(bad)];
             let sources = [&source[..]];
-            let row = EvalRow {
-                sources: &sources,
-                aggregates: &[],
-            };
+            let row = EvalRow::from_sources_for_test(&sources);
             let PlanKind::Query(query) = plan.kind() else {
                 panic!("query")
             };
@@ -1030,10 +1011,7 @@ mod tests {
             let aggregate = [Value::Float64(bad)];
             let error = eval(
                 &query.projection()[0],
-                &EvalRow {
-                    sources: &[],
-                    aggregates: &aggregate,
-                },
+                &EvalRow::from_aggregates_for_test(&aggregate),
                 &empty_frame(),
             )
             .unwrap_err();

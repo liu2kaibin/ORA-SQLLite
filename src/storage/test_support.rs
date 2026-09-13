@@ -145,9 +145,19 @@ impl Phase4bCatalogFixture {
 }
 
 pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
+    phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
+}
+
+fn phase_4b_catalog_fixture_with_uuid(
+    page_size: u32,
+    database_uuid: [u8; 16],
+) -> Phase4bCatalogFixture {
     let temp = TempDatabase::new("phase4b-catalog");
-    let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))
-        .expect("create the Phase 4B catalog fixture");
+    let pager = Pager::create(
+        temp.path(),
+        PagerConfig::new(page_size, database_uuid).expect("query fixture pager config"),
+    )
+    .expect("create the Phase 4B catalog fixture");
     let mut batch = pager
         .begin_write()
         .expect("begin the Phase 4B catalog fixture write");
@@ -189,6 +199,55 @@ pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture 
         users_id,
         orders_id,
     }
+}
+
+pub(crate) fn phase_4c1_query_relation_fixture(rows: &[(i64, &str)]) -> Phase4bCatalogFixture {
+    static NEXT_UUID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+    let uuid_byte = NEXT_UUID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fixture = phase_4b_catalog_fixture_with_uuid(4096, [uuid_byte; 16]);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().expect("open query fixture catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("read query fixture catalog");
+    let table = catalog
+        .find_table_by_id(fixture.users_id())
+        .expect("query fixture USERS table")
+        .clone();
+    let columns = catalog
+        .columns_for_table(fixture.users_id())
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(snapshot);
+
+    let mut batch = pager.begin_write().expect("begin query fixture write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("open query fixture catalog");
+    let mut tree = BTree::from_root(TreeKind::Table, table.root());
+    for (id, name) in rows {
+        let rowid = writer
+            .allocate_rowid(&mut batch, fixture.users_id())
+            .expect("allocate query fixture ROWID");
+        let values = [
+            crate::Value::Int64(*id),
+            crate::Value::Text((*name).to_owned()),
+            crate::Value::Null,
+            crate::Value::Null,
+        ];
+        let bytes = RowCodec::encode(&table, &columns, &values, 64 * 1024)
+            .expect("encode query fixture row");
+        tree.insert(&mut batch, &encode_rowid_key(rowid), &bytes)
+            .expect("insert query fixture row");
+    }
+    if !rows.is_empty() {
+        writer
+            .update_table_root(&mut batch, fixture.users_id(), tree.root())
+            .expect("publish query fixture table root");
+    }
+    writer
+        .finish(&mut batch)
+        .expect("finish query fixture catalog");
+    batch.commit().expect("commit query fixture rows");
+    fixture
 }
 
 fn insert_phase_4b_table(

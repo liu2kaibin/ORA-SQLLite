@@ -100,12 +100,10 @@ impl Statement {
         &self.bound
     }
 
-    #[allow(dead_code, reason = "execution is added in subsequent Phase 4C1 tasks")]
     pub(crate) fn plan(&self) -> &Plan {
         &self.plan
     }
 
-    #[allow(dead_code, reason = "execution is added in Phase 4C")]
     pub(crate) fn validate_schema(
         &self,
         database_uuid: [u8; 16],
