@@ -100,6 +100,13 @@ impl DbError {
     pub const fn sql_location(&self) -> Option<SqlLocation> {
         self.sql_location
     }
+
+    pub(crate) const fn is_fatal(&self) -> bool {
+        matches!(
+            self.code,
+            ErrorCode::Corruption | ErrorCode::Io | ErrorCode::Internal
+        )
+    }
 }
 
 impl fmt::Display for DbError {

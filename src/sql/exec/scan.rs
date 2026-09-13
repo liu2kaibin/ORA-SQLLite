@@ -1,7 +1,8 @@
-use crate::Result;
 use crate::sql::bound::SourceId;
 use crate::storage::relation::RelationScan;
+use crate::{Result, Value};
 
+use super::memory::owned_values_bytes;
 use super::operator::{EvalRow, ExecutionContext, Operator};
 
 pub(crate) struct OneRow {
@@ -38,9 +39,13 @@ impl TableScan {
 
 impl Operator for TableScan {
     fn next(&mut self, context: &mut ExecutionContext<'_>) -> Result<Option<EvalRow>> {
-        context
-            .next_relation(&mut self.scan)?
-            .map(|row| EvalRow::with_source(self.source, row.values().into()))
-            .transpose()
+        let Some(row) = context.next_relation(&mut self.scan)? else {
+            return Ok(None);
+        };
+        let values: Box<[Value]> = row.values().into();
+        let memory_bytes = owned_values_bytes(values.iter())?;
+        let row = EvalRow::with_source(self.source, values, memory_bytes)?;
+        context.memory().reserve(memory_bytes)?;
+        Ok(Some(row))
     }
 }

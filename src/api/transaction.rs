@@ -105,15 +105,25 @@ impl<'connection> WriteTransaction<'connection> {
         let database_uuid = self.database_uuid;
         let max_query_memory_bytes = self.max_query_memory_bytes;
         let batch = self.batch_mut()?;
-        let catalog = batch.catalog_reader()?;
-        let execution = prepare_query(
-            statement,
-            parameters,
-            &catalog,
-            database_uuid,
-            max_query_memory_bytes,
-        )?;
-        Ok(Rows::borrowed_write(batch, execution))
+        let execution = (|| {
+            let catalog = batch.catalog_reader()?;
+            prepare_query(
+                statement,
+                parameters,
+                &catalog,
+                database_uuid,
+                max_query_memory_bytes,
+            )
+        })();
+        match execution {
+            Ok(execution) => Ok(Rows::borrowed_write(batch, execution)),
+            Err(error) => {
+                if error.is_fatal() {
+                    batch.mark_rollback_only();
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Commits this transaction.
@@ -224,6 +234,95 @@ mod tests {
             &[crate::Value::Int64(7)]
         );
         drop(rows);
+        write.rollback().unwrap();
+    }
+
+    #[test]
+    fn fatal_query_error_requires_rollback_but_ordinary_error_keeps_write_transaction_usable() {
+        // Production break caught: returning a fatal streaming error without
+        // transaction-owned rollback-only state allows a later commit, while
+        // treating every query error as fatal rejects valid continuation.
+        let ordinary = crate::storage::test_support::phase_4c1_query_relation_fixture(&[(7, "N")]);
+        let ordinary_db = Database::open(ordinary.main_path(), Options::default()).unwrap();
+        let mut ordinary_connection = ordinary_db.connect().unwrap();
+        let ddl = ordinary_connection
+            .prepare("CREATE TABLE UNUSED (ID INT64)")
+            .unwrap();
+        let mut ordinary_write = ordinary_connection.begin_write().unwrap();
+        assert_eq!(
+            ordinary_write
+                .query(&ddl, crate::Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        let select = ordinary_write.prepare("SELECT ID FROM USERS").unwrap();
+        let mut rows = ordinary_write
+            .query(&select, crate::Parameters::none())
+            .unwrap();
+        assert_eq!(
+            rows.next().unwrap().unwrap().values(),
+            &[crate::Value::Int64(7)]
+        );
+        drop(rows);
+        ordinary_write.commit().unwrap();
+
+        let corrupt = crate::storage::test_support::phase_4c1_corrupt_query_relation_fixture();
+        let corrupt_db = Database::open(corrupt.main_path(), Options::default()).unwrap();
+        let mut corrupt_connection = corrupt_db.connect().unwrap();
+        let mut fatal_write = corrupt_connection.begin_write().unwrap();
+        let select = fatal_write.prepare("SELECT ID FROM USERS").unwrap();
+        let mut rows = fatal_write
+            .query(&select, crate::Parameters::none())
+            .unwrap();
+        assert_eq!(rows.next().unwrap_err().code(), ErrorCode::Corruption);
+        drop(rows);
+        assert_eq!(
+            fatal_write
+                .prepare("SELECT ID FROM USERS")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Transaction
+        );
+        assert_eq!(
+            fatal_write.commit().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+
+        let mut rollback_write = corrupt_connection.begin_write().unwrap();
+        let select = rollback_write.prepare("SELECT ID FROM USERS").unwrap();
+        let mut rows = rollback_write
+            .query(&select, crate::Parameters::none())
+            .unwrap();
+        assert_eq!(rows.next().unwrap_err().code(), ErrorCode::Corruption);
+        drop(rows);
+        rollback_write.rollback().unwrap();
+    }
+
+    #[test]
+    fn fatal_query_construction_error_makes_write_transaction_rollback_only() {
+        // Production break caught: handling fatal errors only in Rows::next
+        // misses catalog/plan construction failures that happen before Rows
+        // exists and would otherwise leave commit reachable.
+        let fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[(7, "N")]);
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let statement = connection.prepare("SELECT ID FROM USERS").unwrap();
+        let mut write = connection.begin_write().unwrap();
+        crate::storage::test_support::phase_4c1_corrupt_batch_catalog(
+            write.batch.as_mut().unwrap(),
+        );
+        assert_eq!(
+            write
+                .query(&statement, crate::Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        assert_eq!(
+            write.prepare("SELECT ID FROM USERS").unwrap_err().code(),
+            ErrorCode::Transaction
+        );
         write.rollback().unwrap();
     }
 }

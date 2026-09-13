@@ -33,7 +33,7 @@ pub(crate) fn prepare_query(
     let mut memory = WorkMemory::new(max_query_memory_bytes)?;
     let params = ParameterFrame::bind(statement.parameters(), parameters, &mut memory)?;
     statement.validate_schema(database_uuid, catalog)?;
-    let max_row_bytes = usize::try_from(max_query_memory_bytes).unwrap_or(usize::MAX);
+    let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
     let input = factory.build(catalog, max_row_bytes)?;
     Ok(QueryExecution {
         root: Box::new(Project::new(input, query)),
@@ -205,12 +205,13 @@ mod tests {
     #[test]
     fn configured_query_memory_is_the_relation_row_decode_limit() {
         // Production break caught: using the storage test model's 16 KiB limit
-        // would reject this row even when the caller configured enough memory.
+        // would reject this row even when the caller configured enough shared
+        // memory for the parameter frame, decoded row, and projected output.
         let long_name = "x".repeat(20_000);
         let storage = phase_4c1_query_relation_fixture(&[(1, &long_name)]);
         let database = Database::open(
             storage.main_path(),
-            Options::default().with_max_query_memory_bytes(32 * 1024),
+            Options::default().with_max_query_memory_bytes(48 * 1024),
         )
         .unwrap();
         let mut connection = database.connect().unwrap();
@@ -220,6 +221,78 @@ mod tests {
             rows.next().unwrap().unwrap().values(),
             &[Value::Text(long_name)]
         );
+    }
+
+    #[test]
+    fn parameters_and_decoded_row_share_one_query_memory_ceiling() {
+        // Production break caught: giving the scan the original full limit
+        // lets the parameter frame and decoded row each fit independently
+        // while their combined retained storage exceeds the query ceiling.
+        let name = "x".repeat(1_024);
+        let storage = phase_4c1_query_relation_fixture(&[(1, &name)]);
+        let database = Database::open(
+            storage.main_path(),
+            Options::default().with_max_query_memory_bytes(1_500),
+        )
+        .unwrap();
+        let mut connection = database.connect().unwrap();
+        let statement = connection
+            .prepare("SELECT ID FROM USERS WHERE NAME = :1")
+            .unwrap();
+        let params = [Value::Text(name).into()];
+        let mut rows = connection
+            .query(&statement, Parameters::positional(&params))
+            .unwrap();
+        assert_eq!(
+            rows.next().unwrap_err().code(),
+            crate::ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn repeated_projection_reserves_transient_output_and_releases_each_row() {
+        // Production break caught: cloning one large source value into three
+        // output slots without a reservation bypasses amplification limits;
+        // failing to release a returned row makes the second exact-boundary
+        // row fail despite the caller owning the first output.
+        let name = "y".repeat(1_024);
+        let value_bytes = std::mem::size_of::<Value>() as u64;
+        let input_bytes = 32 + 4 * value_bytes + 1_024;
+        let output_bytes = 32 + 3 * value_bytes + 3 * 1_024;
+        let empty_parameter_frame_bytes = 32;
+        let exact = empty_parameter_frame_bytes + input_bytes + output_bytes;
+
+        for (limit, accepted) in [(exact - 1, false), (exact, true)] {
+            let storage = phase_4c1_query_relation_fixture(&[(1, &name), (2, &name)]);
+            let database = Database::open(
+                storage.main_path(),
+                Options::default().with_max_query_memory_bytes(limit),
+            )
+            .unwrap();
+            let mut connection = database.connect().unwrap();
+            let statement = connection
+                .prepare("SELECT NAME, NAME, NAME FROM USERS")
+                .unwrap();
+            let mut rows = connection.query(&statement, Parameters::none()).unwrap();
+            if accepted {
+                for _ in 0..2 {
+                    assert_eq!(
+                        rows.next().unwrap().unwrap().values(),
+                        &[
+                            Value::Text(name.clone()),
+                            Value::Text(name.clone()),
+                            Value::Text(name.clone()),
+                        ]
+                    );
+                }
+                assert!(rows.next().unwrap().is_none());
+            } else {
+                assert_eq!(
+                    rows.next().unwrap_err().code(),
+                    crate::ErrorCode::ResourceLimit
+                );
+            }
+        }
     }
 
     #[test]

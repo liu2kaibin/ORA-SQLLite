@@ -89,14 +89,79 @@ impl<'a> Rows<'a> {
         reason = "the streaming API returns Result<Option<Row>>, which cannot implement Iterator::next"
     )]
     pub fn next(&mut self) -> Result<Option<Row>> {
-        let storage = match &mut self.storage {
-            RowsStorage::OwnedRead(snapshot) => ExecutionStorage::Read(snapshot),
-            RowsStorage::BorrowedRead(snapshot) => ExecutionStorage::Read(snapshot),
-            RowsStorage::BorrowedWrite(batch) => ExecutionStorage::Write(batch),
+        let projected = {
+            let storage = match &mut self.storage {
+                RowsStorage::OwnedRead(snapshot) => ExecutionStorage::Read(snapshot),
+                RowsStorage::BorrowedRead(snapshot) => ExecutionStorage::Read(snapshot),
+                RowsStorage::BorrowedWrite(batch) => ExecutionStorage::Write(batch),
+            };
+            let mut context = ExecutionContext::new(storage, &self.params, &mut self.memory);
+            self.root.next(&mut context)
         };
-        let mut context = ExecutionContext::new(storage, &self.params, &mut self.memory);
-        self.root
-            .next(&mut context)
-            .map(|projected| projected.map(|row| row.into_output()))
+        let result = match projected {
+            Ok(Some(projected)) => {
+                let (row, memory_bytes) = projected.into_output();
+                self.memory.release(memory_bytes).map(|()| Some(row))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result {
+            if error.is_fatal() {
+                if let RowsStorage::BorrowedWrite(batch) = &mut self.storage {
+                    batch.mark_rollback_only();
+                }
+            }
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::exec::ProjectedRow;
+    use crate::storage::test_support::phase_4b_catalog_fixture;
+    use crate::{ErrorCode, Parameters};
+
+    struct ReleaseUnderflow(bool);
+
+    impl OutputOperator for ReleaseUnderflow {
+        fn next(&mut self, _context: &mut ExecutionContext<'_>) -> Result<Option<ProjectedRow>> {
+            if std::mem::replace(&mut self.0, false) {
+                Ok(Some(ProjectedRow::from_output_for_test(
+                    Row::new(Vec::new()),
+                    1,
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_output_release_error_makes_write_batch_rollback_only() {
+        // Production break caught: propagating a release failure before it is
+        // classified leaves a borrowed write batch able to continue or commit.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let mut batch = pager.begin_write().unwrap();
+        let params =
+            ParameterFrame::bind(&[], Parameters::none(), &mut WorkMemory::new(64).unwrap())
+                .unwrap();
+        let mut rows = Rows {
+            storage: RowsStorage::BorrowedWrite(&mut batch),
+            root: Box::new(ReleaseUnderflow(true)),
+            params,
+            memory: WorkMemory::new(64).unwrap(),
+        };
+
+        assert_eq!(rows.next().unwrap_err().code(), ErrorCode::Internal);
+        drop(rows);
+        assert_eq!(
+            batch.catalog_reader().err().unwrap().code(),
+            ErrorCode::Transaction
+        );
+        batch.rollback().unwrap();
     }
 }

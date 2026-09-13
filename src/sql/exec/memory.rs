@@ -31,6 +31,20 @@ impl WorkMemory {
     pub(crate) const fn used(&self) -> u64 {
         self.used
     }
+
+    pub(crate) const fn remaining(&self) -> u64 {
+        self.limit - self.used
+    }
+
+    pub(crate) fn release(&mut self, bytes: u64) -> Result<()> {
+        self.used = self.used.checked_sub(bytes).ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Internal,
+                "query work memory accounting underflow",
+            )
+        })?;
+        Ok(())
+    }
 }
 
 pub(super) fn resource_limit() -> DbError {
@@ -80,6 +94,11 @@ mod tests {
             ErrorCode::ResourceLimit
         );
         assert_eq!(memory.used(), 10);
+        memory.release(4).unwrap();
+        assert_eq!(memory.used(), 6);
+        assert_eq!(memory.remaining(), 4);
+        assert_eq!(memory.release(7).unwrap_err().code(), ErrorCode::Internal);
+        assert_eq!(memory.used(), 6);
         memory.reserve(0).unwrap();
         let mut memory = WorkMemory::new(u64::MAX).unwrap();
         memory.reserve(u64::MAX).unwrap();

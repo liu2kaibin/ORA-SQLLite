@@ -7,7 +7,7 @@ use crate::storage::relation::{Relation, RelationScan, StoredRow};
 use crate::storage::{ReadSnapshot, WriteBatch};
 use crate::{DbError, ErrorCode, Result, Row, Value};
 
-use super::memory::resource_limit;
+use super::memory::{owned_values_bytes, resource_limit};
 use super::scan::{OneRow, TableScan};
 use super::{ParameterFrame, WorkMemory, eval};
 
@@ -56,11 +56,22 @@ pub(crate) struct ProjectedRow {
     output: Row,
     order_keys: Box<[Value]>,
     input_ordinal: u64,
+    memory_bytes: u64,
 }
 
 impl ProjectedRow {
-    pub(crate) fn into_output(self) -> Row {
-        self.output
+    pub(crate) fn into_output(self) -> (Row, u64) {
+        (self.output, self.memory_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_output_for_test(output: Row, memory_bytes: u64) -> Self {
+        Self {
+            output,
+            order_keys: Box::new([]),
+            input_ordinal: 0,
+            memory_bytes,
+        }
     }
 
     #[allow(dead_code, reason = "consumed by DISTINCT and ORDER BY in Task 8")]
@@ -115,16 +126,19 @@ impl<'a> ExecutionContext<'a> {
     }
 
     pub(crate) fn next_relation(&mut self, scan: &mut RelationScan) -> Result<Option<StoredRow>> {
-        match &mut self.storage {
+        let result = match &mut self.storage {
             ExecutionStorage::Read(snapshot) => scan.next_snapshot(snapshot),
             ExecutionStorage::Write(batch) => scan.next_batch(batch),
-        }
+        };
+        result.map_err(|error| {
+            if error.code() == ErrorCode::Type {
+                resource_limit()
+            } else {
+                error
+            }
+        })
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared by materializing operators added in Task 8"
-    )]
     pub(crate) fn memory(&mut self) -> &mut WorkMemory {
         self.memory
     }
@@ -134,17 +148,27 @@ impl<'a> ExecutionContext<'a> {
 pub(crate) struct EvalRow {
     sources: Box<[Option<Box<[Value]>>]>,
     aggregates: Box<[Value]>,
+    memory_bytes: u64,
 }
 
 impl EvalRow {
-    pub(crate) fn with_source(source: SourceId, values: Box<[Value]>) -> Result<Self> {
+    pub(crate) fn with_source(
+        source: SourceId,
+        values: Box<[Value]>,
+        memory_bytes: u64,
+    ) -> Result<Self> {
         let count = source.0.checked_add(1).ok_or_else(resource_limit)?;
         let mut sources = vec![None; count].into_boxed_slice();
         sources[source.0] = Some(values);
         Ok(Self {
             sources,
             aggregates: Box::new([]),
+            memory_bytes,
         })
+    }
+
+    pub(crate) const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
     }
 
     pub(crate) fn source_value(&self, source: SourceId, ordinal: u16) -> Option<&Value> {
@@ -172,6 +196,7 @@ impl EvalRow {
                 .map(|source| Some(source.to_vec().into_boxed_slice()))
                 .collect(),
             aggregates: Box::new([]),
+            memory_bytes: 0,
         }
     }
 
@@ -180,6 +205,7 @@ impl EvalRow {
         Self {
             sources: Box::new([]),
             aggregates: aggregates.into(),
+            memory_bytes: 0,
         }
     }
 }
@@ -195,10 +221,18 @@ impl Operator for Filter {
             let Some(row) = self.input.next(context)? else {
                 return Ok(None);
             };
-            match eval(&self.predicate, &row, context.params())? {
-                Value::Bool(true) => return Ok(Some(row)),
-                Value::Bool(false) | Value::Null => {}
-                _ => {
+            let predicate = eval(&self.predicate, &row, context.params());
+            match predicate {
+                Err(error) => {
+                    context.memory().release(row.memory_bytes())?;
+                    return Err(error);
+                }
+                Ok(Value::Bool(true)) => return Ok(Some(row)),
+                Ok(Value::Bool(false) | Value::Null) => {
+                    context.memory().release(row.memory_bytes())?;
+                }
+                Ok(_) => {
+                    context.memory().release(row.memory_bytes())?;
                     return Err(DbError::new(
                         ErrorCode::Type,
                         "query filter requires a boolean value",
@@ -230,20 +264,72 @@ impl OutputOperator for Project {
         let Some(row) = self.input.next(context)? else {
             return Ok(None);
         };
-        let output = self
+        let output = match self
             .projection
             .iter()
             .map(|expression| eval(expression, &row, context.params()))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                context.memory().release(row.memory_bytes())?;
+                return Err(error);
+            }
+        };
+        let output_bytes = match owned_values_bytes(output.iter()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                context.memory().release(row.memory_bytes())?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = context.memory().reserve(output_bytes) {
+            context.memory().release(row.memory_bytes())?;
+            return Err(error);
+        }
+        context.memory().release(row.memory_bytes())?;
         let input_ordinal = self.next_input_ordinal;
-        self.next_input_ordinal = self
-            .next_input_ordinal
-            .checked_add(1)
-            .ok_or_else(resource_limit)?;
+        let Some(next_input_ordinal) = self.next_input_ordinal.checked_add(1) else {
+            context.memory().release(output_bytes)?;
+            return Err(resource_limit());
+        };
+        self.next_input_ordinal = next_input_ordinal;
         Ok(Some(ProjectedRow {
             output: Row::new(output),
             order_keys: Box::new([]),
             input_ordinal,
+            memory_bytes: output_bytes,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::test_support::phase_4b_catalog_fixture;
+
+    #[test]
+    fn ordinal_overflow_releases_reserved_projection_memory() {
+        // Production break caught: returning ordinal overflow after reserving
+        // the output leaves memory charged for a row that was never returned.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let mut read = pager.begin_read().unwrap();
+        let params = crate::sql::exec::tests::empty_frame();
+        let mut memory = WorkMemory::new(64).unwrap();
+        let mut context =
+            ExecutionContext::new(ExecutionStorage::Read(&mut read), &params, &mut memory);
+        let mut project = Project {
+            input: Box::new(OneRow::new()),
+            projection: Box::new([]),
+            next_input_ordinal: u64::MAX,
+        };
+
+        let error = match project.next(&mut context) {
+            Err(error) => error,
+            Ok(_) => panic!("ordinal overflow must reject the row"),
+        };
+        assert_eq!(error.code(), ErrorCode::ResourceLimit);
+        assert_eq!(context.memory().used(), 0);
     }
 }

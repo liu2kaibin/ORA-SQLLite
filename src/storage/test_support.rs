@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -36,6 +36,7 @@ use super::{
 };
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
+static NEXT_QUERY_DATABASE_UUID: AtomicU8 = AtomicU8::new(1);
 
 pub(crate) struct TempDatabase {
     path: PathBuf,
@@ -202,8 +203,7 @@ fn phase_4b_catalog_fixture_with_uuid(
 }
 
 pub(crate) fn phase_4c1_query_relation_fixture(rows: &[(i64, &str)]) -> Phase4bCatalogFixture {
-    static NEXT_UUID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
-    let uuid_byte = NEXT_UUID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let uuid_byte = NEXT_QUERY_DATABASE_UUID.fetch_add(1, Ordering::Relaxed);
     let fixture = phase_4b_catalog_fixture_with_uuid(4096, [uuid_byte; 16]);
     let pager = fixture.pager();
     let mut snapshot = pager.begin_read().expect("open query fixture catalog");
@@ -248,6 +248,51 @@ pub(crate) fn phase_4c1_query_relation_fixture(rows: &[(i64, &str)]) -> Phase4bC
         .expect("finish query fixture catalog");
     batch.commit().expect("commit query fixture rows");
     fixture
+}
+
+pub(crate) fn phase_4c1_corrupt_query_relation_fixture() -> Phase4bCatalogFixture {
+    let uuid_byte = NEXT_QUERY_DATABASE_UUID.fetch_add(1, Ordering::Relaxed);
+    let fixture = phase_4b_catalog_fixture_with_uuid(4096, [uuid_byte; 16]);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().expect("open corrupt query catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("read corrupt query catalog");
+    let table = catalog
+        .find_table_by_id(fixture.users_id())
+        .expect("corrupt query USERS table")
+        .clone();
+    drop(snapshot);
+
+    let mut batch = pager.begin_write().expect("begin corrupt query write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("open corrupt query catalog");
+    let mut tree = BTree::from_root(TreeKind::Table, table.root());
+    let rowid = writer
+        .allocate_rowid(&mut batch, fixture.users_id())
+        .expect("allocate corrupt query ROWID");
+    tree.insert(&mut batch, &encode_rowid_key(rowid), b"not-a-valid-row")
+        .expect("insert corrupt query row");
+    writer
+        .update_table_root(&mut batch, fixture.users_id(), tree.root())
+        .expect("publish corrupt query table root");
+    writer
+        .finish(&mut batch)
+        .expect("finish corrupt query catalog");
+    batch.commit().expect("commit corrupt query row");
+    fixture
+}
+
+pub(crate) fn phase_4c1_corrupt_batch_catalog(batch: &mut WriteBatch) {
+    let (mut catalog, _) = batch
+        .catalog_tree_with_report(TreeKind::Table)
+        .expect("read construction-failure catalog")
+        .expect("construction-failure catalog root");
+    catalog
+        .insert(batch, &[0x11], b"invalid-catalog-record")
+        .expect("insert invalid catalog record");
+    batch
+        .set_catalog_root(catalog.root())
+        .expect("retain invalid catalog root");
 }
 
 fn insert_phase_4b_table(

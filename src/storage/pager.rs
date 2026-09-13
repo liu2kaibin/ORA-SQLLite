@@ -417,6 +417,7 @@ impl Pager {
             superseded_roots: HashSet::new(),
             catalog_update_pending: false,
             catalog_validation_required: false,
+            rollback_only: false,
             finished: false,
         })
     }
@@ -816,6 +817,7 @@ pub(crate) struct WriteBatch {
     // A successful finish binds this batch to catalog validation through commit.
     // Raw low-level batches remain available for deliberate corruption fixtures.
     catalog_validation_required: bool,
+    rollback_only: bool,
     finished: bool,
 }
 
@@ -834,6 +836,12 @@ pub(super) struct WriteBatchCheckpoint {
 impl WriteBatch {
     pub(crate) const fn database_uuid(&self) -> [u8; 16] {
         self.base_header.uuid()
+    }
+
+    pub(crate) fn mark_rollback_only(&mut self) {
+        if !self.finished {
+            self.rollback_only = true;
+        }
     }
 
     pub(crate) fn catalog_reader(&mut self) -> Result<super::catalog::CatalogReader> {
@@ -1117,7 +1125,7 @@ impl WriteBatch {
     }
 
     pub(crate) fn rollback(&mut self) -> Result<()> {
-        self.require_active()?;
+        self.require_not_finished()?;
         self.finish();
         Ok(())
     }
@@ -1649,16 +1657,27 @@ impl WriteBatch {
     }
 
     fn require_active(&self) -> Result<()> {
-        if self.finished {
+        self.require_not_finished()?;
+        if self.rollback_only {
             return Err(DbError::new(
                 ErrorCode::Transaction,
-                "write batch has already finished",
+                "write transaction must be rolled back after a fatal error",
             ));
         }
         if self.pager.published_read()?.write_state == WriteState::NeedsRecovery {
             return Err(DbError::new(
                 ErrorCode::Transaction,
                 "WAL recovery is required before another write batch can begin",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_not_finished(&self) -> Result<()> {
+        if self.finished {
+            return Err(DbError::new(
+                ErrorCode::Transaction,
+                "write batch has already finished",
             ));
         }
         Ok(())
@@ -1686,6 +1705,7 @@ impl WriteBatch {
         self.superseded_roots.clear();
         self.catalog_update_pending = false;
         self.catalog_validation_required = false;
+        self.rollback_only = false;
         self.finished = true;
         self._writer.release();
     }
@@ -1695,6 +1715,7 @@ impl fmt::Debug for WriteBatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WriteBatch")
+            .field("rollback_only", &self.rollback_only)
             .field("finished", &self.finished)
             .finish_non_exhaustive()
     }
@@ -1846,6 +1867,26 @@ mod tests {
         let mut batch = detached_batch(pager.clone()).unwrap();
         assert_eq!(pager.try_begin_write().unwrap_err().code(), ErrorCode::Busy);
         batch.rollback().unwrap();
+        assert!(pager.try_begin_write().is_ok());
+    }
+
+    #[test]
+    fn rollback_only_batch_rejects_operations_and_commit_but_allows_rollback() {
+        // Production break caught: if the streaming owner marks a fatal error
+        // but the batch ignores it, public write transactions can still read
+        // or publish state instead of requiring rollback.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        batch.mark_rollback_only();
+        assert_eq!(
+            batch.catalog_reader().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        batch.rollback().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        batch.mark_rollback_only();
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
         assert!(pager.try_begin_write().is_ok());
     }
 
