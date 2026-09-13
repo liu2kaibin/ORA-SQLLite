@@ -12,6 +12,12 @@ pub(crate) mod bind;
     reason = "later Phase 4B binders and Phase 4C execution consume the bound IR"
 )]
 pub(crate) mod bound;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "subsequent Phase 4C1 operators consume execution primitives"
+)]
+pub(crate) mod exec;
 mod limits;
 #[allow(
     dead_code,
