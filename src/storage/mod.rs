@@ -11,6 +11,7 @@ mod header;
 mod overflow;
 mod page;
 mod pager;
+pub(crate) mod relation;
 mod row;
 mod slotted;
 mod snapshot;

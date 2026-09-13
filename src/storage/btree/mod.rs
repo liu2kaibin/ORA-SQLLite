@@ -12,7 +12,7 @@ mod search;
     unused_imports,
     reason = "the B+Tree search facade is consumed by subsequent storage tasks"
 )]
-pub(super) use search::{BTree, BTreeCursor};
+pub(super) use search::{BTree, BTreeCursor, BTreeScanState};
 
 pub(super) const LEAF_METADATA_END: usize = 56;
 pub(super) const INTERNAL_METADATA_END: usize = 64;
