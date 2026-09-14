@@ -3,15 +3,31 @@ use std::ops::Bound;
 use crate::{DbError, ErrorCode, Result, Value};
 
 use super::{
-    ReadSnapshot, WriteBatch,
+    PageRef, ReadSnapshot, WriteBatch,
     btree::{BTree, BTreeScanState, TreeKind},
     catalog::{
-        CatalogReader,
-        types::{ColumnDef, RowId, TableDef, TableId},
+        CatalogReader, CatalogWriter,
+        types::{
+            CatalogName, ColumnDef, ColumnId, ColumnType, MAX_COLUMNS, RowId, SchemaVersion,
+            TableDef, TableId,
+        },
     },
     pager::PageSource,
-    row::{RowCodec, decode_rowid_key},
+    row::{RowCodec, decode_rowid_key, encode_rowid_key},
 };
+
+#[derive(Clone)]
+pub(crate) struct ColumnSpec {
+    name: CatalogName,
+    column_type: ColumnType,
+    nullable: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct TableSpec {
+    name: CatalogName,
+    columns: Box<[ColumnSpec]>,
+}
 
 #[derive(Clone)]
 pub(crate) struct Relation {
@@ -28,6 +44,58 @@ pub(crate) struct RelationScan {
 pub(crate) struct StoredRow {
     rowid: RowId,
     values: Box<[Value]>,
+}
+
+pub(crate) struct TableWrite {
+    schema: Relation,
+    rows: BTree,
+    catalog: CatalogWriter,
+    original_root: PageRef,
+}
+
+impl ColumnSpec {
+    pub(crate) const fn new(name: CatalogName, column_type: ColumnType, nullable: bool) -> Self {
+        Self {
+            name,
+            column_type,
+            nullable,
+        }
+    }
+
+    pub(crate) const fn name(&self) -> &CatalogName {
+        &self.name
+    }
+
+    pub(crate) const fn column_type(&self) -> ColumnType {
+        self.column_type
+    }
+
+    pub(crate) const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+impl TableSpec {
+    pub(crate) fn new(name: CatalogName, columns: Vec<ColumnSpec>) -> Result<Self> {
+        if columns.len() > usize::from(MAX_COLUMNS) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "table column count must not exceed 1000",
+            ));
+        }
+        Ok(Self {
+            name,
+            columns: columns.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) const fn name(&self) -> &CatalogName {
+        &self.name
+    }
+
+    pub(crate) const fn columns(&self) -> &[ColumnSpec] {
+        &self.columns
+    }
 }
 
 impl Relation {
@@ -97,9 +165,173 @@ impl StoredRow {
     }
 }
 
+impl TableWrite {
+    pub(crate) fn open(batch: &mut WriteBatch, table_id: TableId) -> Result<Self> {
+        let schema = {
+            let catalog = batch.catalog_reader()?;
+            Relation::open(&catalog, table_id)?
+        };
+        let original_root = schema.table.root();
+        let rows = BTree::from_root(TreeKind::Table, original_root);
+        let catalog = CatalogWriter::bootstrap(batch)?;
+        Ok(Self {
+            schema,
+            rows,
+            catalog,
+            original_root,
+        })
+    }
+
+    pub(crate) fn insert(&mut self, batch: &mut WriteBatch, values: &[Value]) -> Result<RowId> {
+        let bytes = RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
+        let checkpoint = batch.checkpoint_mutation()?;
+        let catalog_root = self.catalog.root();
+        let rows_root = self.rows.root();
+        let result = (|| {
+            let rowid = self.catalog.allocate_rowid(batch, self.schema.table.id())?;
+            self.rows.insert(batch, &encode_rowid_key(rowid), &bytes)?;
+            Ok(rowid)
+        })();
+        match result {
+            Ok(rowid) => Ok(rowid),
+            Err(error) => {
+                self.catalog.restore(batch, checkpoint, catalog_root);
+                self.rows = BTree::from_root(TreeKind::Table, rows_root);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        batch: &mut WriteBatch,
+        rowid: RowId,
+        values: &[Value],
+    ) -> Result<()> {
+        let bytes = RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
+        let checkpoint = batch.checkpoint_mutation()?;
+        let catalog_root = self.catalog.root();
+        let rows_root = self.rows.root();
+        let key = encode_rowid_key(rowid);
+        let result = (|| {
+            if self.rows.delete(batch, &key)?.is_none() {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    format!("row ID {} disappeared during replacement", rowid.get()),
+                ));
+            }
+            self.rows.insert(batch, &key, &bytes)
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.catalog.restore(batch, checkpoint, catalog_root);
+                self.rows = BTree::from_root(TreeKind::Table, rows_root);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn delete(&mut self, batch: &mut WriteBatch, rowid: RowId) -> Result<bool> {
+        self.rows
+            .delete(batch, &encode_rowid_key(rowid))
+            .map(|removed| removed.is_some())
+    }
+
+    pub(crate) fn next_after(
+        &mut self,
+        batch: &mut WriteBatch,
+        rowid: Option<RowId>,
+    ) -> Result<Option<StoredRow>> {
+        let mut state = if let Some(rowid) = rowid {
+            let key = encode_rowid_key(rowid);
+            self.rows
+                .scan_state(Bound::Excluded(key.as_slice()), Bound::Unbounded)?
+        } else {
+            self.rows.scan_state(Bound::Unbounded, Bound::Unbounded)?
+        };
+        let Some((key, bytes)) = state.next(batch)? else {
+            return Ok(None);
+        };
+        let rowid = decode_rowid_key(&key)?;
+        let values =
+            RowCodec::decode(&self.schema.table, &self.schema.columns, &bytes, usize::MAX)?
+                .into_boxed_slice();
+        Ok(Some(StoredRow { rowid, values }))
+    }
+
+    pub(crate) fn finish(mut self, batch: &mut WriteBatch) -> Result<()> {
+        if self.rows.root() != self.original_root {
+            self.catalog
+                .update_table_root(batch, self.schema.table.id(), self.rows.root())?;
+        }
+        self.catalog.finish(batch)
+    }
+}
+
+pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Result<TableId> {
+    let checkpoint = batch.statement_checkpoint()?;
+    let result = (|| {
+        let mut catalog = CatalogWriter::bootstrap(batch)?;
+        let table_id = TableId::new(catalog.allocate_object_id(batch)?.get())?;
+        let root = BTree::create(batch, TreeKind::Table)?.root();
+        let column_count = u16::try_from(spec.columns().len()).map_err(|_| {
+            DbError::new(
+                ErrorCode::Type,
+                "table column count does not fit the catalog",
+            )
+        })?;
+        let table = TableDef::new(
+            table_id,
+            SchemaVersion::new(1)?,
+            root,
+            RowId::new(1)?,
+            column_count,
+            spec.name().clone(),
+        )?;
+        catalog.insert_table_definition(batch, &table)?;
+        for (ordinal, spec) in spec.columns().iter().enumerate() {
+            let column = ColumnDef::new(
+                ColumnId::new(catalog.allocate_object_id(batch)?.get())?,
+                table_id,
+                u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "column ordinal does not fit the catalog")
+                })?,
+                spec.column_type(),
+                spec.nullable(),
+                spec.name().clone(),
+            )?;
+            catalog.insert_column_definition(batch, &column)?;
+        }
+        catalog.finish(batch)?;
+        Ok(table_id)
+    })();
+    if result.is_err() {
+        batch.restore_statement(checkpoint);
+    }
+    result
+}
+
+pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result<()> {
+    let checkpoint = batch.statement_checkpoint()?;
+    let result = (|| {
+        let relation = {
+            let catalog = batch.catalog_reader()?;
+            Relation::open(&catalog, table_id)?
+        };
+        let mut catalog = CatalogWriter::bootstrap(batch)?;
+        catalog.remove_relation(batch, &relation.table, &relation.columns)?;
+        catalog.finish(batch)
+    })();
+    if result.is_err() {
+        batch.restore_statement(checkpoint);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Relation;
+    use super::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation};
     use crate::storage::{
         Pager,
         btree::{BTree, TreeKind},
@@ -110,6 +342,8 @@ mod tests {
                 TableId,
             },
         },
+        file::OpenMode,
+        pager::PagerConfig,
         row::{RowCodec, encode_rowid_key},
         test_support::{TempDatabase, test_pager},
     };
@@ -117,6 +351,294 @@ mod tests {
 
     const LARGE_BLOB_BYTES: usize = 20_000;
     const LARGE_ROW_BYTES: usize = 20_041;
+    type RelationContents = (TableDef, Vec<(u64, Vec<Value>)>);
+
+    #[test]
+    fn relation_write_updates_catalog_root_rowid_and_rows_together() {
+        // Production break caught: publishing a row without the matching
+        // catalog root and next ROWID makes the committed relation undecodable.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let table_id = create_relation(
+            &mut batch,
+            &table_spec("T", &[("ID", ColumnType::Int64, true)]),
+        )
+        .unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        let rowid = writer.insert(&mut batch, &[Value::Int64(7)]).unwrap();
+        assert_eq!(rowid.get(), 1);
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let (table, rows) = read_relation(&pager, "T").unwrap();
+        assert_eq!(table.next_rowid().get(), 2);
+        assert_eq!(rows, vec![(1, vec![Value::Int64(7)])]);
+    }
+
+    #[test]
+    fn table_write_inserts_replaces_deletes_and_resumes_after_rowid() {
+        // Production break caught: mutation code that rewrites ROWID, treats a
+        // missing delete as affected, or resumes inclusively repeats a row.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("ID", ColumnType::Int64, true)]),
+            &[],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        let first = writer.insert(&mut batch, &[Value::Int64(1)]).unwrap();
+        let second = writer.insert(&mut batch, &[Value::Int64(2)]).unwrap();
+        let third = writer.insert(&mut batch, &[Value::Int64(3)]).unwrap();
+        assert_eq!([first.get(), second.get(), third.get()], [1, 2, 3]);
+
+        writer
+            .replace(&mut batch, second, &[Value::Int64(20)])
+            .unwrap();
+        assert!(writer.delete(&mut batch, first).unwrap());
+        assert!(!writer.delete(&mut batch, first).unwrap());
+
+        let row = writer.next_after(&mut batch, None).unwrap().unwrap();
+        assert_eq!(row.rowid(), second);
+        assert_eq!(row.values(), &[Value::Int64(20)]);
+        let row = writer
+            .next_after(&mut batch, Some(second))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.rowid(), third);
+        assert_eq!(row.values(), &[Value::Int64(3)]);
+        assert!(
+            writer
+                .next_after(&mut batch, Some(third))
+                .unwrap()
+                .is_none()
+        );
+
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let (table, rows) = read_relation(&pager, "T").unwrap();
+        assert_eq!(table.next_rowid().get(), 4);
+        assert_eq!(
+            rows,
+            vec![(2, vec![Value::Int64(20)]), (3, vec![Value::Int64(3)])]
+        );
+    }
+
+    #[test]
+    fn table_write_finish_updates_only_a_changed_row_tree_root() {
+        // Production break caught: always replacing the TableDef can publish a
+        // stale root, while never replacing it loses a split row tree.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("SMALL", &[("ID", ColumnType::Int64, false)]),
+            &[],
+        );
+        let original = read_relation(&pager, "SMALL").unwrap().0.root();
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        writer.insert(&mut batch, &[Value::Int64(1)]).unwrap();
+        assert_eq!(writer.rows.root(), original);
+        writer.finish(&mut batch).unwrap();
+        assert_eq!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_id(table_id)
+                .unwrap()
+                .root(),
+            original
+        );
+        batch.commit().unwrap();
+
+        let table_id = committed_relation(
+            &pager,
+            table_spec("GROWING", &[("PAYLOAD", ColumnType::Blob, false)]),
+            &[],
+        );
+        let original = read_relation(&pager, "GROWING").unwrap().0.root();
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        for value in 0_u8..96 {
+            writer
+                .insert(&mut batch, &[Value::Blob(vec![value; 128])])
+                .unwrap();
+        }
+        let changed = writer.rows.root();
+        assert_ne!(changed, original);
+        writer.finish(&mut batch).unwrap();
+        assert_eq!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_id(table_id)
+                .unwrap()
+                .root(),
+            changed
+        );
+        batch.commit().unwrap();
+        assert_eq!(read_relation(&pager, "GROWING").unwrap().1.len(), 96);
+    }
+
+    #[test]
+    fn restoring_statement_checkpoint_removes_catalog_root_rowid_and_page_mutations() {
+        // Production break caught: restoring only dirty row bytes can leave a
+        // split root, allocated pages, next ROWID, or catalog gate behind.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("PAYLOAD", ColumnType::Blob, false)]),
+            &[vec![Value::Blob(vec![0x11; 128])]],
+        );
+        let before = read_relation(&pager, "T").unwrap();
+        let page_count = pager.page_count();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        for value in 0_u8..96 {
+            writer
+                .insert(&mut batch, &[Value::Blob(vec![value; 128])])
+                .unwrap();
+        }
+        writer.finish(&mut batch).unwrap();
+        assert_ne!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_id(table_id)
+                .unwrap()
+                .root(),
+            before.0.root()
+        );
+        batch.restore_statement(checkpoint);
+        batch.commit().unwrap();
+
+        assert_eq!(pager.page_count(), page_count);
+        assert_eq!(read_relation(&pager, "T").unwrap(), before);
+    }
+
+    #[test]
+    fn restoring_statement_checkpoint_preserves_independent_fatal_state() {
+        // Production break caught: copying a pre-error rollback flag out of the
+        // checkpoint would let a fatal transaction commit after restoration.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        create_relation(
+            &mut batch,
+            &table_spec("T", &[("ID", ColumnType::Int64, false)]),
+        )
+        .unwrap();
+        batch.mark_rollback_only();
+        batch.restore_statement(checkpoint);
+        assert_eq!(
+            batch.catalog_reader().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
+    }
+
+    #[test]
+    fn failed_insert_restores_rowid_and_keeps_the_table_writer_usable() {
+        // Production break caught: allocating ROWID before row validation can
+        // consume an ID and strand a pending catalog update after a Type error.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("ID", ColumnType::Int64, false)]),
+            &[],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        assert_eq!(
+            writer
+                .insert(&mut batch, &[Value::Text("wrong".into())])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        assert_eq!(
+            writer.insert(&mut batch, &[Value::Int64(7)]).unwrap().get(),
+            1
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        assert_eq!(
+            read_relation(&pager, "T").unwrap().1,
+            vec![(1, vec![Value::Int64(7)])]
+        );
+    }
+
+    #[test]
+    fn failed_duplicate_create_restores_object_ids_pages_and_catalog_gate() {
+        // Production break caught: a CREATE failure after allocating IDs and a
+        // row-tree root must not consume them or leave the batch uncommittable.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let first = create_relation(
+            &mut batch,
+            &table_spec("T", &[("ID", ColumnType::Int64, false)]),
+        )
+        .unwrap();
+        assert_eq!(first.get(), 1);
+        assert_eq!(
+            create_relation(
+                &mut batch,
+                &table_spec("T", &[("OTHER", ColumnType::Int64, false)]),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Constraint
+        );
+        let second = create_relation(
+            &mut batch,
+            &table_spec("U", &[("ID", ColumnType::Int64, false)]),
+        )
+        .unwrap();
+        assert_eq!(second.get(), 3);
+        batch.commit().unwrap();
+        assert!(read_relation(&pager, "T").is_some());
+        assert!(read_relation(&pager, "U").is_some());
+    }
+
+    #[test]
+    fn create_rows_and_drop_publish_atomically_across_reopen() {
+        // Production break caught: WAL publication that separates catalog,
+        // next ROWID, tree root, and rows produces a torn reopened relation.
+        let (temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("ID", ColumnType::Int64, false)]),
+            &[vec![Value::Int64(10)], vec![Value::Int64(20)]],
+        );
+        drop(pager);
+
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let (table, rows) = read_relation(&pager, "T").unwrap();
+        assert_eq!(table.next_rowid().get(), 3);
+        assert_eq!(
+            rows,
+            vec![(1, vec![Value::Int64(10)]), (2, vec![Value::Int64(20)])]
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        drop_relation(&mut batch, table_id).unwrap();
+        batch.commit().unwrap();
+        drop(pager);
+
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        assert!(read_relation(&pager, "T").is_none());
+    }
 
     #[test]
     fn relation_scan_decodes_rowid_and_values_without_borrowing_snapshot() {
@@ -222,6 +744,48 @@ mod tests {
 
     fn large_blob_value() -> Value {
         Value::Blob(vec![0x5a; LARGE_BLOB_BYTES])
+    }
+
+    fn table_spec(name: &str, columns: &[(&str, ColumnType, bool)]) -> TableSpec {
+        TableSpec::new(
+            CatalogName::new(name).unwrap(),
+            columns
+                .iter()
+                .map(|(name, column_type, nullable)| {
+                    ColumnSpec::new(CatalogName::new(*name).unwrap(), *column_type, *nullable)
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn committed_relation(pager: &Pager, spec: TableSpec, rows: &[Vec<Value>]) -> TableId {
+        let mut batch = pager.try_begin_write().unwrap();
+        let table_id = create_relation(&mut batch, &spec).unwrap();
+        if !rows.is_empty() {
+            let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+            for values in rows {
+                writer.insert(&mut batch, values).unwrap();
+            }
+            writer.finish(&mut batch).unwrap();
+        }
+        batch.commit().unwrap();
+        table_id
+    }
+
+    fn read_relation(pager: &Pager, name: &str) -> Option<RelationContents> {
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(&CatalogName::new(name).unwrap())?
+            .clone();
+        let relation = Relation::open(&catalog, table.id()).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_snapshot(&mut snapshot).unwrap() {
+            rows.push((row.rowid().get(), row.values().to_vec()));
+        }
+        Some((table, rows))
     }
 
     fn write_relation_fixture(

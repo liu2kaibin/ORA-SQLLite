@@ -833,6 +833,9 @@ pub(super) struct WriteBatchCheckpoint {
     catalog_validation_required: bool,
 }
 
+/// Opaque statement boundary for SQL-layer rollback.
+pub(crate) struct StatementCheckpoint(WriteBatchCheckpoint);
+
 impl WriteBatch {
     pub(crate) const fn database_uuid(&self) -> [u8; 16] {
         self.base_header.uuid()
@@ -951,6 +954,10 @@ impl WriteBatch {
         })
     }
 
+    pub(crate) fn statement_checkpoint(&mut self) -> Result<StatementCheckpoint> {
+        self.checkpoint_mutation().map(StatementCheckpoint)
+    }
+
     pub(super) fn restore_mutation(&mut self, checkpoint: WriteBatchCheckpoint) {
         self.dirty = checkpoint.dirty;
         self.new_pages = checkpoint.new_pages;
@@ -961,6 +968,12 @@ impl WriteBatch {
         self.superseded_roots = checkpoint.superseded_roots;
         self.catalog_update_pending = checkpoint.catalog_update_pending;
         self.catalog_validation_required = checkpoint.catalog_validation_required;
+    }
+
+    pub(crate) fn restore_statement(&mut self, checkpoint: StatementCheckpoint) {
+        // rollback_only is transaction state, not staged mutation state. Leaving
+        // it untouched ensures a fatal error cannot be cleared by restoration.
+        self.restore_mutation(checkpoint.0);
     }
 
     pub(super) fn track_tree(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
@@ -1244,6 +1257,33 @@ impl WriteBatch {
         }
         self.pending_releases.insert(reference.page_id(), reference);
         Ok(())
+    }
+
+    pub(super) fn release_tree_later(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
+        self.require_active()?;
+        let pages = validate_tree(self, &BTree::from_root(kind, root))?.all_live_pages();
+        let references = pages
+            .iter()
+            .map(|page_id| {
+                let frame = self.read_frame_by_id(*page_id)?;
+                PageRef::new(*page_id, frame.header().generation())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let checkpoint = self.checkpoint_mutation()?;
+        let result = (|| {
+            self.tracked_trees
+                .retain(|(_, reference)| !pages.contains(&reference.page_id()));
+            self.superseded_roots
+                .retain(|reference| !pages.contains(&reference.page_id()));
+            for reference in references {
+                self.release_btree_later(reference)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_mutation(checkpoint);
+        }
+        result
     }
 
     fn validate_releasable(&mut self, reference: PageRef) -> Result<()> {
@@ -1888,6 +1928,69 @@ mod tests {
         batch.mark_rollback_only();
         assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
         assert!(pager.try_begin_write().is_ok());
+    }
+
+    #[test]
+    fn statement_checkpoint_restores_every_mutation_field_without_clearing_fatal_state() {
+        // Production break caught: omitting any staged page, allocation,
+        // release, root, header, or catalog gate field tears statement rollback;
+        // restoring rollback_only=false would make a fatal batch committable.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let committed = {
+            let mut batch = pager.try_begin_write().unwrap();
+            let first = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+            let second = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+            batch.commit().unwrap();
+            [first, second]
+        };
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let baseline_page = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        batch.release_btree_later(committed[0]).unwrap();
+        let expected = batch.checkpoint_mutation().unwrap();
+        let statement = batch.statement_checkpoint().unwrap();
+
+        CatalogWriter::bootstrap(&mut batch)
+            .unwrap()
+            .finish(&mut batch)
+            .unwrap();
+        batch.begin_catalog_update().unwrap();
+        let mut growing = BTree::create(&mut batch, TreeKind::Table).unwrap();
+        let original_root = growing.root();
+        for key in 0_u64..200 {
+            growing
+                .insert(&mut batch, &key.to_be_bytes(), &[0x5a; 128])
+                .unwrap();
+            if growing.root() != original_root {
+                break;
+            }
+        }
+        assert_ne!(growing.root(), original_root);
+        batch.release_btree_later(committed[1]).unwrap();
+        batch.mark_rollback_only();
+        batch.restore_statement(statement);
+
+        assert_eq!(batch.dirty.len(), expected.dirty.len());
+        for (page_id, expected_frame) in &expected.dirty {
+            assert_eq!(batch.dirty[page_id].bytes(), expected_frame.bytes());
+        }
+        assert_eq!(batch.new_pages, expected.new_pages);
+        assert_eq!(batch.pending_generations, expected.pending_generations);
+        assert_eq!(batch.pending_releases, expected.pending_releases);
+        assert_eq!(batch.candidate_header, expected.candidate_header);
+        assert_eq!(batch.tracked_trees, expected.tracked_trees);
+        assert_eq!(batch.superseded_roots, expected.superseded_roots);
+        assert_eq!(
+            batch.catalog_update_pending,
+            expected.catalog_update_pending
+        );
+        assert_eq!(
+            batch.catalog_validation_required,
+            expected.catalog_validation_required
+        );
+        assert!(batch.rollback_only);
+        assert!(batch.read(baseline_page).is_err());
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
     }
 
     #[test]
