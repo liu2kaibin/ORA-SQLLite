@@ -4,6 +4,7 @@ mod distinct;
 mod expr;
 mod join;
 mod memory;
+mod mutation;
 mod operator;
 mod params;
 mod query;
@@ -16,6 +17,7 @@ pub(crate) use expr::{
     TruthValue, eval, sql_equal, sql_group_equal, sql_total_cmp, validate_sql_float,
 };
 pub(crate) use memory::WorkMemory;
+pub(crate) use mutation::{execute_validated_write_plan, validate_write_execution};
 pub(crate) use operator::{
     EvalRow, ExecutionContext, ExecutionStorage, Filter, Operator, OperatorFactory, OutputOperator,
     Project, ProjectedRow,
