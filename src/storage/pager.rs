@@ -419,6 +419,8 @@ impl Pager {
             catalog_validation_required: false,
             rollback_only: false,
             finished: false,
+            #[cfg(test)]
+            fail_tree_release_after: None,
         })
     }
 
@@ -819,6 +821,8 @@ pub(crate) struct WriteBatch {
     catalog_validation_required: bool,
     rollback_only: bool,
     finished: bool,
+    #[cfg(test)]
+    fail_tree_release_after: Option<usize>,
 }
 
 pub(super) struct WriteBatchCheckpoint {
@@ -835,6 +839,27 @@ pub(super) struct WriteBatchCheckpoint {
 
 /// Opaque statement boundary for SQL-layer rollback.
 pub(crate) struct StatementCheckpoint(WriteBatchCheckpoint);
+
+#[cfg(test)]
+impl WriteBatchCheckpoint {
+    pub(super) fn assert_matches_batch_for_test(&self, batch: &WriteBatch) {
+        assert_eq!(batch.dirty.len(), self.dirty.len());
+        for (page_id, expected_frame) in &self.dirty {
+            assert_eq!(batch.dirty[page_id].bytes(), expected_frame.bytes());
+        }
+        assert_eq!(batch.new_pages, self.new_pages);
+        assert_eq!(batch.pending_generations, self.pending_generations);
+        assert_eq!(batch.pending_releases, self.pending_releases);
+        assert_eq!(batch.candidate_header, self.candidate_header);
+        assert_eq!(batch.tracked_trees, self.tracked_trees);
+        assert_eq!(batch.superseded_roots, self.superseded_roots);
+        assert_eq!(batch.catalog_update_pending, self.catalog_update_pending);
+        assert_eq!(
+            batch.catalog_validation_required,
+            self.catalog_validation_required
+        );
+    }
+}
 
 impl WriteBatch {
     pub(crate) const fn database_uuid(&self) -> [u8; 16] {
@@ -1277,6 +1302,17 @@ impl WriteBatch {
                 .retain(|reference| !pages.contains(&reference.page_id()));
             for reference in references {
                 self.release_btree_later(reference)?;
+                #[cfg(test)]
+                if let Some(remaining) = self.fail_tree_release_after {
+                    if remaining <= 1 {
+                        self.fail_tree_release_after = None;
+                        return Err(DbError::new(
+                            ErrorCode::Io,
+                            "injected after staged tree release",
+                        ));
+                    }
+                    self.fail_tree_release_after = Some(remaining - 1);
+                }
             }
             Ok(())
         })();
@@ -1868,6 +1904,7 @@ fn map_writer_try_lock<T>(error: TryLockError<T>) -> DbError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs,
         ops::Bound,
         sync::{Arc, Mutex},
@@ -1885,11 +1922,15 @@ mod tests {
             BTree, INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, TreeKind,
             decode_internal_leftmost, encode_internal_leftmost,
         },
-        catalog::CatalogWriter,
+        catalog::{
+            CatalogWriter,
+            types::{CatalogName, ColumnType},
+        },
         features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
         freelist::Freelist,
         page::{PageFrame, PageType},
+        relation::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation},
         slotted::SlottedPage,
         test_support::{TempDatabase, create_pager, durable_lengths, test_pager},
         validate::validate_tree,
@@ -1991,6 +2032,118 @@ mod tests {
         assert!(batch.rollback_only);
         assert!(batch.read(baseline_page).is_err());
         assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
+    }
+
+    #[test]
+    fn failed_drop_after_first_staged_page_release_restores_every_mutation_field() {
+        // Production break caught: an error after catalog keys are deleted and at
+        // least one table page is staged for release must restore records, page
+        // ownership, pending releases, root tracking, and both catalog gates.
+        let (temp, pager) = test_pager(4096).unwrap();
+        let spec = TableSpec::new(
+            CatalogName::new("T").unwrap(),
+            vec![ColumnSpec::new(
+                CatalogName::new("PAYLOAD").unwrap(),
+                ColumnType::Blob,
+                false,
+            )],
+        )
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let table_id = create_relation(&mut batch, &spec).unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        for value in 0_u8..96 {
+            writer
+                .insert(&mut batch, &[crate::Value::Blob(vec![value; 128])])
+                .unwrap();
+        }
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let (table, columns, pages, expected_rows, committed_pages) = {
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            let table = catalog.find_table_by_id(table_id).unwrap().clone();
+            let columns = catalog
+                .columns_for_table(table_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, table.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            assert!(pages.len() > 1);
+            let relation = Relation::open(&catalog, table_id).unwrap();
+            let mut scan = relation.scan(usize::MAX);
+            let mut rows = Vec::new();
+            while let Some(row) = scan.next_snapshot(&mut snapshot).unwrap() {
+                rows.push((row.rowid(), row.values().to_vec()));
+            }
+            (table, columns, pages, rows, pager.page_count())
+        };
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        batch.fail_tree_release_after = Some(1);
+        let error = drop_relation(&mut batch, table_id).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Io);
+        assert!(
+            error
+                .to_string()
+                .contains("injected after staged tree release")
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert!(batch.fail_tree_release_after.is_none());
+
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(table_id), Some(&table));
+        assert_eq!(
+            catalog
+                .columns_for_table(table_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            columns
+        );
+        assert_eq!(
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, table.root()))
+                .unwrap()
+                .all_live_pages(),
+            pages
+        );
+        batch.commit().unwrap();
+
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(table_id), Some(&table));
+        let relation = Relation::open(&catalog, table_id).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_snapshot(&mut snapshot).unwrap() {
+            rows.push((row.rowid(), row.values().to_vec()));
+        }
+        assert_eq!(rows, expected_rows);
+        drop(snapshot);
+
+        let mut allocation = pager.try_begin_write().unwrap();
+        let mut reused = BTreeSet::new();
+        loop {
+            let page = allocation.allocate(PageType::TableLeaf).unwrap();
+            if page.page_id().0 >= committed_pages {
+                break;
+            }
+            reused.insert(page.page_id());
+        }
+        assert!(pages.is_disjoint(&reused));
+        allocation.rollback().unwrap();
     }
 
     #[test]

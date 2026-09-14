@@ -185,7 +185,7 @@ impl TableWrite {
     pub(crate) fn insert(&mut self, batch: &mut WriteBatch, values: &[Value]) -> Result<RowId> {
         let bytes = RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
         let checkpoint = batch.checkpoint_mutation()?;
-        let catalog_root = self.catalog.root();
+        let catalog_checkpoint = self.catalog.checkpoint();
         let rows_root = self.rows.root();
         let result = (|| {
             let rowid = self.catalog.allocate_rowid(batch, self.schema.table.id())?;
@@ -195,7 +195,7 @@ impl TableWrite {
         match result {
             Ok(rowid) => Ok(rowid),
             Err(error) => {
-                self.catalog.restore(batch, checkpoint, catalog_root);
+                self.catalog.restore(batch, checkpoint, catalog_checkpoint);
                 self.rows = BTree::from_root(TreeKind::Table, rows_root);
                 Err(error)
             }
@@ -210,7 +210,7 @@ impl TableWrite {
     ) -> Result<()> {
         let bytes = RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
         let checkpoint = batch.checkpoint_mutation()?;
-        let catalog_root = self.catalog.root();
+        let catalog_checkpoint = self.catalog.checkpoint();
         let rows_root = self.rows.root();
         let key = encode_rowid_key(rowid);
         let result = (|| {
@@ -225,7 +225,7 @@ impl TableWrite {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.catalog.restore(batch, checkpoint, catalog_root);
+                self.catalog.restore(batch, checkpoint, catalog_checkpoint);
                 self.rows = BTree::from_root(TreeKind::Table, rows_root);
                 Err(error)
             }
@@ -317,7 +317,9 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
     let result = (|| {
         let relation = {
             let catalog = batch.catalog_reader()?;
-            Relation::open(&catalog, table_id)?
+            let relation = Relation::open(&catalog, table_id)?;
+            catalog.validate_deep_batch(batch)?;
+            relation
         };
         let mut catalog = CatalogWriter::bootstrap(batch)?;
         catalog.remove_relation(batch, &relation.table, &relation.columns)?;
@@ -336,7 +338,7 @@ mod tests {
         Pager,
         btree::{BTree, TreeKind},
         catalog::{
-            CatalogWriter,
+            CatalogReader, CatalogWriter,
             types::{
                 CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef,
                 TableId,
@@ -540,34 +542,91 @@ mod tests {
     }
 
     #[test]
-    fn failed_insert_restores_rowid_and_keeps_the_table_writer_usable() {
-        // Production break caught: allocating ROWID before row validation can
-        // consume an ID and strand a pending catalog update after a Type error.
+    fn failed_insert_after_rowid_allocation_restores_batch_writer_and_clean_finish_state() {
+        // Production break caught: restoring only the batch after a duplicate
+        // row key leaves CatalogWriter dirty even though ROWID allocation was
+        // rolled back, so finish publishes state a clean writer would not.
         let (_temp, pager) = test_pager(4096).unwrap();
         let table_id = committed_relation(
             &pager,
             table_spec("T", &[("ID", ColumnType::Int64, false)]),
             &[],
         );
+
         let mut batch = pager.try_begin_write().unwrap();
+        let relation = {
+            let catalog = batch.catalog_reader().unwrap();
+            Relation::open(&catalog, table_id).unwrap()
+        };
+        assert_eq!(relation.table.next_rowid().get(), 1);
+        let bytes = RowCodec::encode(
+            &relation.table,
+            &relation.columns,
+            &[Value::Int64(7)],
+            usize::MAX,
+        )
+        .unwrap();
+        let mut rows = BTree::from_root(TreeKind::Table, relation.table.root());
+        rows.insert(
+            &mut batch,
+            &encode_rowid_key(RowId::new(1).unwrap()),
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(rows.root(), relation.table.root());
+
+        let before_clean_finish = batch.checkpoint_mutation().unwrap();
+        let clean_writer = TableWrite::open(&mut batch, table_id).unwrap();
+        clean_writer.finish(&mut batch).unwrap();
+        let clean_finish = batch.checkpoint_mutation().unwrap();
+        batch.restore_mutation(before_clean_finish);
+
         let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
-        assert_eq!(
+        let catalog_root = writer.catalog.root();
+        let rows_root = writer.rows.root();
+        let expected_row = writer.next_after(&mut batch, None).unwrap().unwrap();
+        let expected_row = (expected_row.rowid(), expected_row.values().to_vec());
+        assert!(
             writer
-                .insert(&mut batch, &[Value::Text("wrong".into())])
-                .unwrap_err()
-                .code(),
-            ErrorCode::Type
+                .next_after(&mut batch, Some(expected_row.0))
+                .unwrap()
+                .is_none()
         );
+        let before_failed_insert = batch.checkpoint_mutation().unwrap();
+
+        let error = writer.insert(&mut batch, &[Value::Int64(8)]).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("duplicate physical B+Tree key"));
+        before_failed_insert.assert_matches_batch_for_test(&batch);
+        assert_eq!(writer.catalog.root(), catalog_root);
+        assert_eq!(writer.rows.root(), rows_root);
+
+        let features = batch.feature_bits();
+        let catalog_tree = BTree::from_root(TreeKind::Table, writer.catalog.root());
+        let catalog = CatalogReader::open_candidate(&mut batch, &catalog_tree, features).unwrap();
         assert_eq!(
-            writer.insert(&mut batch, &[Value::Int64(7)]).unwrap().get(),
+            catalog
+                .find_table_by_id(table_id)
+                .unwrap()
+                .next_rowid()
+                .get(),
             1
         );
-        writer.finish(&mut batch).unwrap();
-        batch.commit().unwrap();
+        let row = writer.next_after(&mut batch, None).unwrap().unwrap();
         assert_eq!(
-            read_relation(&pager, "T").unwrap().1,
-            vec![(1, vec![Value::Int64(7)])]
+            (row.rowid(), row.values()),
+            (expected_row.0, expected_row.1.as_slice())
         );
+        assert!(
+            writer
+                .next_after(&mut batch, Some(expected_row.0))
+                .unwrap()
+                .is_none()
+        );
+
+        writer.finish(&mut batch).unwrap();
+        clean_finish.assert_matches_batch_for_test(&batch);
+        batch.rollback().unwrap();
     }
 
     #[test]

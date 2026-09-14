@@ -278,6 +278,16 @@ impl CatalogReader {
         self.validate_deep_from(snapshot, &tree, report)
     }
 
+    /// Validate every table tree in a write batch before a destructive catalog
+    /// operation can release pages still reachable through another root.
+    pub(super) fn validate_deep_batch(&self, batch: &mut WriteBatch) -> Result<()> {
+        validate_feature_bits(batch.feature_bits())?;
+        let (tree, report) = batch
+            .catalog_tree_with_report(TreeKind::Table)?
+            .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
+        self.validate_deep_from(batch, &tree, report)
+    }
+
     fn validate_deep_from(
         &self,
         source: &mut impl PageSource,
@@ -382,6 +392,11 @@ pub(super) struct CatalogWriter {
     dirty: bool,
 }
 
+pub(super) struct CatalogWriterCheckpoint {
+    root: PageRef,
+    dirty: bool,
+}
+
 impl CatalogWriter {
     pub(super) fn bootstrap(batch: &mut WriteBatch) -> Result<Self> {
         let checkpoint = batch.checkpoint_mutation()?;
@@ -418,15 +433,23 @@ impl CatalogWriter {
         result
     }
 
-    /// Restore the batch image and the writer's separately owned root together.
+    pub(super) const fn checkpoint(&self) -> CatalogWriterCheckpoint {
+        CatalogWriterCheckpoint {
+            root: self.tree.root(),
+            dirty: self.dirty,
+        }
+    }
+
+    /// Restore the batch image and the writer's separately owned state together.
     pub(super) fn restore(
         &mut self,
         batch: &mut WriteBatch,
         checkpoint: WriteBatchCheckpoint,
-        root: PageRef,
+        writer_checkpoint: CatalogWriterCheckpoint,
     ) {
         batch.restore_mutation(checkpoint);
-        self.tree = BTree::from_root(TreeKind::Table, root);
+        self.tree = BTree::from_root(TreeKind::Table, writer_checkpoint.root);
+        self.dirty = writer_checkpoint.dirty;
     }
 
     pub(super) const fn root(&self) -> PageRef {
@@ -439,7 +462,7 @@ impl CatalogWriter {
         mutation: impl FnOnce(&mut BTree, &mut WriteBatch) -> Result<T>,
     ) -> Result<T> {
         let checkpoint = batch.checkpoint_mutation()?;
-        let root = self.tree.root();
+        let writer_checkpoint = self.checkpoint();
         match mutation(&mut self.tree, batch) {
             Ok(value) => {
                 // Bootstrap owns the pending gate until finish, even on clean opens.
@@ -447,7 +470,7 @@ impl CatalogWriter {
                 Ok(value)
             }
             Err(error) => {
-                self.restore(batch, checkpoint, root);
+                self.restore(batch, checkpoint, writer_checkpoint);
                 Err(error)
             }
         }
@@ -1035,7 +1058,7 @@ mod tests {
             file::OpenMode,
             page::PageType,
             pager::{Pager, PagerConfig, WriteBatch},
-            relation::{ColumnSpec, TableSpec, TableWrite, create_relation},
+            relation::{ColumnSpec, TableSpec, TableWrite, create_relation, drop_relation},
             row::{RowCodec, encode_rowid_key},
             test_support::{TempDatabase, test_pager},
         },
@@ -3438,6 +3461,108 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::Corruption);
             assert!(error.to_string().contains("overlap"));
         }
+    }
+
+    #[test]
+    fn drop_rejects_distinct_table_roots_that_share_descendants_without_releasing_pages() {
+        // Production break caught: DROP must not release descendants still
+        // reachable through another individually valid table root.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let first_tree = large_user_tree(&mut batch);
+        let second_root = batch.allocate_append(PageType::TableInternal).unwrap();
+        copy_internal_root(&mut batch, first_tree.root(), second_root);
+
+        let second = new_table(30, second_root, 0, "U");
+        let mut rows = records(first_tree.root());
+        rows.extend([
+            (
+                table_name_key(second.name()).unwrap(),
+                encode_table_name_mapping(second.id()),
+            ),
+            (
+                table_definition_key(second.id()),
+                encode_table_definition(&second),
+            ),
+        ]);
+        let catalog_tree = raw_tree(&mut batch, rows);
+        validate_tree(&mut batch, &first_tree).unwrap();
+        validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, second_root)).unwrap();
+        CatalogReader::open_candidate(&mut batch, &catalog_tree, CATALOG_V1).unwrap();
+        publish(&mut batch, &catalog_tree);
+        batch.commit().unwrap();
+
+        let committed_page_count = pager.page_count();
+        let (first, second, first_pages, second_pages, shared_pages) = {
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            let first = catalog
+                .find_table_by_id(TableId::new(10).unwrap())
+                .unwrap()
+                .clone();
+            let second = catalog.find_table_by_id(second.id()).unwrap().clone();
+            assert_ne!(first.root(), second.root());
+            let first_pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, first.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            let second_pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, second.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            let shared_pages = first_pages
+                .intersection(&second_pages)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(!shared_pages.is_empty());
+            (first, second, first_pages, second_pages, shared_pages)
+        };
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let error = drop_relation(&mut batch, first.id()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert!(error.to_string().contains("overlap"));
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(first.id()), Some(&first));
+        assert_eq!(catalog.find_table_by_id(second.id()), Some(&second));
+        assert_eq!(
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, first.root()))
+                .unwrap()
+                .all_live_pages(),
+            first_pages
+        );
+        assert_eq!(
+            validate_tree(
+                &mut batch,
+                &BTree::from_root(TreeKind::Table, second.root())
+            )
+            .unwrap()
+            .all_live_pages(),
+            second_pages
+        );
+        batch.commit().unwrap();
+
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(first.id()), Some(&first));
+        assert_eq!(catalog.find_table_by_id(second.id()), Some(&second));
+        drop(snapshot);
+
+        let mut allocation = pager.try_begin_write().unwrap();
+        let mut reused = BTreeSet::new();
+        loop {
+            let page = allocation.allocate(PageType::TableLeaf).unwrap();
+            if page.page_id().0 >= committed_page_count {
+                break;
+            }
+            reused.insert(page.page_id());
+        }
+        assert!(shared_pages.is_disjoint(&reused));
+        allocation.rollback().unwrap();
     }
 
     #[test]
