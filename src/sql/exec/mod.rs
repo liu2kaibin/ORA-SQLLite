@@ -1,4 +1,6 @@
 //! Storage-independent runtime values and scalar expression evaluation.
+mod aggregate;
+mod distinct;
 mod expr;
 mod join;
 mod memory;
@@ -6,17 +8,21 @@ mod operator;
 mod params;
 mod query;
 mod scan;
+mod sort;
 
+pub(crate) use aggregate::Aggregate;
+pub(crate) use distinct::Distinct;
 pub(crate) use expr::{
     TruthValue, eval, sql_equal, sql_group_equal, sql_total_cmp, validate_sql_float,
 };
 pub(crate) use memory::WorkMemory;
 pub(crate) use operator::{
-    EvalRow, ExecutionContext, ExecutionStorage, OperatorFactory, OutputOperator, Project,
-    ProjectedRow,
+    EvalRow, ExecutionContext, ExecutionStorage, Filter, Operator, OperatorFactory, OutputOperator,
+    Project, ProjectedRow,
 };
 pub(crate) use params::ParameterFrame;
 pub(crate) use query::{QueryExecution, prepare_query};
+pub(crate) use sort::Sort;
 
 #[cfg(test)]
 mod tests {

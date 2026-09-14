@@ -3,7 +3,10 @@ use crate::sql::plan::{PlanKind, QueryPlan};
 use crate::storage::catalog::CatalogReader;
 use crate::{DbError, ErrorCode, Parameters, Result, Statement};
 
-use super::{OperatorFactory, OutputOperator, ParameterFrame, Project, WorkMemory};
+use super::{
+    Aggregate, Distinct, Filter, OperatorFactory, OutputOperator, ParameterFrame, Project, Sort,
+    WorkMemory,
+};
 
 pub(crate) struct QueryExecution {
     root: Box<dyn OutputOperator>,
@@ -30,32 +33,29 @@ pub(crate) fn prepare_query(
             "query requires a row-producing statement",
         ));
     };
-    validate_supported_operators(query)?;
     let mut memory = WorkMemory::new(max_query_memory_bytes)?;
     let params = ParameterFrame::bind(statement.parameters(), parameters, &mut memory)?;
     statement.validate_schema(database_uuid, catalog)?;
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
-    let input = query_factory(query, catalog, max_row_bytes)?.build()?;
+    let mut input = query_factory(query, catalog, max_row_bytes)?.build()?;
+    if !query.group_by().is_empty() || !query.aggregates().is_empty() || query.having().is_some() {
+        input = Box::new(Aggregate::new(input, query));
+    }
+    if let Some(predicate) = query.having() {
+        input = Box::new(Filter::new(input, predicate.clone()));
+    }
+    let mut root: Box<dyn OutputOperator> = Box::new(Project::new(input, query));
+    if query.distinct() {
+        root = Box::new(Distinct::new(root));
+    }
+    if !query.order_by().is_empty() {
+        root = Box::new(Sort::new(root, query));
+    }
     Ok(QueryExecution {
-        root: Box::new(Project::new(input, query)),
+        root,
         params,
         memory,
     })
-}
-
-fn validate_supported_operators(query: &QueryPlan) -> Result<()> {
-    if !query.group_by().is_empty()
-        || !query.aggregates().is_empty()
-        || query.having().is_some()
-        || query.distinct()
-        || !query.order_by().is_empty()
-    {
-        return Err(DbError::new(
-            ErrorCode::Unsupported,
-            "query requires an operator added by a later Phase 4C1 task",
-        ));
-    }
-    Ok(())
 }
 
 fn query_factory(
@@ -195,27 +195,37 @@ mod tests {
     }
 
     #[test]
-    fn query_rejects_operator_families_owned_by_later_tasks() {
-        // Production break caught: silently partially executing a later-stage
-        // node would return semantically incomplete query results.
+    fn query_executes_every_phase_4b_select_operator_family() {
+        // Production break caught: retaining a former later-task gate or
+        // silently skipping one node changes these ordered literal results.
         let fixture = query_relation_fixture(&[(1, "A"), (2, "B")]);
         let mut connection = fixture.database().connect().unwrap();
-        for sql in [
-            "SELECT ID FROM USERS GROUP BY ID",
-            "SELECT COUNT(*) FROM USERS",
-            "SELECT DISTINCT ID FROM USERS",
-            "SELECT ID FROM USERS ORDER BY ID",
-            "SELECT A.ID FROM USERS A INNER JOIN USERS B ON A.ID = B.ID ORDER BY A.ID",
+        for (sql, expected) in [
+            (
+                "SELECT ID FROM USERS GROUP BY ID ORDER BY ID",
+                vec![vec![Value::Int64(1)], vec![Value::Int64(2)]],
+            ),
+            ("SELECT COUNT(*) FROM USERS", vec![vec![Value::Int64(2)]]),
+            (
+                "SELECT DISTINCT ID FROM USERS ORDER BY ID",
+                vec![vec![Value::Int64(1)], vec![Value::Int64(2)]],
+            ),
+            (
+                "SELECT ID FROM USERS ORDER BY ID DESC",
+                vec![vec![Value::Int64(2)], vec![Value::Int64(1)]],
+            ),
+            (
+                "SELECT A.ID FROM USERS A INNER JOIN USERS B ON A.ID = B.ID ORDER BY A.ID",
+                vec![vec![Value::Int64(1)], vec![Value::Int64(2)]],
+            ),
         ] {
             let statement = connection.prepare(sql).unwrap();
-            assert_eq!(
-                connection
-                    .query(&statement, Parameters::none())
-                    .unwrap_err()
-                    .code(),
-                crate::ErrorCode::Unsupported,
-                "{sql}"
-            );
+            let mut rows = connection.query(&statement, Parameters::none()).unwrap();
+            let mut actual = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                actual.push(row.values().to_vec());
+            }
+            assert_eq!(actual, expected, "{sql}");
         }
     }
 

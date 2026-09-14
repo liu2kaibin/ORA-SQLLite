@@ -1,7 +1,7 @@
 use crate::sql::{
     ast::JoinKind,
     bound::SourceId,
-    plan::{ExecExpr, QueryPlan},
+    plan::{ExecExpr, OrderExpression, QueryPlan},
 };
 use crate::storage::catalog::{CatalogReader, types::TableId};
 use crate::storage::relation::{Relation, RelationScan, StoredRow};
@@ -9,7 +9,7 @@ use crate::storage::{ReadSnapshot, WriteBatch};
 use crate::{DbError, ErrorCode, Result, Row, Value};
 
 use super::join::NestedLoopJoin;
-use super::memory::{owned_values_bytes, resource_limit};
+use super::memory::{checked_add_bytes, owned_values_bytes, resource_limit};
 use super::scan::{OneRow, TableScan};
 use super::{ParameterFrame, WorkMemory, eval};
 
@@ -104,22 +104,20 @@ impl ProjectedRow {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by DISTINCT and ORDER BY in Task 8")]
     pub(crate) fn output(&self) -> &Row {
         &self.output
     }
 
-    #[allow(dead_code, reason = "consumed by ORDER BY in Task 8")]
     pub(crate) fn order_keys(&self) -> &[Value] {
         &self.order_keys
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed as the stable ORDER BY tie-breaker in Task 8"
-    )]
     pub(crate) const fn input_ordinal(&self) -> u64 {
         self.input_ordinal
+    }
+
+    pub(crate) const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
     }
 }
 
@@ -171,6 +169,10 @@ impl<'a> ExecutionContext<'a> {
 
     pub(crate) fn memory(&mut self) -> &mut WorkMemory {
         self.memory
+    }
+
+    pub(crate) fn params_and_memory(&mut self) -> (&ParameterFrame, &mut WorkMemory) {
+        (self.params, self.memory)
     }
 }
 
@@ -272,6 +274,22 @@ impl EvalRow {
         Ok(self.aggregates.get(slot))
     }
 
+    pub(crate) fn with_aggregates(
+        mut self,
+        aggregates: Box<[Value]>,
+        memory_bytes: u64,
+    ) -> Result<Self> {
+        if !self.aggregates.is_empty() {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "aggregate output row already contains aggregate slots",
+            ));
+        }
+        self.aggregates = aggregates;
+        self.memory_bytes = memory_bytes;
+        Ok(self)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sources_for_test(sources: &[&[Value]]) -> Self {
         Self {
@@ -322,6 +340,12 @@ pub(crate) struct Filter {
     predicate: ExecExpr,
 }
 
+impl Filter {
+    pub(crate) fn new(input: Box<dyn Operator>, predicate: ExecExpr) -> Self {
+        Self { input, predicate }
+    }
+}
+
 impl Operator for Filter {
     fn next(&mut self, context: &mut ExecutionContext<'_>) -> Result<Option<EvalRow>> {
         loop {
@@ -353,7 +377,13 @@ impl Operator for Filter {
 pub(crate) struct Project {
     input: Box<dyn Operator>,
     projection: Box<[ExecExpr]>,
+    order_keys: Box<[ProjectOrderKey]>,
     next_input_ordinal: u64,
+}
+
+enum ProjectOrderKey {
+    Projection(usize),
+    Expression(ExecExpr),
 }
 
 impl Project {
@@ -361,6 +391,16 @@ impl Project {
         Self {
             input,
             projection: query.projection().into(),
+            order_keys: query
+                .order_by()
+                .iter()
+                .map(|item| match item.expression() {
+                    OrderExpression::Projection(index) => ProjectOrderKey::Projection(*index),
+                    OrderExpression::Expression(expression) => {
+                        ProjectOrderKey::Expression(expression.clone())
+                    }
+                })
+                .collect(),
             next_input_ordinal: 0,
         }
     }
@@ -383,7 +423,35 @@ impl OutputOperator for Project {
                 return Err(error);
             }
         };
-        let output_bytes = match owned_values_bytes(output.iter()) {
+        let order_keys = match self
+            .order_keys
+            .iter()
+            .map(|key| match key {
+                ProjectOrderKey::Projection(index) => {
+                    output.get(*index).cloned().ok_or_else(|| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "ORDER BY projection index is outside the output row",
+                        )
+                    })
+                }
+                ProjectOrderKey::Expression(expression) => eval(expression, &row, context.params()),
+            })
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(order_keys) => order_keys,
+            Err(error) => {
+                context.memory().release(row.memory_bytes())?;
+                return Err(error);
+            }
+        };
+        let output_bytes = match owned_values_bytes(output.iter()).and_then(|visible| {
+            if order_keys.is_empty() {
+                Ok(visible)
+            } else {
+                checked_add_bytes(visible, owned_values_bytes(order_keys.iter())?)
+            }
+        }) {
             Ok(bytes) => bytes,
             Err(error) => {
                 context.memory().release(row.memory_bytes())?;
@@ -403,7 +471,7 @@ impl OutputOperator for Project {
         self.next_input_ordinal = next_input_ordinal;
         Ok(Some(ProjectedRow {
             output: Row::new(output),
-            order_keys: Box::new([]),
+            order_keys: order_keys.into_boxed_slice(),
             input_ordinal,
             memory_bytes: output_bytes,
         }))
@@ -429,6 +497,7 @@ mod tests {
         let mut project = Project {
             input: Box::new(OneRow::new()),
             projection: Box::new([]),
+            order_keys: Box::new([]),
             next_input_ordinal: u64::MAX,
         };
 

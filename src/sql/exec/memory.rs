@@ -1,5 +1,8 @@
 use crate::{DbError, ErrorCode, Result, Value};
 
+pub(crate) const MATERIALIZED_CONTAINER_BYTES: u64 = 32;
+pub(crate) const MATERIALIZED_ENTRY_OVERHEAD_BYTES: u64 = 64;
+
 /// Deterministic, query-local accounting, not an allocator measurement.
 #[derive(Debug)]
 pub(crate) struct WorkMemory {
@@ -55,20 +58,26 @@ pub(crate) fn checked_array_bytes(count: u64, element_bytes: u64) -> Result<u64>
     count.checked_mul(element_bytes).ok_or_else(resource_limit)
 }
 
+pub(crate) fn checked_add_bytes(left: u64, right: u64) -> Result<u64> {
+    left.checked_add(right).ok_or_else(resource_limit)
+}
+
+pub(crate) fn owned_value_payload_bytes(value: &Value) -> Result<u64> {
+    match value {
+        Value::Text(text) => u64::try_from(text.len()).map_err(|_| resource_limit()),
+        Value::Blob(blob) => u64::try_from(blob.len()).map_err(|_| resource_limit()),
+        _ => Ok(0),
+    }
+}
+
 /// Value bodies plus owned payload bytes and conservative container overhead.
 pub(crate) fn owned_values_bytes<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result<u64> {
     let mut count = 0_u64;
     let mut bytes = 32_u64;
     for value in values {
         count = count.checked_add(1).ok_or_else(resource_limit)?;
-        let payload = match value {
-            Value::Text(text) => text.len(),
-            Value::Blob(blob) => blob.len(),
-            _ => 0,
-        };
-        bytes = bytes
-            .checked_add(u64::try_from(payload).map_err(|_| resource_limit())?)
-            .ok_or_else(resource_limit)?;
+        let payload = owned_value_payload_bytes(value)?;
+        bytes = bytes.checked_add(payload).ok_or_else(resource_limit)?;
     }
     bytes
         .checked_add(checked_array_bytes(
