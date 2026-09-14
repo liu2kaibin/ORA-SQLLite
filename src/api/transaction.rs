@@ -207,12 +207,331 @@ impl Drop for WriteTransaction<'_> {
 mod tests {
     use super::classify_explicit_transaction_error;
     use crate::{
-        Database, DbError, ErrorCode, Options, Parameters, Value,
+        DataType, Database, DbError, Decimal, ErrorCode, Options, ParameterValue, Parameters,
+        Value,
         storage::{
-            catalog::types::ColumnType,
+            catalog::types::{CatalogName, ColumnType, TableDef},
+            relation::Relation,
             test_support::{TempDatabase, phase_4b_add_table, phase_4b_catalog_fixture},
         },
     };
+
+    fn batch_table_contents(
+        transaction: &mut super::WriteTransaction<'_>,
+        name: &str,
+    ) -> (TableDef, Vec<(u64, Vec<Value>)>) {
+        let batch = transaction.batch.as_mut().unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(&CatalogName::new(name).unwrap())
+            .unwrap()
+            .clone();
+        let relation = Relation::open(&catalog, table.id()).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_batch(batch).unwrap() {
+            rows.push((row.rowid().get(), row.values().to_vec()));
+        }
+        (table, rows)
+    }
+
+    #[test]
+    fn insert_maps_targets_parameters_and_omitted_columns() {
+        // Production break caught: writing source-order values instead of target
+        // ordinals swaps ID/NAME, and failing to fill omitted NOTE loses SQL NULL.
+        let temp = TempDatabase::new("transaction-insert-targets");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction
+            .prepare("CREATE TABLE T (ID INT64, NAME TEXT, NOTE TEXT)")
+            .unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+
+        let positional = transaction
+            .prepare("INSERT INTO T (ID, NAME) VALUES (:1, :2)")
+            .unwrap();
+        let positional_values = [Value::Int64(7).into(), Value::Text("A".into()).into()];
+        assert_eq!(
+            transaction
+                .execute(&positional, Parameters::positional(&positional_values))
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+
+        let named = transaction
+            .prepare("INSERT INTO T (NAME, ID) VALUES (:NAME, :ID)")
+            .unwrap();
+        let named_values = [
+            ("id", Value::Int64(8).into()),
+            ("name", Value::Text("B".into()).into()),
+        ];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::named(&named_values))
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+
+        let select = transaction
+            .prepare("SELECT ID, NAME, NOTE FROM T ORDER BY ID")
+            .unwrap();
+        let mut rows = transaction.query(&select, Parameters::none()).unwrap();
+        assert_eq!(
+            rows.next().unwrap().unwrap().values(),
+            &[Value::Int64(7), Value::Text("A".into()), Value::Null]
+        );
+        assert_eq!(
+            rows.next().unwrap().unwrap().values(),
+            &[Value::Int64(8), Value::Text("B".into()), Value::Null]
+        );
+        assert!(rows.next().unwrap().is_none());
+        drop(rows);
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn failed_insert_does_not_consume_rowid_or_change_the_batch() {
+        // Production break caught: allocating ROWID before full value validation
+        // makes an ordinary failed INSERT leave the first successful row at 2.
+        let temp = TempDatabase::new("transaction-insert-failed-rowid");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction.prepare("CREATE TABLE T (ID INT64)").unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+        let insert = transaction.prepare("INSERT INTO T VALUES (:1)").unwrap();
+
+        let bad = [Value::Text("wrong".into()).into()];
+        assert_eq!(
+            transaction
+                .execute(&insert, Parameters::positional(&bad))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        let good = [Value::Int64(1).into()];
+        transaction
+            .execute(&insert, Parameters::positional(&good))
+            .unwrap();
+
+        let batch = transaction.batch.as_mut().unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(&CatalogName::new("T").unwrap())
+            .unwrap();
+        let relation = Relation::open(&catalog, table.id()).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let row = scan.next_batch(batch).unwrap().unwrap();
+        assert_eq!(row.rowid().get(), 1);
+        assert_eq!(row.values(), &[Value::Int64(1)]);
+        assert!(scan.next_batch(batch).unwrap().is_none());
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn insert_enforces_exact_parameters_and_reuses_a_named_value() {
+        // Production break caught: accepting an inexact frame mutates before
+        // validation, while evaluating a repeated parameter only once can omit
+        // its second target or fail the safe INT64-to-DECIMAL assignment.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let named = transaction
+            .prepare("INSERT INTO USERS (ID, AMOUNT) VALUES (:shared, :shared)")
+            .unwrap();
+        let before = batch_table_contents(&mut transaction, "USERS");
+
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+        let extra = [
+            ("shared", Value::Int64(9).into()),
+            ("extra", Value::Int64(9).into()),
+        ];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::named(&extra))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+        let duplicate = [
+            ("shared", Value::Int64(9).into()),
+            (":SHARED", Value::Int64(9).into()),
+        ];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::named(&duplicate))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+        let positional = [Value::Int64(9).into()];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::positional(&positional))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+        let wrong_type = [("shared", Value::Text("nine".into()).into())];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::named(&wrong_type))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        let wrong_typed_null = [(
+            "shared",
+            ParameterValue::typed_null(DataType::Text).unwrap(),
+        )];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::named(&wrong_typed_null))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        let float_insert = transaction
+            .prepare("INSERT INTO USERS (ID, FLOAT_COL) VALUES (1, :value)")
+            .unwrap();
+        let nonfinite = [("value", Value::Float64(f64::INFINITY).into())];
+        assert_eq!(
+            transaction
+                .execute(&float_insert, Parameters::named(&nonfinite))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "USERS"), before);
+
+        let shared = [("SHARED", Value::Int64(9).into())];
+        assert_eq!(
+            transaction
+                .execute(&named, Parameters::named(&shared))
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let (_, rows) = batch_table_contents(&mut transaction, "USERS");
+        assert_eq!(
+            rows,
+            vec![(
+                1,
+                vec![
+                    Value::Int64(9),
+                    Value::Null,
+                    Value::Decimal(Decimal::new(false, 0, 9).unwrap()),
+                    Value::Null,
+                ],
+            )]
+        );
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn insert_typed_null_and_expression_errors_are_atomic_and_located() {
+        // Production break caught: skipping complete-row validation accepts a
+        // NULL ID; losing expression locations makes arithmetic failures opaque.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let nullable = transaction
+            .prepare("INSERT INTO USERS (ID, NAME) VALUES (:1, :2)")
+            .unwrap();
+        let nullable_values = [
+            Value::Int64(1).into(),
+            ParameterValue::typed_null(DataType::Text).unwrap(),
+        ];
+        transaction
+            .execute(&nullable, Parameters::positional(&nullable_values))
+            .unwrap();
+
+        let not_null = transaction
+            .prepare("INSERT INTO USERS (ID) VALUES (:1)")
+            .unwrap();
+        let typed_null = [ParameterValue::typed_null(DataType::Int64).unwrap()];
+        assert_eq!(
+            transaction
+                .execute(&not_null, Parameters::positional(&typed_null))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        let untyped_null = [Value::Null.into()];
+        assert_eq!(
+            transaction
+                .execute(&not_null, Parameters::positional(&untyped_null))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+
+        let arithmetic = transaction
+            .prepare("INSERT INTO USERS (ID) VALUES (:1 / :2)")
+            .unwrap();
+        let divide_by_zero = [Value::Int64(1).into(), Value::Int64(0).into()];
+        let error = transaction
+            .execute(&arithmetic, Parameters::positional(&divide_by_zero))
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        let location = error.sql_location().unwrap();
+        assert_eq!((location.line(), location.column()), (1, 32));
+
+        let good = [Value::Int64(2).into()];
+        transaction
+            .execute(&not_null, Parameters::positional(&good))
+            .unwrap();
+        let (_, rows) = batch_table_contents(&mut transaction, "USERS");
+        assert_eq!(rows.len(), 2);
+        assert_eq!([rows[0].0, rows[1].0], [1, 2]);
+        assert_eq!(rows[0].1[1], Value::Null);
+        assert_eq!(rows[1].1[0], Value::Int64(2));
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn insert_row_size_failure_leaves_rowid_one_available() {
+        // Production break caught: applying the row-size limit only after
+        // TableWrite opens can consume ROWID or alter the row-tree root.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let options = Options::default().with_max_query_memory_bytes(256);
+        let db = Database::open(fixture.main_path(), options).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let oversized_sql = format!(
+            "INSERT INTO USERS (ID, NAME) VALUES (1, '{}')",
+            "x".repeat(220)
+        );
+        let oversized = transaction.prepare(&oversized_sql).unwrap();
+        let before = batch_table_contents(&mut transaction, "USERS");
+        assert_eq!(
+            transaction
+                .execute(&oversized, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "USERS"), before);
+
+        let good = transaction
+            .prepare("INSERT INTO USERS (ID) VALUES (1)")
+            .unwrap();
+        transaction.execute(&good, Parameters::none()).unwrap();
+        let (_, rows) = batch_table_contents(&mut transaction, "USERS");
+        assert_eq!(rows[0].0, 1);
+        transaction.rollback().unwrap();
+    }
 
     #[test]
     fn create_and_drop_are_visible_in_transaction_and_rollbackable() {

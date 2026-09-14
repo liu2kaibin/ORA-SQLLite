@@ -114,6 +114,19 @@ impl Relation {
         Ok(Self { table, columns })
     }
 
+    pub(crate) fn open_from_batch(batch: &mut WriteBatch, table_id: TableId) -> Result<Self> {
+        let catalog = batch.catalog_reader()?;
+        Self::open(&catalog, table_id)
+    }
+
+    pub(crate) fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub(crate) fn validate_values(&self, values: &[Value], max_row_bytes: usize) -> Result<()> {
+        RowCodec::encode(&self.table, &self.columns, values, max_row_bytes).map(|_| ())
+    }
+
     pub(crate) fn scan(&self, max_row_bytes: usize) -> RelationScan {
         let rows = BTree::from_root(TreeKind::Table, self.table.root());
         let state = rows
@@ -347,13 +360,121 @@ mod tests {
         file::OpenMode,
         pager::PagerConfig,
         row::{RowCodec, encode_rowid_key},
-        test_support::{TempDatabase, test_pager},
+        test_support::{TempDatabase, phase_4b_catalog_fixture, test_pager},
     };
-    use crate::{ErrorCode, Result, Value};
+    use crate::{Database, ErrorCode, Options, Parameters, Result, Value};
 
     const LARGE_BLOB_BYTES: usize = 20_000;
     const LARGE_ROW_BYTES: usize = 20_041;
     type RelationContents = (TableDef, Vec<(u64, Vec<Value>)>);
+
+    #[test]
+    fn relation_prevalidates_complete_rows_without_opening_the_catalog_gate() {
+        // Production break caught: deferring NULL/type/size checks until
+        // TableWrite::open can leave the catalog gate open before INSERT fails.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec(
+                "T",
+                &[
+                    ("ID", ColumnType::Int64, false),
+                    ("PAYLOAD", ColumnType::Text, true),
+                ],
+            ),
+            &[],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let before = batch
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_id(table_id)
+            .unwrap()
+            .clone();
+        let relation = Relation::open_from_batch(&mut batch, table_id).unwrap();
+
+        for (values, limit) in [
+            (vec![Value::Null, Value::Null], usize::MAX),
+            (vec![Value::Text("wrong".into()), Value::Null], usize::MAX),
+            (vec![Value::Int64(1), Value::Text("too large".into())], 1),
+        ] {
+            assert_eq!(
+                relation.validate_values(&values, limit).unwrap_err().code(),
+                ErrorCode::Type
+            );
+            let after = batch
+                .catalog_reader()
+                .expect("prevalidation must not leave a catalog writer open")
+                .find_table_by_id(table_id)
+                .unwrap()
+                .clone();
+            assert_eq!(after.root(), before.root());
+            assert_eq!(after.next_rowid(), before.next_rowid());
+        }
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn sql_insert_root_split_rolls_back_and_commits_as_one_relation() {
+        // Production break caught: publishing row pages without the matching
+        // catalog root/next ROWID, or failing to restore them on rollback,
+        // tears a root-splitting sequence executed through the SQL API.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let before = {
+            let pager = fixture.pager();
+            read_relation(&pager, "USERS").unwrap()
+        };
+
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let insert = transaction
+            .prepare("INSERT INTO USERS (ID, NAME) VALUES (:1, :2)")
+            .unwrap();
+        for id in 0_i64..96 {
+            let values = [Value::Int64(id).into(), Value::Text("x".repeat(128)).into()];
+            transaction
+                .execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        let count = transaction.prepare("SELECT COUNT(*) FROM USERS").unwrap();
+        let mut rows = transaction.query(&count, Parameters::none()).unwrap();
+        assert_eq!(rows.next().unwrap().unwrap().values(), &[Value::Int64(96)]);
+        drop(rows);
+        transaction.rollback().unwrap();
+        drop(connection);
+        drop(db);
+
+        let rolled_back = {
+            let pager = fixture.pager();
+            read_relation(&pager, "USERS").unwrap()
+        };
+        assert_eq!(rolled_back, before);
+
+        let db = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let insert = transaction
+            .prepare("INSERT INTO USERS (ID, NAME) VALUES (:1, :2)")
+            .unwrap();
+        for id in 0_i64..96 {
+            let values = [Value::Int64(id).into(), Value::Text("x".repeat(128)).into()];
+            transaction
+                .execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let committed = {
+            let pager = fixture.pager();
+            read_relation(&pager, "USERS").unwrap()
+        };
+        assert_ne!(committed.0.root(), before.0.root());
+        assert_eq!(committed.0.next_rowid().get(), 97);
+        assert_eq!(committed.1.len(), 96);
+    }
 
     #[test]
     fn relation_write_updates_catalog_root_rowid_and_rows_together() {

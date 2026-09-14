@@ -1,14 +1,17 @@
 use crate::{
     DbError, ErrorCode, ExecutionResult, Parameters, Result, Statement,
-    sql::plan::{CreateTablePlan, Plan, PlanKind},
+    sql::{
+        SqlType,
+        plan::{CreateTablePlan, InsertPlan, Plan, PlanKind},
+    },
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
-        relation::{ColumnSpec, TableSpec, create_relation, drop_relation},
+        relation::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation},
     },
 };
 
-use super::{ParameterFrame, WorkMemory};
+use super::{EvalRow, ParameterFrame, WorkMemory, eval, expr::int_decimal};
 
 /// A write plan whose API kind, parameters, and retained schema have all been checked.
 pub(crate) struct ValidatedWrite<'a> {
@@ -47,10 +50,11 @@ pub(crate) fn execute_validated_write_plan(
 ) -> Result<ExecutionResult> {
     let ValidatedWrite {
         plan,
-        params: _params,
-        memory: _memory,
+        params,
+        memory,
     } = validated;
     match plan.kind() {
+        PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &memory),
         PlanKind::CreateTable(plan) => execute_create_table(batch, plan),
         PlanKind::DropTable { table_id } => {
             drop_relation(batch, *table_id)?;
@@ -58,6 +62,47 @@ pub(crate) fn execute_validated_write_plan(
         }
         kind => Err(unsupported_write_kind(kind)),
     }
+}
+
+fn execute_insert(
+    batch: &mut WriteBatch,
+    plan: &InsertPlan,
+    params: &ParameterFrame,
+    memory: &WorkMemory,
+) -> Result<ExecutionResult> {
+    if plan.targets().len() != plan.values().len() {
+        return Err(DbError::new(
+            ErrorCode::Internal,
+            "INSERT target and value counts differ in the execution plan",
+        ));
+    }
+    let table_id = plan.table().table_id();
+    let relation = Relation::open_from_batch(batch, table_id)?;
+    let mut values = vec![crate::Value::Null; relation.column_count()];
+    let empty_row = EvalRow::default();
+    for (target, expression) in plan.targets().iter().zip(plan.values()) {
+        let mut value = eval(expression, &empty_row, params)?;
+        if target.data_type() == SqlType::Decimal {
+            if let crate::Value::Int64(integer) = value {
+                value = crate::Value::Decimal(int_decimal(integer)?);
+            }
+        }
+        let slot = values
+            .get_mut(usize::from(target.ordinal()))
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Internal,
+                    "INSERT target ordinal is outside the table schema",
+                )
+            })?;
+        *slot = value;
+    }
+    let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
+    relation.validate_values(&values, max_row_bytes)?;
+    let mut writer = TableWrite::open(batch, table_id)?;
+    writer.insert(batch, &values)?;
+    writer.finish(batch)?;
+    Ok(ExecutionResult::new(1))
 }
 
 fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Result<ExecutionResult> {
@@ -121,8 +166,9 @@ fn unsupported_write_kind(_kind: &PlanKind) -> DbError {
 mod tests {
     use super::{execute_validated_write_plan, validate_write_execution};
     use crate::sql::bind_sql;
+    use crate::storage::relation::Relation;
     use crate::storage::test_support::phase_4b_catalog_fixture;
-    use crate::{ErrorCode, Parameters, SqlLimits, Statement};
+    use crate::{ErrorCode, Parameters, SqlLimits, Statement, Value};
 
     fn prepare(pager: &crate::storage::Pager, sql: &str) -> Statement {
         let mut snapshot = pager.begin_read().unwrap();
@@ -167,6 +213,67 @@ mod tests {
                     &crate::storage::catalog::types::CatalogName::new("NEW_TABLE").unwrap()
                 )
                 .is_some()
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn insert_prevalidates_nullability_and_row_size_before_any_write() {
+        // Production break caught: opening TableWrite before complete-row
+        // validation can alter the catalog gate/root/ROWID on an ordinary error.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let null_id = prepare(&pager, "INSERT INTO USERS (ID) VALUES (NULL)");
+        let oversized_sql = format!(
+            "INSERT INTO USERS (ID, NAME) VALUES (1, '{}')",
+            "x".repeat(512)
+        );
+        let oversized = prepare(&pager, &oversized_sql);
+        let good = prepare(&pager, "INSERT INTO USERS (ID) VALUES (1)");
+        let mut batch = pager.begin_write().unwrap();
+        let before = batch
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_id(fixture.users_id())
+            .unwrap()
+            .clone();
+
+        for (statement, memory_limit) in [(&null_id, 64 * 1024 * 1024), (&oversized, 128)] {
+            let validated =
+                validate_write_execution(&mut batch, statement, Parameters::none(), memory_limit)
+                    .unwrap();
+            assert_eq!(
+                execute_validated_write_plan(&mut batch, validated)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Type
+            );
+            let after = batch
+                .catalog_reader()
+                .expect("prevalidation must not open the catalog write gate")
+                .find_table_by_id(fixture.users_id())
+                .unwrap()
+                .clone();
+            assert_eq!(after.root(), before.root());
+            assert_eq!(after.next_rowid(), before.next_rowid());
+        }
+
+        let validated =
+            validate_write_execution(&mut batch, &good, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        assert_eq!(
+            execute_validated_write_plan(&mut batch, validated)
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let relation = Relation::open_from_batch(&mut batch, fixture.users_id()).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let row = scan.next_batch(&mut batch).unwrap().unwrap();
+        assert_eq!(row.rowid().get(), 1);
+        assert_eq!(
+            row.values(),
+            &[Value::Int64(1), Value::Null, Value::Null, Value::Null]
         );
         batch.rollback().unwrap();
     }
