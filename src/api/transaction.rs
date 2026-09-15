@@ -207,11 +207,11 @@ impl Drop for WriteTransaction<'_> {
 mod tests {
     use super::classify_explicit_transaction_error;
     use crate::{
-        DataType, Database, DbError, Decimal, ErrorCode, Options, ParameterValue, Parameters,
-        Value,
+        DataType, Database, DbError, Decimal, ErrorCode, Options, OracleDate, OracleTimestamp,
+        ParameterValue, Parameters, Value,
         storage::{
             catalog::types::{CatalogName, ColumnType, TableDef},
-            relation::Relation,
+            relation::{Relation, fail_table_write_next_after_for_test},
             test_support::{TempDatabase, phase_4b_add_table, phase_4b_catalog_fixture},
         },
     };
@@ -233,6 +233,684 @@ mod tests {
             rows.push((row.rowid().get(), row.values().to_vec()));
         }
         (table, rows)
+    }
+
+    fn query_values(transaction: &mut super::WriteTransaction<'_>, sql: &str) -> Vec<Vec<Value>> {
+        let statement = transaction.prepare(sql).unwrap();
+        let mut rows = transaction.query(&statement, Parameters::none()).unwrap();
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            values.push(row.values().to_vec());
+        }
+        values
+    }
+
+    #[test]
+    fn update_uses_one_old_row_for_every_assignment_and_delete_counts_only_matches() {
+        // Production breaks caught: applying A before evaluating B observes a
+        // partially new row, revisiting changed values causes Halloween work,
+        // and counting scanned DELETE rows overstates the affected result.
+        let temp = TempDatabase::new("transaction-update-old-row-delete-count");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction
+            .prepare("CREATE TABLE T (A INT64, B INT64)")
+            .unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+        let insert = transaction
+            .prepare("INSERT INTO T VALUES (:1, :2)")
+            .unwrap();
+        for (a, b) in [(1, 10), (2, 20), (3, 30)] {
+            let values = [Value::Int64(a).into(), Value::Int64(b).into()];
+            transaction
+                .execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+
+        let update = transaction
+            .prepare("UPDATE T SET A = A + 1, B = A WHERE A >= 2")
+            .unwrap();
+        assert_eq!(
+            transaction
+                .execute(&update, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            2
+        );
+        assert_eq!(
+            query_values(&mut transaction, "SELECT A, B FROM T ORDER BY A"),
+            vec![
+                vec![Value::Int64(1), Value::Int64(10)],
+                vec![Value::Int64(3), Value::Int64(2)],
+                vec![Value::Int64(4), Value::Int64(3)],
+            ]
+        );
+
+        let delete = transaction.prepare("DELETE FROM T WHERE A > 2").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&delete, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            2
+        );
+        let no_match = transaction.prepare("DELETE FROM T WHERE A > 100").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&no_match, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        assert_eq!(
+            query_values(&mut transaction, "SELECT A, B FROM T"),
+            vec![vec![Value::Int64(1), Value::Int64(10)]]
+        );
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn later_row_error_restores_every_earlier_update_and_keeps_transaction_usable() {
+        // Production breaks caught: retaining row 1's replacement after row 2
+        // divides by zero, or poisoning the transaction for an ordinary Type
+        // error, makes the before image or the later INSERT assertion fail.
+        let temp = TempDatabase::new("transaction-update-late-error");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction
+            .prepare("CREATE TABLE T (ID INT64, V INT64)")
+            .unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+        let insert = transaction
+            .prepare("INSERT INTO T VALUES (:1, :2)")
+            .unwrap();
+        for (id, value) in [(1, 2), (2, 0), (3, 4)] {
+            let values = [Value::Int64(id).into(), Value::Int64(value).into()];
+            transaction
+                .execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        let before = query_values(&mut transaction, "SELECT ID, V FROM T ORDER BY ID");
+
+        let update = transaction.prepare("UPDATE T SET V = 100 / V").unwrap();
+        let error = transaction
+            .execute(&update, Parameters::none())
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(error.sql_location().unwrap().column(), 18);
+        assert_eq!(
+            query_values(&mut transaction, "SELECT ID, V FROM T ORDER BY ID"),
+            before
+        );
+
+        let values = [Value::Int64(9).into(), Value::Int64(1).into()];
+        transaction
+            .execute(&insert, Parameters::positional(&values))
+            .unwrap();
+        assert_eq!(
+            query_values(&mut transaction, "SELECT ID, V FROM T ORDER BY ID"),
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(2), Value::Int64(0)],
+                vec![Value::Int64(3), Value::Int64(4)],
+                vec![Value::Int64(9), Value::Int64(1)],
+            ]
+        );
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn mutation_memory_is_bounded_per_row_instead_of_accumulating_the_table() {
+        // Production breaks caught: failing to account the old row and pending
+        // replacement accepts the first low-budget UPDATE, while retaining
+        // every scanned row rejects the larger streaming case.
+        let low_temp = TempDatabase::new("transaction-update-row-memory-limit");
+        let db = Database::create(low_temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut seed = connection.begin_write().unwrap();
+        let create = seed
+            .prepare("CREATE TABLE T (ID INT64, PAYLOAD TEXT)")
+            .unwrap();
+        seed.execute(&create, Parameters::none()).unwrap();
+        let insert = seed.prepare("INSERT INTO T VALUES (1, :1)").unwrap();
+        let payload = [Value::Text("x".repeat(256)).into()];
+        seed.execute(&insert, Parameters::positional(&payload))
+            .unwrap();
+        seed.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let options = Options::default().with_max_query_memory_bytes(600);
+        let db = Database::open(low_temp.path(), options).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let before = batch_table_contents(&mut transaction, "T");
+        let update = transaction
+            .prepare("UPDATE T SET PAYLOAD = PAYLOAD")
+            .unwrap();
+        assert_eq!(
+            transaction
+                .execute(&update, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
+        let create_u = transaction.prepare("CREATE TABLE U (ID INT64)").unwrap();
+        transaction.execute(&create_u, Parameters::none()).unwrap();
+        transaction.rollback().unwrap();
+        drop(connection);
+        drop(db);
+
+        let options = Options::default().with_max_query_memory_bytes(900);
+        let db = Database::open(low_temp.path(), options).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let before = batch_table_contents(&mut transaction, "T");
+        let update = transaction.prepare("UPDATE T SET ID = ID + 1").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&update, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
+        transaction.rollback().unwrap();
+        drop(connection);
+        drop(db);
+
+        let streaming_temp = TempDatabase::new("transaction-streaming-mutation-memory");
+        let db = Database::create(streaming_temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut seed = connection.begin_write().unwrap();
+        let create = seed
+            .prepare("CREATE TABLE T (ID INT64, PAYLOAD TEXT)")
+            .unwrap();
+        seed.execute(&create, Parameters::none()).unwrap();
+        let insert = seed.prepare("INSERT INTO T VALUES (:1, :2)").unwrap();
+        for id in 1_i64..=64 {
+            let values = [Value::Int64(id).into(), Value::Text("y".repeat(256)).into()];
+            seed.execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        seed.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let options = Options::default().with_max_query_memory_bytes(2_048);
+        let db = Database::open(streaming_temp.path(), options).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let update = transaction.prepare("UPDATE T SET ID = ID + 1").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&update, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            64
+        );
+        let delete = transaction.prepare("DELETE FROM T WHERE ID > 33").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&delete, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            32
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "T").1.len(), 32);
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn update_preserves_genuine_timestamp_type_errors_under_a_memory_budget() {
+        let temp = TempDatabase::new("transaction-update-timestamp-shape");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction
+            .prepare("CREATE TABLE T (TS TIMESTAMP)")
+            .unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+        let insert = transaction.prepare("INSERT INTO T VALUES (NULL)").unwrap();
+        transaction.execute(&insert, Parameters::none()).unwrap();
+        let before = batch_table_contents(&mut transaction, "T");
+
+        let update = transaction.prepare("UPDATE T SET TS = :1").unwrap();
+        let date = OracleDate::new(2026, 9, 15, 12, 0, 0).unwrap();
+        let timestamp = OracleTimestamp::new(date, 0, Some(60)).unwrap();
+        let values = [Value::Timestamp(timestamp).into()];
+        let error = transaction
+            .execute(&update, Parameters::positional(&values))
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(error.sql_location().unwrap().column(), 19);
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
+        let create_u = transaction.prepare("CREATE TABLE U (ID INT64)").unwrap();
+        transaction.execute(&create_u, Parameters::none()).unwrap();
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn parameterized_mutations_keep_rowids_and_sql_three_valued_predicates() {
+        // Production breaks caught: scanning by a changed visible value can
+        // revisit rows, FALSE/NULL predicates can be miscounted, and DELETE
+        // must not make a committed ROWID available to a later INSERT.
+        let temp = TempDatabase::new("transaction-parameterized-update-delete-rowids");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction
+            .prepare("CREATE TABLE T (ID INT64, V INT64, FLAG BOOL)")
+            .unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+        let insert = transaction
+            .prepare("INSERT INTO T VALUES (:1, :2, :3)")
+            .unwrap();
+        for (id, flag) in [
+            (1, Value::Bool(true)),
+            (2, Value::Bool(false)),
+            (3, Value::Null),
+        ] {
+            let values = [
+                Value::Int64(id).into(),
+                Value::Int64(id * 10).into(),
+                flag.into(),
+            ];
+            transaction
+                .execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        let before_rowids: Vec<_> = batch_table_contents(&mut transaction, "T")
+            .1
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+
+        let update = transaction
+            .prepare("UPDATE T SET ID = ID + :inc, V = ID WHERE ID < :limit")
+            .unwrap();
+        let parameters = [
+            ("inc", Value::Int64(1).into()),
+            ("limit", Value::Int64(4).into()),
+        ];
+        assert_eq!(
+            transaction
+                .execute(&update, Parameters::named(&parameters))
+                .unwrap()
+                .rows_affected(),
+            3
+        );
+        let after_update = batch_table_contents(&mut transaction, "T").1;
+        assert_eq!(
+            after_update.iter().map(|row| row.0).collect::<Vec<_>>(),
+            before_rowids
+        );
+        assert_eq!(
+            after_update.iter().map(|row| &row.1).collect::<Vec<_>>(),
+            vec![
+                &vec![Value::Int64(2), Value::Int64(1), Value::Bool(true)],
+                &vec![Value::Int64(3), Value::Int64(2), Value::Bool(false)],
+                &vec![Value::Int64(4), Value::Int64(3), Value::Null],
+            ]
+        );
+
+        let null_update = transaction
+            .prepare("UPDATE T SET V = 999 WHERE NULL")
+            .unwrap();
+        assert_eq!(
+            transaction
+                .execute(&null_update, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        let delete_true = transaction.prepare("DELETE FROM T WHERE FLAG").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&delete_true, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let delete_parameterized = transaction
+            .prepare("DELETE FROM T WHERE ID >= :minimum")
+            .unwrap();
+        let minimum = [("minimum", Value::Int64(100).into())];
+        assert_eq!(
+            transaction
+                .execute(&delete_parameterized, Parameters::named(&minimum))
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+
+        let insert_one = transaction
+            .prepare("INSERT INTO T VALUES (9, 9, FALSE)")
+            .unwrap();
+        transaction
+            .execute(&insert_one, Parameters::none())
+            .unwrap();
+        let (_, rows) = batch_table_contents(&mut transaction, "T");
+        assert_eq!(rows.iter().map(|row| row.0).collect::<Vec<_>>(), [2, 3, 4]);
+        assert_eq!(
+            query_values(&mut transaction, "SELECT ID, V FROM T ORDER BY ID"),
+            vec![
+                vec![Value::Int64(3), Value::Int64(2)],
+                vec![Value::Int64(4), Value::Int64(3)],
+                vec![Value::Int64(9), Value::Int64(9)],
+            ]
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut reopened = connection.begin_write().unwrap();
+        assert_eq!(
+            query_values(&mut reopened, "SELECT ID, V FROM T ORDER BY ID"),
+            vec![
+                vec![Value::Int64(3), Value::Int64(2)],
+                vec![Value::Int64(4), Value::Int64(3)],
+                vec![Value::Int64(9), Value::Int64(9)],
+            ]
+        );
+        assert_eq!(
+            batch_table_contents(&mut reopened, "T")
+                .1
+                .iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        reopened.rollback().unwrap();
+    }
+
+    #[test]
+    fn later_row_decode_limit_restores_prior_update_and_can_commit_later_work() {
+        // Production breaks caught: decoding with an unbounded limit misses the
+        // late size error, while restoring only the current row leaves row 1
+        // changed or prevents a later ordinary statement from committing.
+        let temp = TempDatabase::new("transaction-update-late-row-size");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut seed = connection.begin_write().unwrap();
+        let create = seed
+            .prepare("CREATE TABLE T (ID INT64, PAYLOAD TEXT)")
+            .unwrap();
+        seed.execute(&create, Parameters::none()).unwrap();
+        let insert = seed.prepare("INSERT INTO T VALUES (:1, :2)").unwrap();
+        for (id, payload) in [(1, "a".to_owned()), (2, "z".repeat(512))] {
+            let values = [Value::Int64(id).into(), Value::Text(payload).into()];
+            seed.execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        seed.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let options = Options::default().with_max_query_memory_bytes(400);
+        let db = Database::open(temp.path(), options).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let before = batch_table_contents(&mut transaction, "T");
+        let update = transaction.prepare("UPDATE T SET ID = ID + 1").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&update, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
+        let delete = transaction.prepare("DELETE FROM T").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&delete, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
+        let create_u = transaction.prepare("CREATE TABLE U (ID INT64)").unwrap();
+        transaction.execute(&create_u, Parameters::none()).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut reopened = connection.begin_write().unwrap();
+        assert_eq!(batch_table_contents(&mut reopened, "T"), before);
+        assert!(reopened.prepare("SELECT ID FROM U").is_ok());
+        reopened.rollback().unwrap();
+    }
+
+    #[test]
+    fn update_across_split_tree_and_delete_collapse_rollback_commit_and_reopen_atomically() {
+        // Production breaks caught: losing TableWrite's changed root on finish,
+        // failing to restore split/collapse page state, changing ROWIDs during
+        // replacement, or recycling a deleted ROWID breaks these snapshots.
+        let temp = TempDatabase::new("transaction-update-split-delete-collapse");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut seed = connection.begin_write().unwrap();
+        let create = seed
+            .prepare("CREATE TABLE T (ID INT64, PAYLOAD TEXT)")
+            .unwrap();
+        seed.execute(&create, Parameters::none()).unwrap();
+        let insert = seed.prepare("INSERT INTO T VALUES (:1, :2)").unwrap();
+        for id in 1_i64..=72 {
+            let values = [Value::Int64(id).into(), Value::Text("s".into()).into()];
+            seed.execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        seed.commit().unwrap();
+
+        let mut update_rollback = connection.begin_write().unwrap();
+        let before = batch_table_contents(&mut update_rollback, "T");
+        let original_rowids: Vec<_> = before.1.iter().map(|row| row.0).collect();
+        let update = update_rollback
+            .prepare("UPDATE T SET PAYLOAD = :payload")
+            .unwrap();
+        let payload = [("payload", Value::Text("x".repeat(128)).into())];
+        assert_eq!(
+            update_rollback
+                .execute(&update, Parameters::named(&payload))
+                .unwrap()
+                .rows_affected(),
+            72
+        );
+        let expanded = batch_table_contents(&mut update_rollback, "T");
+        assert_eq!(expanded.0.next_rowid(), before.0.next_rowid());
+        assert_eq!(
+            expanded.1.iter().map(|row| row.0).collect::<Vec<_>>(),
+            original_rowids
+        );
+        assert!(
+            expanded
+                .1
+                .iter()
+                .all(|row| { row.1[1] == Value::Text("x".repeat(128)) })
+        );
+        update_rollback.rollback().unwrap();
+
+        let mut update_commit = connection.begin_write().unwrap();
+        assert_eq!(batch_table_contents(&mut update_commit, "T"), before);
+        let update = update_commit
+            .prepare("UPDATE T SET PAYLOAD = :payload")
+            .unwrap();
+        update_commit
+            .execute(&update, Parameters::named(&payload))
+            .unwrap();
+        update_commit.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut delete_rollback = connection.begin_write().unwrap();
+        let committed_expanded = batch_table_contents(&mut delete_rollback, "T");
+        assert_eq!(
+            committed_expanded
+                .1
+                .iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            original_rowids
+        );
+        let delete = delete_rollback
+            .prepare("DELETE FROM T WHERE ID < 72")
+            .unwrap();
+        assert_eq!(
+            delete_rollback
+                .execute(&delete, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            71
+        );
+        let collapsed = batch_table_contents(&mut delete_rollback, "T");
+        assert_ne!(collapsed.0.root(), committed_expanded.0.root());
+        assert_eq!(
+            collapsed.1,
+            vec![(72, vec![Value::Int64(72), Value::Text("x".repeat(128))],)]
+        );
+        delete_rollback.rollback().unwrap();
+
+        let mut delete_commit = connection.begin_write().unwrap();
+        assert_eq!(
+            batch_table_contents(&mut delete_commit, "T"),
+            committed_expanded
+        );
+        let delete = delete_commit
+            .prepare("DELETE FROM T WHERE ID < 72")
+            .unwrap();
+        delete_commit.execute(&delete, Parameters::none()).unwrap();
+        delete_commit.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut reopened = connection.begin_write().unwrap();
+        let reopened_collapsed = batch_table_contents(&mut reopened, "T");
+        assert_eq!(reopened_collapsed, collapsed);
+        let insert = reopened
+            .prepare("INSERT INTO T VALUES (100, 'new')")
+            .unwrap();
+        reopened.execute(&insert, Parameters::none()).unwrap();
+        assert_eq!(
+            batch_table_contents(&mut reopened, "T")
+                .1
+                .iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            [72, 73]
+        );
+        reopened.rollback().unwrap();
+    }
+
+    #[test]
+    fn later_delete_error_restores_collapsed_root_releases_and_all_rows() {
+        // Production breaks caught: a late predicate error after earlier
+        // deletes can retain a collapsed root, staged page releases, or a
+        // subset of rows unless the outer statement checkpoint is restored.
+        let temp = TempDatabase::new("transaction-delete-late-error-collapse-restore");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut seed = connection.begin_write().unwrap();
+        let create = seed
+            .prepare("CREATE TABLE T (ID INT64, V INT64, PAYLOAD TEXT)")
+            .unwrap();
+        seed.execute(&create, Parameters::none()).unwrap();
+        let insert = seed.prepare("INSERT INTO T VALUES (:1, :2, :3)").unwrap();
+        for id in 1_i64..=72 {
+            let values = [
+                Value::Int64(id).into(),
+                Value::Int64(if id == 72 { 0 } else { 1 }).into(),
+                Value::Text("x".repeat(128)).into(),
+            ];
+            seed.execute(&insert, Parameters::positional(&values))
+                .unwrap();
+        }
+        seed.commit().unwrap();
+
+        let mut transaction = connection.begin_write().unwrap();
+        let before = batch_table_contents(&mut transaction, "T");
+        let delete = transaction
+            .prepare("DELETE FROM T WHERE 100 / V > 0")
+            .unwrap();
+        let error = transaction
+            .execute(&delete, Parameters::none())
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(error.sql_location().unwrap().column(), 21);
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
+
+        let delete = transaction.prepare("DELETE FROM T WHERE ID < 72").unwrap();
+        assert_eq!(
+            transaction
+                .execute(&delete, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            71
+        );
+        let collapsed = batch_table_contents(&mut transaction, "T");
+        assert_ne!(collapsed.0.root(), before.0.root());
+        assert_eq!(collapsed.0.next_rowid(), before.0.next_rowid());
+        assert_eq!(collapsed.1.len(), 1);
+        assert_eq!(collapsed.1[0].0, 72);
+        transaction.rollback().unwrap();
+
+        let mut reopened = connection.begin_write().unwrap();
+        assert_eq!(batch_table_contents(&mut reopened, "T"), before);
+        reopened.rollback().unwrap();
+    }
+
+    #[test]
+    fn fatal_later_row_errors_restore_then_require_explicit_rollback() {
+        // Production break caught: omitting any fatal class leaves prepare and
+        // commit reachable instead of making the transaction rollback-only.
+        // Checkpoint state itself is covered by the lower storage-layer tests.
+        for code in [ErrorCode::Io, ErrorCode::Corruption, ErrorCode::Internal] {
+            let temp = TempDatabase::new("transaction-update-late-fatal");
+            let db = Database::create(temp.path(), Options::default()).unwrap();
+            let mut connection = db.connect().unwrap();
+            let mut seed = connection.begin_write().unwrap();
+            let create = seed.prepare("CREATE TABLE T (ID INT64)").unwrap();
+            seed.execute(&create, Parameters::none()).unwrap();
+            let insert = seed.prepare("INSERT INTO T VALUES (:1)").unwrap();
+            for id in [1_i64, 2] {
+                let values = [Value::Int64(id).into()];
+                seed.execute(&insert, Parameters::positional(&values))
+                    .unwrap();
+            }
+            seed.commit().unwrap();
+
+            let mut transaction = connection.begin_write().unwrap();
+            let before = batch_table_contents(&mut transaction, "T");
+            let update = transaction.prepare("UPDATE T SET ID = ID + 10").unwrap();
+            fail_table_write_next_after_for_test(1, code);
+            assert_eq!(
+                transaction
+                    .execute(&update, Parameters::none())
+                    .unwrap_err()
+                    .code(),
+                code
+            );
+            assert_eq!(
+                transaction.prepare("SELECT ID FROM T").unwrap_err().code(),
+                ErrorCode::Transaction
+            );
+            transaction.rollback().unwrap();
+
+            let mut reopened = connection.begin_write().unwrap();
+            assert_eq!(batch_table_contents(&mut reopened, "T"), before);
+            reopened.rollback().unwrap();
+        }
     }
 
     #[test]

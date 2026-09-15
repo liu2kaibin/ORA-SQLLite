@@ -1,5 +1,8 @@
 use std::ops::Bound;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::{DbError, ErrorCode, Result, Value};
 
 use super::{
@@ -51,6 +54,31 @@ pub(crate) struct TableWrite {
     rows: BTree,
     catalog: CatalogWriter,
     original_root: PageRef,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_AFTER_FAILURE: Cell<Option<(usize, ErrorCode)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_table_write_next_after_for_test(successful_calls: usize, code: ErrorCode) {
+    NEXT_AFTER_FAILURE.set(Some((successful_calls, code)));
+}
+
+#[cfg(test)]
+fn injected_next_after_error() -> Option<DbError> {
+    NEXT_AFTER_FAILURE.with(|failure| match failure.get() {
+        Some((0, code)) => {
+            failure.set(None);
+            Some(DbError::new(code, "injected TableWrite next_after failure"))
+        }
+        Some((remaining, code)) => {
+            failure.set(Some((remaining - 1, code)));
+            None
+        }
+        None => None,
+    })
 }
 
 impl ColumnSpec {
@@ -176,6 +204,10 @@ impl StoredRow {
     pub(crate) fn values(&self) -> &[Value] {
         &self.values
     }
+
+    pub(crate) fn into_values(self) -> Box<[Value]> {
+        self.values
+    }
 }
 
 impl TableWrite {
@@ -255,7 +287,12 @@ impl TableWrite {
         &mut self,
         batch: &mut WriteBatch,
         rowid: Option<RowId>,
+        max_row_bytes: usize,
     ) -> Result<Option<StoredRow>> {
+        #[cfg(test)]
+        if let Some(error) = injected_next_after_error() {
+            return Err(error);
+        }
         let mut state = if let Some(rowid) = rowid {
             let key = encode_rowid_key(rowid);
             self.rows
@@ -267,9 +304,13 @@ impl TableWrite {
             return Ok(None);
         };
         let rowid = decode_rowid_key(&key)?;
-        let values =
-            RowCodec::decode(&self.schema.table, &self.schema.columns, &bytes, usize::MAX)?
-                .into_boxed_slice();
+        let values = RowCodec::decode(
+            &self.schema.table,
+            &self.schema.columns,
+            &bytes,
+            max_row_bytes,
+        )?
+        .into_boxed_slice();
         Ok(Some(StoredRow { rowid, values }))
     }
 
@@ -521,18 +562,21 @@ mod tests {
         assert!(writer.delete(&mut batch, first).unwrap());
         assert!(!writer.delete(&mut batch, first).unwrap());
 
-        let row = writer.next_after(&mut batch, None).unwrap().unwrap();
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.rowid(), second);
         assert_eq!(row.values(), &[Value::Int64(20)]);
         let row = writer
-            .next_after(&mut batch, Some(second))
+            .next_after(&mut batch, Some(second), usize::MAX)
             .unwrap()
             .unwrap();
         assert_eq!(row.rowid(), third);
         assert_eq!(row.values(), &[Value::Int64(3)]);
         assert!(
             writer
-                .next_after(&mut batch, Some(third))
+                .next_after(&mut batch, Some(third), usize::MAX)
                 .unwrap()
                 .is_none()
         );
@@ -545,6 +589,32 @@ mod tests {
             rows,
             vec![(2, vec![Value::Int64(20)]), (3, vec![Value::Int64(3)])]
         );
+    }
+
+    #[test]
+    fn table_write_next_after_honors_the_caller_row_decode_limit() {
+        // Production break caught: decoding with usize::MAX lets UPDATE/DELETE
+        // retain a row larger than the execution caller's resource boundary.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("PAYLOAD", ColumnType::Text, false)]),
+            &[vec![Value::Text("x".repeat(256))]],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        let error = match writer.next_after(&mut batch, None, 64) {
+            Err(error) => error,
+            Ok(_) => panic!("the caller row limit must reject the stored row"),
+        };
+        assert_eq!(error.code(), ErrorCode::Type);
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.values(), &[Value::Text("x".repeat(256))]);
+        writer.finish(&mut batch).unwrap();
+        batch.rollback().unwrap();
     }
 
     #[test]
@@ -705,11 +775,14 @@ mod tests {
         let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
         let catalog_root = writer.catalog.root();
         let rows_root = writer.rows.root();
-        let expected_row = writer.next_after(&mut batch, None).unwrap().unwrap();
+        let expected_row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
         let expected_row = (expected_row.rowid(), expected_row.values().to_vec());
         assert!(
             writer
-                .next_after(&mut batch, Some(expected_row.0))
+                .next_after(&mut batch, Some(expected_row.0), usize::MAX)
                 .unwrap()
                 .is_none()
         );
@@ -733,14 +806,17 @@ mod tests {
                 .get(),
             1
         );
-        let row = writer.next_after(&mut batch, None).unwrap().unwrap();
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (row.rowid(), row.values()),
             (expected_row.0, expected_row.1.as_slice())
         );
         assert!(
             writer
-                .next_after(&mut batch, Some(expected_row.0))
+                .next_after(&mut batch, Some(expected_row.0), usize::MAX)
                 .unwrap()
                 .is_none()
         );

@@ -2,7 +2,8 @@ use crate::{
     DbError, ErrorCode, ExecutionResult, Parameters, Result, Statement,
     sql::{
         SqlType,
-        plan::{CreateTablePlan, InsertPlan, Plan, PlanKind},
+        bound::SourceId,
+        plan::{CreateTablePlan, DeletePlan, InsertPlan, Plan, PlanKind, UpdatePlan},
     },
     storage::{
         WriteBatch,
@@ -11,7 +12,14 @@ use crate::{
     },
 };
 
-use super::{EvalRow, ParameterFrame, WorkMemory, eval, expr::int_decimal};
+use super::{
+    EvalRow, ParameterFrame, WorkMemory, eval,
+    expr::int_decimal,
+    memory::{
+        MATERIALIZED_CONTAINER_BYTES, checked_add_bytes, checked_array_bytes,
+        owned_value_payload_bytes, owned_values_bytes, resource_limit,
+    },
+};
 
 /// A write plan whose API kind, parameters, and retained schema have all been checked.
 pub(crate) struct ValidatedWrite<'a> {
@@ -51,10 +59,12 @@ pub(crate) fn execute_validated_write_plan(
     let ValidatedWrite {
         plan,
         params,
-        memory,
+        mut memory,
     } = validated;
     match plan.kind() {
         PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &memory),
+        PlanKind::Update(plan) => execute_update(batch, plan, &params, &mut memory),
+        PlanKind::Delete(plan) => execute_delete(batch, plan, &params, &mut memory),
         PlanKind::CreateTable(plan) => execute_create_table(batch, plan),
         PlanKind::DropTable { table_id } => {
             drop_relation(batch, *table_id)?;
@@ -62,6 +72,265 @@ pub(crate) fn execute_validated_write_plan(
         }
         kind => Err(unsupported_write_kind(kind)),
     }
+}
+
+fn execute_update(
+    batch: &mut WriteBatch,
+    plan: &UpdatePlan,
+    params: &ParameterFrame,
+    memory: &mut WorkMemory,
+) -> Result<ExecutionResult> {
+    let table_id = plan.table().table_id();
+    let relation = Relation::open_from_batch(batch, table_id)?;
+    for assignment in plan.assignments() {
+        if usize::from(assignment.target().ordinal()) >= relation.column_count() {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "UPDATE target ordinal is outside the table schema",
+            ));
+        }
+    }
+    let mut writer = TableWrite::open(batch, table_id)?;
+    let mut last = None;
+    let mut affected = 0_u64;
+    while let Some(stored) = writer
+        .next_after(
+            batch,
+            last,
+            usize::try_from(memory.remaining()).unwrap_or(usize::MAX),
+        )
+        .map_err(map_row_memory_limit)?
+    {
+        let rowid = stored.rowid();
+        last = Some(rowid);
+        let old_values = stored.into_values();
+        let old_bytes = owned_values_bytes(old_values.iter())?;
+        memory.reserve(old_bytes)?;
+        let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
+        if !predicate_matches(plan.selection(), &old, params)? {
+            memory.release(old_bytes)?;
+            continue;
+        }
+        let (values, assignment_bytes) = evaluate_update_assignments(plan, &old, params, memory)?;
+        memory.reserve(old_bytes)?;
+        let mut replacement = Vec::with_capacity(relation.column_count());
+        for ordinal in 0..relation.column_count() {
+            let ordinal = u16::try_from(ordinal).map_err(|_| {
+                DbError::new(
+                    ErrorCode::Internal,
+                    "UPDATE relation column ordinal exceeds its bound",
+                )
+            })?;
+            replacement.push(
+                old.source_value(SourceId(0), ordinal)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE old row is missing a relation column",
+                        )
+                    })?,
+            );
+        }
+        for (assignment, value) in plan.assignments().iter().zip(values) {
+            let target = replacement
+                .get_mut(usize::from(assignment.target().ordinal()))
+                .ok_or_else(|| {
+                    DbError::new(
+                        ErrorCode::Internal,
+                        "UPDATE target ordinal is outside the replacement row",
+                    )
+                })?;
+            *target = value;
+        }
+        let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
+        validate_update_replacement(&relation, plan, &old, &replacement, max_row_bytes)?;
+        writer.replace(batch, rowid, &replacement)?;
+        affected = checked_affected_count(affected)?;
+        memory.release(checked_add_bytes(
+            checked_add_bytes(old_bytes, assignment_bytes)?,
+            old_bytes,
+        )?)?;
+    }
+    writer.finish(batch)?;
+    Ok(ExecutionResult::new(affected))
+}
+
+fn evaluate_update_assignments(
+    plan: &UpdatePlan,
+    old: &EvalRow,
+    params: &ParameterFrame,
+    memory: &mut WorkMemory,
+) -> Result<(Vec<crate::Value>, u64)> {
+    let count = u64::try_from(plan.assignments().len()).map_err(|_| resource_limit())?;
+    let mut bytes = checked_add_bytes(
+        MATERIALIZED_CONTAINER_BYTES,
+        checked_array_bytes(count, std::mem::size_of::<crate::Value>() as u64)?,
+    )?;
+    memory.reserve(bytes)?;
+    let mut values = Vec::with_capacity(plan.assignments().len());
+    for assignment in plan.assignments() {
+        let value = coerce_assignment(
+            eval(assignment.value(), old, params)?,
+            assignment.target().data_type(),
+        )?;
+        let payload = owned_value_payload_bytes(&value)?;
+        memory.reserve(payload)?;
+        bytes = checked_add_bytes(bytes, payload)?;
+        values.push(value);
+    }
+    Ok((values, bytes))
+}
+
+fn execute_delete(
+    batch: &mut WriteBatch,
+    plan: &DeletePlan,
+    params: &ParameterFrame,
+    memory: &mut WorkMemory,
+) -> Result<ExecutionResult> {
+    let mut writer = TableWrite::open(batch, plan.table().table_id())?;
+    let mut last = None;
+    let mut affected = 0_u64;
+    while let Some(stored) = writer
+        .next_after(
+            batch,
+            last,
+            usize::try_from(memory.remaining()).unwrap_or(usize::MAX),
+        )
+        .map_err(map_row_memory_limit)?
+    {
+        let rowid = stored.rowid();
+        last = Some(rowid);
+        let old_values = stored.into_values();
+        let old_bytes = owned_values_bytes(old_values.iter())?;
+        memory.reserve(old_bytes)?;
+        let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
+        if predicate_matches(plan.selection(), &old, params)? && writer.delete(batch, rowid)? {
+            affected = checked_affected_count(affected)?;
+        }
+        memory.release(old_bytes)?;
+    }
+    writer.finish(batch)?;
+    Ok(ExecutionResult::new(affected))
+}
+
+fn map_row_memory_limit(error: DbError) -> DbError {
+    if error.code() == ErrorCode::Type {
+        resource_limit()
+    } else {
+        error
+    }
+}
+
+fn validate_update_replacement(
+    relation: &Relation,
+    plan: &UpdatePlan,
+    old: &EvalRow,
+    replacement: &[crate::Value],
+    max_row_bytes: usize,
+) -> Result<()> {
+    match relation.validate_values(replacement, max_row_bytes) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == ErrorCode::Type => {
+            match relation.validate_values(replacement, usize::MAX) {
+                Ok(()) => Err(resource_limit()),
+                Err(unbounded) if unbounded.code() == ErrorCode::Type => {
+                    Err(locate_update_replacement_type_error(
+                        relation,
+                        plan,
+                        old,
+                        replacement,
+                        unbounded,
+                    ))
+                }
+                Err(unbounded) => Err(unbounded),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn locate_update_replacement_type_error(
+    relation: &Relation,
+    plan: &UpdatePlan,
+    old: &EvalRow,
+    replacement: &[crate::Value],
+    fallback: DbError,
+) -> DbError {
+    for assignment in plan.assignments() {
+        let mut candidate = Vec::with_capacity(relation.column_count());
+        for ordinal in 0..relation.column_count() {
+            let Ok(ordinal) = u16::try_from(ordinal) else {
+                return DbError::new(
+                    ErrorCode::Internal,
+                    "UPDATE relation column ordinal exceeds its bound",
+                );
+            };
+            let Some(value) = old.source_value(SourceId(0), ordinal) else {
+                return DbError::new(
+                    ErrorCode::Internal,
+                    "UPDATE old row is missing a relation column",
+                );
+            };
+            candidate.push(value.clone());
+        }
+        let target = usize::from(assignment.target().ordinal());
+        let (Some(candidate_value), Some(replacement_value)) =
+            (candidate.get_mut(target), replacement.get(target))
+        else {
+            return DbError::new(
+                ErrorCode::Internal,
+                "UPDATE target ordinal is outside the replacement row",
+            );
+        };
+        *candidate_value = replacement_value.clone();
+        match relation.validate_values(&candidate, usize::MAX) {
+            Ok(()) => {}
+            Err(error) if error.code() == ErrorCode::Type => {
+                return error.with_sql_location(assignment.value().location());
+            }
+            Err(error) => return error,
+        }
+    }
+    fallback
+}
+
+fn predicate_matches(
+    predicate: Option<&crate::sql::plan::ExecExpr>,
+    row: &EvalRow,
+    params: &ParameterFrame,
+) -> Result<bool> {
+    let Some(predicate) = predicate else {
+        return Ok(true);
+    };
+    predicate_value_matches(eval(predicate, row, params)?, predicate.location())
+}
+
+fn predicate_value_matches(
+    value: crate::Value,
+    location: crate::error::SqlLocation,
+) -> Result<bool> {
+    match value {
+        crate::Value::Bool(value) => Ok(value),
+        crate::Value::Null => Ok(false),
+        _ => Err(
+            DbError::new(ErrorCode::Type, "write predicate requires a boolean value")
+                .with_sql_location(location),
+        ),
+    }
+}
+
+fn checked_affected_count(affected: u64) -> Result<u64> {
+    affected.checked_add(1).ok_or_else(resource_limit)
+}
+
+fn coerce_assignment(value: crate::Value, target: SqlType) -> Result<crate::Value> {
+    if target == SqlType::Decimal {
+        if let crate::Value::Int64(integer) = value {
+            return Ok(crate::Value::Decimal(int_decimal(integer)?));
+        }
+    }
+    Ok(value)
 }
 
 fn execute_insert(
@@ -81,12 +350,7 @@ fn execute_insert(
     let mut values = vec![crate::Value::Null; relation.column_count()];
     let empty_row = EvalRow::default();
     for (target, expression) in plan.targets().iter().zip(plan.values()) {
-        let mut value = eval(expression, &empty_row, params)?;
-        if target.data_type() == SqlType::Decimal {
-            if let crate::Value::Int64(integer) = value {
-                value = crate::Value::Decimal(int_decimal(integer)?);
-            }
-        }
+        let value = coerce_assignment(eval(expression, &empty_row, params)?, target.data_type())?;
         let slot = values
             .get_mut(usize::from(target.ordinal()))
             .ok_or_else(|| {
@@ -164,7 +428,11 @@ fn unsupported_write_kind(_kind: &PlanKind) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_validated_write_plan, validate_write_execution};
+    use super::{
+        checked_affected_count, execute_validated_write_plan, predicate_value_matches,
+        validate_write_execution,
+    };
+    use crate::error::SqlLocation;
     use crate::sql::bind_sql;
     use crate::storage::relation::Relation;
     use crate::storage::test_support::phase_4b_catalog_fixture;
@@ -181,6 +449,30 @@ mod tests {
         )
         .unwrap();
         Statement::from_bound(bound, sql).unwrap()
+    }
+
+    #[test]
+    fn write_predicates_match_only_true_and_locate_non_boolean_values() {
+        // Production breaks caught: treating NULL as true mutates filtered
+        // rows, while returning an unlocated Type loses the retained SQL span.
+        let location = SqlLocation::new(7, 2, 3).unwrap();
+        assert!(predicate_value_matches(Value::Bool(true), location).unwrap());
+        assert!(!predicate_value_matches(Value::Bool(false), location).unwrap());
+        assert!(!predicate_value_matches(Value::Null, location).unwrap());
+        let error = predicate_value_matches(Value::Int64(1), location).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(error.sql_location(), Some(location));
+    }
+
+    #[test]
+    fn affected_count_overflow_is_a_resource_limit() {
+        // Production break caught: wrapping u64::MAX would acknowledge an
+        // unrepresentable result instead of failing the atomic statement.
+        assert_eq!(checked_affected_count(0).unwrap(), 1);
+        assert_eq!(
+            checked_affected_count(u64::MAX).unwrap_err().code(),
+            ErrorCode::ResourceLimit
+        );
     }
 
     #[test]
