@@ -8,7 +8,10 @@ use crate::{
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
-        relation::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation},
+        relation::{
+            ColumnSpec, Relation, RelationValueValidation, TableSpec, TableWrite, create_relation,
+            drop_relation,
+        },
     },
 };
 
@@ -143,9 +146,15 @@ fn execute_update(
                 })?;
             *target = value;
         }
-        let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
-        validate_update_replacement(&relation, plan, &old, &replacement, max_row_bytes)?;
-        writer.replace(batch, rowid, &replacement)?;
+        validate_and_replace(
+            batch,
+            &relation,
+            &mut writer,
+            plan,
+            rowid,
+            &replacement,
+            memory,
+        )?;
         affected = checked_affected_count(affected)?;
         memory.release(checked_add_bytes(
             checked_add_bytes(old_bytes, assignment_bytes)?,
@@ -222,77 +231,42 @@ fn map_row_memory_limit(error: DbError) -> DbError {
     }
 }
 
-fn validate_update_replacement(
+fn validate_and_replace(
+    batch: &mut WriteBatch,
     relation: &Relation,
+    writer: &mut TableWrite,
     plan: &UpdatePlan,
-    old: &EvalRow,
+    rowid: crate::storage::catalog::types::RowId,
     replacement: &[crate::Value],
-    max_row_bytes: usize,
+    memory: &mut WorkMemory,
 ) -> Result<()> {
-    match relation.validate_values(replacement, max_row_bytes) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code() == ErrorCode::Type => {
-            match relation.validate_values(replacement, usize::MAX) {
-                Ok(()) => Err(resource_limit()),
-                Err(unbounded) if unbounded.code() == ErrorCode::Type => {
-                    Err(locate_update_replacement_type_error(
-                        relation,
-                        plan,
-                        old,
-                        replacement,
-                        unbounded,
-                    ))
-                }
-                Err(unbounded) => Err(unbounded),
+    let row_budget = memory.remaining();
+    memory.reserve(row_budget)?;
+    let max_row_bytes = usize::try_from(row_budget).unwrap_or(usize::MAX);
+    let validation = relation.validate_update_values(replacement, max_row_bytes);
+    let result = match validation {
+        Ok(RelationValueValidation::Valid) => writer.replace(batch, rowid, replacement),
+        Ok(RelationValueValidation::ExceedsLimit) => Err(resource_limit()),
+        Ok(RelationValueValidation::InvalidValue { ordinal, error }) => {
+            let assignment = plan
+                .assignments()
+                .iter()
+                .find(|assignment| assignment.target().ordinal() == ordinal)
+                .ok_or_else(|| {
+                    DbError::new(
+                        ErrorCode::Internal,
+                        "UPDATE replacement contains an invalid unassigned value",
+                    )
+                });
+            match assignment {
+                Ok(assignment) => Err(error.with_sql_location(assignment.value().location())),
+                Err(error) => Err(error),
             }
         }
         Err(error) => Err(error),
-    }
-}
-
-fn locate_update_replacement_type_error(
-    relation: &Relation,
-    plan: &UpdatePlan,
-    old: &EvalRow,
-    replacement: &[crate::Value],
-    fallback: DbError,
-) -> DbError {
-    for assignment in plan.assignments() {
-        let mut candidate = Vec::with_capacity(relation.column_count());
-        for ordinal in 0..relation.column_count() {
-            let Ok(ordinal) = u16::try_from(ordinal) else {
-                return DbError::new(
-                    ErrorCode::Internal,
-                    "UPDATE relation column ordinal exceeds its bound",
-                );
-            };
-            let Some(value) = old.source_value(SourceId(0), ordinal) else {
-                return DbError::new(
-                    ErrorCode::Internal,
-                    "UPDATE old row is missing a relation column",
-                );
-            };
-            candidate.push(value.clone());
-        }
-        let target = usize::from(assignment.target().ordinal());
-        let (Some(candidate_value), Some(replacement_value)) =
-            (candidate.get_mut(target), replacement.get(target))
-        else {
-            return DbError::new(
-                ErrorCode::Internal,
-                "UPDATE target ordinal is outside the replacement row",
-            );
-        };
-        *candidate_value = replacement_value.clone();
-        match relation.validate_values(&candidate, usize::MAX) {
-            Ok(()) => {}
-            Err(error) if error.code() == ErrorCode::Type => {
-                return error.with_sql_location(assignment.value().location());
-            }
-            Err(error) => return error,
-        }
-    }
-    fallback
+    };
+    memory.release(row_budget)?;
+    result
 }
 
 fn predicate_matches(

@@ -1,7 +1,7 @@
 use std::ops::Bound;
 
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use crate::{DbError, ErrorCode, Result, Value};
 
@@ -49,6 +49,12 @@ pub(crate) struct StoredRow {
     values: Box<[Value]>,
 }
 
+pub(crate) enum RelationValueValidation {
+    Valid,
+    ExceedsLimit,
+    InvalidValue { ordinal: u16, error: DbError },
+}
+
 pub(crate) struct TableWrite {
     schema: Relation,
     rows: BTree,
@@ -59,11 +65,17 @@ pub(crate) struct TableWrite {
 #[cfg(test)]
 thread_local! {
     static NEXT_AFTER_FAILURE: Cell<Option<(usize, ErrorCode)>> = const { Cell::new(None) };
+    static VALUE_VALIDATION_LIMITS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 pub(crate) fn fail_table_write_next_after_for_test(successful_calls: usize, code: ErrorCode) {
     NEXT_AFTER_FAILURE.set(Some((successful_calls, code)));
+}
+
+#[cfg(test)]
+pub(crate) fn take_value_validation_limits_for_test() -> Vec<usize> {
+    VALUE_VALIDATION_LIMITS.with(|limits| std::mem::take(&mut *limits.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -155,6 +167,40 @@ impl Relation {
         RowCodec::encode(&self.table, &self.columns, values, max_row_bytes).map(|_| ())
     }
 
+    pub(crate) fn validate_update_values(
+        &self,
+        values: &[Value],
+        max_row_bytes: usize,
+    ) -> Result<RelationValueValidation> {
+        #[cfg(test)]
+        VALUE_VALIDATION_LIMITS.with(|limits| limits.borrow_mut().push(max_row_bytes));
+        match RowCodec::encode(&self.table, &self.columns, values, max_row_bytes) {
+            Ok(_) => Ok(RelationValueValidation::Valid),
+            Err(error) if error.code() == ErrorCode::Type => {
+                if values.len() != self.columns.len() {
+                    return Err(error);
+                }
+                for (ordinal, (column, value)) in self.columns.iter().zip(values).enumerate() {
+                    if let Some(error) = invalid_value_shape(column, value) {
+                        let ordinal = u16::try_from(ordinal).map_err(|_| {
+                            DbError::new(
+                                ErrorCode::Internal,
+                                "relation column ordinal exceeds its bound",
+                            )
+                        })?;
+                        return Ok(RelationValueValidation::InvalidValue { ordinal, error });
+                    }
+                }
+                if max_row_bytes <= u32::MAX as usize {
+                    Ok(RelationValueValidation::ExceedsLimit)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn scan(&self, max_row_bytes: usize) -> RelationScan {
         let rows = BTree::from_root(TreeKind::Table, self.table.root());
         let state = rows
@@ -166,6 +212,37 @@ impl Relation {
             max_row_bytes,
         }
     }
+}
+
+fn invalid_value_shape(column: &ColumnDef, value: &Value) -> Option<DbError> {
+    if matches!(value, Value::Null) {
+        return (!column.nullable()).then(|| {
+            DbError::new(
+                ErrorCode::Type,
+                "NULL is not valid for a non-nullable column",
+            )
+        });
+    }
+    let valid = match (column.column_type(), value) {
+        (ColumnType::Int64, Value::Int64(_))
+        | (ColumnType::Decimal, Value::Decimal(_))
+        | (ColumnType::Float64, Value::Float64(_))
+        | (ColumnType::Text, Value::Text(_))
+        | (ColumnType::Blob, Value::Blob(_))
+        | (ColumnType::Date, Value::Date(_))
+        | (ColumnType::Bool, Value::Bool(_)) => true,
+        (ColumnType::Timestamp, Value::Timestamp(value)) => value.offset_minutes().is_none(),
+        (ColumnType::TimestampWithTimeZone, Value::Timestamp(value)) => {
+            value.offset_minutes().is_some()
+        }
+        _ => false,
+    };
+    (!valid).then(|| {
+        DbError::new(
+            ErrorCode::Type,
+            "value does not match its bound column type",
+        )
+    })
 }
 
 impl RelationScan {

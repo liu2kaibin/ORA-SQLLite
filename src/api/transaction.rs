@@ -211,7 +211,10 @@ mod tests {
         ParameterValue, Parameters, Value,
         storage::{
             catalog::types::{CatalogName, ColumnType, TableDef},
-            relation::{Relation, fail_table_write_next_after_for_test},
+            relation::{
+                Relation, fail_table_write_next_after_for_test,
+                take_value_validation_limits_for_test,
+            },
             test_support::{TempDatabase, phase_4b_add_table, phase_4b_catalog_fixture},
         },
     };
@@ -490,6 +493,62 @@ mod tests {
         assert_eq!(batch_table_contents(&mut transaction, "T"), before);
         let create_u = transaction.prepare("CREATE TABLE U (ID INT64)").unwrap();
         transaction.execute(&create_u, Parameters::none()).unwrap();
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn invalid_late_wide_update_never_uses_unbounded_diagnostic_validation() {
+        // Production break caught: retrying validation with usize::MAX and
+        // cloning/encoding one whole candidate row per assignment bypasses the
+        // statement budget while diagnosing the final invalid assignment.
+        let temp = TempDatabase::new("transaction-update-bounded-diagnostics");
+        let db = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut seed = connection.begin_write().unwrap();
+        let create = seed
+            .prepare(
+                "CREATE TABLE T (C1 TEXT, C2 TEXT, C3 TEXT, C4 TEXT, C5 TEXT, \
+                 C6 TEXT, C7 TEXT, C8 TEXT, TS TIMESTAMP)",
+            )
+            .unwrap();
+        seed.execute(&create, Parameters::none()).unwrap();
+        let insert = seed
+            .prepare("INSERT INTO T VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9)")
+            .unwrap();
+        let mut values = (0..8)
+            .map(|index| Value::Text(char::from(b'a' + index).to_string().repeat(128)).into())
+            .collect::<Vec<ParameterValue>>();
+        values.push(Value::Null.into());
+        seed.execute(&insert, Parameters::positional(&values))
+            .unwrap();
+        seed.commit().unwrap();
+        drop(connection);
+        drop(db);
+
+        let options = Options::default().with_max_query_memory_bytes(5_000);
+        let db = Database::open(temp.path(), options).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let before = batch_table_contents(&mut transaction, "T");
+        let update = transaction
+            .prepare(
+                "UPDATE T SET C1 = C1, C2 = C2, C3 = C3, C4 = C4, C5 = C5, \
+                 C6 = C6, C7 = C7, C8 = C8, TS = :1",
+            )
+            .unwrap();
+        let date = OracleDate::new(2026, 9, 15, 12, 0, 0).unwrap();
+        let timestamp = OracleTimestamp::new(date, 0, Some(60)).unwrap();
+        let parameters = [Value::Timestamp(timestamp).into()];
+
+        take_value_validation_limits_for_test();
+        let error = transaction
+            .execute(&update, Parameters::positional(&parameters))
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        let validation_limits = take_value_validation_limits_for_test();
+        assert_eq!(validation_limits.len(), 1);
+        assert_ne!(validation_limits[0], usize::MAX);
+        assert_eq!(batch_table_contents(&mut transaction, "T"), before);
         transaction.rollback().unwrap();
     }
 
