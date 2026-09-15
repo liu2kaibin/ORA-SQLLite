@@ -26,6 +26,58 @@ pub(crate) use params::ParameterFrame;
 pub(crate) use query::{QueryExecution, prepare_query};
 pub(crate) use sort::Sort;
 
+use crate::sql::plan::PlanKind;
+use crate::storage::catalog::CatalogReader;
+use crate::{DbError, ErrorCode, Parameters, Result, Statement};
+
+pub(crate) fn validate_control_execution(
+    statement: &Statement,
+    parameters: Parameters<'_>,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+    max_query_memory_bytes: u64,
+) -> Result<()> {
+    validate_control_parameters(statement, parameters, max_query_memory_bytes)?;
+    statement.validate_schema(database_uuid, catalog)
+}
+
+pub(crate) fn validate_control_parameters(
+    statement: &Statement,
+    parameters: Parameters<'_>,
+    max_query_memory_bytes: u64,
+) -> Result<()> {
+    let mut memory = WorkMemory::new(max_query_memory_bytes)?;
+    let _params = ParameterFrame::bind(statement.parameters(), parameters, &mut memory)?;
+    Ok(())
+}
+
+pub(crate) fn validate_write_before_writer(
+    statement: &Statement,
+    parameters: Parameters<'_>,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+    max_query_memory_bytes: u64,
+) -> Result<()> {
+    validate_control_execution(
+        statement,
+        parameters,
+        catalog,
+        database_uuid,
+        max_query_memory_bytes,
+    )?;
+    if matches!(
+        statement.plan().kind(),
+        PlanKind::DeferredUnsupported { .. }
+    ) {
+        Err(DbError::new(
+            ErrorCode::Unsupported,
+            "statement execution requires Phase 4C2",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;

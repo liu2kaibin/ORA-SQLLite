@@ -920,6 +920,15 @@ impl FaultInjector for RecordingFaults {
     }
 }
 
+pub(crate) fn phase_4c1_commit_io_fault_pager(temp: &TempDatabase) -> Pager {
+    Pager::create(temp.path(), PagerConfig::test_default(4096))
+        .expect("create SQL commit fault pager")
+        .with_faults(Arc::new(RecordingFaults::at(
+            FaultPoint::BeforeWalRecordWrite,
+            1,
+        )))
+}
+
 #[test]
 fn test_fault_injector_is_used_after_pager_creation() {
     let temp = TempDatabase::new("test-fault-injector");

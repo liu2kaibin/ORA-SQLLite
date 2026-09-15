@@ -98,21 +98,7 @@ impl<'connection> WriteTransaction<'connection> {
     ) -> Result<ExecutionResult> {
         let memory_limit = self.max_query_memory_bytes;
         let batch = self.batch_mut()?;
-        let validated = match validate_write_execution(batch, statement, parameters, memory_limit) {
-            Ok(validated) => validated,
-            Err(error) => return Err(classify_explicit_transaction_error(batch, error)),
-        };
-        let checkpoint = match batch.statement_checkpoint() {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => return Err(classify_explicit_transaction_error(batch, error)),
-        };
-        match execute_validated_write_plan(batch, validated) {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                batch.restore_statement(checkpoint);
-                Err(classify_explicit_transaction_error(batch, error))
-            }
-        }
+        execute_write_batch(batch, statement, parameters, memory_limit)
     }
 
     /// Prepares one SQL statement against this write batch's catalog view.
@@ -177,6 +163,29 @@ impl<'connection> WriteTransaction<'connection> {
                 "write transaction has already finished",
             )
         })
+    }
+}
+
+pub(super) fn execute_write_batch(
+    batch: &mut WriteBatch,
+    statement: &Statement,
+    parameters: Parameters<'_>,
+    memory_limit: u64,
+) -> Result<ExecutionResult> {
+    let validated = match validate_write_execution(batch, statement, parameters, memory_limit) {
+        Ok(validated) => validated,
+        Err(error) => return Err(classify_explicit_transaction_error(batch, error)),
+    };
+    let checkpoint = match batch.statement_checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Err(classify_explicit_transaction_error(batch, error)),
+    };
+    match execute_validated_write_plan(batch, validated) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            batch.restore_statement(checkpoint);
+            Err(classify_explicit_transaction_error(batch, error))
+        }
     }
 }
 
