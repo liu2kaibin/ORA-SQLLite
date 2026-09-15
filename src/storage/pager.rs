@@ -825,6 +825,31 @@ pub(crate) struct WriteBatch {
     fail_tree_release_after: Option<usize>,
 }
 
+#[derive(Debug)]
+pub(crate) enum CommitFailure {
+    RetryableBusy {
+        error: DbError,
+        batch: Box<WriteBatch>,
+    },
+    PreDurability(DbError),
+    NeedsReopen(DbError),
+}
+
+impl CommitFailure {
+    fn into_error(self) -> DbError {
+        match self {
+            Self::RetryableBusy { error, .. }
+            | Self::PreDurability(error)
+            | Self::NeedsReopen(error) => error,
+        }
+    }
+}
+
+enum WalLimitPreflight {
+    Ready,
+    RetryableBusy(DbError),
+}
+
 pub(super) struct WriteBatchCheckpoint {
     dirty: BTreeMap<PageId, PageFrame>,
     new_pages: BTreeSet<PageId>,
@@ -1361,23 +1386,37 @@ impl WriteBatch {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self) -> Result<()> {
-        self.require_active()?;
+    pub(crate) fn commit(self) -> Result<()> {
+        self.commit_with_outcome()
+            .map_err(CommitFailure::into_error)
+    }
+
+    pub(crate) fn commit_with_outcome(mut self) -> std::result::Result<(), CommitFailure> {
+        self.require_active()
+            .map_err(CommitFailure::PreDurability)?;
         // Reject before preparing releases or materializing a header-only change,
         // so unfinished writers always produce Transaction and never reach WAL I/O.
-        self.require_catalog_finished()?;
-        self.prepare_freelist_releases()?;
+        self.require_catalog_finished()
+            .map_err(CommitFailure::PreDurability)?;
+        let retry_checkpoint = self
+            .checkpoint_mutation()
+            .map_err(CommitFailure::PreDurability)?;
+        self.prepare_freelist_releases()
+            .map_err(CommitFailure::PreDurability)?;
         if self.dirty.is_empty() && self.candidate_header.is_some() {
             let catalog_root = self.current_header().catalog_root();
             if catalog_root.0 == 0 {
-                return Err(corruption(
+                return Err(CommitFailure::PreDurability(corruption(
                     "catalog root state change requires a nonzero root page",
-                ));
+                )));
             }
-            let frame = self.read_frame_by_id(catalog_root)?;
+            let frame = self
+                .read_frame_by_id(catalog_root)
+                .map_err(CommitFailure::PreDurability)?;
             self.dirty.insert(catalog_root, frame);
         }
-        self.validate_for_commit()?;
+        self.validate_for_commit()
+            .map_err(CommitFailure::PreDurability)?;
 
         if self.dirty.is_empty() && self.candidate_header.is_none() {
             self.finish();
@@ -1385,9 +1424,14 @@ impl WriteBatch {
         }
 
         let transaction_lsn = self.base_lsn.0.checked_add(1).map(Lsn).ok_or_else(|| {
-            DbError::new(ErrorCode::Transaction, "WAL LSN overflow requires recovery")
+            CommitFailure::PreDurability(DbError::new(
+                ErrorCode::Transaction,
+                "WAL LSN overflow requires recovery",
+            ))
         })?;
-        let target_page_count = self.target_page_count()?;
+        let target_page_count = self
+            .target_page_count()
+            .map_err(CommitFailure::PreDurability)?;
         let roots = self.candidate_header.unwrap_or(self.base_header);
         let candidate_state = CommitState {
             page_count: target_page_count,
@@ -1406,24 +1450,58 @@ impl WriteBatch {
                 )
             })
             .collect::<Vec<_>>();
-        self.preflight_wal_limit(&frames)?;
-        let publication_observer = self.pager.wal_lock()?.publication_observer();
-        let versions = self.pager.wal_lock()?.projected_versions(&frames)?;
+        match self
+            .preflight_wal_limit(&frames)
+            .map_err(CommitFailure::PreDurability)?
+        {
+            WalLimitPreflight::Ready => {}
+            WalLimitPreflight::RetryableBusy(error) => {
+                self.restore_mutation(retry_checkpoint);
+                return Err(CommitFailure::RetryableBusy {
+                    error,
+                    batch: Box::new(self),
+                });
+            }
+        }
+        let publication_observer = self
+            .pager
+            .wal_lock()
+            .map_err(CommitFailure::PreDurability)?
+            .publication_observer();
+        let versions = self
+            .pager
+            .wal_lock()
+            .map_err(CommitFailure::PreDurability)?
+            .projected_versions(&frames)
+            .map_err(CommitFailure::PreDurability)?;
         // The writer lease excludes both another commit and checkpoint. Prepare
         // all validation, allocation and map changes before touching the WAL.
-        let mut candidate_index = self.pager.published_read()?.wal_index.clone();
-        candidate_index.publish(transaction_lsn, Some(candidate_state), &versions)?;
+        let mut candidate_index = self
+            .pager
+            .published_read()
+            .map_err(CommitFailure::PreDurability)?
+            .wal_index
+            .clone();
+        candidate_index
+            .publish(transaction_lsn, Some(candidate_state), &versions)
+            .map_err(CommitFailure::PreDurability)?;
         // Verify write-lock health before durable I/O. Only this writer can
         // acquire a write guard until publication (read-guard panic cannot poison).
-        drop(self.pager.published_write()?);
+        drop(
+            self.pager
+                .published_write()
+                .map_err(CommitFailure::PreDurability)?,
+        );
         let wal_pager = self.pager.clone();
-        let mut wal = wal_pager.wal_lock()?;
+        let mut wal = wal_pager.wal_lock().map_err(CommitFailure::PreDurability)?;
         match wal.append_transaction(transaction_lsn, self.base_lsn, candidate_state, &frames) {
             Ok(_) => (),
-            Err(error) => return self.fail_wal_commit(error),
+            Err(error) => {
+                return Err(CommitFailure::NeedsReopen(self.fail_wal_commit(error)));
+            }
         };
         if let Err(error) = wal.sync_all() {
-            return self.fail_wal_commit(error);
+            return Err(CommitFailure::NeedsReopen(self.fail_wal_commit(error)));
         }
         drop(wal);
         publication_observer.observe_publication(crate::fault::FaultPoint::BeforeWalPublish);
@@ -1446,15 +1524,15 @@ impl WriteBatch {
         Ok(())
     }
 
-    fn fail_wal_commit<T>(&mut self, error: DbError) -> Result<T> {
+    fn fail_wal_commit(&mut self, error: DbError) -> DbError {
         if let Ok(mut published) = self.pager.published_write() {
             published.write_state = WriteState::NeedsRecovery;
         }
         self.finish();
-        Err(error)
+        error
     }
 
-    fn preflight_wal_limit(&self, frames: &[(PageId, u64, Vec<u8>)]) -> Result<()> {
+    fn preflight_wal_limit(&self, frames: &[(PageId, u64, Vec<u8>)]) -> Result<WalLimitPreflight> {
         let page_bytes = u64::from(self.base_header.page_size())
             .checked_add(64)
             .ok_or_else(|| corruption("WAL frame length overflow"))?;
@@ -1492,10 +1570,13 @@ impl WriteBatch {
                     None => "WAL hard limit requires a checkpoint retry after snapshot release"
                         .to_owned(),
                 };
-                return Err(DbError::new(ErrorCode::Busy, message));
+                return Ok(WalLimitPreflight::RetryableBusy(DbError::new(
+                    ErrorCode::Busy,
+                    message,
+                )));
             }
         }
-        Ok(())
+        Ok(WalLimitPreflight::Ready)
     }
 
     fn validate_for_commit(&mut self) -> Result<()> {
@@ -1910,7 +1991,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{PageSource, Pager, PagerConfig, WriteBatch, copy_clean_frame};
+    use super::{CommitFailure, PageSource, Pager, PagerConfig, WriteBatch, copy_clean_frame};
     use crate::{
         DbError, ErrorCode, Result,
         fault::{FaultInjector, FaultPoint},
@@ -1949,6 +2030,40 @@ mod tests {
         assert_eq!(pager.try_begin_write().unwrap_err().code(), ErrorCode::Busy);
         batch.rollback().unwrap();
         assert!(pager.try_begin_write().is_ok());
+    }
+
+    #[test]
+    fn retryable_commit_busy_returns_exact_batch_and_writer_lease_for_retry() {
+        // Production break caught: a consuming commit that returns Busy drops
+        // the only copy of the dirty batch and releases its writer lease.
+        let temp = TempDatabase::new("retryable-commit-busy");
+        let mut config = PagerConfig::test_default(4096);
+        config.checkpoint_wal_bytes = 1_000_000;
+        config.max_wal_bytes = 16_384;
+        let pager = Pager::create(temp.path(), config).unwrap();
+
+        let mut seed = pager.begin_write().unwrap();
+        let page = seed.allocate_append(PageType::Catalog).unwrap();
+        seed.modify(page).unwrap().bytes_mut()[100] = 11;
+        seed.commit().unwrap();
+
+        let snapshot = pager.begin_read().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        batch.modify(page).unwrap().bytes_mut()[100] = 22;
+        let before = batch.checkpoint_mutation().unwrap();
+
+        let (error, mut batch) = match batch.commit_with_outcome().unwrap_err() {
+            CommitFailure::RetryableBusy { error, batch } => (error, *batch),
+            other => panic!("expected retained Busy batch, got {other:?}"),
+        };
+        assert_eq!(error.code(), ErrorCode::Busy);
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.read(page).unwrap().bytes()[100], 22);
+        assert_eq!(pager.try_begin_write().unwrap_err().code(), ErrorCode::Busy);
+
+        drop(snapshot);
+        batch.commit_with_outcome().unwrap();
+        assert_eq!(pager.read(page).unwrap().bytes()[100], 22);
     }
 
     #[test]

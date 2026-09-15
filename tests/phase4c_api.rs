@@ -1,6 +1,8 @@
 mod support;
 
-use ora_sqllite::{DataType, ErrorCode, ParameterValue, Parameters, Value};
+use std::fs;
+
+use ora_sqllite::{DataType, Database, ErrorCode, Options, ParameterValue, Parameters, Value};
 
 use support::{collect, collect_statement, execute_sql, execute_statement};
 
@@ -436,5 +438,60 @@ fn fixed_read_snapshots_coexist_with_a_writer_and_do_not_observe_future_commits(
     assert_eq!(
         collect(&mut writer, "SELECT V FROM T WHERE ID = 2"),
         vec![vec![Value::Int64(99)]]
+    );
+}
+
+#[test]
+fn retryable_commit_busy_preserves_sql_transaction_until_later_commit() {
+    // Production break caught: moving the batch out before COMMIT and mapping
+    // a pre-WAL Busy error to Idle loses uncommitted work and prevents retry.
+    let (files, database) = support::new_database("retryable-sql-commit");
+    let mut setup = database.connect().unwrap();
+    execute_sql(&mut setup, "CREATE TABLE T (ID INT64)");
+    execute_sql(&mut setup, "INSERT INTO T VALUES (1)");
+    drop(setup);
+    drop(database);
+
+    let wal_len = fs::metadata(files.wal()).unwrap().len();
+    let options = Options::default()
+        .with_checkpoint_wal_bytes(1_000_000)
+        .with_max_wal_bytes(wal_len.checked_add(1).unwrap());
+    let database = Database::open(files.main(), options).unwrap();
+    let mut blocker_connection = database.connect().unwrap();
+    let blocker = blocker_connection.begin_read().unwrap();
+    let mut writer = database.connect().unwrap();
+
+    execute_sql(&mut writer, "BEGIN");
+    execute_sql(&mut writer, "INSERT INTO T VALUES (2)");
+    assert_eq!(
+        collect(&mut writer, "SELECT ID FROM T ORDER BY ID"),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+    let commit = writer.prepare("COMMIT").unwrap();
+    assert_eq!(
+        writer
+            .execute(&commit, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Busy
+    );
+    assert_eq!(
+        collect(&mut writer, "SELECT ID FROM T ORDER BY ID"),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+
+    drop(blocker);
+    drop(blocker_connection);
+    assert_eq!(
+        writer
+            .execute(&commit, Parameters::none())
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    let mut observer = database.connect().unwrap();
+    assert_eq!(
+        collect(&mut observer, "SELECT ID FROM T ORDER BY ID"),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
     );
 }

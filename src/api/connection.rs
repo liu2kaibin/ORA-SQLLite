@@ -9,7 +9,7 @@ use crate::sql::{
 };
 use crate::{
     DbError, ErrorCode, ExecutionResult, Parameters, Result, Rows, SqlLimits,
-    storage::{Pager, WriteBatch},
+    storage::{CommitFailure, Pager, WriteBatch},
 };
 
 use super::{
@@ -79,7 +79,7 @@ impl Connection {
         }
     }
 
-    /// Starts a pull-based query at the current committed snapshot.
+    /// Starts a pull-based query at the connection's current transaction view.
     pub fn query<'connection>(
         &'connection mut self,
         statement: &Statement,
@@ -291,12 +291,17 @@ impl Connection {
                 return Err(error);
             }
         };
-        match batch.commit() {
+        match batch.commit_with_outcome() {
             Ok(()) => Ok(result),
-            Err(error) => {
+            Err(CommitFailure::RetryableBusy { error, .. }) => Err(error),
+            Err(CommitFailure::PreDurability(error)) => {
                 if error.is_fatal() {
                     self.state = ConnectionState::NeedsReopen;
                 }
+                Err(error)
+            }
+            Err(CommitFailure::NeedsReopen(error)) => {
+                self.state = ConnectionState::NeedsReopen;
                 Err(error)
             }
         }
@@ -355,17 +360,22 @@ impl Connection {
         let ConnectionState::SqlWrite(batch) = state else {
             return Err(transaction_state_error());
         };
-        match batch.commit() {
+        match batch.commit_with_outcome() {
             Ok(()) => {
                 self.state = ConnectionState::Idle;
                 Ok(ExecutionResult::new(0))
             }
-            Err(error) => {
+            Err(CommitFailure::RetryableBusy { error, batch }) => {
+                self.state = ConnectionState::SqlWrite(*batch);
+                Err(error)
+            }
+            Err(CommitFailure::PreDurability(error)) => {
                 if !error.is_fatal() {
                     self.state = ConnectionState::Idle;
                 }
                 Err(error)
             }
+            Err(CommitFailure::NeedsReopen(error)) => Err(error),
         }
     }
 

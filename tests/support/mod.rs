@@ -54,6 +54,10 @@ impl TestFiles {
     pub fn main(&self) -> &Path {
         &self.main
     }
+
+    pub fn wal(&self) -> &Path {
+        &self.wal
+    }
 }
 
 impl Drop for TestFiles {
