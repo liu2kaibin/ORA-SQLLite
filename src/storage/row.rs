@@ -19,6 +19,12 @@ const BOOL_LEN: usize = 1;
 
 pub(crate) struct RowCodec;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowCodecValidation {
+    Valid,
+    ExceedsCallerLimit,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RowLayout {
     bitmap_len: usize,
@@ -28,6 +34,15 @@ struct RowLayout {
 }
 
 impl RowCodec {
+    pub(crate) fn validate(
+        table: &TableDef,
+        columns: &[ColumnDef],
+        values: &[Value],
+        max_row_bytes: usize,
+    ) -> Result<RowCodecValidation> {
+        validate_row_layout(table, columns, values, max_row_bytes).map(|(_, validation)| validation)
+    }
+
     pub(crate) fn encode(
         table: &TableDef,
         columns: &[ColumnDef],
@@ -208,6 +223,21 @@ fn preflight_row_layout(
     values: &[Value],
     max_row_bytes: usize,
 ) -> Result<RowLayout> {
+    let (layout, validation) = validate_row_layout(table, columns, values, max_row_bytes)?;
+    match validation {
+        RowCodecValidation::Valid => Ok(layout),
+        RowCodecValidation::ExceedsCallerLimit => {
+            Err(type_error("row exceeds the caller resource limit"))
+        }
+    }
+}
+
+fn validate_row_layout(
+    table: &TableDef,
+    columns: &[ColumnDef],
+    values: &[Value],
+    max_row_bytes: usize,
+) -> Result<(RowLayout, RowCodecValidation)> {
     validate_caller_schema(table, columns)?;
     if values.len() != columns.len() {
         return Err(type_error(
@@ -237,13 +267,16 @@ fn preflight_row_layout(
 
     let total_len = checked_total_len(bitmap_len, directory_len, payload_len)
         .ok_or_else(|| type_error("row length overflows"))?;
-    require_encodable_row_len(total_len, max_row_bytes)?;
-    Ok(RowLayout {
-        bitmap_len,
-        directory_len,
-        payload_len,
-        total_len,
-    })
+    let validation = classify_row_length(total_len, max_row_bytes)?;
+    Ok((
+        RowLayout {
+            bitmap_len,
+            directory_len,
+            payload_len,
+            total_len,
+        },
+        validation,
+    ))
 }
 
 fn encoded_value_len(column_type: ColumnType, value: &Value) -> Result<usize> {
@@ -308,14 +341,14 @@ fn checked_total_len(bitmap_len: usize, directory_len: usize, payload_len: usize
         .checked_add(payload_len)
 }
 
-fn require_encodable_row_len(total_len: usize, max_row_bytes: usize) -> Result<()> {
+fn classify_row_length(total_len: usize, max_row_bytes: usize) -> Result<RowCodecValidation> {
     if u32::try_from(total_len).is_err() {
         return Err(type_error("row length exceeds the disk format"));
     }
     if total_len > max_row_bytes {
-        return Err(type_error("row exceeds the caller resource limit"));
+        return Ok(RowCodecValidation::ExceedsCallerLimit);
     }
-    Ok(())
+    Ok(RowCodecValidation::Valid)
 }
 
 fn validate_bitmap_high_bits(bitmap: &[u8], column_count: usize) -> Result<()> {
@@ -546,8 +579,8 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::{
-        RowCodec, decode_rowid_key, decode_value, encode_rowid_key, encode_value,
-        preflight_row_layout,
+        RowCodec, RowCodecValidation, classify_row_length, decode_rowid_key, decode_value,
+        encode_rowid_key, encode_value, preflight_row_layout,
     };
     use crate::storage::catalog::types::{
         CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef, TableId,
@@ -849,6 +882,27 @@ mod tests {
             RowCodec::encode(&table, &wrong_columns, &good, MAX_ROW_BYTES)
                 .unwrap_err()
                 .code(),
+            ErrorCode::Type
+        );
+    }
+
+    #[test]
+    fn disk_format_overflow_precedes_smaller_caller_limit() {
+        let disk_limit = usize::try_from(u32::MAX).unwrap();
+        assert_eq!(
+            classify_row_length(disk_limit, disk_limit - 1).unwrap(),
+            RowCodecValidation::ExceedsCallerLimit
+        );
+        assert_eq!(
+            classify_row_length(disk_limit, disk_limit).unwrap(),
+            RowCodecValidation::Valid
+        );
+
+        let Some(disk_overflow) = disk_limit.checked_add(1) else {
+            return;
+        };
+        assert_eq!(
+            classify_row_length(disk_overflow, 1).unwrap_err().code(),
             ErrorCode::Type
         );
     }

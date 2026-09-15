@@ -16,7 +16,7 @@ use super::{
         },
     },
     pager::PageSource,
-    row::{RowCodec, decode_rowid_key, encode_rowid_key},
+    row::{RowCodec, RowCodecValidation, decode_rowid_key, encode_rowid_key},
 };
 
 #[derive(Clone)]
@@ -174,8 +174,9 @@ impl Relation {
     ) -> Result<RelationValueValidation> {
         #[cfg(test)]
         VALUE_VALIDATION_LIMITS.with(|limits| limits.borrow_mut().push(max_row_bytes));
-        match RowCodec::encode(&self.table, &self.columns, values, max_row_bytes) {
-            Ok(_) => Ok(RelationValueValidation::Valid),
+        match RowCodec::validate(&self.table, &self.columns, values, max_row_bytes) {
+            Ok(RowCodecValidation::Valid) => Ok(RelationValueValidation::Valid),
+            Ok(RowCodecValidation::ExceedsCallerLimit) => Ok(RelationValueValidation::ExceedsLimit),
             Err(error) if error.code() == ErrorCode::Type => {
                 if values.len() != self.columns.len() {
                     return Err(error);
@@ -191,11 +192,7 @@ impl Relation {
                         return Ok(RelationValueValidation::InvalidValue { ordinal, error });
                     }
                 }
-                if max_row_bytes <= u32::MAX as usize {
-                    Ok(RelationValueValidation::ExceedsLimit)
-                } else {
-                    Err(error)
-                }
+                Err(error)
             }
             Err(error) => Err(error),
         }
