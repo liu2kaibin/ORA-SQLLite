@@ -1,7 +1,6 @@
 use std::{
-    cell::RefCell,
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -1104,11 +1103,8 @@ impl NoPanicHarness {
                 )
             }
             4 => {
-                let parameters =
-                    [
-                        decimal_value(seed % 2 == 0, if seed % 4 == 0 { -38 } else { 38 }, 1)
-                            .into(),
-                    ];
+                let (negative, scale) = no_panic_decimal_variant(seed);
+                let parameters = [decimal_value(negative, scale, 1).into()];
                 actual_query(
                     &mut self.connection,
                     "SELECT :1 + 0",
@@ -1130,7 +1126,7 @@ impl NoPanicHarness {
             }
             6 => actual_query(&mut self.connection, "SELECT :1", Parameters::none()),
             _ => {
-                let parameters = [Value::Float64(if seed % 2 == 0 { -0.0 } else { 0.0 }).into()];
+                let parameters = [Value::Float64(no_panic_signed_zero_variant(seed)).into()];
                 actual_query(
                     &mut self.connection,
                     "SELECT :1, COUNT(*) GROUP BY :1 ORDER BY :1",
@@ -1142,20 +1138,17 @@ impl NoPanicHarness {
     }
 }
 
-thread_local! {
-    static NO_PANIC_HARNESS: RefCell<Option<NoPanicHarness>> = const { RefCell::new(None) };
+fn no_panic_decimal_variant(seed: u64) -> (bool, i8) {
+    let variant = seed / 8;
+    (variant % 2 != 0, if variant % 4 < 2 { -38 } else { 38 })
 }
 
-fn execute_generated_case(seed: u64) {
-    NO_PANIC_HARNESS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = NoPanicHarness::new().ok();
-        }
-        if let Some(harness) = slot.as_mut() {
-            harness.execute(seed);
-        }
-    });
+fn no_panic_signed_zero_variant(seed: u64) -> f64 {
+    if (seed / 8) % 2 == 0 { -0.0 } else { 0.0 }
+}
+
+fn execute_generated_case(harness: &mut NoPanicHarness, seed: u64) {
+    harness.execute(seed);
 }
 
 #[test]
@@ -1176,9 +1169,34 @@ fn phase_4c1_fixed_seed_execution_model() {
 fn phase_4c1_random_runtime_inputs_never_panic() {
     // Production break caught: an unchecked generated runtime path unwinds
     // instead of returning its stable ErrorCode through the public API.
+    let mut harness = NoPanicHarness::new()
+        .unwrap_or_else(|code| panic!("no-panic harness initialization failed: {code:?}"));
     for seed in 0u64..512 {
-        let result = catch_unwind(AssertUnwindSafe(|| execute_generated_case(seed)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            execute_generated_case(&mut harness, seed);
+        }));
         assert!(result.is_ok(), "panic for seed {seed}");
     }
     eprintln!("phase 4c1 no-panic corpus: 512 deterministic runtime inputs");
+}
+
+#[test]
+fn no_panic_numeric_generator_covers_both_boundary_sides() {
+    let decimals = (0u64..512)
+        .filter(|seed| seed % 8 == 4)
+        .map(no_panic_decimal_variant)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        decimals,
+        BTreeSet::from([(false, -38), (false, 38), (true, -38), (true, 38)])
+    );
+
+    let signed_zero_bits = (0u64..512)
+        .filter(|seed| seed % 8 == 7)
+        .map(|seed| no_panic_signed_zero_variant(seed).to_bits())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        signed_zero_bits,
+        BTreeSet::from([0.0f64.to_bits(), (-0.0f64).to_bits()])
+    );
 }
