@@ -5,8 +5,26 @@ use std::{
 };
 
 use crate::{
-    Connection, DataType, Database, Decimal, ErrorCode, Options, ParameterValue, Parameters, Value,
-    storage::test_support::TempDatabase,
+    Connection, DataType, Database, Decimal, ErrorCode, Options, ParameterValue, Parameters,
+    Statement, Value,
+    fault::FaultPoint,
+    sql::{SqlLimits, bind_sql, plan::PlanKind},
+    storage::{
+        Pager, WriteBatch,
+        test_support::{
+            Phase4c1SqlStorageState, TempDatabase, assert_commit_trace,
+            phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
+            phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
+            phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
+            phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
+            phase_4c1_wal_initialization_trace,
+        },
+    },
+};
+
+use super::{
+    execute_validated_write_plan, validate_control_execution, validate_write_before_writer,
+    validate_write_execution,
 };
 
 const EDGE_INTS: &[i64] = &[i64::MIN, -1, 0, 1, i64::MAX];
@@ -1199,4 +1217,644 @@ fn no_panic_numeric_generator_covers_both_boundary_sides() {
         signed_zero_bits,
         BTreeSet::from([0.0f64.to_bits(), (-0.0f64).to_bits()])
     );
+}
+
+#[test]
+#[ignore = "cross-process recovery matrix"]
+fn phase_4c1_sql_crash_recovery_matrix() {
+    let mut crashes = run_sql_initialization_crashes();
+    for fault in representative_sql_commit_faults() {
+        for outcome in run_sql_child_at_fault(fault) {
+            assert_sql_recovery_matches_durable_commit_record(&outcome);
+            crashes += 1;
+            eprintln!(
+                "phase4c1 SQL {} {:?}/{}: durable_lsn={} recovered atomically",
+                outcome.program, outcome.point, outcome.occurrence, outcome.recovered_lsn,
+            );
+        }
+    }
+    eprintln!("phase4c1 SQL crash matrix: {crashes} inspected child aborts");
+}
+
+fn run_sql_initialization_crashes() -> usize {
+    let fixture = phase_4c1_main_only_crash_fixture();
+    let trace_copy = phase_4c1_copy_main_only(fixture.path());
+    let trace = phase_4c1_wal_initialization_trace(trace_copy.path());
+    assert_eq!(
+        trace,
+        vec![
+            FaultPoint::BeforeWalHeaderWrite,
+            FaultPoint::AfterWalHeaderWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalHeaderWrite,
+            FaultPoint::AfterWalHeaderWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalDirectorySync,
+            FaultPoint::AfterWalDirectorySync,
+        ],
+        "WAL initialization must retain both header-slot and directory boundaries"
+    );
+    let expected = phase_4c1_sql_storage_state(trace_copy.path());
+    assert_eq!(expected.lsn.0, 0);
+    assert!(expected.catalog_records.is_empty());
+    assert_eq!(expected.next_rowid, None);
+    assert!(expected.rows.is_empty());
+
+    for (point, occurrence) in [
+        (FaultPoint::AfterWalHeaderWrite, 2),
+        (FaultPoint::AfterWalDirectorySync, 1),
+    ] {
+        let crash_copy = phase_4c1_copy_main_only(fixture.path());
+        let path = std::fs::canonicalize(crash_copy.path()).expect("canonical init crash path");
+        let marker = "PHASE4C1_ABORT initialize";
+        let mut command = phase_4c1_exact_crash_child_command(SQL_CRASH_CHILD);
+        command
+            .env(SQL_CRASH_PATH_ENV, &path)
+            .env(SQL_CRASH_PROGRAM_ENV, "initialize")
+            .env(SQL_CRASH_POINT_ENV, format!("{point:?}"))
+            .env(SQL_CRASH_OCCURRENCE_ENV, occurrence.to_string())
+            .env(
+                SQL_CRASH_TRACE_ENV,
+                trace
+                    .iter()
+                    .map(|point| format!("{point:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        let output = command.output().expect("reap WAL initialization child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("running 1 test"),
+            "exact child did not run: {stdout}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line == format!("{marker} {point:?} {occurrence}")),
+            "wrong WAL initialization marker: {stderr}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                output.status.signal(),
+                Some(6),
+                "child must die from SIGABRT"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            output.status.code(),
+            Some(-1_073_740_791),
+            "child must die from Windows abort fast-fail 0xC0000409"
+        );
+        assert_eq!(phase_4c1_recovered_lsn(&path).0, 0);
+        assert_eq!(phase_4c1_sql_storage_state(&path), expected);
+        eprintln!(
+            "phase4c1 SQL initialization {point:?}/{occurrence}: empty pre-SQL state recovered"
+        );
+    }
+    2
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SqlCommitFault {
+    FirstPageFrame,
+    LaterPageFrame,
+    CommitRecord,
+    BeforeWalSync,
+    AfterWalSync,
+    BeforePublication,
+    AfterPublication,
+}
+
+fn representative_sql_commit_faults() -> [SqlCommitFault; 7] {
+    [
+        SqlCommitFault::FirstPageFrame,
+        SqlCommitFault::LaterPageFrame,
+        SqlCommitFault::CommitRecord,
+        SqlCommitFault::BeforeWalSync,
+        SqlCommitFault::AfterWalSync,
+        SqlCommitFault::BeforePublication,
+        SqlCommitFault::AfterPublication,
+    ]
+}
+
+#[derive(Clone, Copy)]
+struct SqlCrashProgram {
+    name: &'static str,
+    statements: &'static [&'static str],
+}
+
+const SQL_CRASH_PROGRAMS: [SqlCrashProgram; 4] = [
+    SqlCrashProgram {
+        name: "create-table",
+        statements: &["CREATE TABLE T (ID INT64)"],
+    },
+    SqlCrashProgram {
+        name: "insert-rows",
+        statements: &[
+            "BEGIN",
+            "INSERT INTO T VALUES (1)",
+            "INSERT INTO T VALUES (2)",
+            "COMMIT",
+        ],
+    },
+    SqlCrashProgram {
+        name: "update-delete",
+        statements: &[
+            "BEGIN",
+            "UPDATE T SET ID = ID + 10",
+            "DELETE FROM T WHERE ID = 11",
+            "COMMIT",
+        ],
+    },
+    SqlCrashProgram {
+        name: "drop-table",
+        statements: &["DROP TABLE T"],
+    },
+];
+
+const SQL_CRASH_CHILD: &str = "sql::exec::test_support::phase_4c1_sql_crash_child";
+const SQL_CRASH_PATH_ENV: &str = "ORA_SQLLITE_PHASE4C1_PATH";
+const SQL_CRASH_PROGRAM_ENV: &str = "ORA_SQLLITE_PHASE4C1_PROGRAM";
+const SQL_CRASH_POINT_ENV: &str = "ORA_SQLLITE_PHASE4C1_POINT";
+const SQL_CRASH_OCCURRENCE_ENV: &str = "ORA_SQLLITE_PHASE4C1_OCCURRENCE";
+const SQL_CRASH_TRACE_ENV: &str = "ORA_SQLLITE_PHASE4C1_TRACE";
+
+struct SqlCrashOutcome {
+    program: &'static str,
+    point: FaultPoint,
+    occurrence: usize,
+    recovered_lsn: u64,
+    pre: Phase4c1SqlStorageState,
+    post: Phase4c1SqlStorageState,
+    recovered: Phase4c1SqlStorageState,
+}
+
+fn run_sql_child_at_fault(fault: SqlCommitFault) -> Vec<SqlCrashOutcome> {
+    let outcomes = SQL_CRASH_PROGRAMS
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(program_index, program)| {
+            let fixture = sql_crash_fixture(program_index);
+            let pre = phase_4c1_sql_storage_state(fixture.path());
+            let trace_copy = phase_4c1_copy_crash_pair(fixture.path());
+            let (pager, faults) = phase_4c1_recording_crash_pager(trace_copy.path());
+            FaultSqlConnection::new(pager).run(program.statements);
+            let trace = faults.observed();
+            assert_commit_trace(&trace);
+            drop(faults);
+            let post = phase_4c1_sql_storage_state(trace_copy.path());
+            assert_eq!(post.lsn.0, pre.lsn.0 + 1, "{} commits once", program.name);
+            assert_ne!(pre, post, "{} must change persistent state", program.name);
+
+            let (point, occurrence) = sql_fault_occurrence(fault, &trace)?;
+            let crash_copy = phase_4c1_copy_crash_pair(fixture.path());
+            let path = std::fs::canonicalize(crash_copy.path()).expect("canonical SQL crash path");
+            let marker = format!("PHASE4C1_ABORT {}", program.name);
+            let mut command = phase_4c1_exact_crash_child_command(SQL_CRASH_CHILD);
+            command
+                .env(SQL_CRASH_PATH_ENV, &path)
+                .env(SQL_CRASH_PROGRAM_ENV, program_index.to_string())
+                .env(SQL_CRASH_POINT_ENV, format!("{point:?}"))
+                .env(SQL_CRASH_OCCURRENCE_ENV, occurrence.to_string())
+                .env(
+                    SQL_CRASH_TRACE_ENV,
+                    trace
+                        .iter()
+                        .map(|point| format!("{point:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            let output = command
+                .output()
+                .expect("synchronously wait and reap SQL crash child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains("running 1 test"),
+                "exact child did not run: {stdout}"
+            );
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| { line == format!("{marker} {point:?} {occurrence}") }),
+                "wrong SQL crash marker: {stderr}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    output.status.signal(),
+                    Some(6),
+                    "child must die from SIGABRT"
+                );
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                output.status.code(),
+                Some(-1_073_740_791),
+                "child must die from Windows abort fast-fail 0xC0000409"
+            );
+
+            // This read-only production recovery scan, not child success or
+            // fault position, decides whether a complete Commit Record exists.
+            let recovered_lsn = phase_4c1_recovered_lsn(&path).0;
+            let recovered = phase_4c1_sql_storage_state(&path);
+            assert_eq!(
+                phase_4c1_sql_storage_state(&path),
+                recovered,
+                "repeat recovery must be stable"
+            );
+            Some(SqlCrashOutcome {
+                program: program.name,
+                point,
+                occurrence,
+                recovered_lsn,
+                pre,
+                post,
+                recovered,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !outcomes.is_empty(),
+        "representative SQL fault is uncovered"
+    );
+    outcomes
+}
+
+fn sql_fault_occurrence(
+    fault: SqlCommitFault,
+    trace: &[FaultPoint],
+) -> Option<(FaultPoint, usize)> {
+    let count = |point| trace.iter().filter(|&&seen| seen == point).count();
+    Some(match fault {
+        SqlCommitFault::FirstPageFrame => (FaultPoint::AfterWalRecordPayloadPrefixWrite, 1),
+        SqlCommitFault::LaterPageFrame => {
+            if count(FaultPoint::AfterWalRecordPayloadPrefixWrite) < 3 {
+                return None;
+            }
+            (FaultPoint::AfterWalRecordPayloadPrefixWrite, 2)
+        }
+        SqlCommitFault::CommitRecord => {
+            let occurrence = count(FaultPoint::AfterWalRecordWrite);
+            assert!(
+                occurrence >= 2,
+                "SQL commit trace lacks a page and Commit Record"
+            );
+            (FaultPoint::AfterWalRecordWrite, occurrence)
+        }
+        SqlCommitFault::BeforeWalSync => (FaultPoint::BeforeWalSync, 1),
+        SqlCommitFault::AfterWalSync => (FaultPoint::AfterWalSync, 1),
+        SqlCommitFault::BeforePublication => (FaultPoint::BeforeWalPublish, 1),
+        SqlCommitFault::AfterPublication => (FaultPoint::AfterWalPublish, 1),
+    })
+}
+
+fn assert_sql_recovery_matches_durable_commit_record(outcome: &SqlCrashOutcome) {
+    let expected = if outcome.recovered_lsn == outcome.post.lsn.0 {
+        &outcome.post
+    } else {
+        assert_eq!(
+            outcome.recovered_lsn, outcome.pre.lsn.0,
+            "recovery accepted neither the pre-state nor the complete SQL commit"
+        );
+        &outcome.pre
+    };
+    assert_eq!(
+        &outcome.recovered, expected,
+        "{} {:?}/{} tore catalog, next_rowid, or user rows",
+        outcome.program, outcome.point, outcome.occurrence
+    );
+}
+
+fn sql_crash_fixture(program_index: usize) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-sql-crash-fixture");
+    let database = Database::create(temp.path(), Options::default()).expect("create SQL fixture");
+    let mut connection = database.connect().expect("connect SQL fixture");
+    for program in &SQL_CRASH_PROGRAMS[..program_index] {
+        for &sql in program.statements {
+            match actual_execute(&mut connection, sql, Parameters::none()) {
+                Outcome::Affected(_) => {}
+                outcome => panic!("fixture statement {sql:?} failed: {outcome:?}"),
+            }
+        }
+    }
+    drop(connection);
+    drop(database);
+    temp
+}
+
+struct FaultSqlConnection {
+    pager: Pager,
+    batch: Option<WriteBatch>,
+}
+
+impl FaultSqlConnection {
+    fn new(pager: Pager) -> Self {
+        Self { pager, batch: None }
+    }
+
+    fn run(mut self, statements: &[&str]) {
+        for &sql in statements {
+            self.execute(sql)
+                .unwrap_or_else(|error| panic!("execute crash SQL {sql:?}: {error}"));
+        }
+        assert!(
+            self.batch.is_none(),
+            "SQL crash program left a transaction open"
+        );
+    }
+
+    fn prepare(&mut self, sql: &str) -> crate::Result<Statement> {
+        let bound = if let Some(batch) = &mut self.batch {
+            let catalog = batch.catalog_reader()?;
+            bind_sql(sql, &SqlLimits::default(), &catalog, batch.database_uuid())?
+        } else {
+            let database_uuid = self.pager.database_uuid()?;
+            let mut snapshot = self.pager.begin_read()?;
+            let catalog = snapshot.catalog_reader()?;
+            bind_sql(sql, &SqlLimits::default(), &catalog, database_uuid)?
+        };
+        Statement::from_bound(bound, sql)
+    }
+
+    fn execute(&mut self, sql: &str) -> crate::Result<()> {
+        let statement = self.prepare(sql)?;
+        if matches!(statement.plan().kind(), PlanKind::Begin) {
+            if self.batch.is_some() {
+                panic!("nested BEGIN in SQL crash program");
+            }
+            let database_uuid = self.pager.database_uuid()?;
+            let mut snapshot = self.pager.begin_read()?;
+            let catalog = snapshot.catalog_reader()?;
+            validate_control_execution(
+                &statement,
+                Parameters::none(),
+                &catalog,
+                database_uuid,
+                Options::default().max_query_memory_bytes(),
+            )?;
+            drop(catalog);
+            drop(snapshot);
+            self.batch = Some(self.pager.try_begin_write()?);
+            return Ok(());
+        }
+        if matches!(statement.plan().kind(), PlanKind::Commit) {
+            let mut batch = self.batch.take().expect("COMMIT requires SQL transaction");
+            let catalog = batch.catalog_reader()?;
+            validate_control_execution(
+                &statement,
+                Parameters::none(),
+                &catalog,
+                batch.database_uuid(),
+                Options::default().max_query_memory_bytes(),
+            )?;
+            drop(catalog);
+            return batch.commit();
+        }
+        if matches!(statement.plan().kind(), PlanKind::Rollback) {
+            panic!("crash programs do not roll back");
+        }
+
+        if let Some(batch) = &mut self.batch {
+            let validated = validate_write_execution(
+                batch,
+                &statement,
+                Parameters::none(),
+                Options::default().max_query_memory_bytes(),
+            )?;
+            execute_validated_write_plan(batch, validated)?;
+            return Ok(());
+        }
+
+        let database_uuid = self.pager.database_uuid()?;
+        let mut snapshot = self.pager.begin_read()?;
+        let catalog = snapshot.catalog_reader()?;
+        validate_write_before_writer(
+            &statement,
+            Parameters::none(),
+            &catalog,
+            database_uuid,
+            Options::default().max_query_memory_bytes(),
+        )?;
+        drop(catalog);
+        drop(snapshot);
+        let mut batch = self.pager.try_begin_write()?;
+        let validated = validate_write_execution(
+            &mut batch,
+            &statement,
+            Parameters::none(),
+            Options::default().max_query_memory_bytes(),
+        )?;
+        execute_validated_write_plan(&mut batch, validated)?;
+        batch.commit()
+    }
+}
+
+fn parse_sql_fault_point(name: &str) -> Option<FaultPoint> {
+    [
+        FaultPoint::BeforeWalDirectorySync,
+        FaultPoint::AfterWalDirectorySync,
+        FaultPoint::BeforeWalHeaderWrite,
+        FaultPoint::AfterWalHeaderWrite,
+        FaultPoint::BeforeWalRecordWrite,
+        FaultPoint::AfterWalRecordHeaderPrefixWrite,
+        FaultPoint::AfterWalRecordPayloadPrefixWrite,
+        FaultPoint::AfterWalRecordWrite,
+        FaultPoint::BeforeWalSync,
+        FaultPoint::AfterWalSync,
+        FaultPoint::BeforeWalPublish,
+        FaultPoint::AfterWalPublish,
+    ]
+    .into_iter()
+    .find(|point| format!("{point:?}") == name)
+}
+
+#[test]
+#[ignore = "only launched with validated parameters by phase_4c1_sql_crash_recovery_matrix"]
+fn phase_4c1_sql_crash_child() {
+    let path_text = std::env::var(SQL_CRASH_PATH_ENV).expect("invalid SQL crash path");
+    let path = std::fs::canonicalize(path_text).expect("invalid SQL crash path");
+    assert!(path.is_file(), "invalid SQL crash path");
+    let program_text = std::env::var(SQL_CRASH_PROGRAM_ENV).expect("invalid SQL crash program");
+    let point = parse_sql_fault_point(
+        &std::env::var(SQL_CRASH_POINT_ENV).expect("invalid SQL crash point"),
+    )
+    .expect("invalid SQL crash point");
+    let occurrence_text =
+        std::env::var(SQL_CRASH_OCCURRENCE_ENV).expect("invalid SQL crash occurrence");
+    let occurrence: usize = occurrence_text
+        .parse()
+        .expect("invalid SQL crash occurrence");
+    assert!(occurrence > 0 && occurrence_text == occurrence.to_string());
+    let trace = std::env::var(SQL_CRASH_TRACE_ENV)
+        .expect("invalid SQL crash trace")
+        .split(',')
+        .map(|name| parse_sql_fault_point(name).expect("invalid SQL crash trace"))
+        .collect::<Vec<_>>();
+    assert!(
+        trace.iter().filter(|&&seen| seen == point).count() >= occurrence,
+        "invalid SQL crash occurrence"
+    );
+    if program_text == "initialize" {
+        assert_eq!(
+            trace.last(),
+            Some(&FaultPoint::AfterWalDirectorySync),
+            "invalid WAL initialization trace"
+        );
+        phase_4c1_abort_wal_initialization(
+            &path,
+            trace,
+            point,
+            occurrence,
+            "PHASE4C1_ABORT initialize".to_owned(),
+        );
+        panic!("configured WAL initialization crash point was not reached");
+    }
+    let program_index: usize = program_text.parse().expect("invalid SQL crash program");
+    let program = *SQL_CRASH_PROGRAMS
+        .get(program_index)
+        .expect("invalid SQL crash program");
+    assert_commit_trace(&trace);
+    let pager = phase_4c1_aborting_crash_pager(
+        &path,
+        trace,
+        point,
+        occurrence,
+        format!("PHASE4C1_ABORT {}", program.name),
+    );
+    FaultSqlConnection::new(pager).run(program.statements);
+    panic!("configured SQL crash point was not reached");
+}
+
+#[test]
+fn phase_4c1_readers_never_observe_partial_sql_commit() {
+    // Production breaks caught: query Rows refreshing their read snapshot, a
+    // writer publishing page/catalog changes before COMMIT, or writer
+    // acquisition waiting instead of immediately returning Busy.
+    let temp = TempDatabase::new("phase4c1-sql-snapshot-stress");
+    let options = Options::default()
+        .with_checkpoint_wal_bytes(128 * 1024 * 1024)
+        .with_max_wal_bytes(256 * 1024 * 1024);
+    let database = Database::create(temp.path(), options).expect("create stress DB");
+    let writer_database = database.clone();
+    let first_reader_database = database.clone();
+    let second_reader_database = database.clone();
+    let contender_database = database.clone();
+    let fresh_reader_database = database.clone();
+
+    let mut setup = database.connect().expect("connect setup session");
+    for sql in [
+        "CREATE TABLE T (ID INT64, V INT64)",
+        "BEGIN",
+        "INSERT INTO T VALUES (1, 0)",
+        "INSERT INTO T VALUES (2, 0)",
+        "COMMIT",
+    ] {
+        assert_eq!(
+            actual_execute(&mut setup, sql, Parameters::none()),
+            Outcome::Affected(if sql.starts_with("INSERT") { 1 } else { 0 }),
+            "setup statement: {sql}"
+        );
+    }
+    drop(setup);
+
+    for round in 0_i64..64 {
+        let before = vec![
+            vec![Value::Int64(1), Value::Int64(round)],
+            vec![Value::Int64(2), Value::Int64(round)],
+        ];
+        let after = vec![
+            vec![Value::Int64(1), Value::Int64(round + 1)],
+            vec![Value::Int64(2), Value::Int64(round + 1)],
+        ];
+
+        let mut first_reader = first_reader_database
+            .connect()
+            .expect("connect first old reader");
+        let first_select = first_reader
+            .prepare("SELECT ID, V FROM T ORDER BY ID")
+            .expect("prepare first old reader");
+        let mut first_old_rows = first_reader
+            .query(&first_select, Parameters::none())
+            .expect("open first old Rows");
+
+        let mut second_reader = second_reader_database
+            .connect()
+            .expect("connect second old reader");
+        let second_select = second_reader
+            .prepare("SELECT ID, V FROM T ORDER BY ID")
+            .expect("prepare second old reader");
+        let mut second_old_rows = second_reader
+            .query(&second_select, Parameters::none())
+            .expect("open second old Rows");
+
+        let mut writer = writer_database.connect().expect("connect writer");
+        for sql in ["BEGIN", "UPDATE T SET V = V + 1"] {
+            assert_eq!(
+                actual_execute(&mut writer, sql, Parameters::none()),
+                Outcome::Affected(if sql.starts_with("UPDATE") { 2 } else { 0 }),
+                "round {round} writer statement: {sql}"
+            );
+        }
+
+        let mut contender = contender_database.connect().expect("connect contender");
+        assert_eq!(
+            contender
+                .begin_write()
+                .expect_err("second writer must be Busy immediately")
+                .code(),
+            ErrorCode::Busy,
+            "round {round}"
+        );
+
+        assert_eq!(
+            actual_execute(&mut writer, "COMMIT", Parameters::none()),
+            Outcome::Affected(0),
+            "round {round} commit"
+        );
+
+        assert_eq!(
+            collect_public_rows(&mut first_old_rows),
+            before,
+            "round {round}"
+        );
+        assert_eq!(
+            collect_public_rows(&mut second_old_rows),
+            before,
+            "round {round}"
+        );
+        drop(first_old_rows);
+        drop(second_old_rows);
+
+        let mut fresh_reader = fresh_reader_database
+            .connect()
+            .expect("connect fresh reader");
+        assert_eq!(
+            actual_query(
+                &mut fresh_reader,
+                "SELECT ID, V FROM T ORDER BY ID",
+                Parameters::none(),
+            ),
+            Outcome::Rows(after),
+            "round {round} fresh snapshot"
+        );
+    }
+}
+
+fn collect_public_rows(rows: &mut crate::Rows<'_>) -> Vec<Vec<Value>> {
+    let mut collected = Vec::new();
+    loop {
+        match rows.next().expect("read snapshot row") {
+            Some(row) => collected.push(row.values().to_vec()),
+            None => return collected,
+        }
+    }
 }

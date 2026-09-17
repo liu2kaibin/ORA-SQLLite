@@ -30,6 +30,7 @@ use super::{
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
     pager::PageSource,
+    relation::Relation,
     row::{RowCodec, decode_rowid_key, encode_rowid_key},
     validate::validate_tree,
     wal::{Wal, wal_path},
@@ -883,13 +884,13 @@ fn create_concurrency_table(pager: &Pager) -> Result<PageRef> {
     Ok(root)
 }
 
-struct RecordingFaults {
+pub(crate) struct RecordingFaults {
     fail_on: Option<(FaultPoint, usize)>,
     observed: Mutex<Vec<FaultPoint>>,
 }
 
 impl RecordingFaults {
-    fn never() -> Self {
+    pub(crate) fn never() -> Self {
         Self {
             fail_on: None,
             observed: Mutex::new(Vec::new()),
@@ -903,7 +904,7 @@ impl RecordingFaults {
         }
     }
 
-    fn observed(&self) -> Vec<FaultPoint> {
+    pub(crate) fn observed(&self) -> Vec<FaultPoint> {
         self.observed.lock().expect("fault record lock").clone()
     }
 }
@@ -915,6 +916,189 @@ impl FaultInjector for RecordingFaults {
         let occurrence = observed.iter().filter(|&&seen| seen == point).count();
         if self.fail_on == Some((point, occurrence)) {
             return Err(DbError::new(ErrorCode::Io, "injected pager I/O fault"));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn phase_4c1_recording_crash_pager(path: &Path) -> (Pager, Arc<RecordingFaults>) {
+    let faults = Arc::new(RecordingFaults::never());
+    let pager = crash_open(path).with_faults(faults.clone());
+    (pager, faults)
+}
+
+pub(crate) fn phase_4c1_aborting_crash_pager(
+    path: &Path,
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+) -> Pager {
+    crash_open(path).with_faults(Arc::new(Phase4c1AbortAt {
+        trace,
+        point,
+        occurrence,
+        marker,
+        observed: Mutex::new(Vec::new()),
+    }))
+}
+
+pub(crate) fn phase_4c1_exact_crash_child_command(child_test: &str) -> std::process::Command {
+    let executable = std::env::current_exe().expect("find test executable");
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "ulimit -c 0 && exec \"$@\"", "ora-sqllite-crash"]);
+        command.arg(executable);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new(executable);
+    command.args(["--exact", child_test, "--ignored", "--nocapture"]);
+    command
+}
+
+pub(crate) fn phase_4c1_copy_crash_pair(source: &Path) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-sql-crash-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(source, temp.path()).expect("copy SQL crash main file");
+    fs::copy(wal_path(source), wal_path(temp.path())).expect("copy SQL crash WAL");
+    assert_eq!(crash_pair_bytes(temp.path()), crash_pair_bytes(source));
+    temp
+}
+
+pub(crate) fn phase_4c1_main_only_crash_fixture() -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-main-only-fixture");
+    let file = DatabaseFile::create(temp.path(), 4096, [0x4c; 16], DEFAULT_MAX_DATABASE_BYTES)
+        .expect("create initialized main file without its WAL");
+    drop(file);
+    assert!(temp.path().is_file());
+    assert!(!wal_path(temp.path()).exists());
+    temp
+}
+
+pub(crate) fn phase_4c1_copy_main_only(source: &Path) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-main-only-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(source, temp.path()).expect("copy main-only SQL crash fixture");
+    temp
+}
+
+pub(crate) fn phase_4c1_wal_initialization_trace(path: &Path) -> Vec<FaultPoint> {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)
+            .expect("open main-only fixture");
+    let faults = Arc::new(RecordingFaults::never());
+    let wal = Wal::create_with_faults(path, &file.header(), faults.clone())
+        .expect("trace WAL initialization");
+    drop(wal);
+    drop(file);
+    faults.observed()
+}
+
+pub(crate) fn phase_4c1_abort_wal_initialization(
+    path: &Path,
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+) {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)
+            .expect("open main-only crash fixture");
+    let faults = Arc::new(Phase4c1AbortAt {
+        trace,
+        point,
+        occurrence,
+        marker,
+        observed: Mutex::new(Vec::new()),
+    });
+    let _wal = Wal::create_with_faults(path, &file.header(), faults)
+        .expect("initialize WAL through configured crash point");
+}
+
+pub(crate) fn phase_4c1_recovered_lsn(path: &Path) -> Lsn {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadOnly, DEFAULT_MAX_DATABASE_BYTES)
+            .expect("open SQL crash main file without mutation");
+    let header = file.header();
+    let mut wal =
+        Wal::open(path, &header, OpenMode::ReadOnly).expect("open SQL crash WAL without mutation");
+    wal.recover(&header, OpenMode::ReadOnly)
+        .expect("scan SQL crash WAL with production recovery acceptance")
+        .latest_lsn
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c1SqlStorageState {
+    pub(crate) lsn: Lsn,
+    pub(crate) catalog_records: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) next_rowid: Option<u64>,
+    pub(crate) rows: Vec<(u64, Vec<Value>)>,
+}
+
+pub(crate) fn phase_4c1_sql_storage_state(path: &Path) -> Phase4c1SqlStorageState {
+    let pager = crash_open(path);
+    let mut snapshot = pager.begin_read().expect("open SQL recovery snapshot");
+    let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).expect("open recovered catalog");
+    catalog
+        .validate_deep(&mut snapshot)
+        .expect("deep-validate recovered catalog and user trees");
+    let catalog_records = snapshot
+        .catalog_tree(TreeKind::Table)
+        .expect("read recovered catalog tree")
+        .map_or_else(BTreeMap::new, |tree| {
+            collect_all(&tree, &mut snapshot)
+                .expect("scan recovered catalog records")
+                .into_iter()
+                .collect()
+        });
+    let table = catalog
+        .find_table_by_name(&CatalogName::new("T").expect("valid recovery table name"))
+        .cloned();
+    let next_rowid = table.as_ref().map(|table| table.next_rowid().get());
+    let mut rows = Vec::new();
+    if let Some(table) = table {
+        let relation = Relation::open(&catalog, table.id()).expect("open recovered T relation");
+        let mut scan = relation.scan(PHASE_4A_MAX_ROW);
+        while let Some(row) = scan
+            .next_snapshot(&mut snapshot)
+            .expect("scan recovered T row")
+        {
+            rows.push((row.rowid().get(), row.values().to_vec()));
+        }
+    }
+    Phase4c1SqlStorageState {
+        lsn: snapshot.lsn(),
+        catalog_records,
+        next_rowid,
+        rows,
+    }
+}
+
+struct Phase4c1AbortAt {
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+    observed: Mutex<Vec<FaultPoint>>,
+}
+
+impl FaultInjector for Phase4c1AbortAt {
+    fn check(&self, point: FaultPoint) -> Result<()> {
+        let mut observed = self.observed.lock().expect("SQL crash trace lock");
+        assert_eq!(
+            self.trace.get(observed.len()),
+            Some(&point),
+            "SQL crash child diverged from successful trace"
+        );
+        observed.push(point);
+        let occurrence = observed.iter().filter(|&&seen| seen == point).count();
+        if (point, occurrence) == (self.point, self.occurrence) {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "{} {point:?} {occurrence}", self.marker).unwrap();
+            stderr.flush().unwrap();
+            std::process::abort();
         }
         Ok(())
     }
@@ -3432,7 +3616,7 @@ fn crash_trace(fixture: &TempDatabase, mode: &str) -> (Vec<FaultPoint>, CrashSta
     (faults.observed(), pre, post)
 }
 
-fn assert_commit_trace(trace: &[FaultPoint]) {
+pub(crate) fn assert_commit_trace(trace: &[FaultPoint]) {
     let record_points = [
         FaultPoint::BeforeWalRecordWrite,
         FaultPoint::AfterWalRecordHeaderPrefixWrite,
