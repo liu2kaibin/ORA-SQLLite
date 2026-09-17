@@ -2,29 +2,25 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
 };
 
 use crate::{
     Connection, DataType, Database, Decimal, ErrorCode, Options, ParameterValue, Parameters,
     Statement, Value,
     fault::FaultPoint,
-    sql::{SqlLimits, bind_sql, plan::PlanKind},
+    sql::SqlLimits,
     storage::{
-        Pager, WriteBatch,
+        Pager,
         test_support::{
-            Phase4c1SqlStorageState, TempDatabase, assert_commit_trace,
+            Phase4c1CrashPathKind, Phase4c1SqlStorageState, TempDatabase, assert_commit_trace,
             phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
             phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
             phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
             phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
-            phase_4c1_wal_initialization_trace,
+            phase_4c1_validate_crash_path, phase_4c1_wal_initialization_trace,
         },
     },
-};
-
-use super::{
-    execute_validated_write_plan, validate_control_execution, validate_write_before_writer,
-    validate_write_execution,
 };
 
 const EDGE_INTS: &[i64] = &[i64::MIN, -1, 0, 1, i64::MAX];
@@ -1405,7 +1401,7 @@ fn run_sql_child_at_fault(fault: SqlCommitFault) -> Vec<SqlCrashOutcome> {
             let pre = phase_4c1_sql_storage_state(fixture.path());
             let trace_copy = phase_4c1_copy_crash_pair(fixture.path());
             let (pager, faults) = phase_4c1_recording_crash_pager(trace_copy.path());
-            FaultSqlConnection::new(pager).run(program.statements);
+            run_sql_crash_program(pager, program.statements);
             let trace = faults.observed();
             assert_commit_trace(&trace);
             drop(faults);
@@ -1551,111 +1547,21 @@ fn sql_crash_fixture(program_index: usize) -> TempDatabase {
     temp
 }
 
-struct FaultSqlConnection {
-    pager: Pager,
-    batch: Option<WriteBatch>,
-}
-
-impl FaultSqlConnection {
-    fn new(pager: Pager) -> Self {
-        Self { pager, batch: None }
+fn run_sql_crash_program(pager: Pager, statements: &[&str]) {
+    let mut connection = Connection::from_test_pager(pager);
+    for &sql in statements {
+        let statement = connection
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("prepare crash SQL {sql:?}: {error}"));
+        connection
+            .execute(&statement, Parameters::none())
+            .unwrap_or_else(|error| panic!("execute crash SQL {sql:?}: {error}"));
     }
-
-    fn run(mut self, statements: &[&str]) {
-        for &sql in statements {
-            self.execute(sql)
-                .unwrap_or_else(|error| panic!("execute crash SQL {sql:?}: {error}"));
-        }
-        assert!(
-            self.batch.is_none(),
-            "SQL crash program left a transaction open"
-        );
-    }
-
-    fn prepare(&mut self, sql: &str) -> crate::Result<Statement> {
-        let bound = if let Some(batch) = &mut self.batch {
-            let catalog = batch.catalog_reader()?;
-            bind_sql(sql, &SqlLimits::default(), &catalog, batch.database_uuid())?
-        } else {
-            let database_uuid = self.pager.database_uuid()?;
-            let mut snapshot = self.pager.begin_read()?;
-            let catalog = snapshot.catalog_reader()?;
-            bind_sql(sql, &SqlLimits::default(), &catalog, database_uuid)?
-        };
-        Statement::from_bound(bound, sql)
-    }
-
-    fn execute(&mut self, sql: &str) -> crate::Result<()> {
-        let statement = self.prepare(sql)?;
-        if matches!(statement.plan().kind(), PlanKind::Begin) {
-            if self.batch.is_some() {
-                panic!("nested BEGIN in SQL crash program");
-            }
-            let database_uuid = self.pager.database_uuid()?;
-            let mut snapshot = self.pager.begin_read()?;
-            let catalog = snapshot.catalog_reader()?;
-            validate_control_execution(
-                &statement,
-                Parameters::none(),
-                &catalog,
-                database_uuid,
-                Options::default().max_query_memory_bytes(),
-            )?;
-            drop(catalog);
-            drop(snapshot);
-            self.batch = Some(self.pager.try_begin_write()?);
-            return Ok(());
-        }
-        if matches!(statement.plan().kind(), PlanKind::Commit) {
-            let mut batch = self.batch.take().expect("COMMIT requires SQL transaction");
-            let catalog = batch.catalog_reader()?;
-            validate_control_execution(
-                &statement,
-                Parameters::none(),
-                &catalog,
-                batch.database_uuid(),
-                Options::default().max_query_memory_bytes(),
-            )?;
-            drop(catalog);
-            return batch.commit();
-        }
-        if matches!(statement.plan().kind(), PlanKind::Rollback) {
-            panic!("crash programs do not roll back");
-        }
-
-        if let Some(batch) = &mut self.batch {
-            let validated = validate_write_execution(
-                batch,
-                &statement,
-                Parameters::none(),
-                Options::default().max_query_memory_bytes(),
-            )?;
-            execute_validated_write_plan(batch, validated)?;
-            return Ok(());
-        }
-
-        let database_uuid = self.pager.database_uuid()?;
-        let mut snapshot = self.pager.begin_read()?;
-        let catalog = snapshot.catalog_reader()?;
-        validate_write_before_writer(
-            &statement,
-            Parameters::none(),
-            &catalog,
-            database_uuid,
-            Options::default().max_query_memory_bytes(),
-        )?;
-        drop(catalog);
-        drop(snapshot);
-        let mut batch = self.pager.try_begin_write()?;
-        let validated = validate_write_execution(
-            &mut batch,
-            &statement,
-            Parameters::none(),
-            Options::default().max_query_memory_bytes(),
-        )?;
-        execute_validated_write_plan(&mut batch, validated)?;
-        batch.commit()
-    }
+    drop(
+        connection
+            .begin_read()
+            .expect("SQL crash program left a transaction open"),
+    );
 }
 
 fn parse_sql_fault_point(name: &str) -> Option<FaultPoint> {
@@ -1680,9 +1586,10 @@ fn parse_sql_fault_point(name: &str) -> Option<FaultPoint> {
 #[test]
 #[ignore = "only launched with validated parameters by phase_4c1_sql_crash_recovery_matrix"]
 fn phase_4c1_sql_crash_child() {
-    let path_text = std::env::var(SQL_CRASH_PATH_ENV).expect("invalid SQL crash path");
-    let path = std::fs::canonicalize(path_text).expect("invalid SQL crash path");
-    assert!(path.is_file(), "invalid SQL crash path");
+    let path = PathBuf::from(
+        std::env::var_os(SQL_CRASH_PATH_ENV)
+            .expect("invalid SQL crash configuration: missing path"),
+    );
     let program_text = std::env::var(SQL_CRASH_PROGRAM_ENV).expect("invalid SQL crash program");
     let point = parse_sql_fault_point(
         &std::env::var(SQL_CRASH_POINT_ENV).expect("invalid SQL crash point"),
@@ -1709,6 +1616,7 @@ fn phase_4c1_sql_crash_child() {
             Some(&FaultPoint::AfterWalDirectorySync),
             "invalid WAL initialization trace"
         );
+        let path = phase_4c1_validate_crash_path(path, Phase4c1CrashPathKind::Initialization);
         phase_4c1_abort_wal_initialization(
             &path,
             trace,
@@ -1723,6 +1631,7 @@ fn phase_4c1_sql_crash_child() {
         .get(program_index)
         .expect("invalid SQL crash program");
     assert_commit_trace(&trace);
+    let path = phase_4c1_validate_crash_path(path, Phase4c1CrashPathKind::Sql);
     let pager = phase_4c1_aborting_crash_pager(
         &path,
         trace,
@@ -1730,7 +1639,7 @@ fn phase_4c1_sql_crash_child() {
         occurrence,
         format!("PHASE4C1_ABORT {}", program.name),
     );
-    FaultSqlConnection::new(pager).run(program.statements);
+    run_sql_crash_program(pager, program.statements);
     panic!("configured SQL crash point was not reached");
 }
 

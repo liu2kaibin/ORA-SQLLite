@@ -945,17 +945,35 @@ pub(crate) fn phase_4c1_aborting_crash_pager(
 
 pub(crate) fn phase_4c1_exact_crash_child_command(child_test: &str) -> std::process::Command {
     let executable = std::env::current_exe().expect("find test executable");
-    #[cfg(unix)]
-    let mut command = {
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "ulimit -c 0 && exec \"$@\"", "ora-sqllite-crash"]);
-        command.arg(executable);
-        command
-    };
-    #[cfg(not(unix))]
-    let mut command = std::process::Command::new(executable);
+    let mut command = phase_4c1_crash_command_wrapper(&executable);
     command.args(["--exact", child_test, "--ignored", "--nocapture"]);
     command
+}
+
+#[cfg(unix)]
+fn phase_4c1_crash_command_wrapper(executable: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "ulimit -c 0 && exec \"$@\"", "ora-sqllite-crash"]);
+    command.arg(executable);
+    command
+}
+
+#[cfg(not(unix))]
+fn phase_4c1_crash_command_wrapper(executable: &Path) -> std::process::Command {
+    std::process::Command::new(executable)
+}
+
+#[test]
+fn phase_4c1_exact_child_command_retains_the_libtest_argument_contract() {
+    let child_test = "storage::test_support::phase_4c1_argument_contract_child";
+    let command = phase_4c1_exact_crash_child_command(child_test);
+    let arguments = command.get_args().collect::<Vec<_>>();
+    let expected = ["--exact", child_test, "--ignored", "--nocapture"];
+    assert_eq!(
+        &arguments[arguments.len() - expected.len()..],
+        expected.map(std::ffi::OsStr::new),
+        "platform wrapper must forward the exact ignored child test"
+    );
 }
 
 pub(crate) fn phase_4c1_copy_crash_pair(source: &Path) -> TempDatabase {
@@ -982,6 +1000,195 @@ pub(crate) fn phase_4c1_copy_main_only(source: &Path) -> TempDatabase {
     assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
     fs::copy(source, temp.path()).expect("copy main-only SQL crash fixture");
     temp
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Phase4c1CrashPathKind {
+    Initialization,
+    Sql,
+}
+
+pub(crate) fn phase_4c1_validate_crash_path(path: PathBuf, kind: Phase4c1CrashPathKind) -> PathBuf {
+    assert!(
+        path.is_absolute(),
+        "invalid SQL crash configuration: relative path"
+    );
+    assert!(
+        !path.components().any(|component| matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )),
+        "invalid SQL crash configuration: noncanonical path components"
+    );
+    let canonical = fs::canonicalize(&path).expect("invalid SQL crash configuration: path");
+    assert!(
+        canonical.as_os_str() == path.as_os_str(),
+        "invalid SQL crash configuration: noncanonical path"
+    );
+    let canonical_temp =
+        fs::canonicalize(std::env::temp_dir()).expect("canonicalize system temp directory");
+    assert_eq!(
+        path.parent(),
+        Some(canonical_temp.as_path()),
+        "invalid SQL crash configuration: path outside temp directory"
+    );
+    assert!(
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(is_phase4c1_case_file_name),
+        "invalid SQL crash configuration: non-case path"
+    );
+    let wal = wal_path(&path);
+    match kind {
+        Phase4c1CrashPathKind::Initialization => {
+            assert!(
+                path.is_file() && !wal.exists(),
+                "invalid SQL crash configuration: initialization requires main only"
+            );
+            drop(
+                DatabaseFile::open_for_recovery(
+                    &path,
+                    OpenMode::ReadOnly,
+                    DEFAULT_MAX_DATABASE_BYTES,
+                )
+                .expect("invalid SQL crash configuration: unreadable main file"),
+            );
+        }
+        Phase4c1CrashPathKind::Sql => {
+            assert!(
+                path.is_file() && wal.is_file(),
+                "invalid SQL crash configuration: incomplete database/WAL pair"
+            );
+            let pager = Pager::open(&path, OpenMode::ReadOnly, PagerConfig::test_default(4096))
+                .expect("invalid SQL crash configuration: unreadable database/WAL pair");
+            let mut snapshot = pager
+                .begin_read()
+                .expect("invalid SQL crash configuration: unreadable snapshot");
+            let catalog = snapshot
+                .catalog_reader()
+                .expect("invalid SQL crash configuration: unreadable catalog");
+            catalog
+                .validate_deep(&mut snapshot)
+                .expect("invalid SQL crash configuration: invalid catalog or user tree");
+        }
+    }
+    path
+}
+
+fn is_phase4c1_case_file_name(name: &str) -> bool {
+    let Some(name) = name
+        .strip_prefix("ora-sqllite-")
+        .and_then(|name| name.strip_suffix(".db"))
+    else {
+        return false;
+    };
+    let Some((process_id, name)) = name.split_once("-phase4c1-") else {
+        return false;
+    };
+    let Some((label, sequence)) = name.rsplit_once("-case-") else {
+        return false;
+    };
+    !process_id.is_empty()
+        && process_id.bytes().all(|byte| byte.is_ascii_digit())
+        && !label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[test]
+fn phase_4c1_crash_path_validation_accepts_only_owned_case_files_without_writing() {
+    let sql_fixture = phase4a_fixture("bootstrap");
+    let sql_case = phase_4c1_copy_crash_pair(sql_fixture.path());
+    let sql_path = fs::canonicalize(sql_case.path()).unwrap();
+    let sql_before = crash_pair_bytes(&sql_path);
+    assert_eq!(
+        phase_4c1_validate_crash_path(sql_path.clone(), Phase4c1CrashPathKind::Sql),
+        sql_path
+    );
+    assert_eq!(crash_pair_bytes(sql_case.path()), sql_before);
+
+    let init_fixture = phase_4c1_main_only_crash_fixture();
+    let init_case = phase_4c1_copy_main_only(init_fixture.path());
+    let init_path = fs::canonicalize(init_case.path()).unwrap();
+    let init_before = fs::read(&init_path).unwrap();
+    assert_eq!(
+        phase_4c1_validate_crash_path(init_path.clone(), Phase4c1CrashPathKind::Initialization,),
+        init_path
+    );
+    assert_eq!(fs::read(init_case.path()).unwrap(), init_before);
+    assert!(!wal_path(init_case.path()).exists());
+}
+
+#[test]
+fn phase_4c1_crash_path_validation_rejects_unsafe_paths_without_writing() {
+    let fixture = phase4a_fixture("bootstrap");
+    let case = phase_4c1_copy_crash_pair(fixture.path());
+    let canonical = fs::canonicalize(case.path()).unwrap();
+    let before = crash_pair_bytes(&canonical);
+
+    let relative = PathBuf::from(canonical.file_name().unwrap());
+    let guard_directory = canonical.with_extension("path-guard-directory");
+    fs::create_dir(&guard_directory).expect("create exact path-guard directory");
+    #[cfg(windows)]
+    let noncanonical = std::env::temp_dir().join(canonical.file_name().unwrap());
+    #[cfg(not(windows))]
+    let noncanonical = guard_directory
+        .join("..")
+        .join(canonical.file_name().unwrap());
+    for (case_name, path) in [
+        ("relative", relative),
+        ("noncanonical", noncanonical),
+        ("wrong-name", fs::canonicalize(fixture.path()).unwrap()),
+    ] {
+        let rejected = std::panic::catch_unwind(|| {
+            phase_4c1_validate_crash_path(path, Phase4c1CrashPathKind::Sql)
+        });
+        assert!(
+            rejected.is_err(),
+            "unsafe {case_name} crash path was accepted"
+        );
+        assert_eq!(crash_pair_bytes(&canonical), before);
+    }
+
+    let nested = guard_directory.join(canonical.file_name().unwrap());
+    fs::copy(&canonical, &nested).expect("copy controlled nested main file");
+    fs::copy(wal_path(&canonical), wal_path(&nested)).expect("copy controlled nested WAL");
+    let nested = fs::canonicalize(nested).unwrap();
+    let nested_before = crash_pair_bytes(&nested);
+    let rejected = std::panic::catch_unwind(|| {
+        phase_4c1_validate_crash_path(nested.clone(), Phase4c1CrashPathKind::Sql)
+    });
+    assert!(rejected.is_err(), "nested temp path was accepted");
+    assert_eq!(crash_pair_bytes(&nested), nested_before);
+    fs::remove_file(wal_path(&nested)).expect("remove exact nested WAL");
+    fs::remove_file(&nested).expect("remove exact nested main file");
+    fs::remove_dir(&guard_directory).expect("remove exact path-guard directory");
+
+    let main_only_fixture = phase_4c1_main_only_crash_fixture();
+    let main_only_case = phase_4c1_copy_main_only(main_only_fixture.path());
+    let main_only_path = fs::canonicalize(main_only_case.path()).unwrap();
+    let main_before = fs::read(&main_only_path).unwrap();
+    let rejected = std::panic::catch_unwind(|| {
+        phase_4c1_validate_crash_path(main_only_path, Phase4c1CrashPathKind::Sql)
+    });
+    assert!(rejected.is_err(), "SQL mode accepted a missing WAL");
+    assert_eq!(fs::read(main_only_case.path()).unwrap(), main_before);
+    assert!(!wal_path(main_only_case.path()).exists());
+
+    let init_case = phase_4c1_copy_crash_pair(fixture.path());
+    let init_path = fs::canonicalize(init_case.path()).unwrap();
+    let init_before = crash_pair_bytes(&init_path);
+    let rejected = std::panic::catch_unwind(|| {
+        phase_4c1_validate_crash_path(init_path, Phase4c1CrashPathKind::Initialization)
+    });
+    assert!(
+        rejected.is_err(),
+        "initialization mode accepted an existing WAL"
+    );
+    assert_eq!(crash_pair_bytes(init_case.path()), init_before);
 }
 
 pub(crate) fn phase_4c1_wal_initialization_trace(path: &Path) -> Vec<FaultPoint> {

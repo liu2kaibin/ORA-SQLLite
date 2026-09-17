@@ -56,6 +56,15 @@ impl Connection {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_pager(pager: Pager) -> Self {
+        Self::new(
+            pager,
+            SqlLimits::default(),
+            crate::Options::default().max_query_memory_bytes(),
+        )
+    }
+
     /// Prepares one SQL statement against the connection's current catalog view.
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
         if self.state_kind() == ConnectionStateKind::SqlWrite {
