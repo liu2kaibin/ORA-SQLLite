@@ -10,6 +10,8 @@ mod params;
 mod query;
 mod scan;
 mod sort;
+#[cfg(test)]
+mod test_support;
 
 pub(crate) use aggregate::Aggregate;
 pub(crate) use distinct::Distinct;
