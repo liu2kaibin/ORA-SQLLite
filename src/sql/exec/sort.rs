@@ -79,7 +79,7 @@ impl Sort {
 
         let order = &self.order;
         let mut comparison_error = None;
-        self.rows.sort_by(|left, right| {
+        self.rows.sort_unstable_by(|left, right| {
             if comparison_error.is_some() {
                 return Ordering::Equal;
             }
@@ -290,6 +290,45 @@ mod tests {
                 assert!(rows.next().unwrap().is_none());
             } else {
                 assert_eq!(rows.next().unwrap_err().code(), ErrorCode::ResourceLimit);
+            }
+        }
+    }
+
+    #[test]
+    fn multi_row_ties_are_deterministic_at_the_exact_sort_memory_boundary() {
+        // Characterization coverage: the exact budget must retain all four
+        // rows, and equal ID keys must preserve input order through the
+        // explicit input-ordinal tie-breaker.
+        let input = [(2, "FIRST"), (1, "LOW"), (2, "SECOND"), (3, "HIGH")];
+        let value_bytes = std::mem::size_of::<Value>() as u64;
+        let entry_bytes = 64 + std::mem::size_of::<super::ProjectedRow>() as u64;
+        let mut retained = 32 + 32;
+        let mut exact = retained;
+        for (_, name) in input {
+            let input_bytes = 32 + 4 * value_bytes + name.len() as u64;
+            let output_bytes = 32 + value_bytes + name.len() as u64;
+            let order_key_bytes = 32 + value_bytes;
+            let projected_bytes = output_bytes + order_key_bytes;
+            exact = exact.max(retained + input_bytes + projected_bytes);
+            retained += projected_bytes + entry_bytes;
+            exact = exact.max(retained);
+        }
+
+        for (limit, accepted) in [(exact - 1, false), (exact, true)] {
+            let fixture = fixture(
+                &input,
+                Options::default().with_max_query_memory_bytes(limit),
+            );
+            let result = values(&fixture, "SELECT NAME FROM USERS ORDER BY ID DESC");
+            if accepted {
+                assert_eq!(
+                    result.unwrap(),
+                    ["HIGH", "FIRST", "SECOND", "LOW"]
+                        .map(|name| vec![Value::Text(name.into())])
+                        .to_vec()
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code(), ErrorCode::ResourceLimit);
             }
         }
     }
