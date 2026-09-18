@@ -303,7 +303,7 @@ impl TableWrite {
 
     pub(crate) fn insert(&mut self, batch: &mut WriteBatch, values: &[Value]) -> Result<RowId> {
         let bytes = RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let catalog_checkpoint = self.catalog.checkpoint();
         let rows_root = self.rows.root();
         let result = (|| {
@@ -312,9 +312,13 @@ impl TableWrite {
             Ok(rowid)
         })();
         match result {
-            Ok(rowid) => Ok(rowid),
+            Ok(rowid) => {
+                batch.finish_mutation_scope(checkpoint)?;
+                Ok(rowid)
+            }
             Err(error) => {
-                self.catalog.restore(batch, checkpoint, catalog_checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
+                self.catalog.restore(catalog_checkpoint);
                 self.rows = BTree::from_root(TreeKind::Table, rows_root);
                 Err(error)
             }
@@ -328,7 +332,7 @@ impl TableWrite {
         values: &[Value],
     ) -> Result<()> {
         let bytes = RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let catalog_checkpoint = self.catalog.checkpoint();
         let rows_root = self.rows.root();
         let key = encode_rowid_key(rowid);
@@ -342,9 +346,10 @@ impl TableWrite {
             self.rows.insert(batch, &key, &bytes)
         })();
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => batch.finish_mutation_scope(checkpoint),
             Err(error) => {
-                self.catalog.restore(batch, checkpoint, catalog_checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
+                self.catalog.restore(catalog_checkpoint);
                 self.rows = BTree::from_root(TreeKind::Table, rows_root);
                 Err(error)
             }
@@ -434,10 +439,16 @@ pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Resul
         catalog.finish(batch)?;
         Ok(table_id)
     })();
-    if result.is_err() {
-        batch.restore_statement(checkpoint);
+    match result {
+        Ok(table_id) => {
+            batch.finish_statement(checkpoint)?;
+            Ok(table_id)
+        }
+        Err(error) => {
+            batch.restore_statement(checkpoint);
+            Err(error)
+        }
     }
-    result
 }
 
 pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result<()> {
@@ -453,10 +464,13 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
         catalog.remove_relation(batch, &relation.table, &relation.columns)?;
         catalog.finish(batch)
     })();
-    if result.is_err() {
-        batch.restore_statement(checkpoint);
+    match result {
+        Ok(()) => batch.finish_statement(checkpoint),
+        Err(error) => {
+            batch.restore_statement(checkpoint);
+            Err(error)
+        }
     }
-    result
 }
 
 #[cfg(test)]

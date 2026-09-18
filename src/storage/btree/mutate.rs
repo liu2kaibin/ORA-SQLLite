@@ -32,15 +32,15 @@ impl BTree {
     ) -> Result<()> {
         validate_key(key)?;
         let old_root = self.root;
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let result = self
             .insert_inner(batch, key, value)
             .and_then(|()| batch.refresh_tree(self.kind, old_root, self.root));
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => batch.finish_mutation_scope(checkpoint),
             Err(error) => {
                 self.root = old_root;
-                batch.restore_mutation(checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
                 Err(error)
             }
         }
@@ -113,7 +113,7 @@ impl BTree {
     ) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
         let old_root = self.root;
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let result = self.delete_inner(batch, key).and_then(|removed| {
             if removed.is_some() {
                 batch.refresh_tree(self.kind, old_root, self.root)?;
@@ -121,10 +121,13 @@ impl BTree {
             Ok(removed)
         });
         match result {
-            Ok(removed) => Ok(removed),
+            Ok(removed) => {
+                batch.finish_mutation_scope(checkpoint)?;
+                Ok(removed)
+            }
             Err(error) => {
                 self.root = old_root;
-                batch.restore_mutation(checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
                 Err(error)
             }
         }

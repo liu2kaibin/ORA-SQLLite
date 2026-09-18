@@ -27,6 +27,14 @@ use crate::{DbError, ErrorCode, Result};
 
 use crate::fault::FaultInjector;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_PAGE_PREIMAGE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
 pub(crate) struct PagerConfig {
     pub(super) page_size: u32,
     pub(super) uuid: [u8; 16],
@@ -417,6 +425,8 @@ impl Pager {
             superseded_roots: HashSet::new(),
             catalog_update_pending: false,
             catalog_validation_required: false,
+            mutation_scopes: Vec::new(),
+            next_mutation_scope: 1,
             rollback_only: false,
             finished: false,
             #[cfg(test)]
@@ -819,6 +829,8 @@ pub(crate) struct WriteBatch {
     // A successful finish binds this batch to catalog validation through commit.
     // Raw low-level batches remain available for deliberate corruption fixtures.
     catalog_validation_required: bool,
+    mutation_scopes: Vec<MutationScopeState>,
+    next_mutation_scope: u64,
     rollback_only: bool,
     finished: bool,
     #[cfg(test)]
@@ -862,8 +874,35 @@ pub(super) struct WriteBatchCheckpoint {
     catalog_validation_required: bool,
 }
 
+pub(super) struct MutationScope {
+    id: u64,
+}
+
+struct MutationScopeState {
+    id: u64,
+    dirty: BTreeMap<PageId, Option<PageFrame>>,
+    new_pages: BTreeMap<PageId, bool>,
+    pending_generations: BTreeMap<PageId, Option<u64>>,
+    pending_releases: BTreeMap<PageId, Option<PageRef>>,
+    candidate_header: Option<Option<DatabaseHeader>>,
+    tracked_trees: Option<Vec<(TreeKind, PageRef)>>,
+    superseded_roots: Option<HashSet<PageRef>>,
+    catalog_update_pending: Option<bool>,
+    catalog_validation_required: Option<bool>,
+}
+
 /// Opaque statement boundary for SQL-layer rollback.
-pub(crate) struct StatementCheckpoint(WriteBatchCheckpoint);
+pub(crate) struct StatementCheckpoint(MutationScope);
+
+#[cfg(test)]
+fn reset_scope_page_preimage_count_for_test() {
+    SCOPE_PAGE_PREIMAGE_COUNT.set(0);
+}
+
+#[cfg(test)]
+fn take_scope_page_preimage_count_for_test() -> usize {
+    SCOPE_PAGE_PREIMAGE_COUNT.replace(0)
+}
 
 #[cfg(test)]
 impl WriteBatchCheckpoint {
@@ -910,6 +949,7 @@ impl WriteBatch {
     pub(super) fn begin_catalog_update(&mut self) -> Result<()> {
         self.require_active()?;
         self.require_catalog_finished()?;
+        self.record_catalog_update_pending_preimage();
         self.catalog_update_pending = true;
         Ok(())
     }
@@ -923,6 +963,8 @@ impl WriteBatch {
             ));
         }
         self.validate_catalog_candidate()?;
+        self.record_catalog_update_pending_preimage();
+        self.record_catalog_validation_required_preimage();
         self.catalog_update_pending = false;
         self.catalog_validation_required = true;
         Ok(())
@@ -980,6 +1022,7 @@ impl WriteBatch {
         validate_feature_bits(candidate)?;
         let mut header = self.current_header();
         header.set_features(candidate)?;
+        self.record_candidate_header_preimage();
         self.candidate_header = Some(header);
         Ok(())
     }
@@ -1004,8 +1047,199 @@ impl WriteBatch {
         })
     }
 
+    pub(super) fn begin_mutation_scope(&mut self) -> Result<MutationScope> {
+        self.require_active()?;
+        let id = self.next_mutation_scope;
+        self.next_mutation_scope = id
+            .checked_add(1)
+            .ok_or_else(|| internal("mutation scope identifier overflow"))?;
+        self.mutation_scopes.push(MutationScopeState {
+            id,
+            dirty: BTreeMap::new(),
+            new_pages: BTreeMap::new(),
+            pending_generations: BTreeMap::new(),
+            pending_releases: BTreeMap::new(),
+            candidate_header: None,
+            tracked_trees: None,
+            superseded_roots: None,
+            catalog_update_pending: None,
+            catalog_validation_required: None,
+        });
+        Ok(MutationScope { id })
+    }
+
+    pub(super) fn finish_mutation_scope(&mut self, scope: MutationScope) -> Result<()> {
+        self.require_scope(scope.id)?;
+        self.mutation_scopes.pop();
+        Ok(())
+    }
+
+    pub(super) fn rollback_mutation_scope(&mut self, scope: MutationScope) -> Result<()> {
+        self.require_scope(scope.id)?;
+        let state = self
+            .mutation_scopes
+            .pop()
+            .ok_or_else(|| internal("mutation scope stack disappeared"))?;
+        for (page_id, previous) in state.dirty {
+            match previous {
+                Some(frame) => {
+                    self.dirty.insert(page_id, frame);
+                }
+                None => {
+                    self.dirty.remove(&page_id);
+                }
+            }
+        }
+        for (page_id, existed) in state.new_pages {
+            if existed {
+                self.new_pages.insert(page_id);
+            } else {
+                self.new_pages.remove(&page_id);
+            }
+        }
+        for (page_id, previous) in state.pending_generations {
+            match previous {
+                Some(generation) => {
+                    self.pending_generations.insert(page_id, generation);
+                }
+                None => {
+                    self.pending_generations.remove(&page_id);
+                }
+            }
+        }
+        for (page_id, previous) in state.pending_releases {
+            match previous {
+                Some(reference) => {
+                    self.pending_releases.insert(page_id, reference);
+                }
+                None => {
+                    self.pending_releases.remove(&page_id);
+                }
+            }
+        }
+        if let Some(previous) = state.candidate_header {
+            self.candidate_header = previous;
+        }
+        if let Some(previous) = state.tracked_trees {
+            self.tracked_trees = previous;
+        }
+        if let Some(previous) = state.superseded_roots {
+            self.superseded_roots = previous;
+        }
+        if let Some(previous) = state.catalog_update_pending {
+            self.catalog_update_pending = previous;
+        }
+        if let Some(previous) = state.catalog_validation_required {
+            self.catalog_validation_required = previous;
+        }
+        Ok(())
+    }
+
+    fn require_scope(&self, id: u64) -> Result<()> {
+        if self.mutation_scopes.last().map(|scope| scope.id) != Some(id) {
+            return Err(internal("mutation scopes must finish in LIFO order"));
+        }
+        Ok(())
+    }
+
+    fn record_dirty_preimage(&mut self, page_id: PageId) -> Result<()> {
+        let missing = self
+            .mutation_scopes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, scope)| (!scope.dirty.contains_key(&page_id)).then_some(index))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if let Some(frame) = self.dirty.get_mut(&page_id) {
+            frame.prepare_for_write()?;
+            let bytes = frame.bytes().to_vec();
+            let page_type = frame.header().page_type();
+            let generation = frame.header().generation();
+            for index in missing {
+                let previous =
+                    PageFrame::decode(bytes.clone(), page_id, Some(page_type), Some(generation))?;
+                #[cfg(test)]
+                SCOPE_PAGE_PREIMAGE_COUNT.set(SCOPE_PAGE_PREIMAGE_COUNT.get().saturating_add(1));
+                self.mutation_scopes[index]
+                    .dirty
+                    .insert(page_id, Some(previous));
+            }
+        } else {
+            for index in missing {
+                self.mutation_scopes[index].dirty.insert(page_id, None);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_new_page_preimage(&mut self, page_id: PageId) {
+        let previous = self.new_pages.contains(&page_id);
+        for scope in &mut self.mutation_scopes {
+            scope.new_pages.entry(page_id).or_insert(previous);
+        }
+    }
+
+    fn record_pending_generation_preimage(&mut self, page_id: PageId) {
+        let previous = self.pending_generations.get(&page_id).copied();
+        for scope in &mut self.mutation_scopes {
+            scope.pending_generations.entry(page_id).or_insert(previous);
+        }
+    }
+
+    fn record_pending_release_preimage(&mut self, page_id: PageId) {
+        let previous = self.pending_releases.get(&page_id).copied();
+        for scope in &mut self.mutation_scopes {
+            scope.pending_releases.entry(page_id).or_insert(previous);
+        }
+    }
+
+    fn record_candidate_header_preimage(&mut self) {
+        let previous = self.candidate_header;
+        for scope in &mut self.mutation_scopes {
+            scope.candidate_header.get_or_insert(previous);
+        }
+    }
+
+    fn record_tracked_trees_preimage(&mut self) {
+        let previous = self.tracked_trees.clone();
+        for scope in &mut self.mutation_scopes {
+            if scope.tracked_trees.is_none() {
+                scope.tracked_trees = Some(previous.clone());
+            }
+        }
+    }
+
+    fn record_superseded_roots_preimage(&mut self) {
+        let previous = self.superseded_roots.clone();
+        for scope in &mut self.mutation_scopes {
+            if scope.superseded_roots.is_none() {
+                scope.superseded_roots = Some(previous.clone());
+            }
+        }
+    }
+
+    fn record_catalog_update_pending_preimage(&mut self) {
+        let previous = self.catalog_update_pending;
+        for scope in &mut self.mutation_scopes {
+            scope.catalog_update_pending.get_or_insert(previous);
+        }
+    }
+
+    fn record_catalog_validation_required_preimage(&mut self) {
+        let previous = self.catalog_validation_required;
+        for scope in &mut self.mutation_scopes {
+            scope.catalog_validation_required.get_or_insert(previous);
+        }
+    }
+
     pub(crate) fn statement_checkpoint(&mut self) -> Result<StatementCheckpoint> {
-        self.checkpoint_mutation().map(StatementCheckpoint)
+        self.begin_mutation_scope().map(StatementCheckpoint)
+    }
+
+    pub(crate) fn finish_statement(&mut self, checkpoint: StatementCheckpoint) -> Result<()> {
+        self.finish_mutation_scope(checkpoint.0)
     }
 
     pub(super) fn restore_mutation(&mut self, checkpoint: WriteBatchCheckpoint) {
@@ -1023,7 +1257,9 @@ impl WriteBatch {
     pub(crate) fn restore_statement(&mut self, checkpoint: StatementCheckpoint) {
         // rollback_only is transaction state, not staged mutation state. Leaving
         // it untouched ensures a fatal error cannot be cleared by restoration.
-        self.restore_mutation(checkpoint.0);
+        if self.rollback_mutation_scope(checkpoint.0).is_err() {
+            self.mark_rollback_only();
+        }
     }
 
     pub(super) fn track_tree(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
@@ -1035,6 +1271,7 @@ impl WriteBatch {
         }
         self.read(root)?;
         if !self.tracked_trees.contains(&(kind, root)) {
+            self.record_tracked_trees_preimage();
             self.tracked_trees.push((kind, root));
         }
         Ok(())
@@ -1064,11 +1301,13 @@ impl WriteBatch {
         root: PageRef,
     ) -> Result<()> {
         if previous_root != root {
+            self.record_tracked_trees_preimage();
             self.tracked_trees
                 .retain(|tracked| *tracked != (kind, previous_root));
         }
         self.track_tree(kind, root)?;
         if previous_root != root {
+            self.record_superseded_roots_preimage();
             self.superseded_roots.insert(previous_root);
             // A root can become current again after a split followed by collapse.
             self.superseded_roots.remove(&root);
@@ -1087,6 +1326,7 @@ impl WriteBatch {
             validate_tree(self, &BTree::from_root(kind, root))?;
             let mut header = self.current_header();
             header.set_catalog_root(root.page_id());
+            self.record_candidate_header_preimage();
             self.candidate_header = Some(header);
         }
         Ok(())
@@ -1115,9 +1355,12 @@ impl WriteBatch {
             ));
         }
         if !self.dirty.contains_key(&reference.page_id()) {
+            self.record_dirty_preimage(reference.page_id())?;
             let handle = self.read_base(reference)?;
             self.dirty
                 .insert(reference.page_id(), copy_clean_frame(handle.as_ref())?);
+        } else {
+            self.record_dirty_preimage(reference.page_id())?;
         }
         let frame = self
             .dirty
@@ -1151,6 +1394,9 @@ impl WriteBatch {
             self.pager.inner.max_database_bytes,
         )?;
         let frame = PageFrame::new_zeroed(page_type, reference, self.base_header.page_size())?;
+        self.record_dirty_preimage(reference.page_id())?;
+        self.record_new_page_preimage(reference.page_id());
+        self.record_pending_generation_preimage(reference.page_id());
         self.dirty.insert(reference.page_id(), frame);
         self.new_pages.insert(reference.page_id());
         self.pending_generations
@@ -1225,6 +1471,7 @@ impl WriteBatch {
 
         let mut header = self.current_header();
         header.set_catalog_root(root.page_id());
+        self.record_candidate_header_preimage();
         self.candidate_header = Some(header);
         Ok(())
     }
@@ -1235,6 +1482,7 @@ impl WriteBatch {
             return Err(corruption("page is already pending release in this batch"));
         }
         self.validate_releasable(reference)?;
+        self.record_pending_release_preimage(reference.page_id());
         self.pending_releases.insert(reference.page_id(), reference);
         Ok(())
     }
@@ -1300,11 +1548,14 @@ impl WriteBatch {
                 self.base_header.page_size(),
             )?;
             SlottedPage::open(&mut tombstone, LEAF_METADATA_END)?;
+            self.record_dirty_preimage(reference.page_id())?;
             self.dirty.insert(reference.page_id(), tombstone);
         } else {
             self.read_base(reference)?;
+            self.record_dirty_preimage(reference.page_id())?;
             self.dirty.remove(&reference.page_id());
         }
+        self.record_pending_release_preimage(reference.page_id());
         self.pending_releases.insert(reference.page_id(), reference);
         Ok(())
     }
@@ -1319,10 +1570,12 @@ impl WriteBatch {
                 PageRef::new(*page_id, frame.header().generation())
             })
             .collect::<Result<Vec<_>>>()?;
-        let checkpoint = self.checkpoint_mutation()?;
+        let checkpoint = self.begin_mutation_scope()?;
         let result = (|| {
+            self.record_tracked_trees_preimage();
             self.tracked_trees
                 .retain(|(_, reference)| !pages.contains(&reference.page_id()));
+            self.record_superseded_roots_preimage();
             self.superseded_roots
                 .retain(|reference| !pages.contains(&reference.page_id()));
             for reference in references {
@@ -1341,10 +1594,13 @@ impl WriteBatch {
             }
             Ok(())
         })();
-        if result.is_err() {
-            self.restore_mutation(checkpoint);
+        match result {
+            Ok(()) => self.finish_mutation_scope(checkpoint),
+            Err(error) => {
+                self.rollback_mutation_scope(checkpoint)?;
+                Err(error)
+            }
         }
-        result
     }
 
     fn validate_releasable(&mut self, reference: PageRef) -> Result<()> {
@@ -1726,6 +1982,8 @@ impl WriteBatch {
                 .checked_add(1)
                 .ok_or_else(|| corruption("test-only reused page counter overflow"))?;
         }
+        self.record_dirty_preimage(page_id)?;
+        self.record_pending_generation_preimage(page_id);
         self.dirty.insert(page_id, frame);
         self.pending_generations.insert(page_id, generation);
         Ok(reference)
@@ -1747,8 +2005,11 @@ impl WriteBatch {
 
     fn freelist_frame(&mut self, page_id: PageId) -> Result<&mut PageFrame> {
         if !self.dirty.contains_key(&page_id) {
+            self.record_dirty_preimage(page_id)?;
             let frame = self.read_frame_by_id(page_id)?;
             self.dirty.insert(page_id, frame);
+        } else {
+            self.record_dirty_preimage(page_id)?;
         }
         let frame = self
             .dirty
@@ -1785,6 +2046,7 @@ impl WriteBatch {
     fn stage_freelist_root(&mut self, root: PageId) {
         let mut header = self.current_header();
         header.set_freelist_root(root);
+        self.record_candidate_header_preimage();
         self.candidate_header = Some(header);
     }
 
@@ -1862,6 +2124,7 @@ impl WriteBatch {
         self.superseded_roots.clear();
         self.catalog_update_pending = false;
         self.catalog_validation_required = false;
+        self.mutation_scopes.clear();
         self.rollback_only = false;
         self.finished = true;
         self._writer.release();
@@ -1991,7 +2254,10 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{CommitFailure, PageSource, Pager, PagerConfig, WriteBatch, copy_clean_frame};
+    use super::{
+        CommitFailure, PageSource, Pager, PagerConfig, WriteBatch, copy_clean_frame,
+        reset_scope_page_preimage_count_for_test, take_scope_page_preimage_count_for_test,
+    };
     use crate::{
         DbError, ErrorCode, Result,
         fault::{FaultInjector, FaultPoint},
@@ -2147,6 +2413,74 @@ mod tests {
         assert!(batch.rollback_only);
         assert!(batch.read(baseline_page).is_err());
         assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
+    }
+
+    #[test]
+    fn scoped_checkpoint_copies_only_the_one_distinct_page_it_rolls_back() {
+        // Production break caught: eagerly cloning every pre-existing dirty page
+        // makes repeated SQL statements quadratic in the transaction size.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let pages = (0..32)
+            .map(|_| batch.allocate(PageType::Catalog).unwrap())
+            .collect::<Vec<_>>();
+        let target = pages[17];
+        let original = batch.read(target).unwrap().bytes()[100];
+
+        reset_scope_page_preimage_count_for_test();
+        let scope = batch.begin_mutation_scope().unwrap();
+        batch.modify(target).unwrap().bytes_mut()[100] = 0x5a;
+        batch.modify(target).unwrap().bytes_mut()[100] = 0xa5;
+        batch.rollback_mutation_scope(scope).unwrap();
+
+        assert_eq!(take_scope_page_preimage_count_for_test(), 1);
+        assert_eq!(batch.read(target).unwrap().bytes()[100], original);
+    }
+
+    #[test]
+    fn nested_scopes_keep_successful_inner_work_until_the_outer_scope_rolls_back() {
+        // Production breaks caught: discarding a successful child's undo state,
+        // or letting a failed child erase its parent's earlier mutation.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let first = batch.allocate(PageType::Catalog).unwrap();
+        let second = batch.allocate(PageType::Catalog).unwrap();
+        let first_original = batch.read(first).unwrap().bytes()[100];
+        let second_original = batch.read(second).unwrap().bytes()[100];
+
+        let outer = batch.begin_mutation_scope().unwrap();
+        batch.modify(first).unwrap().bytes_mut()[100] = 0x11;
+        let successful = batch.begin_mutation_scope().unwrap();
+        batch.modify(first).unwrap().bytes_mut()[100] = 0x22;
+        batch.modify(second).unwrap().bytes_mut()[100] = 0x33;
+        batch.finish_mutation_scope(successful).unwrap();
+        let failed = batch.begin_mutation_scope().unwrap();
+        batch.modify(first).unwrap().bytes_mut()[100] = 0x44;
+        batch.rollback_mutation_scope(failed).unwrap();
+
+        assert_eq!(batch.read(first).unwrap().bytes()[100], 0x22);
+        assert_eq!(batch.read(second).unwrap().bytes()[100], 0x33);
+        batch.rollback_mutation_scope(outer).unwrap();
+        assert_eq!(batch.read(first).unwrap().bytes()[100], first_original);
+        assert_eq!(batch.read(second).unwrap().bytes()[100], second_original);
+    }
+
+    #[test]
+    fn scoped_checkpoint_restores_all_touched_batch_metadata() {
+        // Production break caught: restoring page bytes but leaking an allocation,
+        // generation, tracked root, header feature, or catalog-update gate.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let expected = batch.checkpoint_mutation().unwrap();
+
+        let scope = batch.begin_mutation_scope().unwrap();
+        let root = batch.allocate(PageType::TableLeaf).unwrap();
+        batch.track_tree(TreeKind::Table, root).unwrap();
+        batch.enable_feature_bits(CATALOG_V1).unwrap();
+        batch.begin_catalog_update().unwrap();
+        batch.rollback_mutation_scope(scope).unwrap();
+
+        expected.assert_matches_batch_for_test(&batch);
     }
 
     #[test]

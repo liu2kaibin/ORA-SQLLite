@@ -181,7 +181,10 @@ pub(super) fn execute_write_batch(
         Err(error) => return Err(classify_explicit_transaction_error(batch, error)),
     };
     match execute_validated_write_plan(batch, validated) {
-        Ok(result) => Ok(result),
+        Ok(result) => batch
+            .finish_statement(checkpoint)
+            .map(|()| result)
+            .map_err(|error| classify_explicit_transaction_error(batch, error)),
         Err(error) => {
             batch.restore_statement(checkpoint);
             Err(classify_explicit_transaction_error(batch, error))

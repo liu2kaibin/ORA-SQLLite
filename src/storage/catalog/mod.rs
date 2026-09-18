@@ -11,7 +11,7 @@ use super::{
     PageRef,
     btree::{BTree, TreeKind},
     features::{CATALOG_V1, validate_feature_bits},
-    pager::{PageSource, ReadSnapshot, WriteBatch, WriteBatchCheckpoint},
+    pager::{PageSource, ReadSnapshot, WriteBatch},
     validate::{
         ValidationReport, validate_freelist, validate_table_roots, validate_table_trees,
         validate_tree,
@@ -399,7 +399,7 @@ pub(super) struct CatalogWriterCheckpoint {
 
 impl CatalogWriter {
     pub(super) fn bootstrap(batch: &mut WriteBatch) -> Result<Self> {
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let result = (|| {
             // One outstanding writer per batch prevents a later open from finishing
             // an older root. The checkpoint also restores this gate on every error.
@@ -427,10 +427,16 @@ impl CatalogWriter {
                 Ok(Self { tree, dirty: false })
             }
         })();
-        if result.is_err() {
-            batch.restore_mutation(checkpoint);
+        match result {
+            Ok(writer) => {
+                batch.finish_mutation_scope(checkpoint)?;
+                Ok(writer)
+            }
+            Err(error) => {
+                batch.rollback_mutation_scope(checkpoint)?;
+                Err(error)
+            }
         }
-        result
     }
 
     pub(super) const fn checkpoint(&self) -> CatalogWriterCheckpoint {
@@ -441,13 +447,7 @@ impl CatalogWriter {
     }
 
     /// Restore the batch image and the writer's separately owned state together.
-    pub(super) fn restore(
-        &mut self,
-        batch: &mut WriteBatch,
-        checkpoint: WriteBatchCheckpoint,
-        writer_checkpoint: CatalogWriterCheckpoint,
-    ) {
-        batch.restore_mutation(checkpoint);
+    pub(super) fn restore(&mut self, writer_checkpoint: CatalogWriterCheckpoint) {
         self.tree = BTree::from_root(TreeKind::Table, writer_checkpoint.root);
         self.dirty = writer_checkpoint.dirty;
     }
@@ -461,16 +461,19 @@ impl CatalogWriter {
         batch: &mut WriteBatch,
         mutation: impl FnOnce(&mut BTree, &mut WriteBatch) -> Result<T>,
     ) -> Result<T> {
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let writer_checkpoint = self.checkpoint();
         match mutation(&mut self.tree, batch) {
             Ok(value) => {
                 // Bootstrap owns the pending gate until finish, even on clean opens.
                 self.dirty = true;
+                batch.finish_mutation_scope(checkpoint)?;
                 Ok(value)
             }
             Err(error) => {
-                self.restore(batch, checkpoint, writer_checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
+                self.tree = BTree::from_root(TreeKind::Table, writer_checkpoint.root);
+                self.dirty = writer_checkpoint.dirty;
                 Err(error)
             }
         }
