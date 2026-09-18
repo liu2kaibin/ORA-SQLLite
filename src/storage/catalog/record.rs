@@ -83,6 +83,18 @@ pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<Catalo
         RecordKind::ColumnDefinition => {
             decode_column_definition_payload(payload).map(CatalogRecord::ColumnDefinition)
         }
+        RecordKind::IndexName
+        | RecordKind::IndexDefinition
+        | RecordKind::TableIndex
+        | RecordKind::IndexColumn
+        | RecordKind::ConstraintName
+        | RecordKind::ConstraintDefinition
+        | RecordKind::TableConstraint
+        | RecordKind::ConstraintColumn
+        | RecordKind::ReferencedBy => Err(DbError::new(
+            ErrorCode::Unsupported,
+            "index and constraint catalog records are not implemented",
+        )),
     }
 }
 

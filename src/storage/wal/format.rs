@@ -424,7 +424,11 @@ mod tests {
     use super::*;
     use crate::{
         ErrorCode,
-        storage::{Lsn, PageId, features::CATALOG_V1, header::DatabaseHeader},
+        storage::{
+            Lsn, PageId,
+            features::{CATALOG_V1, INDEX_CONSTRAINT_V1},
+            header::DatabaseHeader,
+        },
     };
 
     const UUID: [u8; 16] = [
@@ -640,21 +644,23 @@ mod tests {
     }
 
     #[test]
-    fn catalog_v1_feature_round_trips_through_header_and_wal() {
+    fn catalog_features_round_trip_through_header_and_wal() {
         let mut header = DatabaseHeader::new(4096, [7; 16]).unwrap();
-        header.set_features(CATALOG_V1).unwrap();
+        header
+            .set_features(CATALOG_V1 | INDEX_CONSTRAINT_V1)
+            .unwrap();
         assert_eq!(
             DatabaseHeader::decode_slot(&header.encode_slot())
                 .unwrap()
                 .features(),
-            CATALOG_V1
+            CATALOG_V1 | INDEX_CONSTRAINT_V1
         );
 
         let state = CommitState {
             page_count: 2,
             catalog_root: PageId(1),
             freelist_root: PageId(0),
-            feature_bits: CATALOG_V1,
+            feature_bits: CATALOG_V1 | INDEX_CONSTRAINT_V1,
         };
         let encoded = CommitPayload {
             previous_lsn: Lsn(0),
@@ -666,7 +672,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             CommitPayload::decode(&encoded).unwrap().state.feature_bits,
-            CATALOG_V1
+            CATALOG_V1 | INDEX_CONSTRAINT_V1
         );
     }
 

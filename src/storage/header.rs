@@ -314,7 +314,7 @@ fn database_header_rejects_unknown_feature_bits() {
             .set_features(1 << 63)
             .expect_err("unknown feature bit")
             .code(),
-        ErrorCode::Corruption
+        ErrorCode::Unsupported
     );
     assert_eq!(header.features(), 0);
 }

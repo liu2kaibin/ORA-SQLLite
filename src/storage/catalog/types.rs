@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 use crate::{DbError, ErrorCode, Result, storage::PageRef};
 
 const MAX_CATALOG_NAME_BYTES: usize = 1013;
+pub(super) const MAX_GLOBAL_CATALOG_NAME_BYTES: usize = 128;
 pub(crate) const MAX_COLUMNS: u16 = 1000;
 
 macro_rules! nonzero_id {

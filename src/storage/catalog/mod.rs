@@ -92,6 +92,20 @@ impl CatalogImage {
                         record::decode_column_definition(id, &value)?,
                     )?;
                 }
+                DecodedCatalogKey::IndexName(_)
+                | DecodedCatalogKey::IndexDefinition(_)
+                | DecodedCatalogKey::TableIndex { .. }
+                | DecodedCatalogKey::IndexColumn { .. }
+                | DecodedCatalogKey::ConstraintName(_)
+                | DecodedCatalogKey::ConstraintDefinition(_)
+                | DecodedCatalogKey::TableConstraint { .. }
+                | DecodedCatalogKey::ConstraintColumn { .. }
+                | DecodedCatalogKey::ReferencedBy { .. } => {
+                    return Err(DbError::new(
+                        ErrorCode::Unsupported,
+                        "index and constraint catalog records are not implemented",
+                    ));
+                }
             }
         }
         image.meta = meta.ok_or_else(|| corruption("catalog meta record is missing"))?;
