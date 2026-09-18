@@ -9,8 +9,8 @@ use crate::{
 use super::{
     key::RecordKind,
     types::{
-        CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType, ObjectId, RowId,
-        SchemaVersion, TableDef, TableId,
+        CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType, ConstraintId,
+        IndexDef, IndexId, IndexOwnership, ObjectId, RowId, SchemaVersion, TableDef, TableId,
     },
 };
 
@@ -66,6 +66,42 @@ pub(super) fn encode_column_definition(column: &ColumnDef) -> Vec<u8> {
     encode_envelope(RecordKind::ColumnDefinition, payload.into_bytes())
 }
 
+pub(super) fn encode_index_name_mapping(id: IndexId) -> Vec<u8> {
+    encode_mapping(RecordKind::IndexName, id.get())
+}
+
+pub(super) fn encode_table_index_mapping(id: IndexId) -> Vec<u8> {
+    encode_mapping(RecordKind::TableIndex, id.get())
+}
+
+pub(super) fn encode_index_column_mapping(id: ColumnId) -> Vec<u8> {
+    encode_mapping(RecordKind::IndexColumn, id.get())
+}
+
+pub(super) fn encode_index_definition(index: &IndexDef) -> Vec<u8> {
+    let mut payload = Encoder::new();
+    payload.put_u64(index.id().get());
+    payload.put_u64(index.table_id().get());
+    payload.put_u64(index.root().page_id().0);
+    payload.put_u64(index.root().generation());
+    payload.put_u16(index.column_count());
+    payload.put_u8(u8::from(index.unique()));
+    let owner_id = match index.ownership() {
+        IndexOwnership::Explicit => {
+            payload.put_u8(0);
+            0
+        }
+        IndexOwnership::Constraint(id) => {
+            payload.put_u8(1);
+            id.get()
+        }
+    };
+    payload.put_u16(0);
+    payload.put_u64(owner_id);
+    put_name(&mut payload, index.name());
+    encode_envelope(RecordKind::IndexDefinition, payload.into_bytes())
+}
+
 pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<CatalogRecord> {
     let payload = decode_envelope(expected, bytes)?;
     match expected {
@@ -83,11 +119,15 @@ pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<Catalo
         RecordKind::ColumnDefinition => {
             decode_column_definition_payload(payload).map(CatalogRecord::ColumnDefinition)
         }
-        RecordKind::IndexName
-        | RecordKind::IndexDefinition
-        | RecordKind::TableIndex
-        | RecordKind::IndexColumn
-        | RecordKind::ConstraintName
+        RecordKind::IndexName => decode_index_id_mapping(payload).map(CatalogRecord::IndexName),
+        RecordKind::IndexDefinition => {
+            decode_index_definition_payload(payload).map(CatalogRecord::IndexDefinition)
+        }
+        RecordKind::TableIndex => decode_index_id_mapping(payload).map(CatalogRecord::TableIndex),
+        RecordKind::IndexColumn => {
+            decode_column_id_mapping(payload).map(CatalogRecord::IndexColumn)
+        }
+        RecordKind::ConstraintName
         | RecordKind::ConstraintDefinition
         | RecordKind::TableConstraint
         | RecordKind::ConstraintColumn
@@ -103,6 +143,45 @@ pub(super) fn decode_catalog_meta(bytes: &[u8]) -> Result<CatalogMeta> {
         CatalogRecord::CatalogMeta(meta) => Ok(meta),
         _ => Err(corruption(
             "catalog meta decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_index_name_mapping(bytes: &[u8]) -> Result<IndexId> {
+    match decode_record(RecordKind::IndexName, bytes)? {
+        CatalogRecord::IndexName(id) => Ok(id),
+        _ => Err(corruption(
+            "index name decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_table_index_mapping(bytes: &[u8]) -> Result<IndexId> {
+    match decode_record(RecordKind::TableIndex, bytes)? {
+        CatalogRecord::TableIndex(id) => Ok(id),
+        _ => Err(corruption(
+            "table index decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_index_column_mapping(bytes: &[u8]) -> Result<ColumnId> {
+    match decode_record(RecordKind::IndexColumn, bytes)? {
+        CatalogRecord::IndexColumn(id) => Ok(id),
+        _ => Err(corruption(
+            "index column decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_index_definition(expected_id: IndexId, bytes: &[u8]) -> Result<IndexDef> {
+    match decode_record(RecordKind::IndexDefinition, bytes)? {
+        CatalogRecord::IndexDefinition(index) if index.id() == expected_id => Ok(index),
+        CatalogRecord::IndexDefinition(_) => Err(corruption(
+            "index definition key id does not match its payload id",
+        )),
+        _ => Err(corruption(
+            "index definition decoder received a different record kind",
         )),
     }
 }
@@ -184,10 +263,6 @@ fn put_name(payload: &mut Encoder, name: &CatalogName) {
 
 fn decode_envelope(expected: RecordKind, bytes: &[u8]) -> Result<&[u8]> {
     let kind = RecordKind::from_byte(*bytes.first().ok_or_else(truncated_record)?)?;
-    if kind != expected {
-        return Err(corruption("catalog key and record kind disagree"));
-    }
-
     let version = *bytes.get(1).ok_or_else(truncated_record)?;
     if version > RECORD_VERSION_V1 {
         return Err(DbError::new(
@@ -197,6 +272,9 @@ fn decode_envelope(expected: RecordKind, bytes: &[u8]) -> Result<&[u8]> {
     }
     if version != RECORD_VERSION_V1 {
         return Err(corruption("catalog record version zero is invalid"));
+    }
+    if kind != expected {
+        return Err(corruption("catalog key and record kind disagree"));
     }
 
     strict_payload(bytes)
@@ -263,6 +341,12 @@ fn decode_column_id_mapping(payload: &[u8]) -> Result<ColumnId> {
     decode_column_id(decoder.get_u64()?)
 }
 
+fn decode_index_id_mapping(payload: &[u8]) -> Result<IndexId> {
+    require_mapping_length(payload)?;
+    let mut decoder = Decoder::new(payload);
+    decode_index_id(decoder.get_u64()?)
+}
+
 fn require_mapping_length(payload: &[u8]) -> Result<()> {
     if payload.len() != MAPPING_PAYLOAD_LEN {
         return Err(corruption(
@@ -313,6 +397,39 @@ fn decode_column_definition_payload(payload: &[u8]) -> Result<ColumnDef> {
         .map_err(|_| corruption("catalog column definition fields are invalid"))
 }
 
+fn decode_index_definition_payload(payload: &[u8]) -> Result<IndexDef> {
+    let mut decoder = Decoder::new(payload);
+    let id = decode_index_id(decoder.get_u64()?)?;
+    let table_id = decode_table_id(decoder.get_u64()?)?;
+    let root = PageRef::new(PageId(decoder.get_u64()?), decoder.get_u64()?)
+        .map_err(|_| corruption("catalog index root page reference is invalid"))?;
+    let column_count = decoder.get_u16()?;
+    let unique = match decoder.get_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(corruption("catalog index unique flag is invalid")),
+    };
+    let owner_kind = decoder.get_u8()?;
+    if decoder.get_u16()? != 0 {
+        return Err(corruption(
+            "catalog index definition reserved bytes are nonzero",
+        ));
+    }
+    let owner_id = decoder.get_u64()?;
+    let ownership = match (owner_kind, owner_id) {
+        (0, 0) => IndexOwnership::Explicit,
+        (0, _) => return Err(corruption("explicit index owner id must be zero")),
+        (1, 0) => return Err(corruption("constraint index owner id must be nonzero")),
+        (1, id) => IndexOwnership::Constraint(decode_constraint_id(id)?),
+        _ => return Err(corruption("catalog index owner kind is invalid")),
+    };
+    let name_len = usize::from(decoder.get_u16()?);
+    let name = decode_name(&mut decoder, name_len)?;
+    require_eof(&decoder)?;
+    IndexDef::new(id, table_id, root, column_count, unique, ownership, name)
+        .map_err(|_| corruption("catalog index definition fields are invalid"))
+}
+
 fn decode_name(decoder: &mut Decoder<'_>, name_len: usize) -> Result<CatalogName> {
     let bytes = decoder.get_bytes(name_len)?;
     let name = std::str::from_utf8(bytes)
@@ -338,6 +455,14 @@ fn decode_table_id(value: u64) -> Result<TableId> {
 
 fn decode_column_id(value: u64) -> Result<ColumnId> {
     ColumnId::new(value).map_err(|_| corruption("catalog column id must be nonzero"))
+}
+
+fn decode_index_id(value: u64) -> Result<IndexId> {
+    IndexId::new(value).map_err(|_| corruption("catalog index id must be nonzero"))
+}
+
+fn decode_constraint_id(value: u64) -> Result<ConstraintId> {
+    ConstraintId::new(value).map_err(|_| corruption("catalog constraint id must be nonzero"))
 }
 
 fn decode_schema_version(value: u64) -> Result<SchemaVersion> {
@@ -367,7 +492,8 @@ mod tests {
                 key::RecordKind,
                 types::{
                     CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType,
-                    ObjectId, RowId, SchemaVersion, TableDef, TableId,
+                    ConstraintId, IndexDef, IndexId, IndexOwnership, ObjectId, RowId,
+                    SchemaVersion, TableDef, TableId,
                 },
             },
         },
@@ -395,6 +521,152 @@ mod tests {
             CatalogName::new("C表").unwrap(),
         )
         .unwrap()
+    }
+
+    fn index_definition_fixture() -> IndexDef {
+        IndexDef::new(
+            IndexId::new(0x0102_0304_0506_0708).unwrap(),
+            TableId::new(0x1112_1314_1516_1718).unwrap(),
+            PageRef::new(PageId(0x2122_2324_2526_2728), 0x3132_3334_3536_3738).unwrap(),
+            2,
+            true,
+            IndexOwnership::Constraint(ConstraintId::new(0x4142_4344_4546_4748).unwrap()),
+            CatalogName::new("IX_表").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn index_record_v1_has_hand_computed_envelope_and_strict_round_trip() {
+        let index = index_definition_fixture();
+        let encoded = encode_index_definition(&index);
+        assert_eq!(&encoded[0..4], &[0x21, 1, 0, 0]);
+        assert_eq!(
+            u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize,
+            encoded.len() - 8
+        );
+        assert_eq!(
+            decode_index_definition(index.id(), &encoded).unwrap(),
+            index
+        );
+        let mut reserved = encoded.clone();
+        reserved[2] = 1;
+        assert_eq!(
+            decode_index_definition(index.id(), &reserved)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn index_record_v1_has_hand_computed_payload_bytes() {
+        assert_eq!(
+            encode_index_definition(&index_definition_fixture()),
+            vec![
+                0x21, 1, 0, 0, 54, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14,
+                0x13, 0x12, 0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x38, 0x37, 0x36,
+                0x35, 0x34, 0x33, 0x32, 0x31, 2, 0, 1, 1, 0, 0, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43,
+                0x42, 0x41, 6, 0, b'I', b'X', b'_', 0xe8, 0xa1, 0xa8,
+            ]
+        );
+    }
+
+    #[test]
+    fn index_definition_rejects_every_truncation_and_trailing_byte() {
+        let index = index_definition_fixture();
+        let encoded = encode_index_definition(&index);
+        for end in 0..encoded.len() {
+            assert_eq!(
+                decode_index_definition(index.id(), &encoded[..end])
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            decode_index_definition(index.id(), &trailing)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn index_records_reject_invalid_fields_and_round_trip_mappings() {
+        let index = index_definition_fixture();
+        let index_id = index.id();
+        let column_id = ColumnId::new(9).unwrap();
+        assert_eq!(
+            decode_index_name_mapping(&encode_index_name_mapping(index_id)).unwrap(),
+            index_id
+        );
+        assert_eq!(
+            decode_table_index_mapping(&encode_table_index_mapping(index_id)).unwrap(),
+            index_id
+        );
+        assert_eq!(
+            decode_index_column_mapping(&encode_index_column_mapping(column_id)).unwrap(),
+            column_id
+        );
+
+        let valid = encode_index_definition(&index);
+        assert_eq!(
+            decode_index_definition(IndexId::new(10).unwrap(), &valid)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        for (range, bytes) in [
+            (43..44, vec![2]),
+            (46..54, vec![0; 8]),
+            (42..43, vec![2]),
+            (24..32, vec![0; 8]),
+            (32..40, vec![0; 8]),
+            (40..42, vec![0, 0]),
+            (44..46, vec![1, 0]),
+            (54..56, vec![7, 0]),
+            (8..16, vec![0; 8]),
+            (4..8, 53_u32.to_le_bytes().to_vec()),
+        ] {
+            let mut encoded = valid.clone();
+            encoded[range].copy_from_slice(&bytes);
+            assert_eq!(
+                decode_index_definition(index_id, &encoded)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+
+        let mut explicit_with_owner = valid.clone();
+        explicit_with_owner[43] = 0;
+        assert_eq!(
+            decode_index_definition(index_id, &explicit_with_owner)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let mut invalid_utf8 = encode_index_definition(&index);
+        invalid_utf8[60] = 0xff;
+        assert_eq!(
+            decode_index_definition(index_id, &invalid_utf8)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let mut version = valid;
+        version[1] = 2;
+        assert_eq!(
+            decode_index_definition(index_id, &version)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
     }
 
     #[test]
