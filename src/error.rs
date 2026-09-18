@@ -13,6 +13,7 @@ pub enum ErrorCode {
     Busy = 1400,
     Transaction = 1500,
     Unsupported = 1600,
+    ResourceLimit = 1650,
     Corruption = 1700,
     Io = 1800,
     Internal = 1900,
@@ -98,6 +99,13 @@ impl DbError {
 
     pub const fn sql_location(&self) -> Option<SqlLocation> {
         self.sql_location
+    }
+
+    pub(crate) const fn is_fatal(&self) -> bool {
+        matches!(
+            self.code,
+            ErrorCode::Corruption | ErrorCode::Io | ErrorCode::Internal
+        )
     }
 }
 

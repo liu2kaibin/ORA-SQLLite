@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    fmt,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError},
 };
 
 use super::{
@@ -25,6 +26,14 @@ use super::{
 use crate::{DbError, ErrorCode, Result};
 
 use crate::fault::FaultInjector;
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_PAGE_PREIMAGE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(crate) struct PagerConfig {
     pub(super) page_size: u32,
@@ -82,13 +91,78 @@ pub(super) struct PagerInner {
     pub(super) snapshots: SnapshotRegistry,
     pub(super) cache: Mutex<PageCache>,
     pub(super) cache_pages: usize,
-    writer: Mutex<()>,
+    writer: Arc<WriterCoordinator>,
     mode: OpenMode,
     max_database_bytes: u64,
     max_wal_bytes: u64,
     checkpoint_wal_bytes: u64,
     #[cfg(test)]
     reused_page_count: Mutex<u64>,
+}
+
+struct WriterCoordinator {
+    active: Mutex<bool>,
+    available: Condvar,
+}
+
+struct WriterLease {
+    coordinator: Arc<WriterCoordinator>,
+    active: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct PublishedWriteGuardForTest<'a> {
+    _guard: std::sync::RwLockWriteGuard<'a, PublishedState>,
+}
+
+impl WriterCoordinator {
+    fn try_acquire(self: &Arc<Self>) -> Result<WriterLease> {
+        let mut active = self.active.try_lock().map_err(map_writer_try_lock)?;
+        if *active {
+            return Err(DbError::new(
+                ErrorCode::Busy,
+                "another write batch is active",
+            ));
+        }
+        *active = true;
+        Ok(WriterLease {
+            coordinator: self.clone(),
+            active: true,
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<WriterLease> {
+        let mut active = self.active.lock().map_err(map_writer_poison)?;
+        while *active {
+            active = self.available.wait(active).map_err(map_writer_poison)?;
+        }
+        *active = true;
+        Ok(WriterLease {
+            coordinator: self.clone(),
+            active: true,
+        })
+    }
+}
+
+impl WriterLease {
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut active = match self.coordinator.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *active = false;
+        self.active = false;
+        self.coordinator.available.notify_one();
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 pub(super) struct PublishedState {
@@ -121,11 +195,7 @@ impl Pager {
                 "read-only pager cannot checkpoint",
             ));
         }
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| internal("pager writer mutex is poisoned"))?;
+        let _writer = self.inner.writer.acquire()?;
         super::checkpoint::run(&self.inner)
     }
 
@@ -246,7 +316,10 @@ impl Pager {
                 snapshots: SnapshotRegistry::default(),
                 cache: Mutex::new(cache),
                 cache_pages: config.cache_pages,
-                writer: Mutex::new(()),
+                writer: Arc::new(WriterCoordinator {
+                    active: Mutex::new(false),
+                    available: Condvar::new(),
+                }),
                 mode,
                 max_database_bytes: config.max_database_bytes,
                 max_wal_bytes: config.max_wal_bytes,
@@ -277,44 +350,29 @@ impl Pager {
         })
     }
 
-    pub(crate) fn begin_write(&self) -> Result<WriteBatch<'_>> {
+    pub(crate) fn begin_write(&self) -> Result<WriteBatch> {
         if self.inner.mode == OpenMode::ReadOnly {
             return Err(DbError::new(
                 ErrorCode::Unsupported,
                 "read-only pager cannot begin a write batch",
             ));
         }
-        let writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| internal("pager writer mutex is poisoned"))?;
-        self.begin_write_with_guard(writer)
+        let writer = self.inner.writer.acquire()?;
+        self.begin_write_with_lease(writer)
     }
 
-    pub(super) fn try_begin_write(&self) -> Result<WriteBatch<'_>> {
+    pub(crate) fn try_begin_write(&self) -> Result<WriteBatch> {
         if self.inner.mode == OpenMode::ReadOnly {
             return Err(DbError::new(
                 ErrorCode::Unsupported,
                 "read-only pager cannot begin a write batch",
             ));
         }
-        let writer = match self.inner.writer.try_lock() {
-            Ok(writer) => writer,
-            Err(TryLockError::WouldBlock) => {
-                return Err(DbError::new(
-                    ErrorCode::Busy,
-                    "another write batch is active",
-                ));
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(internal("pager writer mutex is poisoned"));
-            }
-        };
-        self.begin_write_with_guard(writer)
+        let writer = self.inner.writer.try_acquire()?;
+        self.begin_write_with_lease(writer)
     }
 
-    fn begin_write_with_guard<'a>(&'a self, writer: MutexGuard<'a, ()>) -> Result<WriteBatch<'a>> {
+    fn begin_write_with_lease(&self, writer: WriterLease) -> Result<WriteBatch> {
         let wal_len = self.wal_lock()?.len();
         if wal_len >= self.inner.checkpoint_wal_bytes {
             super::checkpoint::run(&self.inner)?;
@@ -351,7 +409,7 @@ impl Pager {
         drop(read);
 
         Ok(WriteBatch {
-            pager: self,
+            pager: self.clone(),
             _writer: writer,
             base_lsn,
             committed_state,
@@ -367,7 +425,12 @@ impl Pager {
             superseded_roots: HashSet::new(),
             catalog_update_pending: false,
             catalog_validation_required: false,
+            mutation_scopes: Vec::new(),
+            next_mutation_scope: 1,
+            rollback_only: false,
             finished: false,
+            #[cfg(test)]
+            fail_tree_release_after: None,
         })
     }
 
@@ -406,6 +469,17 @@ impl Pager {
             .reused_page_count
             .lock()
             .expect("test-only reused page count mutex is poisoned")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_published_write_for_test(&self) -> PublishedWriteGuardForTest<'_> {
+        PublishedWriteGuardForTest {
+            _guard: self
+                .inner
+                .published
+                .write()
+                .expect("test-only published-state lock is poisoned"),
+        }
     }
 
     #[cfg(test)]
@@ -567,22 +641,16 @@ pub(super) fn checkpoint_after_writer_contention(
             "read-only pager cannot checkpoint",
         ));
     }
-    match pager.inner.writer.try_lock() {
+    match pager.inner.writer.try_acquire() {
         Ok(_writer) => {
             return Err(internal(
                 "checkpoint contention test requires an active writer",
             ));
         }
-        Err(TryLockError::WouldBlock) => on_contention(),
-        Err(TryLockError::Poisoned(_)) => {
-            return Err(internal("pager writer mutex is poisoned"));
-        }
+        Err(error) if error.code() == ErrorCode::Busy => on_contention(),
+        Err(error) => return Err(error),
     }
-    let _writer = pager
-        .inner
-        .writer
-        .lock()
-        .map_err(|_| internal("pager writer mutex is poisoned"))?;
+    let _writer = pager.inner.writer.acquire()?;
     super::checkpoint::run(&pager.inner)
 }
 
@@ -740,9 +808,9 @@ fn snapshot_catalog_reachability(
     Ok(Some((root, report.all_live_pages())))
 }
 
-pub(crate) struct WriteBatch<'a> {
-    pager: &'a Pager,
-    _writer: MutexGuard<'a, ()>,
+pub(crate) struct WriteBatch {
+    pager: Pager,
+    _writer: WriterLease,
     base_lsn: Lsn,
     committed_state: CommitState,
     base_header: DatabaseHeader,
@@ -761,7 +829,37 @@ pub(crate) struct WriteBatch<'a> {
     // A successful finish binds this batch to catalog validation through commit.
     // Raw low-level batches remain available for deliberate corruption fixtures.
     catalog_validation_required: bool,
+    mutation_scopes: Vec<MutationScopeState>,
+    next_mutation_scope: u64,
+    rollback_only: bool,
     finished: bool,
+    #[cfg(test)]
+    fail_tree_release_after: Option<usize>,
+}
+
+#[derive(Debug)]
+pub(crate) enum CommitFailure {
+    RetryableBusy {
+        error: DbError,
+        batch: Box<WriteBatch>,
+    },
+    PreDurability(DbError),
+    NeedsReopen(DbError),
+}
+
+impl CommitFailure {
+    fn into_error(self) -> DbError {
+        match self {
+            Self::RetryableBusy { error, .. }
+            | Self::PreDurability(error)
+            | Self::NeedsReopen(error) => error,
+        }
+    }
+}
+
+enum WalLimitPreflight {
+    Ready,
+    RetryableBusy(DbError),
 }
 
 pub(super) struct WriteBatchCheckpoint {
@@ -776,7 +874,68 @@ pub(super) struct WriteBatchCheckpoint {
     catalog_validation_required: bool,
 }
 
-impl WriteBatch<'_> {
+pub(super) struct MutationScope {
+    id: u64,
+}
+
+struct MutationScopeState {
+    id: u64,
+    dirty: BTreeMap<PageId, Option<PageFrame>>,
+    new_pages: BTreeMap<PageId, bool>,
+    pending_generations: BTreeMap<PageId, Option<u64>>,
+    pending_releases: BTreeMap<PageId, Option<PageRef>>,
+    candidate_header: Option<Option<DatabaseHeader>>,
+    tracked_trees: Option<Vec<(TreeKind, PageRef)>>,
+    superseded_roots: Option<HashSet<PageRef>>,
+    catalog_update_pending: Option<bool>,
+    catalog_validation_required: Option<bool>,
+}
+
+/// Opaque statement boundary for SQL-layer rollback.
+pub(crate) struct StatementCheckpoint(MutationScope);
+
+#[cfg(test)]
+fn reset_scope_page_preimage_count_for_test() {
+    SCOPE_PAGE_PREIMAGE_COUNT.set(0);
+}
+
+#[cfg(test)]
+fn take_scope_page_preimage_count_for_test() -> usize {
+    SCOPE_PAGE_PREIMAGE_COUNT.replace(0)
+}
+
+#[cfg(test)]
+impl WriteBatchCheckpoint {
+    pub(super) fn assert_matches_batch_for_test(&self, batch: &WriteBatch) {
+        assert_eq!(batch.dirty.len(), self.dirty.len());
+        for (page_id, expected_frame) in &self.dirty {
+            assert_eq!(batch.dirty[page_id].bytes(), expected_frame.bytes());
+        }
+        assert_eq!(batch.new_pages, self.new_pages);
+        assert_eq!(batch.pending_generations, self.pending_generations);
+        assert_eq!(batch.pending_releases, self.pending_releases);
+        assert_eq!(batch.candidate_header, self.candidate_header);
+        assert_eq!(batch.tracked_trees, self.tracked_trees);
+        assert_eq!(batch.superseded_roots, self.superseded_roots);
+        assert_eq!(batch.catalog_update_pending, self.catalog_update_pending);
+        assert_eq!(
+            batch.catalog_validation_required,
+            self.catalog_validation_required
+        );
+    }
+}
+
+impl WriteBatch {
+    pub(crate) const fn database_uuid(&self) -> [u8; 16] {
+        self.base_header.uuid()
+    }
+
+    pub(crate) fn mark_rollback_only(&mut self) {
+        if !self.finished {
+            self.rollback_only = true;
+        }
+    }
+
     pub(crate) fn catalog_reader(&mut self) -> Result<super::catalog::CatalogReader> {
         self.require_active()?;
         self.require_catalog_finished()?;
@@ -790,6 +949,7 @@ impl WriteBatch<'_> {
     pub(super) fn begin_catalog_update(&mut self) -> Result<()> {
         self.require_active()?;
         self.require_catalog_finished()?;
+        self.record_catalog_update_pending_preimage();
         self.catalog_update_pending = true;
         Ok(())
     }
@@ -803,6 +963,8 @@ impl WriteBatch<'_> {
             ));
         }
         self.validate_catalog_candidate()?;
+        self.record_catalog_update_pending_preimage();
+        self.record_catalog_validation_required_preimage();
         self.catalog_update_pending = false;
         self.catalog_validation_required = true;
         Ok(())
@@ -860,6 +1022,7 @@ impl WriteBatch<'_> {
         validate_feature_bits(candidate)?;
         let mut header = self.current_header();
         header.set_features(candidate)?;
+        self.record_candidate_header_preimage();
         self.candidate_header = Some(header);
         Ok(())
     }
@@ -884,6 +1047,201 @@ impl WriteBatch<'_> {
         })
     }
 
+    pub(super) fn begin_mutation_scope(&mut self) -> Result<MutationScope> {
+        self.require_active()?;
+        let id = self.next_mutation_scope;
+        self.next_mutation_scope = id
+            .checked_add(1)
+            .ok_or_else(|| internal("mutation scope identifier overflow"))?;
+        self.mutation_scopes.push(MutationScopeState {
+            id,
+            dirty: BTreeMap::new(),
+            new_pages: BTreeMap::new(),
+            pending_generations: BTreeMap::new(),
+            pending_releases: BTreeMap::new(),
+            candidate_header: None,
+            tracked_trees: None,
+            superseded_roots: None,
+            catalog_update_pending: None,
+            catalog_validation_required: None,
+        });
+        Ok(MutationScope { id })
+    }
+
+    pub(super) fn finish_mutation_scope(&mut self, scope: MutationScope) -> Result<()> {
+        self.require_scope(scope.id)?;
+        self.mutation_scopes.pop();
+        Ok(())
+    }
+
+    pub(super) fn rollback_mutation_scope(&mut self, scope: MutationScope) -> Result<()> {
+        self.require_scope(scope.id)?;
+        let state = self
+            .mutation_scopes
+            .pop()
+            .ok_or_else(|| internal("mutation scope stack disappeared"))?;
+        for (page_id, previous) in state.dirty {
+            match previous {
+                Some(frame) => {
+                    self.dirty.insert(page_id, frame);
+                }
+                None => {
+                    self.dirty.remove(&page_id);
+                }
+            }
+        }
+        for (page_id, existed) in state.new_pages {
+            if existed {
+                self.new_pages.insert(page_id);
+            } else {
+                self.new_pages.remove(&page_id);
+            }
+        }
+        for (page_id, previous) in state.pending_generations {
+            match previous {
+                Some(generation) => {
+                    self.pending_generations.insert(page_id, generation);
+                }
+                None => {
+                    self.pending_generations.remove(&page_id);
+                }
+            }
+        }
+        for (page_id, previous) in state.pending_releases {
+            match previous {
+                Some(reference) => {
+                    self.pending_releases.insert(page_id, reference);
+                }
+                None => {
+                    self.pending_releases.remove(&page_id);
+                }
+            }
+        }
+        if let Some(previous) = state.candidate_header {
+            self.candidate_header = previous;
+        }
+        if let Some(previous) = state.tracked_trees {
+            self.tracked_trees = previous;
+        }
+        if let Some(previous) = state.superseded_roots {
+            self.superseded_roots = previous;
+        }
+        if let Some(previous) = state.catalog_update_pending {
+            self.catalog_update_pending = previous;
+        }
+        if let Some(previous) = state.catalog_validation_required {
+            self.catalog_validation_required = previous;
+        }
+        Ok(())
+    }
+
+    fn require_scope(&self, id: u64) -> Result<()> {
+        if self.mutation_scopes.last().map(|scope| scope.id) != Some(id) {
+            return Err(internal("mutation scopes must finish in LIFO order"));
+        }
+        Ok(())
+    }
+
+    fn record_dirty_preimage(&mut self, page_id: PageId) -> Result<()> {
+        let missing = self
+            .mutation_scopes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, scope)| (!scope.dirty.contains_key(&page_id)).then_some(index))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if let Some(frame) = self.dirty.get_mut(&page_id) {
+            frame.prepare_for_write()?;
+            let bytes = frame.bytes().to_vec();
+            let page_type = frame.header().page_type();
+            let generation = frame.header().generation();
+            for index in missing {
+                let previous =
+                    PageFrame::decode(bytes.clone(), page_id, Some(page_type), Some(generation))?;
+                #[cfg(test)]
+                SCOPE_PAGE_PREIMAGE_COUNT.set(SCOPE_PAGE_PREIMAGE_COUNT.get().saturating_add(1));
+                self.mutation_scopes[index]
+                    .dirty
+                    .insert(page_id, Some(previous));
+            }
+        } else {
+            for index in missing {
+                self.mutation_scopes[index].dirty.insert(page_id, None);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_new_page_preimage(&mut self, page_id: PageId) {
+        let previous = self.new_pages.contains(&page_id);
+        for scope in &mut self.mutation_scopes {
+            scope.new_pages.entry(page_id).or_insert(previous);
+        }
+    }
+
+    fn record_pending_generation_preimage(&mut self, page_id: PageId) {
+        let previous = self.pending_generations.get(&page_id).copied();
+        for scope in &mut self.mutation_scopes {
+            scope.pending_generations.entry(page_id).or_insert(previous);
+        }
+    }
+
+    fn record_pending_release_preimage(&mut self, page_id: PageId) {
+        let previous = self.pending_releases.get(&page_id).copied();
+        for scope in &mut self.mutation_scopes {
+            scope.pending_releases.entry(page_id).or_insert(previous);
+        }
+    }
+
+    fn record_candidate_header_preimage(&mut self) {
+        let previous = self.candidate_header;
+        for scope in &mut self.mutation_scopes {
+            scope.candidate_header.get_or_insert(previous);
+        }
+    }
+
+    fn record_tracked_trees_preimage(&mut self) {
+        let previous = self.tracked_trees.clone();
+        for scope in &mut self.mutation_scopes {
+            if scope.tracked_trees.is_none() {
+                scope.tracked_trees = Some(previous.clone());
+            }
+        }
+    }
+
+    fn record_superseded_roots_preimage(&mut self) {
+        let previous = self.superseded_roots.clone();
+        for scope in &mut self.mutation_scopes {
+            if scope.superseded_roots.is_none() {
+                scope.superseded_roots = Some(previous.clone());
+            }
+        }
+    }
+
+    fn record_catalog_update_pending_preimage(&mut self) {
+        let previous = self.catalog_update_pending;
+        for scope in &mut self.mutation_scopes {
+            scope.catalog_update_pending.get_or_insert(previous);
+        }
+    }
+
+    fn record_catalog_validation_required_preimage(&mut self) {
+        let previous = self.catalog_validation_required;
+        for scope in &mut self.mutation_scopes {
+            scope.catalog_validation_required.get_or_insert(previous);
+        }
+    }
+
+    pub(crate) fn statement_checkpoint(&mut self) -> Result<StatementCheckpoint> {
+        self.begin_mutation_scope().map(StatementCheckpoint)
+    }
+
+    pub(crate) fn finish_statement(&mut self, checkpoint: StatementCheckpoint) -> Result<()> {
+        self.finish_mutation_scope(checkpoint.0)
+    }
+
     pub(super) fn restore_mutation(&mut self, checkpoint: WriteBatchCheckpoint) {
         self.dirty = checkpoint.dirty;
         self.new_pages = checkpoint.new_pages;
@@ -896,6 +1254,14 @@ impl WriteBatch<'_> {
         self.catalog_validation_required = checkpoint.catalog_validation_required;
     }
 
+    pub(crate) fn restore_statement(&mut self, checkpoint: StatementCheckpoint) {
+        // rollback_only is transaction state, not staged mutation state. Leaving
+        // it untouched ensures a fatal error cannot be cleared by restoration.
+        if self.rollback_mutation_scope(checkpoint.0).is_err() {
+            self.mark_rollback_only();
+        }
+    }
+
     pub(super) fn track_tree(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
         self.require_active()?;
         if self.pending_releases.contains_key(&root.page_id()) {
@@ -905,6 +1271,7 @@ impl WriteBatch<'_> {
         }
         self.read(root)?;
         if !self.tracked_trees.contains(&(kind, root)) {
+            self.record_tracked_trees_preimage();
             self.tracked_trees.push((kind, root));
         }
         Ok(())
@@ -934,11 +1301,13 @@ impl WriteBatch<'_> {
         root: PageRef,
     ) -> Result<()> {
         if previous_root != root {
+            self.record_tracked_trees_preimage();
             self.tracked_trees
                 .retain(|tracked| *tracked != (kind, previous_root));
         }
         self.track_tree(kind, root)?;
         if previous_root != root {
+            self.record_superseded_roots_preimage();
             self.superseded_roots.insert(previous_root);
             // A root can become current again after a split followed by collapse.
             self.superseded_roots.remove(&root);
@@ -957,6 +1326,7 @@ impl WriteBatch<'_> {
             validate_tree(self, &BTree::from_root(kind, root))?;
             let mut header = self.current_header();
             header.set_catalog_root(root.page_id());
+            self.record_candidate_header_preimage();
             self.candidate_header = Some(header);
         }
         Ok(())
@@ -985,9 +1355,12 @@ impl WriteBatch<'_> {
             ));
         }
         if !self.dirty.contains_key(&reference.page_id()) {
+            self.record_dirty_preimage(reference.page_id())?;
             let handle = self.read_base(reference)?;
             self.dirty
                 .insert(reference.page_id(), copy_clean_frame(handle.as_ref())?);
+        } else {
+            self.record_dirty_preimage(reference.page_id())?;
         }
         let frame = self
             .dirty
@@ -1021,6 +1394,9 @@ impl WriteBatch<'_> {
             self.pager.inner.max_database_bytes,
         )?;
         let frame = PageFrame::new_zeroed(page_type, reference, self.base_header.page_size())?;
+        self.record_dirty_preimage(reference.page_id())?;
+        self.record_new_page_preimage(reference.page_id());
+        self.record_pending_generation_preimage(reference.page_id());
         self.dirty.insert(reference.page_id(), frame);
         self.new_pages.insert(reference.page_id());
         self.pending_generations
@@ -1058,7 +1434,7 @@ impl WriteBatch<'_> {
     }
 
     pub(crate) fn rollback(&mut self) -> Result<()> {
-        self.require_active()?;
+        self.require_not_finished()?;
         self.finish();
         Ok(())
     }
@@ -1095,6 +1471,7 @@ impl WriteBatch<'_> {
 
         let mut header = self.current_header();
         header.set_catalog_root(root.page_id());
+        self.record_candidate_header_preimage();
         self.candidate_header = Some(header);
         Ok(())
     }
@@ -1105,6 +1482,7 @@ impl WriteBatch<'_> {
             return Err(corruption("page is already pending release in this batch"));
         }
         self.validate_releasable(reference)?;
+        self.record_pending_release_preimage(reference.page_id());
         self.pending_releases.insert(reference.page_id(), reference);
         Ok(())
     }
@@ -1170,13 +1548,59 @@ impl WriteBatch<'_> {
                 self.base_header.page_size(),
             )?;
             SlottedPage::open(&mut tombstone, LEAF_METADATA_END)?;
+            self.record_dirty_preimage(reference.page_id())?;
             self.dirty.insert(reference.page_id(), tombstone);
         } else {
             self.read_base(reference)?;
+            self.record_dirty_preimage(reference.page_id())?;
             self.dirty.remove(&reference.page_id());
         }
+        self.record_pending_release_preimage(reference.page_id());
         self.pending_releases.insert(reference.page_id(), reference);
         Ok(())
+    }
+
+    pub(super) fn release_tree_later(&mut self, kind: TreeKind, root: PageRef) -> Result<()> {
+        self.require_active()?;
+        let pages = validate_tree(self, &BTree::from_root(kind, root))?.all_live_pages();
+        let references = pages
+            .iter()
+            .map(|page_id| {
+                let frame = self.read_frame_by_id(*page_id)?;
+                PageRef::new(*page_id, frame.header().generation())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let checkpoint = self.begin_mutation_scope()?;
+        let result = (|| {
+            self.record_tracked_trees_preimage();
+            self.tracked_trees
+                .retain(|(_, reference)| !pages.contains(&reference.page_id()));
+            self.record_superseded_roots_preimage();
+            self.superseded_roots
+                .retain(|reference| !pages.contains(&reference.page_id()));
+            for reference in references {
+                self.release_btree_later(reference)?;
+                #[cfg(test)]
+                if let Some(remaining) = self.fail_tree_release_after {
+                    if remaining <= 1 {
+                        self.fail_tree_release_after = None;
+                        return Err(DbError::new(
+                            ErrorCode::Io,
+                            "injected after staged tree release",
+                        ));
+                    }
+                    self.fail_tree_release_after = Some(remaining - 1);
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.finish_mutation_scope(checkpoint),
+            Err(error) => {
+                self.rollback_mutation_scope(checkpoint)?;
+                Err(error)
+            }
+        }
     }
 
     fn validate_releasable(&mut self, reference: PageRef) -> Result<()> {
@@ -1218,23 +1642,37 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self) -> Result<()> {
-        self.require_active()?;
+    pub(crate) fn commit(self) -> Result<()> {
+        self.commit_with_outcome()
+            .map_err(CommitFailure::into_error)
+    }
+
+    pub(crate) fn commit_with_outcome(mut self) -> std::result::Result<(), CommitFailure> {
+        self.require_active()
+            .map_err(CommitFailure::PreDurability)?;
         // Reject before preparing releases or materializing a header-only change,
         // so unfinished writers always produce Transaction and never reach WAL I/O.
-        self.require_catalog_finished()?;
-        self.prepare_freelist_releases()?;
+        self.require_catalog_finished()
+            .map_err(CommitFailure::PreDurability)?;
+        let retry_checkpoint = self
+            .checkpoint_mutation()
+            .map_err(CommitFailure::PreDurability)?;
+        self.prepare_freelist_releases()
+            .map_err(CommitFailure::PreDurability)?;
         if self.dirty.is_empty() && self.candidate_header.is_some() {
             let catalog_root = self.current_header().catalog_root();
             if catalog_root.0 == 0 {
-                return Err(corruption(
+                return Err(CommitFailure::PreDurability(corruption(
                     "catalog root state change requires a nonzero root page",
-                ));
+                )));
             }
-            let frame = self.read_frame_by_id(catalog_root)?;
+            let frame = self
+                .read_frame_by_id(catalog_root)
+                .map_err(CommitFailure::PreDurability)?;
             self.dirty.insert(catalog_root, frame);
         }
-        self.validate_for_commit()?;
+        self.validate_for_commit()
+            .map_err(CommitFailure::PreDurability)?;
 
         if self.dirty.is_empty() && self.candidate_header.is_none() {
             self.finish();
@@ -1242,9 +1680,14 @@ impl WriteBatch<'_> {
         }
 
         let transaction_lsn = self.base_lsn.0.checked_add(1).map(Lsn).ok_or_else(|| {
-            DbError::new(ErrorCode::Transaction, "WAL LSN overflow requires recovery")
+            CommitFailure::PreDurability(DbError::new(
+                ErrorCode::Transaction,
+                "WAL LSN overflow requires recovery",
+            ))
         })?;
-        let target_page_count = self.target_page_count()?;
+        let target_page_count = self
+            .target_page_count()
+            .map_err(CommitFailure::PreDurability)?;
         let roots = self.candidate_header.unwrap_or(self.base_header);
         let candidate_state = CommitState {
             page_count: target_page_count,
@@ -1263,23 +1706,58 @@ impl WriteBatch<'_> {
                 )
             })
             .collect::<Vec<_>>();
-        self.preflight_wal_limit(&frames)?;
-        let publication_observer = self.pager.wal_lock()?.publication_observer();
-        let versions = self.pager.wal_lock()?.projected_versions(&frames)?;
-        // The writer guard excludes both another commit and checkpoint. Prepare
+        match self
+            .preflight_wal_limit(&frames)
+            .map_err(CommitFailure::PreDurability)?
+        {
+            WalLimitPreflight::Ready => {}
+            WalLimitPreflight::RetryableBusy(error) => {
+                self.restore_mutation(retry_checkpoint);
+                return Err(CommitFailure::RetryableBusy {
+                    error,
+                    batch: Box::new(self),
+                });
+            }
+        }
+        let publication_observer = self
+            .pager
+            .wal_lock()
+            .map_err(CommitFailure::PreDurability)?
+            .publication_observer();
+        let versions = self
+            .pager
+            .wal_lock()
+            .map_err(CommitFailure::PreDurability)?
+            .projected_versions(&frames)
+            .map_err(CommitFailure::PreDurability)?;
+        // The writer lease excludes both another commit and checkpoint. Prepare
         // all validation, allocation and map changes before touching the WAL.
-        let mut candidate_index = self.pager.published_read()?.wal_index.clone();
-        candidate_index.publish(transaction_lsn, Some(candidate_state), &versions)?;
+        let mut candidate_index = self
+            .pager
+            .published_read()
+            .map_err(CommitFailure::PreDurability)?
+            .wal_index
+            .clone();
+        candidate_index
+            .publish(transaction_lsn, Some(candidate_state), &versions)
+            .map_err(CommitFailure::PreDurability)?;
         // Verify write-lock health before durable I/O. Only this writer can
         // acquire a write guard until publication (read-guard panic cannot poison).
-        drop(self.pager.published_write()?);
-        let mut wal = self.pager.wal_lock()?;
+        drop(
+            self.pager
+                .published_write()
+                .map_err(CommitFailure::PreDurability)?,
+        );
+        let wal_pager = self.pager.clone();
+        let mut wal = wal_pager.wal_lock().map_err(CommitFailure::PreDurability)?;
         match wal.append_transaction(transaction_lsn, self.base_lsn, candidate_state, &frames) {
             Ok(_) => (),
-            Err(error) => return self.fail_wal_commit(error),
+            Err(error) => {
+                return Err(CommitFailure::NeedsReopen(self.fail_wal_commit(error)));
+            }
         };
         if let Err(error) = wal.sync_all() {
-            return self.fail_wal_commit(error);
+            return Err(CommitFailure::NeedsReopen(self.fail_wal_commit(error)));
         }
         drop(wal);
         publication_observer.observe_publication(crate::fault::FaultPoint::BeforeWalPublish);
@@ -1302,15 +1780,15 @@ impl WriteBatch<'_> {
         Ok(())
     }
 
-    fn fail_wal_commit<T>(&mut self, error: DbError) -> Result<T> {
+    fn fail_wal_commit(&mut self, error: DbError) -> DbError {
         if let Ok(mut published) = self.pager.published_write() {
             published.write_state = WriteState::NeedsRecovery;
         }
         self.finish();
-        Err(error)
+        error
     }
 
-    fn preflight_wal_limit(&self, frames: &[(PageId, u64, Vec<u8>)]) -> Result<()> {
+    fn preflight_wal_limit(&self, frames: &[(PageId, u64, Vec<u8>)]) -> Result<WalLimitPreflight> {
         let page_bytes = u64::from(self.base_header.page_size())
             .checked_add(64)
             .ok_or_else(|| corruption("WAL frame length overflow"))?;
@@ -1348,10 +1826,13 @@ impl WriteBatch<'_> {
                     None => "WAL hard limit requires a checkpoint retry after snapshot release"
                         .to_owned(),
                 };
-                return Err(DbError::new(ErrorCode::Busy, message));
+                return Ok(WalLimitPreflight::RetryableBusy(DbError::new(
+                    ErrorCode::Busy,
+                    message,
+                )));
             }
         }
-        Ok(())
+        Ok(WalLimitPreflight::Ready)
     }
 
     fn validate_for_commit(&mut self) -> Result<()> {
@@ -1501,6 +1982,8 @@ impl WriteBatch<'_> {
                 .checked_add(1)
                 .ok_or_else(|| corruption("test-only reused page counter overflow"))?;
         }
+        self.record_dirty_preimage(page_id)?;
+        self.record_pending_generation_preimage(page_id);
         self.dirty.insert(page_id, frame);
         self.pending_generations.insert(page_id, generation);
         Ok(reference)
@@ -1522,8 +2005,11 @@ impl WriteBatch<'_> {
 
     fn freelist_frame(&mut self, page_id: PageId) -> Result<&mut PageFrame> {
         if !self.dirty.contains_key(&page_id) {
+            self.record_dirty_preimage(page_id)?;
             let frame = self.read_frame_by_id(page_id)?;
             self.dirty.insert(page_id, frame);
+        } else {
+            self.record_dirty_preimage(page_id)?;
         }
         let frame = self
             .dirty
@@ -1560,6 +2046,7 @@ impl WriteBatch<'_> {
     fn stage_freelist_root(&mut self, root: PageId) {
         let mut header = self.current_header();
         header.set_freelist_root(root);
+        self.record_candidate_header_preimage();
         self.candidate_header = Some(header);
     }
 
@@ -1589,16 +2076,27 @@ impl WriteBatch<'_> {
     }
 
     fn require_active(&self) -> Result<()> {
-        if self.finished {
+        self.require_not_finished()?;
+        if self.rollback_only {
             return Err(DbError::new(
                 ErrorCode::Transaction,
-                "write batch has already finished",
+                "write transaction must be rolled back after a fatal error",
             ));
         }
         if self.pager.published_read()?.write_state == WriteState::NeedsRecovery {
             return Err(DbError::new(
                 ErrorCode::Transaction,
                 "WAL recovery is required before another write batch can begin",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_not_finished(&self) -> Result<()> {
+        if self.finished {
+            return Err(DbError::new(
+                ErrorCode::Transaction,
+                "write batch has already finished",
             ));
         }
         Ok(())
@@ -1626,7 +2124,20 @@ impl WriteBatch<'_> {
         self.superseded_roots.clear();
         self.catalog_update_pending = false;
         self.catalog_validation_required = false;
+        self.mutation_scopes.clear();
+        self.rollback_only = false;
         self.finished = true;
+        self._writer.release();
+    }
+}
+
+impl fmt::Debug for WriteBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteBatch")
+            .field("rollback_only", &self.rollback_only)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1667,7 +2178,7 @@ fn validate_internal_page(frame: &mut PageFrame) -> Result<()> {
     Ok(())
 }
 
-impl PageSource for WriteBatch<'_> {
+impl PageSource for WriteBatch {
     fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
         self.read(reference)
     }
@@ -1723,15 +2234,30 @@ fn internal(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Internal, message)
 }
 
+fn map_writer_poison<T>(_: PoisonError<T>) -> DbError {
+    internal("pager writer mutex is poisoned")
+}
+
+fn map_writer_try_lock<T>(error: TryLockError<T>) -> DbError {
+    match error {
+        TryLockError::WouldBlock => DbError::new(ErrorCode::Busy, "another write batch is active"),
+        TryLockError::Poisoned(_) => internal("pager writer mutex is poisoned"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs,
         ops::Bound,
         sync::{Arc, Mutex},
     };
 
-    use super::{PageSource, Pager, PagerConfig, copy_clean_frame};
+    use super::{
+        CommitFailure, PageSource, Pager, PagerConfig, WriteBatch, copy_clean_frame,
+        reset_scope_page_preimage_count_for_test, take_scope_page_preimage_count_for_test,
+    };
     use crate::{
         DbError, ErrorCode, Result,
         fault::{FaultInjector, FaultPoint},
@@ -1743,16 +2269,341 @@ mod tests {
             BTree, INTERNAL_METADATA_END, InternalCell, LEAF_METADATA_END, TreeKind,
             decode_internal_leftmost, encode_internal_leftmost,
         },
-        catalog::CatalogWriter,
+        catalog::{
+            CatalogWriter,
+            types::{CatalogName, ColumnType},
+        },
         features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
         freelist::Freelist,
         page::{PageFrame, PageType},
+        relation::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation},
         slotted::SlottedPage,
-        test_support::{TempDatabase, test_pager},
+        test_support::{TempDatabase, create_pager, durable_lengths, test_pager},
         validate::validate_tree,
         wal::{Wal, format::CommitState, wal_path},
     };
+
+    fn detached_batch(pager: Pager) -> Result<WriteBatch> {
+        pager.try_begin_write()
+    }
+
+    #[test]
+    fn write_batch_owns_its_writer_lease() {
+        let temp = TempDatabase::new("owned-writer-lease");
+        let pager = create_pager(&temp);
+        let mut batch = detached_batch(pager.clone()).unwrap();
+        assert_eq!(pager.try_begin_write().unwrap_err().code(), ErrorCode::Busy);
+        batch.rollback().unwrap();
+        assert!(pager.try_begin_write().is_ok());
+    }
+
+    #[test]
+    fn retryable_commit_busy_returns_exact_batch_and_writer_lease_for_retry() {
+        // Production break caught: a consuming commit that returns Busy drops
+        // the only copy of the dirty batch and releases its writer lease.
+        let temp = TempDatabase::new("retryable-commit-busy");
+        let mut config = PagerConfig::test_default(4096);
+        config.checkpoint_wal_bytes = 1_000_000;
+        config.max_wal_bytes = 16_384;
+        let pager = Pager::create(temp.path(), config).unwrap();
+
+        let mut seed = pager.begin_write().unwrap();
+        let page = seed.allocate_append(PageType::Catalog).unwrap();
+        seed.modify(page).unwrap().bytes_mut()[100] = 11;
+        seed.commit().unwrap();
+
+        let snapshot = pager.begin_read().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        batch.modify(page).unwrap().bytes_mut()[100] = 22;
+        let before = batch.checkpoint_mutation().unwrap();
+
+        let (error, mut batch) = match batch.commit_with_outcome().unwrap_err() {
+            CommitFailure::RetryableBusy { error, batch } => (error, *batch),
+            other => panic!("expected retained Busy batch, got {other:?}"),
+        };
+        assert_eq!(error.code(), ErrorCode::Busy);
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.read(page).unwrap().bytes()[100], 22);
+        assert_eq!(pager.try_begin_write().unwrap_err().code(), ErrorCode::Busy);
+
+        drop(snapshot);
+        batch.commit_with_outcome().unwrap();
+        assert_eq!(pager.read(page).unwrap().bytes()[100], 22);
+    }
+
+    #[test]
+    fn rollback_only_batch_rejects_operations_and_commit_but_allows_rollback() {
+        // Production break caught: if the streaming owner marks a fatal error
+        // but the batch ignores it, public write transactions can still read
+        // or publish state instead of requiring rollback.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        batch.mark_rollback_only();
+        assert_eq!(
+            batch.catalog_reader().unwrap_err().code(),
+            ErrorCode::Transaction
+        );
+        batch.rollback().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        batch.mark_rollback_only();
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
+        assert!(pager.try_begin_write().is_ok());
+    }
+
+    #[test]
+    fn statement_checkpoint_restores_every_mutation_field_without_clearing_fatal_state() {
+        // Production break caught: omitting any staged page, allocation,
+        // release, root, header, or catalog gate field tears statement rollback;
+        // restoring rollback_only=false would make a fatal batch committable.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let committed = {
+            let mut batch = pager.try_begin_write().unwrap();
+            let first = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+            let second = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+            batch.commit().unwrap();
+            [first, second]
+        };
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let baseline_page = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        batch.release_btree_later(committed[0]).unwrap();
+        let expected = batch.checkpoint_mutation().unwrap();
+        let statement = batch.statement_checkpoint().unwrap();
+
+        CatalogWriter::bootstrap(&mut batch)
+            .unwrap()
+            .finish(&mut batch)
+            .unwrap();
+        batch.begin_catalog_update().unwrap();
+        let mut growing = BTree::create(&mut batch, TreeKind::Table).unwrap();
+        let original_root = growing.root();
+        for key in 0_u64..200 {
+            growing
+                .insert(&mut batch, &key.to_be_bytes(), &[0x5a; 128])
+                .unwrap();
+            if growing.root() != original_root {
+                break;
+            }
+        }
+        assert_ne!(growing.root(), original_root);
+        batch.release_btree_later(committed[1]).unwrap();
+        batch.mark_rollback_only();
+        batch.restore_statement(statement);
+
+        assert_eq!(batch.dirty.len(), expected.dirty.len());
+        for (page_id, expected_frame) in &expected.dirty {
+            assert_eq!(batch.dirty[page_id].bytes(), expected_frame.bytes());
+        }
+        assert_eq!(batch.new_pages, expected.new_pages);
+        assert_eq!(batch.pending_generations, expected.pending_generations);
+        assert_eq!(batch.pending_releases, expected.pending_releases);
+        assert_eq!(batch.candidate_header, expected.candidate_header);
+        assert_eq!(batch.tracked_trees, expected.tracked_trees);
+        assert_eq!(batch.superseded_roots, expected.superseded_roots);
+        assert_eq!(
+            batch.catalog_update_pending,
+            expected.catalog_update_pending
+        );
+        assert_eq!(
+            batch.catalog_validation_required,
+            expected.catalog_validation_required
+        );
+        assert!(batch.rollback_only);
+        assert!(batch.read(baseline_page).is_err());
+        assert_eq!(batch.commit().unwrap_err().code(), ErrorCode::Transaction);
+    }
+
+    #[test]
+    fn scoped_checkpoint_copies_only_the_one_distinct_page_it_rolls_back() {
+        // Production break caught: eagerly cloning every pre-existing dirty page
+        // makes repeated SQL statements quadratic in the transaction size.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let pages = (0..32)
+            .map(|_| batch.allocate(PageType::Catalog).unwrap())
+            .collect::<Vec<_>>();
+        let target = pages[17];
+        let original = batch.read(target).unwrap().bytes()[100];
+
+        reset_scope_page_preimage_count_for_test();
+        let scope = batch.begin_mutation_scope().unwrap();
+        batch.modify(target).unwrap().bytes_mut()[100] = 0x5a;
+        batch.modify(target).unwrap().bytes_mut()[100] = 0xa5;
+        batch.rollback_mutation_scope(scope).unwrap();
+
+        assert_eq!(take_scope_page_preimage_count_for_test(), 1);
+        assert_eq!(batch.read(target).unwrap().bytes()[100], original);
+    }
+
+    #[test]
+    fn nested_scopes_keep_successful_inner_work_until_the_outer_scope_rolls_back() {
+        // Production breaks caught: discarding a successful child's undo state,
+        // or letting a failed child erase its parent's earlier mutation.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let first = batch.allocate(PageType::Catalog).unwrap();
+        let second = batch.allocate(PageType::Catalog).unwrap();
+        let first_original = batch.read(first).unwrap().bytes()[100];
+        let second_original = batch.read(second).unwrap().bytes()[100];
+
+        let outer = batch.begin_mutation_scope().unwrap();
+        batch.modify(first).unwrap().bytes_mut()[100] = 0x11;
+        let successful = batch.begin_mutation_scope().unwrap();
+        batch.modify(first).unwrap().bytes_mut()[100] = 0x22;
+        batch.modify(second).unwrap().bytes_mut()[100] = 0x33;
+        batch.finish_mutation_scope(successful).unwrap();
+        let failed = batch.begin_mutation_scope().unwrap();
+        batch.modify(first).unwrap().bytes_mut()[100] = 0x44;
+        batch.rollback_mutation_scope(failed).unwrap();
+
+        assert_eq!(batch.read(first).unwrap().bytes()[100], 0x22);
+        assert_eq!(batch.read(second).unwrap().bytes()[100], 0x33);
+        batch.rollback_mutation_scope(outer).unwrap();
+        assert_eq!(batch.read(first).unwrap().bytes()[100], first_original);
+        assert_eq!(batch.read(second).unwrap().bytes()[100], second_original);
+    }
+
+    #[test]
+    fn scoped_checkpoint_restores_all_touched_batch_metadata() {
+        // Production break caught: restoring page bytes but leaking an allocation,
+        // generation, tracked root, header feature, or catalog-update gate.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let expected = batch.checkpoint_mutation().unwrap();
+
+        let scope = batch.begin_mutation_scope().unwrap();
+        let root = batch.allocate(PageType::TableLeaf).unwrap();
+        batch.track_tree(TreeKind::Table, root).unwrap();
+        batch.enable_feature_bits(CATALOG_V1).unwrap();
+        batch.begin_catalog_update().unwrap();
+        batch.rollback_mutation_scope(scope).unwrap();
+
+        expected.assert_matches_batch_for_test(&batch);
+    }
+
+    #[test]
+    fn failed_drop_after_first_staged_page_release_restores_every_mutation_field() {
+        // Production break caught: an error after catalog keys are deleted and at
+        // least one table page is staged for release must restore records, page
+        // ownership, pending releases, root tracking, and both catalog gates.
+        let (temp, pager) = test_pager(4096).unwrap();
+        let spec = TableSpec::new(
+            CatalogName::new("T").unwrap(),
+            vec![ColumnSpec::new(
+                CatalogName::new("PAYLOAD").unwrap(),
+                ColumnType::Blob,
+                false,
+            )],
+        )
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let table_id = create_relation(&mut batch, &spec).unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        for value in 0_u8..96 {
+            writer
+                .insert(&mut batch, &[crate::Value::Blob(vec![value; 128])])
+                .unwrap();
+        }
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let (table, columns, pages, expected_rows, committed_pages) = {
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            let table = catalog.find_table_by_id(table_id).unwrap().clone();
+            let columns = catalog
+                .columns_for_table(table_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, table.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            assert!(pages.len() > 1);
+            let relation = Relation::open(&catalog, table_id).unwrap();
+            let mut scan = relation.scan(usize::MAX);
+            let mut rows = Vec::new();
+            while let Some(row) = scan.next_snapshot(&mut snapshot).unwrap() {
+                rows.push((row.rowid(), row.values().to_vec()));
+            }
+            (table, columns, pages, rows, pager.page_count())
+        };
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        batch.fail_tree_release_after = Some(1);
+        let error = drop_relation(&mut batch, table_id).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Io);
+        assert!(
+            error
+                .to_string()
+                .contains("injected after staged tree release")
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert!(batch.fail_tree_release_after.is_none());
+
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(table_id), Some(&table));
+        assert_eq!(
+            catalog
+                .columns_for_table(table_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            columns
+        );
+        assert_eq!(
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, table.root()))
+                .unwrap()
+                .all_live_pages(),
+            pages
+        );
+        batch.commit().unwrap();
+
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(table_id), Some(&table));
+        let relation = Relation::open(&catalog, table_id).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_snapshot(&mut snapshot).unwrap() {
+            rows.push((row.rowid(), row.values().to_vec()));
+        }
+        assert_eq!(rows, expected_rows);
+        drop(snapshot);
+
+        let mut allocation = pager.try_begin_write().unwrap();
+        let mut reused = BTreeSet::new();
+        loop {
+            let page = allocation.allocate(PageType::TableLeaf).unwrap();
+            if page.page_id().0 >= committed_pages {
+                break;
+            }
+            reused.insert(page.page_id());
+        }
+        assert!(pages.is_disjoint(&reused));
+        allocation.rollback().unwrap();
+    }
+
+    #[test]
+    fn dropping_unfinished_owned_batch_releases_writer_without_wal_io() {
+        let temp = TempDatabase::new("owned-writer-drop");
+        let pager = create_pager(&temp);
+        let before = durable_lengths(&temp);
+        drop(detached_batch(pager.clone()).unwrap());
+        assert_eq!(durable_lengths(&temp), before);
+        assert!(pager.try_begin_write().is_ok());
+    }
 
     #[test]
     fn catalog_checkpoint_publishes_the_matching_snapshot_commit_state() {

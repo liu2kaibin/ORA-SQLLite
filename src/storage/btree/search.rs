@@ -52,7 +52,7 @@ impl InternalNode {
 }
 
 impl BTree {
-    pub(in crate::storage) fn create(batch: &mut WriteBatch<'_>, kind: TreeKind) -> Result<Self> {
+    pub(in crate::storage) fn create(batch: &mut WriteBatch, kind: TreeKind) -> Result<Self> {
         let root = batch.allocate(kind.leaf_page_type())?;
         let frame = batch.modify(root)?;
         SlottedPage::open(frame, LEAF_METADATA_END)?;
@@ -83,9 +83,60 @@ impl BTree {
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
     ) -> Result<BTreeCursor<'a, S>> {
+        let mut state = self.scan_state(start, end)?;
+        state.initialize_if_needed(source)?;
+        Ok(BTreeCursor { source, state })
+    }
+
+    pub(in crate::storage) fn scan_state(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+    ) -> Result<BTreeScanState> {
         validate_bound(&start)?;
         validate_bound(&end)?;
-        let (current, leaf, next_slot) = match start {
+        Ok(BTreeScanState {
+            kind: self.kind,
+            root: self.root,
+            start: own_bound(start),
+            end: own_bound(end),
+            current: None,
+            leaf: None,
+            next_slot: 0,
+            visited: BTreeSet::new(),
+            max_leaf_hops: 0,
+            previous_leaf_last_key: None,
+        })
+    }
+}
+
+pub(in crate::storage) struct BTreeScanState {
+    kind: TreeKind,
+    root: PageRef,
+    start: Bound<Vec<u8>>,
+    end: Bound<Vec<u8>>,
+    current: Option<PageRef>,
+    leaf: Option<LeafNode>,
+    next_slot: usize,
+    visited: BTreeSet<PageId>,
+    max_leaf_hops: u64,
+    previous_leaf_last_key: Option<Vec<u8>>,
+}
+
+impl BTreeScanState {
+    pub(in crate::storage) fn next(
+        &mut self,
+        source: &mut impl PageSource,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.initialize_if_needed(source)?;
+        self.next_validated_cell(source)
+    }
+
+    fn initialize_if_needed(&mut self, source: &mut impl PageSource) -> Result<()> {
+        if self.max_leaf_hops != 0 || self.current.is_some() || self.leaf.is_some() {
+            return Ok(());
+        }
+        let (current, leaf, next_slot) = match &self.start {
             Bound::Unbounded => {
                 let (reference, leaf) = descend_to_leftmost(source, self.kind, self.root)?;
                 (reference, leaf, 0)
@@ -102,19 +153,91 @@ impl BTree {
             }
         };
         let max_leaf_hops = max_page_hops(source)?;
-        let mut visited = BTreeSet::new();
-        visit_page(&mut visited, current, max_leaf_hops, "B+Tree leaf chain")?;
-        Ok(BTreeCursor {
-            source,
-            kind: self.kind,
-            current: Some(current),
-            leaf: Some(leaf),
-            next_slot,
-            end: own_bound(end),
-            visited,
+        visit_page(
+            &mut self.visited,
+            current,
             max_leaf_hops,
-            previous_leaf_last_key: None,
-        })
+            "B+Tree leaf chain",
+        )?;
+        self.current = Some(current);
+        self.leaf = Some(leaf);
+        self.next_slot = next_slot;
+        self.max_leaf_hops = max_leaf_hops;
+        Ok(())
+    }
+
+    fn next_validated_cell(
+        &mut self,
+        source: &mut impl PageSource,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if self.current.is_none() {
+                return Ok(None);
+            }
+            let cell = self
+                .leaf
+                .as_ref()
+                .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?
+                .cells
+                .get(self.next_slot)
+                .cloned();
+            if let Some(cell) = cell {
+                self.next_slot = self
+                    .next_slot
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("B+Tree cursor slot index overflows"))?;
+                if is_past_end(cell.key(), &self.end) {
+                    self.current = None;
+                    self.leaf = None;
+                    return Ok(None);
+                }
+                return read_value(source, &cell).map(|value| Some((cell.key().to_vec(), value)));
+            }
+
+            let (last_key, right_sibling) = {
+                let leaf = self
+                    .leaf
+                    .as_ref()
+                    .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?;
+                (
+                    leaf.cells.last().map(|cell| cell.key().to_vec()),
+                    leaf.right_sibling,
+                )
+            };
+            if let Some(last_key) = last_key {
+                self.previous_leaf_last_key = Some(last_key);
+            }
+            match right_sibling {
+                Some(right) => {
+                    visit_page(
+                        &mut self.visited,
+                        right,
+                        self.max_leaf_hops,
+                        "B+Tree leaf chain",
+                    )?;
+                    let leaf = load_leaf(source, self.kind, right)?;
+                    if let Some(previous) = self.previous_leaf_last_key.as_deref() {
+                        if leaf
+                            .cells
+                            .first()
+                            .is_some_and(|cell| cell.key() <= previous)
+                        {
+                            return Err(corruption(
+                                "B+Tree leaf chain keys are not strictly ordered",
+                            ));
+                        }
+                    }
+                    self.current = Some(right);
+                    self.leaf = Some(leaf);
+                    self.next_slot = 0;
+                }
+                None => {
+                    self.current = None;
+                    self.leaf = None;
+                    return Ok(None);
+                }
+            }
+        }
     }
 }
 
@@ -327,87 +450,12 @@ fn visit_page(
 
 pub(in crate::storage) struct BTreeCursor<'a, S: PageSource> {
     source: &'a mut S,
-    kind: TreeKind,
-    current: Option<PageRef>,
-    leaf: Option<LeafNode>,
-    next_slot: usize,
-    end: Bound<Vec<u8>>,
-    visited: BTreeSet<PageId>,
-    max_leaf_hops: u64,
-    previous_leaf_last_key: Option<Vec<u8>>,
+    state: BTreeScanState,
 }
 
 impl<S: PageSource> BTreeCursor<'_, S> {
     pub(in crate::storage) fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        loop {
-            if self.current.is_none() {
-                return Ok(None);
-            }
-            let cell = self
-                .leaf
-                .as_ref()
-                .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?
-                .cells
-                .get(self.next_slot)
-                .cloned();
-            if let Some(cell) = cell {
-                self.next_slot = self
-                    .next_slot
-                    .checked_add(1)
-                    .ok_or_else(|| corruption("B+Tree cursor slot index overflows"))?;
-                if is_past_end(cell.key(), &self.end) {
-                    self.current = None;
-                    self.leaf = None;
-                    return Ok(None);
-                }
-                return read_value(self.source, &cell)
-                    .map(|value| Some((cell.key().to_vec(), value)));
-            }
-
-            let (last_key, right_sibling) = {
-                let leaf = self
-                    .leaf
-                    .as_ref()
-                    .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?;
-                (
-                    leaf.cells.last().map(|cell| cell.key().to_vec()),
-                    leaf.right_sibling,
-                )
-            };
-            if let Some(last_key) = last_key {
-                self.previous_leaf_last_key = Some(last_key);
-            }
-            match right_sibling {
-                Some(right) => {
-                    visit_page(
-                        &mut self.visited,
-                        right,
-                        self.max_leaf_hops,
-                        "B+Tree leaf chain",
-                    )?;
-                    let leaf = load_leaf(self.source, self.kind, right)?;
-                    if let Some(previous) = self.previous_leaf_last_key.as_deref() {
-                        if leaf
-                            .cells
-                            .first()
-                            .is_some_and(|cell| cell.key() <= previous)
-                        {
-                            return Err(corruption(
-                                "B+Tree leaf chain keys are not strictly ordered",
-                            ));
-                        }
-                    }
-                    self.current = Some(right);
-                    self.leaf = Some(leaf);
-                    self.next_slot = 0;
-                }
-                None => {
-                    self.current = None;
-                    self.leaf = None;
-                    return Ok(None);
-                }
-            }
-        }
+        self.state.next(self.source)
     }
 }
 
@@ -667,6 +715,20 @@ mod tests {
                 (b"dog".to_vec(), b"four".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn two_scan_states_alternate_on_one_snapshot() {
+        let (tree_a, tree_b, mut snapshot) = two_tree_fixture();
+        let mut a = tree_a
+            .scan_state(Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        let mut b = tree_b
+            .scan_state(Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        assert_eq!(a.next(&mut snapshot).unwrap().unwrap().0, vec![1]);
+        assert_eq!(b.next(&mut snapshot).unwrap().unwrap().0, vec![9]);
+        assert_eq!(a.next(&mut snapshot).unwrap().unwrap().0, vec![2]);
     }
 
     #[test]
@@ -1042,7 +1104,7 @@ mod tests {
         PageRef::new(PageId(page_id), generation).expect("page reference")
     }
 
-    fn write_leaf(batch: &mut WriteBatch<'_>, cells: &[(&[u8], &[u8])]) -> PageRef {
+    fn write_leaf(batch: &mut WriteBatch, cells: &[(&[u8], &[u8])]) -> PageRef {
         let reference = batch
             .allocate(PageType::TableLeaf)
             .expect("allocate leaf page");
@@ -1056,7 +1118,7 @@ mod tests {
         reference
     }
 
-    fn write_leaf_cell(batch: &mut WriteBatch<'_>, cell: LeafCell) -> PageRef {
+    fn write_leaf_cell(batch: &mut WriteBatch, cell: LeafCell) -> PageRef {
         let reference = batch
             .allocate(PageType::TableLeaf)
             .expect("allocate leaf page");
@@ -1068,7 +1130,7 @@ mod tests {
     }
 
     fn write_internal(
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         leftmost: PageRef,
         cells: &[(&[u8], PageRef)],
     ) -> PageRef {
@@ -1122,7 +1184,7 @@ mod tests {
         }
     }
 
-    fn link_right_sibling(batch: &mut WriteBatch<'_>, leaf: PageRef, right: PageRef) {
+    fn link_right_sibling(batch: &mut WriteBatch, leaf: PageRef, right: PageRef) {
         let frame = batch.modify(leaf).expect("modify leaf page");
         frame
             .set_right_sibling(Some(right.page_id()))
@@ -1142,6 +1204,44 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    struct TestSnapshot {
+        _temp: crate::storage::test_support::TempDatabase,
+        snapshot: crate::storage::ReadSnapshot,
+    }
+
+    impl PageSource for TestSnapshot {
+        fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
+            self.snapshot.read_page(reference)
+        }
+
+        fn page_count(&self) -> Result<u64> {
+            self.snapshot.page_count()
+        }
+    }
+
+    fn two_tree_fixture() -> (BTree, BTree, TestSnapshot) {
+        let (temp, pager) = test_pager(4096).expect("test pager");
+        let (tree_a, tree_b) = {
+            let mut batch = pager.begin_write().expect("begin fixture write");
+            let mut tree_a = BTree::create(&mut batch, TreeKind::Table).expect("create tree A");
+            tree_a.insert(&mut batch, &[1], b"a1").expect("insert A1");
+            tree_a.insert(&mut batch, &[2], b"a2").expect("insert A2");
+            let mut tree_b = BTree::create(&mut batch, TreeKind::Table).expect("create tree B");
+            tree_b.insert(&mut batch, &[9], b"b9").expect("insert B9");
+            batch.commit().expect("commit fixture trees");
+            (tree_a, tree_b)
+        };
+        let snapshot = pager.begin_read().expect("begin shared snapshot");
+        (
+            tree_a,
+            tree_b,
+            TestSnapshot {
+                _temp: temp,
+                snapshot,
+            },
+        )
     }
 
     struct CountingSource {

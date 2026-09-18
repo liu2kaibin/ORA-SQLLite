@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,12 +30,14 @@ use super::{
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
     page::{PageFrame, PageType},
     pager::PageSource,
+    relation::Relation,
     row::{RowCodec, decode_rowid_key, encode_rowid_key},
     validate::validate_tree,
     wal::{Wal, wal_path},
 };
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
+static NEXT_QUERY_DATABASE_UUID: AtomicU8 = AtomicU8::new(1);
 
 pub(crate) struct TempDatabase {
     path: PathBuf,
@@ -75,6 +77,21 @@ pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
     let temp = TempDatabase::new("pager");
     let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
     Ok((temp, pager))
+}
+
+pub(super) fn create_pager(temp: &TempDatabase) -> Pager {
+    Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager")
+}
+
+pub(super) fn durable_lengths(temp: &TempDatabase) -> (u64, u64) {
+    (
+        fs::metadata(temp.path())
+            .expect("read database metadata")
+            .len(),
+        fs::metadata(wal_path(temp.path()))
+            .expect("read WAL metadata")
+            .len(),
+    )
 }
 
 impl Drop for TempDatabase {
@@ -130,9 +147,19 @@ impl Phase4bCatalogFixture {
 }
 
 pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
+    phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
+}
+
+fn phase_4b_catalog_fixture_with_uuid(
+    page_size: u32,
+    database_uuid: [u8; 16],
+) -> Phase4bCatalogFixture {
     let temp = TempDatabase::new("phase4b-catalog");
-    let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))
-        .expect("create the Phase 4B catalog fixture");
+    let pager = Pager::create(
+        temp.path(),
+        PagerConfig::new(page_size, database_uuid).expect("query fixture pager config"),
+    )
+    .expect("create the Phase 4B catalog fixture");
     let mut batch = pager
         .begin_write()
         .expect("begin the Phase 4B catalog fixture write");
@@ -176,9 +203,102 @@ pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture 
     }
 }
 
+pub(crate) fn phase_4c1_query_relation_fixture(rows: &[(i64, &str)]) -> Phase4bCatalogFixture {
+    let uuid_byte = NEXT_QUERY_DATABASE_UUID.fetch_add(1, Ordering::Relaxed);
+    let fixture = phase_4b_catalog_fixture_with_uuid(4096, [uuid_byte; 16]);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().expect("open query fixture catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("read query fixture catalog");
+    let table = catalog
+        .find_table_by_id(fixture.users_id())
+        .expect("query fixture USERS table")
+        .clone();
+    let columns = catalog
+        .columns_for_table(fixture.users_id())
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(snapshot);
+
+    let mut batch = pager.begin_write().expect("begin query fixture write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("open query fixture catalog");
+    let mut tree = BTree::from_root(TreeKind::Table, table.root());
+    for (id, name) in rows {
+        let rowid = writer
+            .allocate_rowid(&mut batch, fixture.users_id())
+            .expect("allocate query fixture ROWID");
+        let values = [
+            crate::Value::Int64(*id),
+            crate::Value::Text((*name).to_owned()),
+            crate::Value::Null,
+            crate::Value::Null,
+        ];
+        let bytes = RowCodec::encode(&table, &columns, &values, 64 * 1024)
+            .expect("encode query fixture row");
+        tree.insert(&mut batch, &encode_rowid_key(rowid), &bytes)
+            .expect("insert query fixture row");
+    }
+    if !rows.is_empty() {
+        writer
+            .update_table_root(&mut batch, fixture.users_id(), tree.root())
+            .expect("publish query fixture table root");
+    }
+    writer
+        .finish(&mut batch)
+        .expect("finish query fixture catalog");
+    batch.commit().expect("commit query fixture rows");
+    fixture
+}
+
+pub(crate) fn phase_4c1_corrupt_query_relation_fixture() -> Phase4bCatalogFixture {
+    let uuid_byte = NEXT_QUERY_DATABASE_UUID.fetch_add(1, Ordering::Relaxed);
+    let fixture = phase_4b_catalog_fixture_with_uuid(4096, [uuid_byte; 16]);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().expect("open corrupt query catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("read corrupt query catalog");
+    let table = catalog
+        .find_table_by_id(fixture.users_id())
+        .expect("corrupt query USERS table")
+        .clone();
+    drop(snapshot);
+
+    let mut batch = pager.begin_write().expect("begin corrupt query write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("open corrupt query catalog");
+    let mut tree = BTree::from_root(TreeKind::Table, table.root());
+    let rowid = writer
+        .allocate_rowid(&mut batch, fixture.users_id())
+        .expect("allocate corrupt query ROWID");
+    tree.insert(&mut batch, &encode_rowid_key(rowid), b"not-a-valid-row")
+        .expect("insert corrupt query row");
+    writer
+        .update_table_root(&mut batch, fixture.users_id(), tree.root())
+        .expect("publish corrupt query table root");
+    writer
+        .finish(&mut batch)
+        .expect("finish corrupt query catalog");
+    batch.commit().expect("commit corrupt query row");
+    fixture
+}
+
+pub(crate) fn phase_4c1_corrupt_batch_catalog(batch: &mut WriteBatch) {
+    let (mut catalog, _) = batch
+        .catalog_tree_with_report(TreeKind::Table)
+        .expect("read construction-failure catalog")
+        .expect("construction-failure catalog root");
+    catalog
+        .insert(batch, &[0x11], b"invalid-catalog-record")
+        .expect("insert invalid catalog record");
+    batch
+        .set_catalog_root(catalog.root())
+        .expect("retain invalid catalog root");
+}
+
 fn insert_phase_4b_table(
     writer: &mut CatalogWriter,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     name: &str,
     columns: &[(&str, ColumnType, bool)],
 ) -> Result<TableId> {
@@ -764,13 +884,13 @@ fn create_concurrency_table(pager: &Pager) -> Result<PageRef> {
     Ok(root)
 }
 
-struct RecordingFaults {
+pub(crate) struct RecordingFaults {
     fail_on: Option<(FaultPoint, usize)>,
     observed: Mutex<Vec<FaultPoint>>,
 }
 
 impl RecordingFaults {
-    fn never() -> Self {
+    pub(crate) fn never() -> Self {
         Self {
             fail_on: None,
             observed: Mutex::new(Vec::new()),
@@ -784,7 +904,7 @@ impl RecordingFaults {
         }
     }
 
-    fn observed(&self) -> Vec<FaultPoint> {
+    pub(crate) fn observed(&self) -> Vec<FaultPoint> {
         self.observed.lock().expect("fault record lock").clone()
     }
 }
@@ -799,6 +919,405 @@ impl FaultInjector for RecordingFaults {
         }
         Ok(())
     }
+}
+
+pub(crate) fn phase_4c1_recording_crash_pager(path: &Path) -> (Pager, Arc<RecordingFaults>) {
+    let faults = Arc::new(RecordingFaults::never());
+    let pager = crash_open(path).with_faults(faults.clone());
+    (pager, faults)
+}
+
+pub(crate) fn phase_4c1_aborting_crash_pager(
+    path: &Path,
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+) -> Pager {
+    crash_open(path).with_faults(Arc::new(Phase4c1AbortAt {
+        trace,
+        point,
+        occurrence,
+        marker,
+        observed: Mutex::new(Vec::new()),
+    }))
+}
+
+pub(crate) fn phase_4c1_exact_crash_child_command(child_test: &str) -> std::process::Command {
+    let executable = std::env::current_exe().expect("find test executable");
+    let mut command = phase_4c1_crash_command_wrapper(&executable);
+    command.args(["--exact", child_test, "--ignored", "--nocapture"]);
+    command
+}
+
+#[cfg(unix)]
+fn phase_4c1_crash_command_wrapper(executable: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "ulimit -c 0 && exec \"$@\"", "ora-sqllite-crash"]);
+    command.arg(executable);
+    command
+}
+
+#[cfg(not(unix))]
+fn phase_4c1_crash_command_wrapper(executable: &Path) -> std::process::Command {
+    std::process::Command::new(executable)
+}
+
+#[test]
+fn phase_4c1_exact_child_command_retains_the_libtest_argument_contract() {
+    let child_test = "storage::test_support::phase_4c1_argument_contract_child";
+    let command = phase_4c1_exact_crash_child_command(child_test);
+    let arguments = command.get_args().collect::<Vec<_>>();
+    let expected = ["--exact", child_test, "--ignored", "--nocapture"];
+    assert_eq!(
+        &arguments[arguments.len() - expected.len()..],
+        expected.map(std::ffi::OsStr::new),
+        "platform wrapper must forward the exact ignored child test"
+    );
+}
+
+pub(crate) fn phase_4c1_copy_crash_pair(source: &Path) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-sql-crash-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(source, temp.path()).expect("copy SQL crash main file");
+    fs::copy(wal_path(source), wal_path(temp.path())).expect("copy SQL crash WAL");
+    assert_eq!(crash_pair_bytes(temp.path()), crash_pair_bytes(source));
+    temp
+}
+
+pub(crate) fn phase_4c1_main_only_crash_fixture() -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-main-only-fixture");
+    let file = DatabaseFile::create(temp.path(), 4096, [0x4c; 16], DEFAULT_MAX_DATABASE_BYTES)
+        .expect("create initialized main file without its WAL");
+    drop(file);
+    assert!(temp.path().is_file());
+    assert!(!wal_path(temp.path()).exists());
+    temp
+}
+
+pub(crate) fn phase_4c1_copy_main_only(source: &Path) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c1-main-only-case");
+    assert!(!temp.path().exists() && !wal_path(temp.path()).exists());
+    fs::copy(source, temp.path()).expect("copy main-only SQL crash fixture");
+    temp
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Phase4c1CrashPathKind {
+    Initialization,
+    Sql,
+}
+
+pub(crate) fn phase_4c1_validate_crash_path(path: PathBuf, kind: Phase4c1CrashPathKind) -> PathBuf {
+    assert!(
+        path.is_absolute(),
+        "invalid SQL crash configuration: relative path"
+    );
+    assert!(
+        !path.components().any(|component| matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )),
+        "invalid SQL crash configuration: noncanonical path components"
+    );
+    let canonical = fs::canonicalize(&path).expect("invalid SQL crash configuration: path");
+    assert!(
+        canonical.as_os_str() == path.as_os_str(),
+        "invalid SQL crash configuration: noncanonical path"
+    );
+    let canonical_temp =
+        fs::canonicalize(std::env::temp_dir()).expect("canonicalize system temp directory");
+    assert_eq!(
+        path.parent(),
+        Some(canonical_temp.as_path()),
+        "invalid SQL crash configuration: path outside temp directory"
+    );
+    assert!(
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(is_phase4c1_case_file_name),
+        "invalid SQL crash configuration: non-case path"
+    );
+    let wal = wal_path(&path);
+    match kind {
+        Phase4c1CrashPathKind::Initialization => {
+            assert!(
+                path.is_file() && !wal.exists(),
+                "invalid SQL crash configuration: initialization requires main only"
+            );
+            drop(
+                DatabaseFile::open_for_recovery(
+                    &path,
+                    OpenMode::ReadOnly,
+                    DEFAULT_MAX_DATABASE_BYTES,
+                )
+                .expect("invalid SQL crash configuration: unreadable main file"),
+            );
+        }
+        Phase4c1CrashPathKind::Sql => {
+            assert!(
+                path.is_file() && wal.is_file(),
+                "invalid SQL crash configuration: incomplete database/WAL pair"
+            );
+            let pager = Pager::open(&path, OpenMode::ReadOnly, PagerConfig::test_default(4096))
+                .expect("invalid SQL crash configuration: unreadable database/WAL pair");
+            let mut snapshot = pager
+                .begin_read()
+                .expect("invalid SQL crash configuration: unreadable snapshot");
+            let catalog = snapshot
+                .catalog_reader()
+                .expect("invalid SQL crash configuration: unreadable catalog");
+            catalog
+                .validate_deep(&mut snapshot)
+                .expect("invalid SQL crash configuration: invalid catalog or user tree");
+        }
+    }
+    path
+}
+
+fn is_phase4c1_case_file_name(name: &str) -> bool {
+    let Some(name) = name
+        .strip_prefix("ora-sqllite-")
+        .and_then(|name| name.strip_suffix(".db"))
+    else {
+        return false;
+    };
+    let Some((process_id, name)) = name.split_once("-phase4c1-") else {
+        return false;
+    };
+    let Some((label, sequence)) = name.rsplit_once("-case-") else {
+        return false;
+    };
+    !process_id.is_empty()
+        && process_id.bytes().all(|byte| byte.is_ascii_digit())
+        && !label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[test]
+fn phase_4c1_crash_path_validation_accepts_only_owned_case_files_without_writing() {
+    let sql_fixture = phase4a_fixture("bootstrap");
+    let sql_case = phase_4c1_copy_crash_pair(sql_fixture.path());
+    let sql_path = fs::canonicalize(sql_case.path()).unwrap();
+    let sql_before = crash_pair_bytes(&sql_path);
+    assert_eq!(
+        phase_4c1_validate_crash_path(sql_path.clone(), Phase4c1CrashPathKind::Sql),
+        sql_path
+    );
+    assert_eq!(crash_pair_bytes(sql_case.path()), sql_before);
+
+    let init_fixture = phase_4c1_main_only_crash_fixture();
+    let init_case = phase_4c1_copy_main_only(init_fixture.path());
+    let init_path = fs::canonicalize(init_case.path()).unwrap();
+    let init_before = fs::read(&init_path).unwrap();
+    assert_eq!(
+        phase_4c1_validate_crash_path(init_path.clone(), Phase4c1CrashPathKind::Initialization,),
+        init_path
+    );
+    assert_eq!(fs::read(init_case.path()).unwrap(), init_before);
+    assert!(!wal_path(init_case.path()).exists());
+}
+
+#[test]
+fn phase_4c1_crash_path_validation_rejects_unsafe_paths_without_writing() {
+    let fixture = phase4a_fixture("bootstrap");
+    let case = phase_4c1_copy_crash_pair(fixture.path());
+    let canonical = fs::canonicalize(case.path()).unwrap();
+    let before = crash_pair_bytes(&canonical);
+
+    let relative = PathBuf::from(canonical.file_name().unwrap());
+    let guard_directory = canonical.with_extension("path-guard-directory");
+    fs::create_dir(&guard_directory).expect("create exact path-guard directory");
+    #[cfg(windows)]
+    let noncanonical = std::env::temp_dir().join(canonical.file_name().unwrap());
+    #[cfg(not(windows))]
+    let noncanonical = guard_directory
+        .join("..")
+        .join(canonical.file_name().unwrap());
+    for (case_name, path) in [
+        ("relative", relative),
+        ("noncanonical", noncanonical),
+        ("wrong-name", fs::canonicalize(fixture.path()).unwrap()),
+    ] {
+        let rejected = std::panic::catch_unwind(|| {
+            phase_4c1_validate_crash_path(path, Phase4c1CrashPathKind::Sql)
+        });
+        assert!(
+            rejected.is_err(),
+            "unsafe {case_name} crash path was accepted"
+        );
+        assert_eq!(crash_pair_bytes(&canonical), before);
+    }
+
+    let nested = guard_directory.join(canonical.file_name().unwrap());
+    fs::copy(&canonical, &nested).expect("copy controlled nested main file");
+    fs::copy(wal_path(&canonical), wal_path(&nested)).expect("copy controlled nested WAL");
+    let nested = fs::canonicalize(nested).unwrap();
+    let nested_before = crash_pair_bytes(&nested);
+    let rejected = std::panic::catch_unwind(|| {
+        phase_4c1_validate_crash_path(nested.clone(), Phase4c1CrashPathKind::Sql)
+    });
+    assert!(rejected.is_err(), "nested temp path was accepted");
+    assert_eq!(crash_pair_bytes(&nested), nested_before);
+    fs::remove_file(wal_path(&nested)).expect("remove exact nested WAL");
+    fs::remove_file(&nested).expect("remove exact nested main file");
+    fs::remove_dir(&guard_directory).expect("remove exact path-guard directory");
+
+    let main_only_fixture = phase_4c1_main_only_crash_fixture();
+    let main_only_case = phase_4c1_copy_main_only(main_only_fixture.path());
+    let main_only_path = fs::canonicalize(main_only_case.path()).unwrap();
+    let main_before = fs::read(&main_only_path).unwrap();
+    let rejected = std::panic::catch_unwind(|| {
+        phase_4c1_validate_crash_path(main_only_path, Phase4c1CrashPathKind::Sql)
+    });
+    assert!(rejected.is_err(), "SQL mode accepted a missing WAL");
+    assert_eq!(fs::read(main_only_case.path()).unwrap(), main_before);
+    assert!(!wal_path(main_only_case.path()).exists());
+
+    let init_case = phase_4c1_copy_crash_pair(fixture.path());
+    let init_path = fs::canonicalize(init_case.path()).unwrap();
+    let init_before = crash_pair_bytes(&init_path);
+    let rejected = std::panic::catch_unwind(|| {
+        phase_4c1_validate_crash_path(init_path, Phase4c1CrashPathKind::Initialization)
+    });
+    assert!(
+        rejected.is_err(),
+        "initialization mode accepted an existing WAL"
+    );
+    assert_eq!(crash_pair_bytes(init_case.path()), init_before);
+}
+
+pub(crate) fn phase_4c1_wal_initialization_trace(path: &Path) -> Vec<FaultPoint> {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)
+            .expect("open main-only fixture");
+    let faults = Arc::new(RecordingFaults::never());
+    let wal = Wal::create_with_faults(path, &file.header(), faults.clone())
+        .expect("trace WAL initialization");
+    drop(wal);
+    drop(file);
+    faults.observed()
+}
+
+pub(crate) fn phase_4c1_abort_wal_initialization(
+    path: &Path,
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+) {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadWrite, DEFAULT_MAX_DATABASE_BYTES)
+            .expect("open main-only crash fixture");
+    let faults = Arc::new(Phase4c1AbortAt {
+        trace,
+        point,
+        occurrence,
+        marker,
+        observed: Mutex::new(Vec::new()),
+    });
+    let _wal = Wal::create_with_faults(path, &file.header(), faults)
+        .expect("initialize WAL through configured crash point");
+}
+
+pub(crate) fn phase_4c1_recovered_lsn(path: &Path) -> Lsn {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadOnly, DEFAULT_MAX_DATABASE_BYTES)
+            .expect("open SQL crash main file without mutation");
+    let header = file.header();
+    let mut wal =
+        Wal::open(path, &header, OpenMode::ReadOnly).expect("open SQL crash WAL without mutation");
+    wal.recover(&header, OpenMode::ReadOnly)
+        .expect("scan SQL crash WAL with production recovery acceptance")
+        .latest_lsn
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c1SqlStorageState {
+    pub(crate) lsn: Lsn,
+    pub(crate) catalog_records: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) next_rowid: Option<u64>,
+    pub(crate) rows: Vec<(u64, Vec<Value>)>,
+}
+
+pub(crate) fn phase_4c1_sql_storage_state(path: &Path) -> Phase4c1SqlStorageState {
+    let pager = crash_open(path);
+    let mut snapshot = pager.begin_read().expect("open SQL recovery snapshot");
+    let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).expect("open recovered catalog");
+    catalog
+        .validate_deep(&mut snapshot)
+        .expect("deep-validate recovered catalog and user trees");
+    let catalog_records = snapshot
+        .catalog_tree(TreeKind::Table)
+        .expect("read recovered catalog tree")
+        .map_or_else(BTreeMap::new, |tree| {
+            collect_all(&tree, &mut snapshot)
+                .expect("scan recovered catalog records")
+                .into_iter()
+                .collect()
+        });
+    let table = catalog
+        .find_table_by_name(&CatalogName::new("T").expect("valid recovery table name"))
+        .cloned();
+    let next_rowid = table.as_ref().map(|table| table.next_rowid().get());
+    let mut rows = Vec::new();
+    if let Some(table) = table {
+        let relation = Relation::open(&catalog, table.id()).expect("open recovered T relation");
+        let mut scan = relation.scan(PHASE_4A_MAX_ROW);
+        while let Some(row) = scan
+            .next_snapshot(&mut snapshot)
+            .expect("scan recovered T row")
+        {
+            rows.push((row.rowid().get(), row.values().to_vec()));
+        }
+    }
+    Phase4c1SqlStorageState {
+        lsn: snapshot.lsn(),
+        catalog_records,
+        next_rowid,
+        rows,
+    }
+}
+
+struct Phase4c1AbortAt {
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+    observed: Mutex<Vec<FaultPoint>>,
+}
+
+impl FaultInjector for Phase4c1AbortAt {
+    fn check(&self, point: FaultPoint) -> Result<()> {
+        let mut observed = self.observed.lock().expect("SQL crash trace lock");
+        assert_eq!(
+            self.trace.get(observed.len()),
+            Some(&point),
+            "SQL crash child diverged from successful trace"
+        );
+        observed.push(point);
+        let occurrence = observed.iter().filter(|&&seen| seen == point).count();
+        if (point, occurrence) == (self.point, self.occurrence) {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "{} {point:?} {occurrence}", self.marker).unwrap();
+            stderr.flush().unwrap();
+            std::process::abort();
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn phase_4c1_commit_io_fault_pager(temp: &TempDatabase) -> Pager {
+    Pager::create(temp.path(), PagerConfig::test_default(4096))
+        .expect("create SQL commit fault pager")
+        .with_faults(Arc::new(RecordingFaults::at(
+            FaultPoint::BeforeWalRecordWrite,
+            1,
+        )))
 }
 
 #[test]
@@ -916,10 +1435,7 @@ fn commit_multi_page_tree(faults: Arc<RecordingFaults>) -> Result<Vec<FaultPoint
     Ok(faults.observed())
 }
 
-fn insert_multi_page_fixture(
-    tree: &mut BTree,
-    batch: &mut super::pager::WriteBatch<'_>,
-) -> Result<()> {
+fn insert_multi_page_fixture(tree: &mut BTree, batch: &mut super::pager::WriteBatch) -> Result<()> {
     for index in 0..30u8 {
         tree.insert(batch, &index.to_be_bytes(), &[index; 400])?;
     }
@@ -1848,7 +2364,7 @@ fn model_definitions(id: u64, table: &ModelTable, root: PageRef) -> (TableDef, V
 
 fn phase4a_create_table(
     writer: &mut CatalogWriter,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     model: &CatalogModel,
     id: u64,
 ) -> Result<TableDef> {
@@ -1868,7 +2384,7 @@ fn phase4a_create_table(
 
 fn phase4a_insert_row(
     writer: &mut CatalogWriter,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     table: &TableDef,
     model: &CatalogModel,
     rowid: u64,
@@ -2193,7 +2709,7 @@ fn phase_4a_catalog_reserved_field_expectations() {
 
 fn assert_phase4a_catalog_mutation(
     reader: &CatalogReader,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     tree: &BTree,
     original: &TableDef,
     model: &CatalogModel,
@@ -3307,7 +3823,7 @@ fn crash_trace(fixture: &TempDatabase, mode: &str) -> (Vec<FaultPoint>, CrashSta
     (faults.observed(), pre, post)
 }
 
-fn assert_commit_trace(trace: &[FaultPoint]) {
+pub(crate) fn assert_commit_trace(trace: &[FaultPoint]) {
     let record_points = [
         FaultPoint::BeforeWalRecordWrite,
         FaultPoint::AfterWalRecordHeaderPrefixWrite,

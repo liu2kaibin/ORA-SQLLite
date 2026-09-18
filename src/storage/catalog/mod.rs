@@ -11,7 +11,7 @@ use super::{
     PageRef,
     btree::{BTree, TreeKind},
     features::{CATALOG_V1, validate_feature_bits},
-    pager::{PageSource, ReadSnapshot, WriteBatch, WriteBatchCheckpoint},
+    pager::{PageSource, ReadSnapshot, WriteBatch},
     validate::{
         ValidationReport, validate_freelist, validate_table_roots, validate_table_trees,
         validate_tree,
@@ -205,7 +205,7 @@ impl CatalogReader {
         Self::open_validated(snapshot, &tree, report)
     }
 
-    pub(super) fn open_empty_or_v1_batch(batch: &mut WriteBatch<'_>) -> Result<Self> {
+    pub(super) fn open_empty_or_v1_batch(batch: &mut WriteBatch) -> Result<Self> {
         let feature_bits = batch.feature_bits();
         validate_feature_bits(feature_bits)?;
         if feature_bits & CATALOG_V1 == 0 {
@@ -229,7 +229,7 @@ impl CatalogReader {
 
     /// Validate an unpublished candidate; its current root can differ from the header.
     pub(super) fn open_candidate(
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         tree: &BTree,
         feature_bits: u64,
     ) -> Result<Self> {
@@ -276,6 +276,16 @@ impl CatalogReader {
             .catalog_tree_with_report(TreeKind::Table)?
             .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
         self.validate_deep_from(snapshot, &tree, report)
+    }
+
+    /// Validate every table tree in a write batch before a destructive catalog
+    /// operation can release pages still reachable through another root.
+    pub(super) fn validate_deep_batch(&self, batch: &mut WriteBatch) -> Result<()> {
+        validate_feature_bits(batch.feature_bits())?;
+        let (tree, report) = batch
+            .catalog_tree_with_report(TreeKind::Table)?
+            .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
+        self.validate_deep_from(batch, &tree, report)
     }
 
     fn validate_deep_from(
@@ -382,9 +392,14 @@ pub(super) struct CatalogWriter {
     dirty: bool,
 }
 
+pub(super) struct CatalogWriterCheckpoint {
+    root: PageRef,
+    dirty: bool,
+}
+
 impl CatalogWriter {
-    pub(super) fn bootstrap(batch: &mut WriteBatch<'_>) -> Result<Self> {
-        let checkpoint = batch.checkpoint_mutation()?;
+    pub(super) fn bootstrap(batch: &mut WriteBatch) -> Result<Self> {
+        let checkpoint = batch.begin_mutation_scope()?;
         let result = (|| {
             // One outstanding writer per batch prevents a later open from finishing
             // an older root. The checkpoint also restores this gate on every error.
@@ -412,44 +427,59 @@ impl CatalogWriter {
                 Ok(Self { tree, dirty: false })
             }
         })();
-        if result.is_err() {
-            batch.restore_mutation(checkpoint);
-        }
-        result
-    }
-
-    /// Restore the batch image and the writer's separately owned root together.
-    fn restore(
-        &mut self,
-        batch: &mut WriteBatch<'_>,
-        checkpoint: WriteBatchCheckpoint,
-        root: PageRef,
-    ) {
-        batch.restore_mutation(checkpoint);
-        self.tree = BTree::from_root(TreeKind::Table, root);
-    }
-
-    fn mutate<T>(
-        &mut self,
-        batch: &mut WriteBatch<'_>,
-        mutation: impl FnOnce(&mut BTree, &mut WriteBatch<'_>) -> Result<T>,
-    ) -> Result<T> {
-        let checkpoint = batch.checkpoint_mutation()?;
-        let root = self.tree.root();
-        match mutation(&mut self.tree, batch) {
-            Ok(value) => {
-                // Bootstrap owns the pending gate until finish, even on clean opens.
-                self.dirty = true;
-                Ok(value)
+        match result {
+            Ok(writer) => {
+                batch.finish_mutation_scope(checkpoint)?;
+                Ok(writer)
             }
             Err(error) => {
-                self.restore(batch, checkpoint, root);
+                batch.rollback_mutation_scope(checkpoint)?;
                 Err(error)
             }
         }
     }
 
-    pub(crate) fn allocate_object_id(&mut self, batch: &mut WriteBatch<'_>) -> Result<ObjectId> {
+    pub(super) const fn checkpoint(&self) -> CatalogWriterCheckpoint {
+        CatalogWriterCheckpoint {
+            root: self.tree.root(),
+            dirty: self.dirty,
+        }
+    }
+
+    /// Restore the batch image and the writer's separately owned state together.
+    pub(super) fn restore(&mut self, writer_checkpoint: CatalogWriterCheckpoint) {
+        self.tree = BTree::from_root(TreeKind::Table, writer_checkpoint.root);
+        self.dirty = writer_checkpoint.dirty;
+    }
+
+    pub(super) const fn root(&self) -> PageRef {
+        self.tree.root()
+    }
+
+    fn mutate<T>(
+        &mut self,
+        batch: &mut WriteBatch,
+        mutation: impl FnOnce(&mut BTree, &mut WriteBatch) -> Result<T>,
+    ) -> Result<T> {
+        let checkpoint = batch.begin_mutation_scope()?;
+        let writer_checkpoint = self.checkpoint();
+        match mutation(&mut self.tree, batch) {
+            Ok(value) => {
+                // Bootstrap owns the pending gate until finish, even on clean opens.
+                self.dirty = true;
+                batch.finish_mutation_scope(checkpoint)?;
+                Ok(value)
+            }
+            Err(error) => {
+                batch.rollback_mutation_scope(checkpoint)?;
+                self.tree = BTree::from_root(TreeKind::Table, writer_checkpoint.root);
+                self.dirty = writer_checkpoint.dirty;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn allocate_object_id(&mut self, batch: &mut WriteBatch) -> Result<ObjectId> {
         self.mutate(batch, |tree, batch| {
             let key = key::catalog_meta_key();
             let bytes = tree
@@ -468,7 +498,7 @@ impl CatalogWriter {
 
     pub(crate) fn insert_table_definition(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         table: &TableDef,
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
@@ -498,7 +528,7 @@ impl CatalogWriter {
 
     pub(crate) fn insert_column_definition(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         column: &ColumnDef,
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
@@ -534,7 +564,7 @@ impl CatalogWriter {
 
     pub(crate) fn update_table_root(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         table_id: TableId,
         root: PageRef,
     ) -> Result<()> {
@@ -552,7 +582,7 @@ impl CatalogWriter {
 
     pub(crate) fn allocate_rowid(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         table_id: TableId,
     ) -> Result<RowId> {
         self.mutate(batch, |tree, batch| {
@@ -575,8 +605,49 @@ impl CatalogWriter {
         })
     }
 
+    pub(crate) fn remove_relation(
+        &mut self,
+        batch: &mut WriteBatch,
+        table: &TableDef,
+        columns: &[ColumnDef],
+    ) -> Result<()> {
+        self.mutate(batch, |tree, batch| {
+            if columns.len() != usize::from(table.column_count()) {
+                return Err(corruption(
+                    "bound relation columns do not match the table column count",
+                ));
+            }
+            require_matching_table_record(tree, batch, table)?;
+            for (ordinal, column) in columns.iter().enumerate() {
+                if column.table_id() != table.id() || usize::from(column.ordinal()) != ordinal {
+                    return Err(corruption(
+                        "bound relation columns do not match the table definition",
+                    ));
+                }
+                require_matching_column_record(tree, batch, column)?;
+            }
+
+            for column in columns {
+                delete_required_record(
+                    tree,
+                    batch,
+                    &key::column_name_key(column.table_id(), column.name())?,
+                )?;
+                delete_required_record(
+                    tree,
+                    batch,
+                    &key::column_ordinal_key(column.table_id(), column.ordinal()),
+                )?;
+                delete_required_record(tree, batch, &key::column_definition_key(column.id()))?;
+            }
+            delete_required_record(tree, batch, &key::table_name_key(table.name())?)?;
+            delete_required_record(tree, batch, &key::table_definition_key(table.id()))?;
+            batch.release_tree_later(TreeKind::Table, table.root())
+        })
+    }
+
     /// Publish only the fully validated current root; failure leaves commit gated.
-    pub(super) fn finish(self, batch: &mut WriteBatch<'_>) -> Result<()> {
+    pub(super) fn finish(self, batch: &mut WriteBatch) -> Result<()> {
         if self.dirty {
             CatalogReader::open_candidate(batch, &self.tree, batch.feature_bits())?;
             batch.track_tree(TreeKind::Table, self.tree.root())?;
@@ -586,11 +657,7 @@ impl CatalogWriter {
     }
 }
 
-fn read_table_definition(
-    tree: &BTree,
-    batch: &mut WriteBatch<'_>,
-    id: TableId,
-) -> Result<TableDef> {
+fn read_table_definition(tree: &BTree, batch: &mut WriteBatch, id: TableId) -> Result<TableDef> {
     let bytes = tree
         .get(batch, &key::table_definition_key(id))?
         .ok_or_else(|| {
@@ -602,7 +669,7 @@ fn read_table_definition(
     record::decode_table_definition(id, &bytes)
 }
 
-fn require_available_object(tree: &BTree, batch: &mut WriteBatch<'_>, id: ObjectId) -> Result<()> {
+fn require_available_object(tree: &BTree, batch: &mut WriteBatch, id: ObjectId) -> Result<()> {
     // V1 defines only table and column objects; their identities share one namespace.
     for key in [
         key::table_definition_key(TableId::new(id.get())?),
@@ -620,7 +687,7 @@ fn require_available_object(tree: &BTree, batch: &mut WriteBatch<'_>, id: Object
 
 fn require_available_key(
     tree: &BTree,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     key: &[u8],
     message: &'static str,
 ) -> Result<()> {
@@ -633,7 +700,7 @@ fn require_available_key(
 // Called only inside a logical mutation checkpoint, not as an independent upsert.
 fn replace_record(
     tree: &mut BTree,
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     key: &[u8],
     value: &[u8],
 ) -> Result<()> {
@@ -641,6 +708,73 @@ fn replace_record(
         return Err(corruption("catalog replacement record is missing"));
     }
     tree.insert(batch, key, value)
+}
+
+fn require_matching_table_record(
+    tree: &BTree,
+    batch: &mut WriteBatch,
+    expected: &TableDef,
+) -> Result<()> {
+    let bytes = tree
+        .get(batch, &key::table_definition_key(expected.id()))?
+        .ok_or_else(|| corruption("bound table definition is missing before mutation"))?;
+    if record::decode_table_definition(expected.id(), &bytes)? != *expected {
+        return Err(corruption("bound table definition changed before mutation"));
+    }
+    let name_bytes = tree
+        .get(batch, &key::table_name_key(expected.name())?)?
+        .ok_or_else(|| corruption("bound table name mapping is missing before mutation"))?;
+    if record::decode_table_name_mapping(&name_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound table name mapping changed before mutation",
+        ));
+    }
+    Ok(())
+}
+
+fn require_matching_column_record(
+    tree: &BTree,
+    batch: &mut WriteBatch,
+    expected: &ColumnDef,
+) -> Result<()> {
+    let bytes = tree
+        .get(batch, &key::column_definition_key(expected.id()))?
+        .ok_or_else(|| corruption("bound column definition is missing before mutation"))?;
+    if record::decode_column_definition(expected.id(), &bytes)? != *expected {
+        return Err(corruption(
+            "bound column definition changed before mutation",
+        ));
+    }
+    let name_bytes = tree
+        .get(
+            batch,
+            &key::column_name_key(expected.table_id(), expected.name())?,
+        )?
+        .ok_or_else(|| corruption("bound column name mapping is missing before mutation"))?;
+    if record::decode_column_name_mapping(&name_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound column name mapping changed before mutation",
+        ));
+    }
+    let ordinal_bytes = tree
+        .get(
+            batch,
+            &key::column_ordinal_key(expected.table_id(), expected.ordinal()),
+        )?
+        .ok_or_else(|| corruption("bound column ordinal mapping is missing before mutation"))?;
+    if record::decode_column_ordinal_mapping(&ordinal_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound column ordinal mapping changed before mutation",
+        ));
+    }
+    Ok(())
+}
+
+fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch, key: &[u8]) -> Result<()> {
+    if tree.delete(batch, key)?.is_none() {
+        return Err(corruption("catalog record is missing during mutation"));
+    }
+    Ok(())
 }
 
 fn insert_unique<K: Ord, V>(map: &mut BTreeMap<K, V>, key: K, value: V) -> Result<()> {
@@ -915,74 +1049,6 @@ fn open_catalog_for_test(pager: &super::Pager) -> Result<CatalogReader> {
 }
 
 #[cfg(test)]
-fn require_matching_table_record(
-    tree: &BTree,
-    batch: &mut WriteBatch<'_>,
-    expected: &TableDef,
-) -> Result<()> {
-    let bytes = tree
-        .get(batch, &key::table_definition_key(expected.id()))?
-        .ok_or_else(|| corruption("test table definition is missing before mutation"))?;
-    if record::decode_table_definition(expected.id(), &bytes)? != *expected {
-        return Err(corruption("test table definition differs before mutation"));
-    }
-    let name_bytes = tree
-        .get(batch, &key::table_name_key(expected.name())?)?
-        .ok_or_else(|| corruption("test table name mapping is missing before mutation"))?;
-    if record::decode_table_name_mapping(&name_bytes)? != expected.id() {
-        return Err(corruption(
-            "test table name mapping differs before mutation",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn require_matching_column_record(
-    tree: &BTree,
-    batch: &mut WriteBatch<'_>,
-    expected: &ColumnDef,
-) -> Result<()> {
-    let bytes = tree
-        .get(batch, &key::column_definition_key(expected.id()))?
-        .ok_or_else(|| corruption("test column definition is missing before mutation"))?;
-    if record::decode_column_definition(expected.id(), &bytes)? != *expected {
-        return Err(corruption("test column definition differs before mutation"));
-    }
-    let name_bytes = tree
-        .get(
-            batch,
-            &key::column_name_key(expected.table_id(), expected.name())?,
-        )?
-        .ok_or_else(|| corruption("test column name mapping is missing before mutation"))?;
-    if record::decode_column_name_mapping(&name_bytes)? != expected.id() {
-        return Err(corruption(
-            "test column name mapping differs before mutation",
-        ));
-    }
-    let ordinal_bytes = tree
-        .get(
-            batch,
-            &key::column_ordinal_key(expected.table_id(), expected.ordinal()),
-        )?
-        .ok_or_else(|| corruption("test column ordinal mapping is missing before mutation"))?;
-    if record::decode_column_ordinal_mapping(&ordinal_bytes)? != expected.id() {
-        return Err(corruption(
-            "test column ordinal mapping differs before mutation",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch<'_>, key: &[u8]) -> Result<()> {
-    if tree.delete(batch, key)?.is_none() {
-        return Err(corruption("test catalog record is missing during mutation"));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use super::{key::*, record::*, types::*};
@@ -995,6 +1061,7 @@ mod tests {
             file::OpenMode,
             page::PageType,
             pager::{Pager, PagerConfig, WriteBatch},
+            relation::{ColumnSpec, TableSpec, TableWrite, create_relation, drop_relation},
             row::{RowCodec, encode_rowid_key},
             test_support::{TempDatabase, test_pager},
         },
@@ -1022,6 +1089,134 @@ mod tests {
         drop(pager);
         assert_eq!(std::fs::read(temp.path()).unwrap(), before);
         assert_eq!(std::fs::read(wal_path).unwrap(), wal_before);
+    }
+
+    #[test]
+    fn remove_relation_deletes_exact_records_and_releases_the_complete_bound_tree() {
+        // Production break caught: deleting by name or releasing only the root
+        // leaves column mappings, descendants, or overflow pages live after DROP.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let spec = TableSpec::new(
+            CatalogName::new("T").unwrap(),
+            vec![ColumnSpec::new(
+                CatalogName::new("PAYLOAD").unwrap(),
+                ColumnType::Blob,
+                false,
+            )],
+        )
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let table_id = create_relation(&mut batch, &spec).unwrap();
+        let mut table_write = TableWrite::open(&mut batch, table_id).unwrap();
+        for value in 0_u8..96 {
+            table_write
+                .insert(&mut batch, &[crate::Value::Blob(vec![value; 128])])
+                .unwrap();
+        }
+        table_write.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let (table, columns, user_pages) = {
+            let mut snapshot = pager.begin_read().unwrap();
+            let reader = snapshot.catalog_reader().unwrap();
+            let table = reader.find_table_by_id(table_id).unwrap().clone();
+            let columns = reader
+                .columns_for_table(table_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, table.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            assert!(
+                pages.len() > 1,
+                "fixture must own descendants or overflow pages"
+            );
+            (table, columns, pages)
+        };
+        let committed_page_count = pager.page_count();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        assert_eq!(
+            writer
+                .remove_relation(&mut batch, &table, &[])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        assert!(
+            writer
+                .tree
+                .get(&mut batch, &table_definition_key(table_id))
+                .unwrap()
+                .is_some(),
+            "failed exact-match validation must restore the table record"
+        );
+
+        writer
+            .remove_relation(&mut batch, &table, &columns)
+            .unwrap();
+        assert!(
+            writer
+                .tree
+                .get(&mut batch, &table_definition_key(table_id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            writer
+                .tree
+                .get(&mut batch, &table_name_key(table.name()).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        for column in &columns {
+            for key in [
+                column_definition_key(column.id()),
+                column_name_key(table_id, column.name()).unwrap(),
+                column_ordinal_key(table_id, column.ordinal()),
+            ] {
+                assert!(writer.tree.get(&mut batch, &key).unwrap().is_none());
+            }
+        }
+        assert!(
+            writer
+                .tree
+                .get(&mut batch, &catalog_meta_key())
+                .unwrap()
+                .is_some(),
+            "DROP must retain unrelated catalog records"
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut snapshot = pager.begin_read().unwrap();
+        assert!(
+            snapshot
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_id(table_id)
+                .is_none()
+        );
+        drop(snapshot);
+
+        let mut allocation = pager.try_begin_write().unwrap();
+        let mut reused = BTreeSet::new();
+        loop {
+            let page = allocation.allocate(PageType::TableLeaf).unwrap();
+            if page.page_id().0 >= committed_page_count {
+                break;
+            }
+            reused.insert(page.page_id());
+        }
+        assert!(
+            user_pages.is_subset(&reused),
+            "every page owned by the dropped table must return to the freelist"
+        );
+        allocation.rollback().unwrap();
     }
 
     type Records = Vec<(Vec<u8>, Vec<u8>)>;
@@ -1123,7 +1318,7 @@ mod tests {
         batch.commit().unwrap();
     }
 
-    fn current_records(writer: &CatalogWriter, batch: &mut WriteBatch<'_>) -> Records {
+    fn current_records(writer: &CatalogWriter, batch: &mut WriteBatch) -> Records {
         let mut cursor = writer
             .tree
             .scan(batch, Bound::Unbounded, Bound::Unbounded)
@@ -1320,7 +1515,7 @@ mod tests {
         }
     }
 
-    fn split_user_tree(tree: &mut BTree, batch: &mut WriteBatch<'_>) -> u64 {
+    fn split_user_tree(tree: &mut BTree, batch: &mut WriteBatch) -> u64 {
         let old_root = tree.root();
         for key in 0u64..200 {
             tree.insert(batch, &key.to_be_bytes(), &[7; 128]).unwrap();
@@ -1359,7 +1554,7 @@ mod tests {
         .with_faults(std::sync::Arc::new(NoWrites));
         let mut batch = pager.begin_write().unwrap();
         let mut tree = BTree::from_root(TreeKind::Table, root);
-        let mutate = |tree: &mut BTree, batch: &mut WriteBatch<'_>| {
+        let mutate = |tree: &mut BTree, batch: &mut WriteBatch| {
             if split {
                 split_user_tree(tree, batch);
             } else {
@@ -2320,7 +2515,7 @@ mod tests {
         }
     }
 
-    fn grow_catalog_for_split(writer: &mut CatalogWriter, batch: &mut WriteBatch<'_>) {
+    fn grow_catalog_for_split(writer: &mut CatalogWriter, batch: &mut WriteBatch) {
         for id in 10..50 {
             let root = BTree::create(batch, TreeKind::Table).unwrap().root();
             let table = TableDef::new(
@@ -2411,7 +2606,7 @@ mod tests {
         records
     }
 
-    fn raw_tree(batch: &mut WriteBatch<'_>, records: Records) -> BTree {
+    fn raw_tree(batch: &mut WriteBatch, records: Records) -> BTree {
         let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
         for (key, value) in records {
             tree.insert(batch, &key, &value).unwrap();
@@ -2420,7 +2615,7 @@ mod tests {
         tree
     }
 
-    fn publish(batch: &mut WriteBatch<'_>, tree: &BTree) {
+    fn publish(batch: &mut WriteBatch, tree: &BTree) {
         batch.enable_feature_bits(CATALOG_V1).unwrap();
         batch.set_catalog_root(tree.root()).unwrap();
     }
@@ -3193,7 +3388,7 @@ mod tests {
         );
     }
 
-    fn large_user_tree(batch: &mut WriteBatch<'_>) -> BTree {
+    fn large_user_tree(batch: &mut WriteBatch) -> BTree {
         let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
         for key in 0_u64..80 {
             tree.insert(batch, &key.to_be_bytes(), &[42; 700]).unwrap();
@@ -3202,7 +3397,7 @@ mod tests {
         tree
     }
 
-    fn copy_internal_root(batch: &mut WriteBatch<'_>, from: PageRef, to: PageRef) {
+    fn copy_internal_root(batch: &mut WriteBatch, from: PageRef, to: PageRef) {
         let source = batch.read(from).unwrap();
         let header = source.header();
         assert_eq!(header.page_type(), PageType::TableInternal);
@@ -3269,6 +3464,108 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::Corruption);
             assert!(error.to_string().contains("overlap"));
         }
+    }
+
+    #[test]
+    fn drop_rejects_distinct_table_roots_that_share_descendants_without_releasing_pages() {
+        // Production break caught: DROP must not release descendants still
+        // reachable through another individually valid table root.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let first_tree = large_user_tree(&mut batch);
+        let second_root = batch.allocate_append(PageType::TableInternal).unwrap();
+        copy_internal_root(&mut batch, first_tree.root(), second_root);
+
+        let second = new_table(30, second_root, 0, "U");
+        let mut rows = records(first_tree.root());
+        rows.extend([
+            (
+                table_name_key(second.name()).unwrap(),
+                encode_table_name_mapping(second.id()),
+            ),
+            (
+                table_definition_key(second.id()),
+                encode_table_definition(&second),
+            ),
+        ]);
+        let catalog_tree = raw_tree(&mut batch, rows);
+        validate_tree(&mut batch, &first_tree).unwrap();
+        validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, second_root)).unwrap();
+        CatalogReader::open_candidate(&mut batch, &catalog_tree, CATALOG_V1).unwrap();
+        publish(&mut batch, &catalog_tree);
+        batch.commit().unwrap();
+
+        let committed_page_count = pager.page_count();
+        let (first, second, first_pages, second_pages, shared_pages) = {
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            let first = catalog
+                .find_table_by_id(TableId::new(10).unwrap())
+                .unwrap()
+                .clone();
+            let second = catalog.find_table_by_id(second.id()).unwrap().clone();
+            assert_ne!(first.root(), second.root());
+            let first_pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, first.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            let second_pages = validate_tree(
+                &mut snapshot,
+                &BTree::from_root(TreeKind::Table, second.root()),
+            )
+            .unwrap()
+            .all_live_pages();
+            let shared_pages = first_pages
+                .intersection(&second_pages)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(!shared_pages.is_empty());
+            (first, second, first_pages, second_pages, shared_pages)
+        };
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let error = drop_relation(&mut batch, first.id()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert!(error.to_string().contains("overlap"));
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(first.id()), Some(&first));
+        assert_eq!(catalog.find_table_by_id(second.id()), Some(&second));
+        assert_eq!(
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, first.root()))
+                .unwrap()
+                .all_live_pages(),
+            first_pages
+        );
+        assert_eq!(
+            validate_tree(
+                &mut batch,
+                &BTree::from_root(TreeKind::Table, second.root())
+            )
+            .unwrap()
+            .all_live_pages(),
+            second_pages
+        );
+        batch.commit().unwrap();
+
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_eq!(catalog.find_table_by_id(first.id()), Some(&first));
+        assert_eq!(catalog.find_table_by_id(second.id()), Some(&second));
+        drop(snapshot);
+
+        let mut allocation = pager.try_begin_write().unwrap();
+        let mut reused = BTreeSet::new();
+        loop {
+            let page = allocation.allocate(PageType::TableLeaf).unwrap();
+            if page.page_id().0 >= committed_page_count {
+                break;
+            }
+            reused.insert(page.page_id());
+        }
+        assert!(shared_pages.is_disjoint(&reused));
+        allocation.rollback().unwrap();
     }
 
     #[test]

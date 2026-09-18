@@ -5,7 +5,7 @@ fn prepared_check_parameters_are_solved_and_owned_without_execution() {
     use ora_sqllite::{DataType, ParameterIdentifier};
     let paths = TempPaths::new("public-final-constraints");
     let db = Database::create(paths.main(), Options::default()).unwrap();
-    let conn = db.connect().unwrap();
+    let mut conn = db.connect().unwrap();
     let statement = conn
         .prepare("CREATE TABLE FLAGS (B BOOL CHECK (:first = :second AND :second = TRUE))")
         .unwrap();
@@ -155,7 +155,7 @@ fn public_prepare_accepts_create_table_on_a_new_empty_database() {
 
     let statement = {
         let db = Database::open(paths.main(), Options::default()).unwrap();
-        let conn = db.connect().unwrap();
+        let mut conn = db.connect().unwrap();
         conn.prepare("CREATE TABLE T (ID INT64)").unwrap()
     };
 

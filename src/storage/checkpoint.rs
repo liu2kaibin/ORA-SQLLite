@@ -13,7 +13,7 @@ pub(super) struct CheckpointResult {
     pub(super) wal_reset: bool,
 }
 
-/// Caller retains the writer mutex throughout materialization and both publications.
+/// Caller retains the writer lease throughout materialization and both publications.
 pub(super) fn run(inner: &PagerInner) -> Result<CheckpointResult> {
     let operation = || -> Result<CheckpointResult> {
         let (checkpoint, latest, target, state, versions) = {

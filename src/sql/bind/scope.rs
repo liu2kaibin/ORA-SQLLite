@@ -77,7 +77,7 @@ impl BindingScope {
 
     pub(crate) fn join_condition_scope(catalog: &CatalogReader, query: &AstQuery) -> Result<Self> {
         let mut sources = Vec::with_capacity(query.joins.len().saturating_add(1));
-        sources.push(query.from.clone());
+        sources.extend(query.from.iter().cloned());
         sources.extend(query.joins.iter().map(|join| join.source.clone()));
         Self::from_sources(catalog, &sources, MAX_AST_JOINS)
     }
@@ -108,9 +108,6 @@ impl BindingScope {
         sources: &[TableSource],
         max_joins: u16,
     ) -> Result<Self> {
-        if sources.is_empty() {
-            return Err(bind_error("query scope must contain a FROM source"));
-        }
         if sources.len().saturating_sub(1) > usize::from(max_joins) {
             return Err(bind_error("query exceeds the maximum join count"));
         }
@@ -164,6 +161,9 @@ impl BindingScope {
     }
 
     fn star_tables(&self, qualifier: Option<&Identifier>) -> Result<&[BoundTable]> {
+        if self.tables.is_empty() {
+            return Err(bind_error("star requires a query source"));
+        }
         match qualifier {
             Some(qualifier) => {
                 let index = self
@@ -375,7 +375,7 @@ mod tests {
         AstQuery {
             distinct: false,
             projection: Vec::new(),
-            from,
+            from: Some(from),
             joins: joins
                 .into_iter()
                 .map(|source| Join {

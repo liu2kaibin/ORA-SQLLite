@@ -11,6 +11,7 @@ mod header;
 mod overflow;
 mod page;
 mod pager;
+pub(crate) mod relation;
 mod row;
 mod slotted;
 mod snapshot;
@@ -21,7 +22,7 @@ mod wal;
 pub(crate) mod test_support;
 
 pub(crate) use file::OpenMode;
-pub(crate) use pager::{Pager, PagerConfig};
+pub(crate) use pager::{CommitFailure, Pager, PagerConfig};
 #[allow(
     unused_imports,
     reason = "transaction wrappers consume these crate-private handles in Task 11"

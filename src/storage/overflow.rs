@@ -15,7 +15,7 @@ const CHUNK_LEN_OFFSET: usize = NEXT_GENERATION_OFFSET + 8;
 const RESERVED_OFFSET: usize = CHUNK_LEN_OFFSET + 4;
 const CHUNK_OFFSET: usize = PAGE_HEADER_LEN + OVERFLOW_PREFIX_LEN;
 
-pub(super) fn write_value(batch: &mut WriteBatch<'_>, bytes: &[u8]) -> Result<Option<PageRef>> {
+pub(super) fn write_value(batch: &mut WriteBatch, bytes: &[u8]) -> Result<Option<PageRef>> {
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -84,11 +84,7 @@ pub(super) fn read_value(
     Ok(value)
 }
 
-pub(super) fn release_chain(
-    batch: &mut WriteBatch<'_>,
-    first: PageRef,
-    total_len: u64,
-) -> Result<()> {
+pub(super) fn release_chain(batch: &mut WriteBatch, first: PageRef, total_len: u64) -> Result<()> {
     let chain = collect_chain(batch, first, total_len)?;
     for reference in chain {
         batch.release_later(reference)?;

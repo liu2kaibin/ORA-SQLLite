@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use crate::{
     Result, SqlLimits,
-    sql::{bind_sql, bound::BoundStatement},
+    sql::{bind_sql, bound::BoundStatement, plan::Plan},
     storage::catalog::CatalogReader,
 };
 
@@ -12,6 +12,7 @@ use super::{ColumnMetadata, ParameterMetadata};
 #[derive(Clone)]
 pub struct Statement {
     bound: Arc<BoundStatement>,
+    plan: Arc<Plan>,
     parameters: Box<[ParameterMetadata]>,
     columns: Box<[ColumnMetadata]>,
 }
@@ -74,14 +75,16 @@ impl fmt::Debug for PublicColumn<'_> {
 }
 
 impl Statement {
-    pub(crate) fn from_bound(bound: BoundStatement) -> Self {
+    pub(crate) fn from_bound(bound: BoundStatement, sql: &str) -> Result<Self> {
+        let plan = Arc::new(Plan::from_bound(&bound, sql)?);
         let parameters = bound.parameters().to_vec().into_boxed_slice();
         let columns = bound.columns().to_vec().into_boxed_slice();
-        Self {
+        Ok(Self {
             bound: Arc::new(bound),
+            plan,
             parameters,
             columns,
-        }
+        })
     }
 
     pub fn parameters(&self) -> &[ParameterMetadata] {
@@ -97,7 +100,10 @@ impl Statement {
         &self.bound
     }
 
-    #[allow(dead_code, reason = "execution is added in Phase 4C")]
+    pub(crate) fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
     pub(crate) fn validate_schema(
         &self,
         database_uuid: [u8; 16],
@@ -115,7 +121,7 @@ pub(crate) fn prepare_with_catalog(
     database_uuid: [u8; 16],
 ) -> Result<Statement> {
     let bound = bind_sql(sql, limits, catalog, database_uuid)?;
-    Ok(Statement::from_bound(bound))
+    Statement::from_bound(bound, sql)
 }
 
 #[cfg(test)]
@@ -192,7 +198,7 @@ mod tests {
     #[test]
     fn statement_exposes_owned_stable_metadata() {
         let bound = fixture_bound_select();
-        let statement = Statement::from_bound(bound);
+        let statement = Statement::from_bound(bound, &" ".repeat(32)).unwrap();
         assert_eq!(
             statement.parameters()[0].identifier(),
             &ParameterIdentifier::Position(1)
@@ -200,6 +206,25 @@ mod tests {
         assert_eq!(statement.parameters()[0].data_type(), Some(DataType::Int64));
         assert_eq!(statement.columns()[0].name(), "ID");
         assert_eq!(statement.columns()[0].data_type(), DataType::Int64);
+    }
+
+    #[test]
+    fn statement_clone_shares_the_compiled_plan_without_borrowing_source() {
+        // Recompiling/cloning recursive IR or retaining the caller's source
+        // breaks the immutable, cheaply shared prepared-statement boundary.
+        let source = " ".repeat(32);
+        let statement = Statement::from_bound(fixture_bound_select(), &source).unwrap();
+        drop(source);
+        let cloned = statement.clone();
+        assert!(std::sync::Arc::ptr_eq(&statement.bound, &cloned.bound));
+        assert!(std::sync::Arc::ptr_eq(&statement.plan, &cloned.plan));
+        assert!(matches!(
+            cloned.plan().kind(),
+            crate::sql::plan::PlanKind::Query(_)
+        ));
+        assert_eq!(cloned.plan().parameters(), cloned.parameters());
+        assert_eq!(cloned.plan().columns(), cloned.columns());
+        assert_eq!(cloned.plan().dependencies(), cloned.bound().dependencies());
     }
 
     #[test]
@@ -215,11 +240,15 @@ mod tests {
             span: SqlSpan::new(17, 26).unwrap(),
         }];
 
-        let rendered = format!("{:?}", Statement::from_bound(bound));
+        let rendered = format!(
+            "{:?}",
+            Statement::from_bound(bound, &" ".repeat(32)).unwrap()
+        );
         assert!(rendered.contains("parameters"), "{rendered}");
         assert!(rendered.contains("columns"), "{rendered}");
         for private in [
             "BoundStatement",
+            "Plan",
             "database_uuid",
             "table_id",
             "column_id",
@@ -239,7 +268,7 @@ mod tests {
         let mut snapshot = pager.begin_read().unwrap();
         let catalog = snapshot.catalog_reader().unwrap();
         let database_uuid = [7; 16];
-        let statement = Statement::from_bound(fixture_bound_select());
+        let statement = Statement::from_bound(fixture_bound_select(), &" ".repeat(32)).unwrap();
 
         assert!(statement.validate_schema(database_uuid, &catalog).is_ok());
         let mut wrong_uuid = database_uuid;

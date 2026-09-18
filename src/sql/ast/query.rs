@@ -5,7 +5,7 @@ use super::AstExpr;
 pub(crate) struct AstQuery {
     pub(crate) distinct: bool,
     pub(crate) projection: Vec<SelectItem>,
-    pub(crate) from: TableSource,
+    pub(crate) from: Option<TableSource>,
     pub(crate) joins: Vec<Join>,
     pub(crate) selection: Option<AstExpr>,
     pub(crate) group_by: Vec<AstExpr>,
@@ -244,7 +244,7 @@ mod tests {
         let query = AstQuery {
             distinct: true,
             projection,
-            from: source,
+            from: Some(source),
             joins: vec![join],
             selection: Some(expression(57)),
             group_by: vec![expression(58)],
@@ -254,7 +254,7 @@ mod tests {
         };
         assert_eq!(query.span(), span(60));
         assert!(query.distinct);
-        assert_eq!(query.from.table.as_str(), "USERS");
+        assert_eq!(query.from.as_ref().unwrap().table.as_str(), "USERS");
         assert_eq!(query.projection.len(), 2);
         assert_eq!(query.joins.len(), 1);
         assert_eq!(query.order_by.len(), 3);

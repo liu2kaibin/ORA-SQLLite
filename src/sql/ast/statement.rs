@@ -204,11 +204,11 @@ mod tests {
                 qualifier: None,
                 span: span(start + 1),
             }],
-            from: TableSource {
+            from: Some(TableSource {
                 table: identifier("users", start + 2),
                 alias: None,
                 span: span(start + 3),
-            },
+            }),
             joins: Vec::new(),
             selection: None,
             group_by: Vec::new(),

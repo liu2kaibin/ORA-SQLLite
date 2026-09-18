@@ -26,27 +26,27 @@ struct Split {
 impl BTree {
     pub(in crate::storage) fn insert(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
         validate_key(key)?;
         let old_root = self.root;
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let result = self
             .insert_inner(batch, key, value)
             .and_then(|()| batch.refresh_tree(self.kind, old_root, self.root));
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => batch.finish_mutation_scope(checkpoint),
             Err(error) => {
                 self.root = old_root;
-                batch.restore_mutation(checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
                 Err(error)
             }
         }
     }
 
-    fn insert_inner(&mut self, batch: &mut WriteBatch<'_>, key: &[u8], value: &[u8]) -> Result<()> {
+    fn insert_inner(&mut self, batch: &mut WriteBatch, key: &[u8], value: &[u8]) -> Result<()> {
         let (leaf_ref, mut leaf, mut path) = descend_with_path(batch, self.kind, self.root, key)?;
         let insert_at = lower_bound(&leaf.cells, key);
         if leaf
@@ -108,12 +108,12 @@ impl BTree {
 
     pub(in crate::storage) fn delete(
         &mut self,
-        batch: &mut WriteBatch<'_>,
+        batch: &mut WriteBatch,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
         let old_root = self.root;
-        let checkpoint = batch.checkpoint_mutation()?;
+        let checkpoint = batch.begin_mutation_scope()?;
         let result = self.delete_inner(batch, key).and_then(|removed| {
             if removed.is_some() {
                 batch.refresh_tree(self.kind, old_root, self.root)?;
@@ -121,16 +121,19 @@ impl BTree {
             Ok(removed)
         });
         match result {
-            Ok(removed) => Ok(removed),
+            Ok(removed) => {
+                batch.finish_mutation_scope(checkpoint)?;
+                Ok(removed)
+            }
             Err(error) => {
                 self.root = old_root;
-                batch.restore_mutation(checkpoint);
+                batch.rollback_mutation_scope(checkpoint)?;
                 Err(error)
             }
         }
     }
 
-    fn delete_inner(&mut self, batch: &mut WriteBatch<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn delete_inner(&mut self, batch: &mut WriteBatch, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (leaf_ref, mut leaf, path) = descend_with_path(batch, self.kind, self.root, key)?;
         let delete_at = lower_bound(&leaf.cells, key);
         let Some(cell) = leaf.cells.get(delete_at).filter(|cell| cell.key() == key) else {
@@ -155,7 +158,7 @@ impl BTree {
     }
 }
 
-fn read_cell_value(batch: &mut WriteBatch<'_>, cell: &LeafCell) -> Result<Vec<u8>> {
+fn read_cell_value(batch: &mut WriteBatch, cell: &LeafCell) -> Result<Vec<u8>> {
     match cell.storage() {
         super::ValueStorage::Inline(value) => Ok(value.clone()),
         super::ValueStorage::Overflow(first) => {
@@ -165,7 +168,7 @@ fn read_cell_value(batch: &mut WriteBatch<'_>, cell: &LeafCell) -> Result<Vec<u8
 }
 
 fn repair_after_delete(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     kind: super::TreeKind,
     root: &mut PageRef,
     mut current_ref: PageRef,
@@ -472,7 +475,7 @@ fn encoded_node_cells(node: &Node) -> Result<(usize, Vec<Vec<u8>>)> {
     }
 }
 
-fn rewrite_node(batch: &mut WriteBatch<'_>, reference: PageRef, node: &Node) -> Result<()> {
+fn rewrite_node(batch: &mut WriteBatch, reference: PageRef, node: &Node) -> Result<()> {
     match node {
         Node::Leaf(leaf) => rewrite_leaf(batch, reference, leaf.right_sibling, &leaf.cells),
         Node::Internal(internal) => {
@@ -493,7 +496,7 @@ fn parent_child(parent: &InternalNode, child_index: usize) -> Result<PageRef> {
     }
 }
 
-fn node_minimum(batch: &mut WriteBatch<'_>, kind: super::TreeKind, node: &Node) -> Result<Vec<u8>> {
+fn node_minimum(batch: &mut WriteBatch, kind: super::TreeKind, node: &Node) -> Result<Vec<u8>> {
     match node {
         Node::Leaf(leaf) => leaf
             .cells
@@ -531,7 +534,7 @@ fn subtree_minimum(
 }
 
 fn propagate_minimum(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     kind: super::TreeKind,
     mut child_ref: PageRef,
     minimum: Vec<u8>,
@@ -589,7 +592,7 @@ fn descend_with_path(
 }
 
 fn cell_fits_target(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     reference: PageRef,
     metadata_end: usize,
     encoded_len: usize,
@@ -608,7 +611,7 @@ fn cell_fits_target(
 }
 
 fn write_or_split_leaf(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     kind: super::TreeKind,
     left_ref: PageRef,
     leaf: LeafNode,
@@ -637,7 +640,7 @@ fn write_or_split_leaf(
 }
 
 fn write_or_split_internal(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     kind: super::TreeKind,
     left_ref: PageRef,
     node: InternalNode,
@@ -747,7 +750,7 @@ fn encode_internal_cells(cells: &[InternalCell]) -> Result<Vec<Vec<u8>>> {
 }
 
 fn rewrite_leaf(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     reference: PageRef,
     right_sibling: Option<PageRef>,
     cells: &[LeafCell],
@@ -765,7 +768,7 @@ fn rewrite_leaf(
 }
 
 fn rewrite_internal(
-    batch: &mut WriteBatch<'_>,
+    batch: &mut WriteBatch,
     reference: PageRef,
     leftmost: PageRef,
     cells: &[InternalCell],
