@@ -8,7 +8,7 @@ use crate::{
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
-        index::{IndexSpec, create_index},
+        index::{IndexSpec, create_index, drop_index},
         relation::{
             ColumnSpec, Relation, RelationValueValidation, TableSpec, TableWrite, create_relation,
             drop_relation,
@@ -106,7 +106,17 @@ pub(crate) fn execute_validated_write_plan(
             result?;
             Ok(ExecutionResult::new(0))
         }
+        PlanKind::DropIndex(plan) => {
+            // Recheck retained database, table version and index owner identity
+            // immediately before mutation, even after earlier validation.
+            let catalog = batch.catalog_reader()?;
+            statement.validate_schema(batch.database_uuid(), &catalog)?;
+            drop_index(batch, plan.index_id())?;
+            Ok(ExecutionResult::new(0))
+        }
         PlanKind::DropTable { table_id } => {
+            let catalog = batch.catalog_reader()?;
+            statement.validate_schema(batch.database_uuid(), &catalog)?;
             drop_relation(batch, *table_id)?;
             Ok(ExecutionResult::new(0))
         }
@@ -662,6 +672,74 @@ mod tests {
         );
         batch.rollback().unwrap();
         other.rollback().unwrap();
+    }
+
+    #[test]
+    fn drop_index_rechecks_retained_identity_owner_version_and_database_before_mutation() {
+        use crate::storage::test_support::{
+            phase_4b_catalog_fixture_with_explicit_index, phase_4b_rehome_explicit_index_to_orders,
+            phase_4b_remove_explicit_index,
+        };
+        // ValidatedWrite intentionally does not borrow the batch. Swapping to a
+        // later/current batch must still reject stale identities before writes.
+        for change in ["missing", "owner", "version", "database", "same-name"] {
+            let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_T");
+            let pager = fixture.pager();
+            let statement = prepare(&pager, "DROP INDEX IX_T");
+            let mut batch = pager.begin_write().unwrap();
+            let validated = validate_write_execution(
+                &mut batch,
+                &statement,
+                Parameters::none(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            batch.rollback().unwrap();
+            let other_fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[]);
+            match change {
+                "missing" | "same-name" => {
+                    phase_4b_remove_explicit_index(&pager, fixture.index_id()).unwrap()
+                }
+                "owner" => phase_4b_rehome_explicit_index_to_orders(&pager, &fixture).unwrap(),
+                _ => {}
+            }
+            if matches!(change, "version" | "same-name") {
+                let create = prepare(
+                    &pager,
+                    if change == "version" {
+                        "CREATE INDEX IX_NEW ON USERS (ID)"
+                    } else {
+                        "CREATE INDEX IX_T ON USERS (ID)"
+                    },
+                );
+                let mut batch = pager.begin_write().unwrap();
+                let create = validate_write_execution(
+                    &mut batch,
+                    &create,
+                    Parameters::none(),
+                    64 * 1024 * 1024,
+                )
+                .unwrap();
+                execute_validated_write_plan(&mut batch, create).unwrap();
+                batch.commit().unwrap();
+            }
+            let target = if change == "database" {
+                other_fixture.pager()
+            } else {
+                pager
+            };
+            let mut batch = target.begin_write().unwrap();
+            crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+                assert_eq!(
+                    execute_validated_write_plan(batch, validated)
+                        .unwrap_err()
+                        .code(),
+                    ErrorCode::SchemaChanged,
+                    "{change}"
+                );
+            });
+            batch.rollback().unwrap();
+        }
     }
 
     #[test]

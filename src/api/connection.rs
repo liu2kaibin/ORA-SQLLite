@@ -519,7 +519,7 @@ mod tests {
     fn index_ddl_plans_route_through_autocommit_and_sql_write_dispatch() {
         // Production break caught: classifying index DDL as control or a
         // deferred plan skips the write validation/transaction path. CREATE
-        // now publishes atomically; DROP still awaits its storage lifecycle.
+        // publishes atomically, while DROP also obeys SQL transaction rollback.
         let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
         let mut connection = Connection::from_test_pager(fixture.pager());
         let create = connection
@@ -554,9 +554,16 @@ mod tests {
         assert_eq!(
             connection
                 .execute(&drop, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        assert_eq!(
+            connection
+                .prepare("DROP INDEX IX_USERS_ID")
                 .unwrap_err()
                 .code(),
-            ErrorCode::Unsupported
+            ErrorCode::Bind
         );
         execute_sql(
             &mut connection,
@@ -564,6 +571,7 @@ mod tests {
         )
         .unwrap();
         execute_sql(&mut connection, "ROLLBACK").unwrap();
+        assert!(connection.prepare("DROP INDEX IX_USERS_ID").is_ok());
         assert!(
             connection
                 .prepare("CREATE INDEX IX_USERS_TEMP ON USERS (NAME)")
@@ -611,9 +619,17 @@ mod tests {
         assert_eq!(
             connection
                 .execute(&drop_index, Parameters::none())
-                .unwrap_err()
-                .code(),
-            ErrorCode::Unsupported
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        let mut snapshot = connection.pager.begin_read().unwrap();
+        assert!(
+            snapshot
+                .catalog_reader()
+                .unwrap()
+                .find_index_by_id(fixture.index_id())
+                .is_none()
         );
     }
 

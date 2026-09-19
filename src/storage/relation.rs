@@ -485,13 +485,31 @@ pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Resul
 pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result<()> {
     let checkpoint = batch.statement_checkpoint()?;
     let result = (|| {
-        let relation = {
+        let (relation, indexes) = {
             let catalog = batch.catalog_reader()?;
             let relation = Relation::open(&catalog, table_id)?;
+            let indexes = catalog
+                .indexes_for_table(table_id)
+                .map(|index| {
+                    super::index::require_explicit_owner(index)?;
+                    let columns = catalog
+                        .columns_for_index(index.id())
+                        .map(ColumnDef::id)
+                        .collect::<Vec<_>>();
+                    Ok((index.clone(), columns))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Prove every owned tree and live/free disjointness before any
+            // release. No foreign-key/constraint behavior is introduced here.
             catalog.validate_deep_batch(batch)?;
-            relation
+            (relation, indexes)
         };
         let mut catalog = CatalogWriter::bootstrap(batch)?;
+        for (index, columns) in indexes {
+            catalog.remove_index(batch, &index, &columns)?;
+            #[cfg(test)]
+            super::index::after_index_release_for_test()?;
+        }
         catalog.remove_relation(batch, &relation.table, &relation.columns)?;
         catalog.finish(batch)
     })();

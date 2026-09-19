@@ -165,6 +165,93 @@ pub(crate) fn create_index(
     }
 }
 
+/// Resolve only the retained identity. Names are never rebound during DROP.
+pub(crate) fn drop_index(batch: &mut WriteBatch, index_id: IndexId) -> Result<()> {
+    let checkpoint = batch.statement_checkpoint()?;
+    let result = (|| {
+        let (index, columns) = {
+            let catalog = batch.catalog_reader()?;
+            let index = catalog.find_index_by_id(index_id).cloned().ok_or_else(|| {
+                DbError::new(ErrorCode::SchemaChanged, "prepared index no longer exists")
+            })?;
+            require_explicit_owner(&index)?;
+            Relation::open(&catalog, index.table_id())?;
+            let columns = catalog
+                .columns_for_index(index_id)
+                .map(ColumnDef::id)
+                .collect::<Vec<_>>();
+            // Include relation/index descendants and all live/free overlaps
+            // before deleting even the first catalog record or releasing a page.
+            catalog.validate_deep_batch(batch)?;
+            (index, columns)
+        };
+        let mut catalog = CatalogWriter::bootstrap(batch)?;
+        catalog.remove_index(batch, &index, &columns)?;
+        #[cfg(test)]
+        after_index_release_for_test()?;
+        catalog.bump_table_schema_version(batch, index.table_id())?;
+        catalog.finish(batch)
+    })();
+    match result {
+        Ok(()) => batch.finish_statement(checkpoint),
+        Err(error) => {
+            batch.restore_statement(checkpoint);
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn require_explicit_owner(index: &IndexDef) -> Result<()> {
+    if index.ownership() != IndexOwnership::Explicit {
+        return Err(DbError::new(
+            ErrorCode::Constraint,
+            "constraint-owned indexes cannot be dropped independently",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static INDEX_RELEASE_FAILURE: std::cell::Cell<Option<(usize, ErrorCode)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct IndexReleaseFaultGuard;
+
+#[cfg(test)]
+impl Drop for IndexReleaseFaultGuard {
+    fn drop(&mut self) {
+        INDEX_RELEASE_FAILURE.set(None);
+    }
+}
+
+/// Inject after real catalog deletion and whole-tree staging, so tests exercise
+/// restoration of the lifecycle checkpoint rather than a no-op error path.
+#[cfg(test)]
+pub(crate) fn fail_index_release_for_test(
+    successful_releases: usize,
+    code: ErrorCode,
+) -> IndexReleaseFaultGuard {
+    INDEX_RELEASE_FAILURE.set(Some((successful_releases, code)));
+    IndexReleaseFaultGuard
+}
+
+#[cfg(test)]
+pub(super) fn after_index_release_for_test() -> Result<()> {
+    INDEX_RELEASE_FAILURE.with(|failure| match failure.get() {
+        Some((0, code)) => {
+            failure.set(None);
+            Err(DbError::new(code, "injected after index tree release"))
+        }
+        Some((remaining, code)) => {
+            failure.set(Some((remaining - 1, code)));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct IndexSchema {
     definition: IndexDef,
@@ -388,6 +475,469 @@ mod tests {
         }
         writer.finish(&mut batch).unwrap();
         (temp, pager, batch, table_id, ids)
+    }
+
+    #[test]
+    fn drop_index_reclaims_multilevel_tree_and_retains_empty_catalog_after_reopen() {
+        use crate::storage::validate::{validate_freelist, validate_tree};
+        // Long real index keys force internal/leaf pages. Root-only release,
+        // clearing the feature bit, or failing to bump the schema breaks this.
+        let rows = (0..240)
+            .map(|n| vec![Value::Text(format!("{n:04}{}", "x".repeat(800)))])
+            .collect::<Vec<_>>();
+        let (temp, pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Text], 1, &rows);
+        let spec =
+            IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, columns, false).unwrap();
+        let index = create_index(&mut batch, &spec).unwrap();
+        let definition = batch
+            .catalog_reader()
+            .unwrap()
+            .find_index_by_id(index)
+            .unwrap()
+            .clone();
+        let pages = validate_tree(
+            &mut batch,
+            &BTree::from_root(TreeKind::Index, definition.root()),
+        )
+        .unwrap()
+        .all_live_pages();
+        assert!(pages.len() > 20, "fixture must have multiple index levels");
+        let root = batch.read(definition.root()).unwrap();
+        let child = crate::storage::btree::decode_internal_leftmost(&root.bytes()[48..64]).unwrap();
+        assert_eq!(
+            batch.read(child).unwrap().header().page_type(),
+            crate::storage::page::PageType::IndexInternal,
+            "fixture must exercise internal descendants, not only leaf children"
+        );
+        batch.commit().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        super::drop_index(&mut batch, index).unwrap();
+        batch.commit().unwrap();
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        catalog.validate_deep(&mut snapshot).unwrap();
+        assert!(catalog.find_index_by_id(index).is_none());
+        assert!(catalog.find_index_by_name(&spec.name).is_none());
+        assert_eq!(catalog.columns_for_index(index).count(), 0);
+        assert_eq!(catalog.indexes_for_table(table).count(), 0);
+        assert_eq!(
+            catalog
+                .find_table_by_id(table)
+                .unwrap()
+                .schema_version()
+                .get(),
+            3
+        );
+        assert_eq!(snapshot.feature_bits(), CATALOG_V1 | INDEX_CONSTRAINT_V1);
+        let free = validate_freelist(&mut snapshot, &Default::default()).unwrap();
+        assert!(
+            free.is_superset(&pages),
+            "all old index pages must be reusable"
+        );
+    }
+
+    #[test]
+    fn drop_index_missing_id_and_constraint_owner_do_not_mutate() {
+        use crate::storage::catalog::types::ConstraintId;
+        let (_temp, _pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Int64], 1, &[]);
+        let spec =
+            IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, columns, false).unwrap();
+        let index = create_index(&mut batch, &spec).unwrap();
+        let definition = batch
+            .catalog_reader()
+            .unwrap()
+            .find_index_by_id(index)
+            .unwrap()
+            .clone();
+        let before = batch.checkpoint_mutation().unwrap();
+        assert_eq!(
+            super::drop_index(&mut batch, IndexId::new(9999).unwrap())
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+        before.assert_matches_batch_for_test(&batch);
+        // Phase 4C2-A intentionally cannot persist constraint catalog records.
+        // Exercise the future-owner guard with an actual typed definition.
+        let owned = IndexDef::new(
+            index,
+            table,
+            definition.root(),
+            1,
+            false,
+            IndexOwnership::Constraint(ConstraintId::new(99).unwrap()),
+            definition.name().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::require_explicit_owner(&owned).unwrap_err().code(),
+            ErrorCode::Constraint
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(
+            batch.catalog_reader().unwrap().find_index_by_id(index),
+            Some(&definition)
+        );
+    }
+
+    #[test]
+    fn drop_index_schema_bump_failure_restores_removed_records_and_released_pages() {
+        // Real late failure after removal (no fault injection): restoring only
+        // CatalogWriter's local checkpoint would lose the whole index tree.
+        let (_temp, _pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Int64], u64::MAX - 1, &[vec![Value::Int64(7)]]);
+        let index = create_index(
+            &mut batch,
+            &IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, columns, false).unwrap(),
+        )
+        .unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        assert_eq!(
+            super::drop_index(&mut batch, index).unwrap_err().code(),
+            ErrorCode::Type
+        );
+        before.assert_matches_batch_for_test(&batch);
+        let catalog = batch.catalog_reader().unwrap();
+        assert!(catalog.find_index_by_id(index).is_some());
+        assert_eq!(
+            catalog
+                .find_table_by_id(table)
+                .unwrap()
+                .schema_version()
+                .get(),
+            u64::MAX
+        );
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn drop_index_release_fault_restores_every_batch_field_and_reopen() {
+        let (temp, pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Int64], 1, &[vec![Value::Int64(7)]]);
+        let index = create_index(
+            &mut batch,
+            &IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, columns, false).unwrap(),
+        )
+        .unwrap();
+        let definition = batch
+            .catalog_reader()
+            .unwrap()
+            .find_index_by_id(index)
+            .unwrap()
+            .clone();
+        batch.commit().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        // Include earlier private transaction work in the exact checkpoint.
+        create_relation(
+            &mut batch,
+            &TableSpec::new(
+                CatalogName::new("PRIOR").unwrap(),
+                vec![ColumnSpec::new(
+                    CatalogName::new("C").unwrap(),
+                    ColumnType::Int64,
+                    true,
+                )],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        let _fault = super::fail_index_release_for_test(0, ErrorCode::Io);
+        assert_eq!(
+            super::drop_index(&mut batch, index).unwrap_err().code(),
+            ErrorCode::Io
+        );
+        before.assert_matches_batch_for_test(&batch);
+        batch
+            .catalog_reader()
+            .unwrap()
+            .validate_deep_batch(&mut batch)
+            .unwrap();
+        batch.rollback().unwrap();
+        drop(batch);
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        catalog.validate_deep(&mut snapshot).unwrap();
+        assert_eq!(catalog.find_index_by_id(index), Some(&definition));
+        assert_eq!(
+            catalog
+                .find_table_by_id(table)
+                .unwrap()
+                .schema_version()
+                .get(),
+            2
+        );
+        assert!(
+            catalog
+                .find_table_by_name(&CatalogName::new("PRIOR").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drop_relation_reclaims_two_indexes_and_relation_without_live_free_overlap() {
+        use crate::storage::validate::{validate_freelist, validate_tree};
+        let rows = (0..80)
+            .map(|n| vec![Value::Text(format!("{n:04}{}", "x".repeat(800)))])
+            .collect::<Vec<_>>();
+        let (temp, pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Text], 1, &rows);
+        let mut indexes = Vec::new();
+        for name in ["IX_A", "IX_B"] {
+            indexes.push(
+                create_index(
+                    &mut batch,
+                    &IndexSpec::new(
+                        CatalogName::new(name).unwrap(),
+                        table,
+                        columns.clone(),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let catalog = batch.catalog_reader().unwrap();
+        let table_root = catalog.find_table_by_id(table).unwrap().root();
+        let mut pages = validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, table_root))
+            .unwrap()
+            .all_live_pages();
+        for index in &indexes {
+            let root = catalog.find_index_by_id(*index).unwrap().root();
+            pages.extend(
+                validate_tree(&mut batch, &BTree::from_root(TreeKind::Index, root))
+                    .unwrap()
+                    .all_live_pages(),
+            );
+        }
+        batch.commit().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        crate::storage::relation::drop_relation(&mut batch, table).unwrap();
+        batch.commit().unwrap();
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        catalog.validate_deep(&mut snapshot).unwrap();
+        assert!(catalog.find_table_by_id(table).is_none());
+        assert_eq!(catalog.columns_for_table(table).count(), 0);
+        assert_eq!(catalog.indexes_for_table(table).count(), 0);
+        for index in indexes {
+            assert!(catalog.find_index_by_id(index).is_none());
+            assert_eq!(catalog.columns_for_index(index).count(), 0);
+        }
+        assert_eq!(snapshot.feature_bits(), CATALOG_V1 | INDEX_CONSTRAINT_V1);
+        let free = validate_freelist(&mut snapshot, &Default::default()).unwrap();
+        assert!(free.is_superset(&pages));
+    }
+
+    #[test]
+    fn drop_relation_second_index_release_failure_restores_first_index_and_table() {
+        let (_temp, pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Int64], 1, &[vec![Value::Int64(1)]]);
+        for name in ["IX_A", "IX_B"] {
+            create_index(
+                &mut batch,
+                &IndexSpec::new(
+                    CatalogName::new(name).unwrap(),
+                    table,
+                    columns.clone(),
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        batch.commit().unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        let _fault = super::fail_index_release_for_test(1, ErrorCode::Io);
+        assert_eq!(
+            crate::storage::relation::drop_relation(&mut batch, table)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Io
+        );
+        before.assert_matches_batch_for_test(&batch);
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(catalog.indexes_for_table(table).count(), 2);
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        batch.rollback().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        snapshot
+            .catalog_reader()
+            .unwrap()
+            .validate_deep(&mut snapshot)
+            .unwrap();
+    }
+
+    #[test]
+    fn drop_index_and_drop_relation_release_errors_preserve_transaction_classification() {
+        use crate::{Database, Options, Parameters};
+        // The hook fires only after actual catalog deletion/page release. An
+        // ordinary error must restore the statement but keep prior writes;
+        // each fatal class must poison the explicit transaction, not commit it.
+        for sql in ["DROP INDEX IX_T", "DROP TABLE T"] {
+            for code in [
+                ErrorCode::Constraint,
+                ErrorCode::Io,
+                ErrorCode::Corruption,
+                ErrorCode::Internal,
+            ] {
+                let temp = TempDatabase::new("index-drop-transaction-errors");
+                let database = Database::create(temp.path(), Options::default()).unwrap();
+                let mut connection = database.connect().unwrap();
+                for setup in [
+                    "CREATE TABLE T (A INT64)",
+                    "INSERT INTO T VALUES (7)",
+                    "CREATE INDEX IX_T ON T (A)",
+                ] {
+                    let statement = connection.prepare(setup).unwrap();
+                    connection.execute(&statement, Parameters::none()).unwrap();
+                }
+                let retained = connection.prepare("SELECT A FROM T").unwrap();
+                let mut transaction = connection.begin_write().unwrap();
+                let prior = transaction.prepare("CREATE TABLE PRIOR (A INT64)").unwrap();
+                transaction.execute(&prior, Parameters::none()).unwrap();
+                let drop_statement = transaction.prepare(sql).unwrap();
+                let _fault = super::fail_index_release_for_test(0, code);
+                assert_eq!(
+                    transaction
+                        .execute(&drop_statement, Parameters::none())
+                        .unwrap_err()
+                        .code(),
+                    code
+                );
+                if code == ErrorCode::Constraint {
+                    let mut rows = transaction.query(&retained, Parameters::none()).unwrap();
+                    assert_eq!(rows.next().unwrap().unwrap().values(), &[Value::Int64(7)]);
+                    drop(rows);
+                    let insert = transaction.prepare("INSERT INTO PRIOR VALUES (9)").unwrap();
+                    transaction.execute(&insert, Parameters::none()).unwrap();
+                    assert!(transaction.prepare("DROP INDEX IX_T").is_ok());
+                    transaction.commit().unwrap();
+                } else {
+                    assert_eq!(
+                        transaction.prepare("SELECT A FROM T").unwrap_err().code(),
+                        ErrorCode::Transaction
+                    );
+                    assert_eq!(
+                        transaction
+                            .execute(&drop_statement, Parameters::none())
+                            .unwrap_err()
+                            .code(),
+                        ErrorCode::Transaction
+                    );
+                    assert_eq!(
+                        transaction.commit().unwrap_err().code(),
+                        ErrorCode::Transaction
+                    );
+                }
+                drop(connection);
+                drop(database);
+                let database = Database::open(temp.path(), Options::default()).unwrap();
+                let mut connection = database.connect().unwrap();
+                assert!(connection.prepare("DROP INDEX IX_T").is_ok());
+                assert_eq!(
+                    connection.prepare("SELECT A FROM PRIOR").is_ok(),
+                    code == ErrorCode::Constraint
+                );
+                let mut rows = connection.query(&retained, Parameters::none()).unwrap();
+                assert_eq!(rows.next().unwrap().unwrap().values(), &[Value::Int64(7)]);
+            }
+        }
+    }
+
+    #[test]
+    fn drop_index_and_drop_relation_validate_all_descendants_before_first_release() {
+        use crate::storage::{
+            PageRef, btree::LEAF_METADATA_END, pager::PageSource, validate::validate_tree,
+        };
+        let rows = (0..40)
+            .map(|n| vec![Value::Text(format!("{n:04}{}", "x".repeat(800)))])
+            .collect::<Vec<_>>();
+        let (_temp, _pager, mut batch, table, columns) =
+            create_fixture(&[ColumnType::Text], 1, &rows);
+        let mut last = None;
+        for name in ["IX_A", "IX_B"] {
+            last = Some(
+                create_index(
+                    &mut batch,
+                    &IndexSpec::new(
+                        CatalogName::new(name).unwrap(),
+                        table,
+                        columns.clone(),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let index = batch
+            .catalog_reader()
+            .unwrap()
+            .find_index_by_id(last.unwrap())
+            .unwrap()
+            .clone();
+        let report =
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Index, index.root())).unwrap();
+        let mut child = None;
+        for page in report.tree_pages {
+            let frame = batch.read_page_by_id(page).unwrap();
+            if frame.header().page_type() == crate::storage::page::PageType::IndexLeaf {
+                child = Some(PageRef::new(page, frame.header().generation()).unwrap());
+                break;
+            }
+        }
+        let child = child.expect("multi-page fixture needs a leaf child");
+        assert_ne!(child, index.root());
+        // Destroy a descendant slot offset; normal catalog open still succeeds.
+        batch.modify(child).unwrap().bytes_mut()[LEAF_METADATA_END..LEAF_METADATA_END + 2].fill(0);
+        batch.catalog_reader().unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        let _fault = super::fail_index_release_for_test(0, ErrorCode::Io);
+        assert_eq!(
+            super::drop_index(&mut batch, index.id())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(
+            crate::storage::relation::drop_relation(&mut batch, table)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert!(
+            super::INDEX_RELEASE_FAILURE.get().is_some(),
+            "preflight must not release even the healthy first index"
+        );
     }
 
     #[test]

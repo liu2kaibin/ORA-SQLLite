@@ -5,6 +5,106 @@ mod support;
 use ora_sqllite::{Database, ErrorCode, Options, Parameters, Value};
 
 #[test]
+fn drop_index_frees_tree_bumps_schema_and_never_clears_feature_bit() {
+    // Storage tests inspect freed pages/feature bits; this public contract
+    // catches a missing DROP executor, schema bump, or durable removal.
+    let (files, database) = support::new_database("drop-last-index");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (7)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+    let stale = connection.prepare("SELECT A FROM T").unwrap();
+    assert_eq!(
+        support::execute_sql(&mut connection, "DROP INDEX IX_T_A").rows_affected(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query(&stale, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+    drop(connection);
+    drop(database);
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A FROM T"),
+        vec![vec![Value::Int64(7)]]
+    );
+    assert_eq!(
+        connection.prepare("DROP INDEX IX_T_A").unwrap_err().code(),
+        ErrorCode::Bind
+    );
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+}
+
+#[test]
+fn drop_table_removes_all_owned_explicit_indexes_atomically() {
+    // Leaving any index record behind prevents valid reopen/name reuse.
+    let (files, database) = support::new_database("drop-indexed-table");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B TEXT)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1, 'one')");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_B ON T (B)");
+    support::execute_sql(&mut connection, "DROP TABLE T");
+    drop(connection);
+    drop(database);
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        connection.prepare("SELECT A FROM T").unwrap_err().code(),
+        ErrorCode::Bind
+    );
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B TEXT)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_B ON T (B)");
+}
+
+#[test]
+fn drop_index_stale_plan_never_rebinds_recreated_name() {
+    let (_files, database) = support::new_database("drop-index-stale-name");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T ON T (A)");
+    let stale = connection.prepare("DROP INDEX IX_T").unwrap();
+    support::execute_sql(&mut connection, "DROP INDEX IX_T");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T ON T (A)");
+    assert_eq!(
+        connection
+            .execute(&stale, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+    assert!(connection.prepare("DROP INDEX IX_T").is_ok());
+    support::execute_sql(&mut connection, "DROP INDEX IX_T");
+}
+
+#[test]
+fn drop_index_and_indexed_table_explicit_rollback_restore_prepared_statements() {
+    for sql in ["DROP INDEX IX_T", "DROP TABLE T"] {
+        let (_files, database) = support::new_database("drop-index-rollback");
+        let mut connection = database.connect().unwrap();
+        support::execute_sql(&mut connection, "CREATE TABLE T (A INT64)");
+        support::execute_sql(&mut connection, "INSERT INTO T VALUES (7)");
+        support::execute_sql(&mut connection, "CREATE INDEX IX_T ON T (A)");
+        let retained = connection.prepare("SELECT A FROM T").unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let statement = transaction.prepare(sql).unwrap();
+        transaction.execute(&statement, Parameters::none()).unwrap();
+        transaction.rollback().unwrap();
+        assert_eq!(
+            support::collect_statement(&mut connection, &retained, Parameters::none()),
+            vec![vec![Value::Int64(7)]]
+        );
+        assert!(connection.prepare("DROP INDEX IX_T").is_ok());
+    }
+}
+
+#[test]
 fn create_index_low_memory_rejects_indexed_and_unindexed_payloads_and_can_continue() {
     // Both a small physical key over a large unindexed row and an indexable
     // 900-byte text key must obey the connection's budget, not just key length.
