@@ -231,6 +231,65 @@ pub(crate) fn phase_4b_catalog_fixture_with_explicit_index(
     Phase4bExplicitIndexFixture { fixture, index_id }
 }
 
+/// Removes the explicit fixture index without changing the owner table's
+/// schema version, for prepared-statement identity tests.
+pub(crate) fn phase_4b_remove_explicit_index(pager: &Pager, index_id: IndexId) -> Result<()> {
+    let (index, columns) = explicit_index_parts(pager, index_id)?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    writer.remove_index(&mut batch, &index, &columns)?;
+    writer.finish(&mut batch)?;
+    batch.commit()
+}
+
+/// Rehomes the same explicit fixture IndexId to ORDERS without changing USERS'
+/// schema version, for prepared-statement owner-identity tests.
+pub(crate) fn phase_4b_rehome_explicit_index_to_orders(
+    pager: &Pager,
+    fixture: &Phase4bExplicitIndexFixture,
+) -> Result<()> {
+    let (index, columns) = explicit_index_parts(pager, fixture.index_id())?;
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let orders_id_column = catalog
+        .find_column_by_name(fixture.fixture.orders_id(), &CatalogName::new("ID")?)
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "fixture ORDERS(ID) is missing"))?
+        .id();
+    drop(catalog);
+    drop(snapshot);
+
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    writer.remove_index(&mut batch, &index, &columns)?;
+    let root = BTree::create(&mut batch, TreeKind::Index)?.root();
+    let rehomed = IndexDef::new(
+        index.id(),
+        fixture.fixture.orders_id(),
+        root,
+        1,
+        index.unique(),
+        IndexOwnership::Explicit,
+        index.name().clone(),
+    )?;
+    writer.insert_index_definition(&mut batch, &rehomed, &[orders_id_column])?;
+    writer.finish(&mut batch)?;
+    batch.commit()
+}
+
+fn explicit_index_parts(pager: &Pager, index_id: IndexId) -> Result<(IndexDef, Vec<ColumnId>)> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let index = catalog
+        .find_index_by_id(index_id)
+        .cloned()
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "fixture index is missing"))?;
+    let columns = catalog
+        .columns_for_index(index.id())
+        .map(|column| column.id())
+        .collect();
+    Ok((index, columns))
+}
+
 fn phase_4b_catalog_fixture_with_uuid(
     page_size: u32,
     database_uuid: [u8; 16],

@@ -554,6 +554,45 @@ mod tests {
     }
 
     #[test]
+    fn drop_index_plan_survives_ordinary_dml_that_replaces_the_table_root() {
+        // Production break caught: treating a physical root replacement as a
+        // schema change invalidates valid prepared index DDL after normal DML.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let mut connection = Connection::from_test_pager(fixture.pager());
+        let drop_index = connection.prepare("DROP INDEX IX_USERS_ID").unwrap();
+        let before_root = {
+            let mut snapshot = connection.pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            catalog.find_table_by_id(fixture.users_id()).unwrap().root()
+        };
+        let name = "x".repeat(900);
+        for id in 1..=16 {
+            execute_sql(
+                &mut connection,
+                &format!("INSERT INTO USERS (ID, NAME) VALUES ({id}, '{name}')"),
+            )
+            .unwrap();
+        }
+        let database_uuid = connection.pager.database_uuid().unwrap();
+        let mut snapshot = connection.pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_ne!(
+            catalog.find_table_by_id(fixture.users_id()).unwrap().root(),
+            before_root
+        );
+        assert!(drop_index.validate_schema(database_uuid, &catalog).is_ok());
+        drop(catalog);
+        drop(snapshot);
+        assert_eq!(
+            connection
+                .execute(&drop_index, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+    }
+
+    #[test]
     fn fatal_sql_write_error_enters_rollback_only_state() {
         // Production break caught: retaining SqlWrite after fatal catalog
         // corruption would allow prepare/execute/commit instead of rollback only.
