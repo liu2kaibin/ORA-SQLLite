@@ -3,11 +3,12 @@ use crate::{
     sql::{
         SqlType,
         bound::SourceId,
-        plan::{CreateTablePlan, DeletePlan, InsertPlan, Plan, PlanKind, UpdatePlan},
+        plan::{CreateTablePlan, DeletePlan, InsertPlan, PlanKind, UpdatePlan},
     },
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
+        index::{IndexSpec, create_index},
         relation::{
             ColumnSpec, Relation, RelationValueValidation, TableSpec, TableWrite, create_relation,
             drop_relation,
@@ -26,7 +27,7 @@ use super::{
 
 /// A write plan whose API kind, parameters, and retained schema have all been checked.
 pub(crate) struct ValidatedWrite<'a> {
-    plan: &'a Plan,
+    statement: &'a Statement,
     params: ParameterFrame,
     memory: WorkMemory,
 }
@@ -49,7 +50,7 @@ pub(crate) fn validate_write_execution<'a>(
         return Err(unsupported_4c2());
     }
     Ok(ValidatedWrite {
-        plan: statement.plan(),
+        statement,
         params,
         memory,
     })
@@ -60,15 +61,32 @@ pub(crate) fn execute_validated_write_plan(
     validated: ValidatedWrite<'_>,
 ) -> Result<ExecutionResult> {
     let ValidatedWrite {
-        plan,
+        statement,
         params,
         mut memory,
     } = validated;
-    match plan.kind() {
+    match statement.plan().kind() {
         PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &memory),
         PlanKind::Update(plan) => execute_update(batch, plan, &params, &mut memory),
         PlanKind::Delete(plan) => execute_delete(batch, plan, &params, &mut memory),
         PlanKind::CreateTable(plan) => execute_create_table(batch, plan),
+        PlanKind::CreateIndex(plan) => {
+            // Recheck database identity, owner-table version, and the created
+            // name next to mutation, even for an already validated write plan.
+            let catalog = batch.catalog_reader()?;
+            statement.validate_schema(batch.database_uuid(), &catalog)?;
+            let spec = IndexSpec::new(
+                plan.name().clone(),
+                plan.table().table_id(),
+                plan.columns()
+                    .iter()
+                    .map(|column| column.column_id())
+                    .collect(),
+                plan.unique(),
+            )?;
+            create_index(batch, &spec)?;
+            Ok(ExecutionResult::new(0))
+        }
         PlanKind::DropTable { table_id } => {
             drop_relation(batch, *table_id)?;
             Ok(ExecutionResult::new(0))
@@ -481,6 +499,59 @@ mod tests {
                 .is_some()
         );
         batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn create_index_rechecks_name_version_and_database_after_validation() {
+        // Validation can be separated from execution internally: neither a
+        // name taken on a different table, a version bump, nor a different
+        // database with identical object IDs may reuse the validated request.
+        let fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[]);
+        let pager = fixture.pager();
+        let first = prepare(&pager, "CREATE INDEX IX_SHARED ON USERS (ID)");
+        let same_name = prepare(&pager, "CREATE INDEX IX_SHARED ON ORDERS (ID)");
+        let same_table = prepare(&pager, "CREATE INDEX IX_NEW ON USERS (ID)");
+        let mut batch = pager.begin_write().unwrap();
+        let validated = [&first, &same_name, &same_table].map(|statement| {
+            validate_write_execution(&mut batch, statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap()
+        });
+        let [first, same_name, same_table] = validated;
+        execute_validated_write_plan(&mut batch, first).unwrap();
+        for stale in [same_name, same_table] {
+            assert_eq!(
+                execute_validated_write_plan(&mut batch, stale)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::SchemaChanged
+            );
+        }
+        let catalog = batch.catalog_reader().unwrap();
+        assert!(
+            catalog
+                .find_index_by_name(
+                    &crate::storage::catalog::types::CatalogName::new("IX_NEW").unwrap()
+                )
+                .is_none()
+        );
+        batch.rollback().unwrap();
+
+        let other_fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[]);
+        let other_pager = other_fixture.pager();
+        let mut batch = pager.begin_write().unwrap();
+        let statement = prepare(&pager, "CREATE INDEX IX_DATABASE ON USERS (ID)");
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let mut other = other_pager.begin_write().unwrap();
+        assert_eq!(
+            execute_validated_write_plan(&mut other, validated)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+        batch.rollback().unwrap();
+        other.rollback().unwrap();
     }
 
     #[test]

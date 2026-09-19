@@ -1,0 +1,177 @@
+#![allow(dead_code)]
+
+mod support;
+
+use ora_sqllite::{Database, ErrorCode, Options, Parameters, Value};
+
+#[test]
+fn create_index_backfills_commits_reopens_and_invalidates_old_table_plans() {
+    // A missing executor, schema-version bump, or durable catalog publication
+    // must fail through the real public API, not just a catalog constructor.
+    let (files, database) = support::new_database("phase4c2-create-index");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B TEXT)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (2, 'B')");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1, 'A')");
+    let stale = connection.prepare("SELECT A FROM T").unwrap();
+    assert_eq!(
+        support::execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)").rows_affected(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query(&stale, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+    drop(connection);
+    drop(database);
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A FROM T ORDER BY A"),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+    assert_eq!(
+        connection
+            .prepare("CREATE INDEX IX_T_A ON T (A)")
+            .unwrap_err()
+            .code(),
+        ErrorCode::Bind
+    );
+}
+
+#[test]
+fn create_index_unique_failure_keeps_explicit_transaction_usable() {
+    // A duplicate found late in backfill must not consume the name or invalidate
+    // existing table plans, and must not roll back earlier transaction writes.
+    let (_files, database) = support::new_database("index-duplicate-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64)");
+    let mut transaction = connection.begin_write().unwrap();
+    for sql in ["INSERT INTO T VALUES (1)", "INSERT INTO T VALUES (1)"] {
+        let statement = transaction.prepare(sql).unwrap();
+        transaction.execute(&statement, Parameters::none()).unwrap();
+    }
+    let retained = transaction.prepare("INSERT INTO T VALUES (9)").unwrap();
+    let create = transaction
+        .prepare("CREATE UNIQUE INDEX UX_T_A ON T (A)")
+        .unwrap();
+    let error = transaction
+        .execute(&create, Parameters::none())
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Constraint);
+    assert!(error.to_string().contains("UX_T_A"));
+    transaction.execute(&retained, Parameters::none()).unwrap();
+    let create = transaction.prepare("CREATE INDEX UX_T_A ON T (A)").unwrap();
+    transaction.execute(&create, Parameters::none()).unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A FROM T ORDER BY A"),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(9)]
+        ]
+    );
+}
+
+#[test]
+fn create_index_unique_null_composite_and_explicit_rollback() {
+    // NULL-containing logical duplicates are allowed, and rolling a successful
+    // build back must restore both the name namespace and the old schema version.
+    let (_files, database) = support::new_database("index-null-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B INT64)");
+    for row in [
+        "NULL, NULL",
+        "NULL, NULL",
+        "1, NULL",
+        "1, NULL",
+        "NULL, 2",
+        "NULL, 2",
+        "1, 2",
+        "2, 1",
+    ] {
+        support::execute_sql(&mut connection, &format!("INSERT INTO T VALUES ({row})"));
+    }
+    let retained = connection.prepare("SELECT A FROM T").unwrap();
+    let mut transaction = connection.begin_write().unwrap();
+    let create = transaction
+        .prepare("CREATE UNIQUE INDEX UX_T_B_A ON T (B, A)")
+        .unwrap();
+    transaction.execute(&create, Parameters::none()).unwrap();
+    transaction.rollback().unwrap();
+    assert_eq!(
+        support::collect_statement(&mut connection, &retained, Parameters::none()).len(),
+        8
+    );
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_B_A ON T (B, A)");
+}
+
+#[test]
+fn create_index_complete_key_boundary_is_atomic() {
+    // Nonzero text: NULL tag (1) + payload + terminator (2) + ROWID (8).
+    // Omitting ROWID from the 1024-byte limit would incorrectly accept 1014.
+    for (text_len, expected) in [(1013, None), (1014, Some(ErrorCode::ResourceLimit))] {
+        let (_files, database) = support::new_database("index-key-boundary");
+        let mut connection = database.connect().unwrap();
+        support::execute_sql(&mut connection, "CREATE TABLE T (A TEXT)");
+        support::execute_sql(&mut connection, "INSERT INTO T VALUES ('small')");
+        support::execute_sql(
+            &mut connection,
+            &format!("INSERT INTO T VALUES ('{}')", "x".repeat(text_len)),
+        );
+        let retained = connection.prepare("SELECT A FROM T").unwrap();
+        let create = connection.prepare("CREATE INDEX IX_T_A ON T (A)").unwrap();
+        let result = connection.execute(&create, Parameters::none());
+        match expected {
+            None => assert_eq!(result.unwrap().rows_affected(), 0),
+            Some(code) => {
+                assert_eq!(result.unwrap_err().code(), code);
+                assert_eq!(
+                    support::collect_statement(&mut connection, &retained, Parameters::none())
+                        .len(),
+                    2
+                );
+                assert!(connection.prepare("CREATE INDEX IX_T_A ON T (A)").is_ok());
+                support::execute_sql(&mut connection, "INSERT INTO T VALUES ('after')");
+            }
+        }
+    }
+}
+
+#[test]
+fn create_index_read_only_prepare_and_execute_do_not_change_files() {
+    // Preparing DDL must not publish the feature, and rejected execution must
+    // not append either file. Byte equality is stronger than length equality.
+    let (files, database) = support::new_database("index-read-only");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64)");
+    drop(connection);
+    drop(database);
+    let before = (
+        std::fs::read(files.main()).unwrap(),
+        std::fs::read(files.wal()).unwrap(),
+    );
+    let readonly = Database::open(files.main(), Options::default().read_only()).unwrap();
+    let mut connection = readonly.connect().unwrap();
+    let create = connection.prepare("CREATE INDEX IX_T_A ON T (A)").unwrap();
+    assert_eq!(
+        connection
+            .execute(&create, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Unsupported
+    );
+    drop(connection);
+    drop(readonly);
+    assert_eq!(
+        (
+            std::fs::read(files.main()).unwrap(),
+            std::fs::read(files.wal()).unwrap()
+        ),
+        before
+    );
+}

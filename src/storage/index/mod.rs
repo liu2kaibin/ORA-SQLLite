@@ -4,12 +4,137 @@ use crate::storage::{
     PageRef, WriteBatch,
     btree::{BTree, TreeKind},
     catalog::{
-        CatalogReader,
-        types::{ColumnDef, IndexDef, IndexId, RowId},
+        CatalogReader, CatalogWriter,
+        types::{
+            CatalogName, ColumnDef, ColumnId, IndexDef, IndexId, IndexOwnership, MAX_COLUMNS,
+            ObjectKind, RowId, TableId,
+        },
     },
+    relation::Relation,
 };
 use crate::{DbError, ErrorCode, Result, Value};
 use key::IndexKeyCodec;
+
+pub(crate) struct IndexSpec {
+    name: CatalogName,
+    table_id: TableId,
+    columns: Box<[ColumnId]>,
+    unique: bool,
+}
+
+impl IndexSpec {
+    pub(crate) fn new(
+        name: CatalogName,
+        table_id: TableId,
+        columns: Vec<ColumnId>,
+        unique: bool,
+    ) -> Result<Self> {
+        if columns.is_empty() || columns.len() > usize::from(MAX_COLUMNS) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index column count must be between 1 and 1000",
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if columns.iter().any(|column| !seen.insert(*column)) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index column list contains a repeated column",
+            ));
+        }
+        Ok(Self {
+            name,
+            table_id,
+            columns: columns.into_boxed_slice(),
+            unique,
+        })
+    }
+}
+
+pub(crate) fn create_index(batch: &mut WriteBatch, spec: &IndexSpec) -> Result<IndexId> {
+    // Clone the current relation and ordered column definitions before opening
+    // the write gate. No retained reader or plan contains a physical root.
+    let (relation, columns) = {
+        let catalog = batch.catalog_reader()?;
+        if catalog.object_name_exists(ObjectKind::Index, &spec.name) {
+            return Err(DbError::new(
+                ErrorCode::SchemaChanged,
+                "prepared CREATE INDEX name is no longer available",
+            ));
+        }
+        let relation = Relation::open(&catalog, spec.table_id)?;
+        let columns = spec
+            .columns
+            .iter()
+            .map(|id| {
+                catalog
+                    .find_column_by_id(*id)
+                    .filter(|column| column.table_id() == spec.table_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::SchemaChanged, "indexed column ownership changed")
+                    })
+            })
+            .collect::<Result<Box<[_]>>>()?;
+        (relation, columns)
+    };
+    let checkpoint = batch.statement_checkpoint()?;
+    let result = (|| {
+        let mut catalog = CatalogWriter::bootstrap(batch)?;
+        let id = IndexId::new(catalog.allocate_object_id(batch)?.get())?;
+        let tree = BTree::create(batch, TreeKind::Index)?;
+        let definition = IndexDef::new(
+            id,
+            spec.table_id,
+            tree.root(),
+            spec.columns.len() as u16,
+            spec.unique,
+            IndexOwnership::Explicit,
+            spec.name.clone(),
+        )?;
+        let mut storage = IndexStorage::from_new(
+            IndexSchema {
+                definition,
+                columns,
+            },
+            tree,
+        );
+        // ROWID order, one decoded row and one physical key at a time. There is
+        // no retained key collection, sort, or spill file; NULLs are inserted too.
+        let mut scan = relation.scan(usize::MAX);
+        while let Some(row) = scan.next_batch(batch)? {
+            let entry = storage.prepare(row.values(), row.rowid())?;
+            storage.check_unique(batch, &entry, None)?;
+            storage.insert(batch, &entry)?;
+        }
+        let definition = IndexDef::new(
+            id,
+            spec.table_id,
+            storage.root(),
+            spec.columns.len() as u16,
+            spec.unique,
+            IndexOwnership::Explicit,
+            spec.name.clone(),
+        )?;
+        // This writes all four record kinds and enables the feature in the
+        // gated candidate. Neither is published until the version bump and
+        // writer finish succeed; the outer scope restores all on any failure.
+        catalog.insert_index_definition(batch, &definition, &spec.columns)?;
+        catalog.bump_table_schema_version(batch, spec.table_id)?;
+        catalog.finish(batch)?;
+        Ok(id)
+    })();
+    match result {
+        Ok(id) => {
+            batch.finish_statement(checkpoint)?;
+            Ok(id)
+        }
+        Err(error) => {
+            batch.restore_statement(checkpoint);
+            Err(error)
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct IndexSchema {
@@ -175,18 +300,297 @@ fn corruption(message: &'static str) -> DbError {
 mod tests {
     use std::ops::Bound;
 
-    use super::{IndexStorage, key::IndexKeyCodec};
+    use super::{IndexSpec, IndexStorage, create_index, key::IndexKeyCodec};
     use crate::storage::{
         OpenMode, Pager, PagerConfig, WriteBatch,
         btree::{BTree, TreeKind},
         catalog::{
             CatalogWriter,
-            types::{CatalogName, ColumnType, IndexDef, IndexId, IndexOwnership, RowId},
+            types::{
+                CatalogName, ColumnDef, ColumnId, ColumnType, IndexDef, IndexId, IndexOwnership,
+                RowId, SchemaVersion, TableDef, TableId,
+            },
         },
-        relation::{ColumnSpec, TableSpec, create_relation},
+        features::{CATALOG_V1, INDEX_CONSTRAINT_V1},
+        relation::{ColumnSpec, TableSpec, TableWrite, create_relation},
         test_support::{TempDatabase, test_pager},
     };
     use crate::{ErrorCode, Result, Value};
+
+    fn create_fixture(
+        types: &[ColumnType],
+        version: u64,
+        rows: &[Vec<Value>],
+    ) -> (TempDatabase, Pager, WriteBatch, TableId, Vec<ColumnId>) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let mut catalog = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let table_id = TableId::new(catalog.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let table = TableDef::new(
+            table_id,
+            SchemaVersion::new(version).unwrap(),
+            BTree::create(&mut batch, TreeKind::Table).unwrap().root(),
+            RowId::new(1).unwrap(),
+            types.len() as u16,
+            CatalogName::new("T").unwrap(),
+        )
+        .unwrap();
+        catalog.insert_table_definition(&mut batch, &table).unwrap();
+        let mut ids = Vec::new();
+        for (ordinal, ty) in types.iter().enumerate() {
+            let id = ColumnId::new(catalog.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+            let column = ColumnDef::new(
+                id,
+                table_id,
+                ordinal as u16,
+                *ty,
+                true,
+                CatalogName::new(format!("C{ordinal}")).unwrap(),
+            )
+            .unwrap();
+            catalog
+                .insert_column_definition(&mut batch, &column)
+                .unwrap();
+            ids.push(id);
+        }
+        catalog.finish(&mut batch).unwrap();
+        let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
+        for row in rows {
+            writer.insert(&mut batch, row).unwrap();
+        }
+        writer.finish(&mut batch).unwrap();
+        (temp, pager, batch, table_id, ids)
+    }
+
+    #[test]
+    fn create_index_persists_column_order_and_every_null_row_after_reopen() {
+        // Excluding NULL rows or using table rather than declared key order
+        // changes these independently specified physical leaf ROWIDs.
+        let rows = vec![
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(2), Value::Int64(1)],
+            vec![Value::Null, Value::Null],
+            vec![Value::Null, Value::Null],
+            vec![Value::Int64(1), Value::Null],
+            vec![Value::Int64(1), Value::Null],
+            vec![Value::Null, Value::Int64(2)],
+            vec![Value::Null, Value::Int64(2)],
+        ];
+        let (temp, pager, mut batch, table, ids) =
+            create_fixture(&[ColumnType::Int64, ColumnType::Int64], 1, &rows);
+        assert_eq!(batch.feature_bits(), CATALOG_V1);
+        let columns = vec![ids[1], ids[0]];
+        let spec = IndexSpec::new(
+            CatalogName::new("UX_T").unwrap(),
+            table,
+            columns.clone(),
+            true,
+        )
+        .unwrap();
+        let index = create_index(&mut batch, &spec).unwrap();
+        assert_eq!(batch.feature_bits(), CATALOG_V1 | INDEX_CONSTRAINT_V1);
+        batch.commit().unwrap();
+        drop(pager);
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        catalog.validate_deep(&mut snapshot).unwrap();
+        assert_eq!(snapshot.feature_bits(), CATALOG_V1 | INDEX_CONSTRAINT_V1);
+        assert_eq!(
+            catalog
+                .find_table_by_id(table)
+                .unwrap()
+                .schema_version()
+                .get(),
+            2
+        );
+        assert_eq!(
+            catalog
+                .columns_for_index(index)
+                .map(ColumnDef::id)
+                .collect::<Vec<_>>(),
+            columns
+        );
+        let storage = IndexStorage::open(&catalog, index).unwrap();
+        let mut scan = storage
+            .tree
+            .scan_state(Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        for rowid in [2, 1, 7, 8, 5, 6, 3, 4] {
+            let (key, value) = scan.next(&mut snapshot).unwrap().unwrap();
+            assert!(value.is_empty());
+            let decoded = IndexKeyCodec::decode(&storage.schema.columns, &key).unwrap();
+            assert_eq!(decoded.rowid().get(), rowid);
+        }
+        assert!(scan.next(&mut snapshot).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_index_late_duplicate_restores_all_batch_state_and_reuses_id() {
+        // The duplicate comes after root splits; restoration must include dirty
+        // bytes, allocations/releases, roots, catalog gate, counter and bits.
+        let mut rows = (0..240).map(|n| vec![Value::Int64(n)]).collect::<Vec<_>>();
+        rows.push(vec![Value::Int64(0)]);
+        let (_temp, _pager, mut batch, table, ids) = create_fixture(&[ColumnType::Int64], 1, &rows);
+        let before = batch.checkpoint_mutation().unwrap();
+        let spec =
+            IndexSpec::new(CatalogName::new("UX_T").unwrap(), table, ids.clone(), true).unwrap();
+        let error = create_index(&mut batch, &spec).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("UX_T"));
+        before.assert_matches_batch_for_test(&batch);
+        let catalog = batch.catalog_reader().unwrap();
+        assert!(catalog.find_index_by_name(&spec.name).is_none());
+        assert_eq!(
+            catalog
+                .find_table_by_id(table)
+                .unwrap()
+                .schema_version()
+                .get(),
+            1
+        );
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        let spec = IndexSpec::new(spec.name, table, ids, false).unwrap();
+        let index = create_index(&mut batch, &spec).unwrap();
+        assert_eq!(index.get(), 3, "failed build must not consume object ID 3");
+        let catalog = batch.catalog_reader().unwrap();
+        let storage = IndexStorage::open(&catalog, index).unwrap();
+        let mut scan = storage
+            .tree
+            .scan_state(Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        let mut count = 0;
+        while scan.next(&mut batch).unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 241);
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        let before_second = batch.checkpoint_mutation().unwrap();
+        let second = IndexSpec::new(
+            CatalogName::new("UX_SECOND").unwrap(),
+            table,
+            spec.columns.to_vec(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            create_index(&mut batch, &second).unwrap_err().code(),
+            ErrorCode::Constraint
+        );
+        before_second.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.feature_bits(), CATALOG_V1 | INDEX_CONSTRAINT_V1);
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn create_index_nonfinite_type_failure_restores_all_batch_state() {
+        // Row storage preserves all Float64 bits; the index codec must reject
+        // nonfinite values after earlier entries without publishing a partial tree.
+        let rows = vec![vec![Value::Float64(1.0)], vec![Value::Float64(f64::NAN)]];
+        let (_temp, _pager, mut batch, table, ids) =
+            create_fixture(&[ColumnType::Float64], 1, &rows);
+        let before = batch.checkpoint_mutation().unwrap();
+        let spec = IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, ids, false).unwrap();
+        assert_eq!(
+            create_index(&mut batch, &spec).unwrap_err().code(),
+            ErrorCode::Type
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.feature_bits(), CATALOG_V1);
+        batch
+            .catalog_reader()
+            .unwrap()
+            .validate_deep_batch(&mut batch)
+            .unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn create_index_oversized_key_restores_all_batch_state() {
+        // Failure after one successful insert must be just as atomic as an
+        // oversized first key, including the candidate feature flag.
+        let rows = vec![
+            vec![Value::Text("small".into())],
+            vec![Value::Text("x".repeat(1014).into())],
+        ];
+        let (_temp, _pager, mut batch, table, ids) = create_fixture(&[ColumnType::Text], 1, &rows);
+        let before = batch.checkpoint_mutation().unwrap();
+        let spec = IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, ids, false).unwrap();
+        assert_eq!(
+            create_index(&mut batch, &spec).unwrap_err().code(),
+            ErrorCode::ResourceLimit
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.feature_bits(), CATALOG_V1);
+        batch
+            .catalog_reader()
+            .unwrap()
+            .validate_deep_batch(&mut batch)
+            .unwrap();
+        let mut writer = TableWrite::open(&mut batch, table).unwrap();
+        writer
+            .insert(&mut batch, &[Value::Text("after".into())])
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn create_index_schema_bump_failure_restores_published_candidate_records_and_bit() {
+        // Unlike duplicate/key failures, schema overflow occurs after all four
+        // record kinds and INDEX_CONSTRAINT_V1 were staged by CatalogWriter.
+        let rows = (0..240).map(|n| vec![Value::Int64(n)]).collect::<Vec<_>>();
+        let (_temp, _pager, mut batch, table, ids) =
+            create_fixture(&[ColumnType::Int64], u64::MAX, &rows);
+        let before = batch.checkpoint_mutation().unwrap();
+        let spec = IndexSpec::new(CatalogName::new("IX_T").unwrap(), table, ids, false).unwrap();
+        assert_eq!(
+            create_index(&mut batch, &spec).unwrap_err().code(),
+            ErrorCode::Type
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.feature_bits(), CATALOG_V1);
+        let catalog = batch.catalog_reader().unwrap();
+        assert!(catalog.find_index_by_name(&spec.name).is_none());
+        assert_eq!(
+            catalog
+                .find_table_by_id(table)
+                .unwrap()
+                .schema_version()
+                .get(),
+            u64::MAX
+        );
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        let mut writer = TableWrite::open(&mut batch, table).unwrap();
+        writer.insert(&mut batch, &[Value::Int64(241)]).unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn create_index_rejects_invalid_specs_and_foreign_columns_without_mutation() {
+        // Invalid shape/ownership is rejected before taking the catalog gate.
+        let (_temp, _pager, mut batch, table, ids) = create_fixture(&[ColumnType::Int64], 1, &[]);
+        let name = CatalogName::new("IX_T").unwrap();
+        for columns in [vec![], vec![ids[0], ids[0]], vec![ids[0]; 1001]] {
+            assert!(
+                matches!(IndexSpec::new(name.clone(), table, columns, false), Err(error) if error.code() == ErrorCode::Type)
+            );
+        }
+        let before = batch.checkpoint_mutation().unwrap();
+        let spec = IndexSpec::new(name, table, vec![ColumnId::new(999).unwrap()], false).unwrap();
+        assert_eq!(
+            create_index(&mut batch, &spec).unwrap_err().code(),
+            ErrorCode::SchemaChanged
+        );
+        before.assert_matches_batch_for_test(&batch);
+        batch.catalog_reader().unwrap();
+    }
 
     struct IndexFixture {
         storage: IndexStorage,

@@ -1488,9 +1488,9 @@ mod tests {
     }
 
     #[test]
-    fn deferred_index_is_unsupported_without_any_committable_mutation() {
-        // Production break caught: allocating pages or catalog objects before
-        // DeferredUnsupported would change the database even though execute fails.
+    fn create_index_rollback_leaves_files_unchanged_and_commit_survives_reopen() {
+        // Publication before commit would change the database on rollback;
+        // omitted publication would make the name available after committed reopen.
         let temp = TempDatabase::new("transaction-deferred-index");
         let db = Database::create(temp.path(), Options::default()).unwrap();
         let mut connection = db.connect().unwrap();
@@ -1509,19 +1509,39 @@ mod tests {
         let db = Database::open(temp.path(), Options::default()).unwrap();
         let mut connection = db.connect().unwrap();
         let mut transaction = connection.begin_write().unwrap();
-        let deferred = transaction.prepare("CREATE INDEX IX_T ON T (ID)").unwrap();
+        let create_index = transaction.prepare("CREATE INDEX IX_T ON T (ID)").unwrap();
         assert_eq!(
             transaction
-                .execute(&deferred, Parameters::none())
-                .unwrap_err()
-                .code(),
-            ErrorCode::Unsupported
+                .execute(&create_index, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
         );
-        transaction.commit().unwrap();
+        transaction.rollback().unwrap();
         assert!(connection.prepare("CREATE INDEX IX_T ON T (ID)").is_ok());
         drop(connection);
         drop(db);
         assert_eq!(std::fs::read(temp.path()).unwrap(), before);
+
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create_index = transaction.prepare("CREATE INDEX IX_T ON T (ID)").unwrap();
+        transaction
+            .execute(&create_index, Parameters::none())
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        drop(db);
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .prepare("CREATE INDEX IX_T ON T (ID)")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
     }
 
     #[test]
