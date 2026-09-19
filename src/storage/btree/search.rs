@@ -129,7 +129,18 @@ impl BTreeScanState {
         source: &mut impl PageSource,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.initialize_if_needed(source)?;
-        self.next_validated_cell(source)
+        self.next_validated_cell(source, None)
+    }
+
+    /// Reject using the leaf's declared length before cloning the selected
+    /// inline cell or following/materializing any overflow value.
+    pub(in crate::storage) fn next_value_limited(
+        &mut self,
+        source: &mut impl PageSource,
+        max_value_bytes: u64,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.initialize_if_needed(source)?;
+        self.next_validated_cell(source, Some(max_value_bytes))
     }
 
     fn initialize_if_needed(&mut self, source: &mut impl PageSource) -> Result<()> {
@@ -169,6 +180,7 @@ impl BTreeScanState {
     fn next_validated_cell(
         &mut self,
         source: &mut impl PageSource,
+        max_value_bytes: Option<u64>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
             if self.current.is_none() {
@@ -179,18 +191,24 @@ impl BTreeScanState {
                 .as_ref()
                 .ok_or_else(|| corruption("B+Tree cursor lost its current decoded leaf"))?
                 .cells
-                .get(self.next_slot)
-                .cloned();
+                .get(self.next_slot);
             if let Some(cell) = cell {
-                self.next_slot = self
-                    .next_slot
-                    .checked_add(1)
-                    .ok_or_else(|| corruption("B+Tree cursor slot index overflows"))?;
                 if is_past_end(cell.key(), &self.end) {
                     self.current = None;
                     self.leaf = None;
                     return Ok(None);
                 }
+                if max_value_bytes.is_some_and(|limit| cell.total_value_len() > limit) {
+                    return Err(DbError::new(
+                        ErrorCode::ResourceLimit,
+                        "B+Tree value exceeds the work memory limit",
+                    ));
+                }
+                let cell = cell.clone();
+                self.next_slot = self
+                    .next_slot
+                    .checked_add(1)
+                    .ok_or_else(|| corruption("B+Tree cursor slot index overflows"))?;
                 return read_value(source, &cell).map(|value| Some((cell.key().to_vec(), value)));
             }
 
@@ -516,6 +534,37 @@ mod tests {
         assert_eq!(node.child_for(b"a"), page_ref(1, 1));
         assert_eq!(node.child_for(b"m"), page_ref(2, 1));
         assert_eq!(node.child_for(b"z"), page_ref(3, 1));
+    }
+
+    #[test]
+    fn create_index_bounded_scan_rejects_inline_and_overflow_before_value_reads() {
+        // A limit checked after read_value would read the overflow pages. A
+        // rejected row must also remain available for a subsequent wider limit.
+        for length in [64_usize, 20_000] {
+            let (_temp, pager) = test_pager(4096).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).unwrap();
+            let payload = vec![0x5a; length];
+            tree.insert(&mut batch, b"a", &payload).unwrap();
+            batch.commit().unwrap();
+            let mut source = CountingSource::new(pager.begin_read().unwrap());
+            let mut scan = tree.scan_state(Bound::Unbounded, Bound::Unbounded).unwrap();
+            assert_eq!(
+                scan.next_value_limited(&mut source, length as u64 - 1)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::ResourceLimit
+            );
+            assert_eq!(source.overflow_loads, 0);
+            assert_eq!(
+                scan.next_value_limited(&mut source, length as u64)
+                    .unwrap()
+                    .unwrap()
+                    .1,
+                payload
+            );
+            assert_eq!(source.overflow_loads > 0, length > 4096);
+        }
     }
 
     #[test]
@@ -1247,6 +1296,7 @@ mod tests {
     struct CountingSource {
         snapshot: crate::storage::pager::ReadSnapshot,
         leaf_loads: BTreeMap<PageId, usize>,
+        overflow_loads: usize,
     }
 
     impl CountingSource {
@@ -1254,6 +1304,7 @@ mod tests {
             Self {
                 snapshot,
                 leaf_loads: BTreeMap::new(),
+                overflow_loads: 0,
             }
         }
     }
@@ -1262,6 +1313,9 @@ mod tests {
         fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
             let handle = self.snapshot.read(reference)?;
             let page_type = handle.header().page_type();
+            if page_type == PageType::Overflow {
+                self.overflow_loads += 1;
+            }
             if matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf) {
                 *self.leaf_loads.entry(reference.page_id()).or_default() += 1;
             }

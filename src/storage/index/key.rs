@@ -5,6 +5,9 @@ use crate::storage::catalog::types::{ColumnDef, ColumnType, RowId};
 use crate::{DbError, Decimal, ErrorCode, OracleDate, OracleTimestamp, Result, Value};
 
 pub(crate) const MAX_INDEX_KEY_BYTES: usize = 1024;
+// A final fixed-width component can cross the logical limit before the
+// component check, but never by 64 bytes. Reserve once; never grow a large key.
+pub(crate) const INDEX_KEY_BUFFER_BYTES: usize = MAX_INDEX_KEY_BYTES + 64;
 const ROWID_BYTES: usize = 8;
 
 #[derive(Debug)]
@@ -27,6 +30,9 @@ impl EncodedIndexKey {
     }
     pub(crate) const fn rowid(&self) -> RowId {
         self.rowid
+    }
+    pub(crate) fn into_physical(self) -> Vec<u8> {
+        self.physical
     }
 }
 
@@ -59,9 +65,21 @@ impl IndexKeyCodec {
                 "index key requires one value per column",
             ));
         }
-        let mut physical = Vec::new();
+        Self::encode_borrowed(columns, values.iter().map(Ok), rowid)
+    }
+
+    pub(crate) fn encode_borrowed<'a>(
+        columns: &[ColumnDef],
+        values: impl IntoIterator<Item = Result<&'a Value>>,
+        rowid: RowId,
+    ) -> Result<EncodedIndexKey> {
+        let mut values = values.into_iter();
+        let mut physical = Vec::with_capacity(INDEX_KEY_BUFFER_BYTES);
         let mut contains_null = false;
-        for (column, value) in columns.iter().zip(values) {
+        for column in columns {
+            let value = values.next().ok_or_else(|| {
+                DbError::new(ErrorCode::Type, "index key requires one value per column")
+            })??;
             if matches!(value, Value::Null) {
                 physical.push(1);
                 contains_null = true;
@@ -70,6 +88,12 @@ impl IndexKeyCodec {
                 encode_scalar(column.column_type(), value, &mut physical)?;
             }
             check_encoded_size(physical.len())?;
+        }
+        if values.next().is_some() {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index key requires one value per column",
+            ));
         }
         let logical_len = physical.len();
         physical.extend_from_slice(&rowid.get().to_be_bytes());
@@ -91,7 +115,7 @@ impl IndexKeyCodec {
         let mut reader = Reader {
             bytes: &bytes[..logical_len],
         };
-        let mut values = Vec::new();
+        let mut values = Vec::with_capacity(columns.len());
         for column in columns {
             values.push(match reader.byte()? {
                 0 => decode_scalar(column.column_type(), &mut reader)?,

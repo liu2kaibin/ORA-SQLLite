@@ -1,12 +1,14 @@
 use super::{ExecExpr, Locations, expr::ExprCompiler};
 use crate::{
-    Result,
+    DbError, ErrorCode, Result,
     error::SqlLocation,
     sql::{
         SqlType,
         bound::{BoundAssignment, BoundColumn, BoundColumnDefinition, BoundExpr, BoundTable},
     },
-    storage::catalog::types::{CatalogName, ColumnId, ColumnType, IndexId, SchemaVersion, TableId},
+    storage::catalog::types::{
+        CatalogName, ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId,
+    },
 };
 
 /// Logical identities only: never a physical root or a retained catalog reader.
@@ -69,6 +71,31 @@ impl ColumnTarget {
     }
     pub(crate) const fn nullable(&self) -> bool {
         self.nullable
+    }
+    pub(crate) fn validate_catalog_column(&self, column: &ColumnDef) -> Result<()> {
+        let logical_type = match column.column_type() {
+            ColumnType::Int64 => SqlType::Int64,
+            ColumnType::Decimal => SqlType::Decimal,
+            ColumnType::Float64 => SqlType::Float64,
+            ColumnType::Text => SqlType::Text,
+            ColumnType::Blob => SqlType::Blob,
+            ColumnType::Date => SqlType::Date,
+            ColumnType::Timestamp | ColumnType::TimestampWithTimeZone => SqlType::Timestamp,
+            ColumnType::Bool => SqlType::Bool,
+        };
+        if self.column_id != column.id()
+            || self.table_id != column.table_id()
+            || self.ordinal != column.ordinal()
+            || self.data_type != logical_type
+            || self.nullable != column.nullable()
+        {
+            return Err(DbError::new(
+                ErrorCode::SchemaChanged,
+                "prepared indexed column definition changed",
+            )
+            .with_sql_location(self.location));
+        }
+        Ok(())
     }
     pub(crate) const fn location(&self) -> SqlLocation {
         self.location

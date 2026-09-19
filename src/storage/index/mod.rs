@@ -18,7 +18,7 @@ use key::IndexKeyCodec;
 pub(crate) struct IndexSpec {
     name: CatalogName,
     table_id: TableId,
-    columns: Box<[ColumnId]>,
+    columns: Box<[ColumnDef]>,
     unique: bool,
 }
 
@@ -26,7 +26,7 @@ impl IndexSpec {
     pub(crate) fn new(
         name: CatalogName,
         table_id: TableId,
-        columns: Vec<ColumnId>,
+        columns: Vec<ColumnDef>,
         unique: bool,
     ) -> Result<Self> {
         if columns.is_empty() || columns.len() > usize::from(MAX_COLUMNS) {
@@ -36,7 +36,7 @@ impl IndexSpec {
             ));
         }
         let mut seen = std::collections::BTreeSet::new();
-        if columns.iter().any(|column| !seen.insert(*column)) {
+        if columns.iter().any(|column| !seen.insert(column.id())) {
             return Err(DbError::new(
                 ErrorCode::Type,
                 "index column list contains a repeated column",
@@ -51,7 +51,11 @@ impl IndexSpec {
     }
 }
 
-pub(crate) fn create_index(batch: &mut WriteBatch, spec: &IndexSpec) -> Result<IndexId> {
+pub(crate) fn create_index(
+    batch: &mut WriteBatch,
+    spec: &IndexSpec,
+    work_bytes: u64,
+) -> Result<IndexId> {
     // Clone the current relation and ordered column definitions before opening
     // the write gate. No retained reader or plan contains a physical root.
     let (relation, columns) = {
@@ -66,18 +70,39 @@ pub(crate) fn create_index(batch: &mut WriteBatch, spec: &IndexSpec) -> Result<I
         let columns = spec
             .columns
             .iter()
-            .map(|id| {
+            .map(|retained| {
                 catalog
-                    .find_column_by_id(*id)
-                    .filter(|column| column.table_id() == spec.table_id)
+                    .find_column_by_id(retained.id())
+                    .filter(|column| {
+                        column.table_id() == spec.table_id
+                            && column.table_id() == retained.table_id()
+                            && column.ordinal() == retained.ordinal()
+                            && column.column_type() == retained.column_type()
+                            && column.nullable() == retained.nullable()
+                    })
                     .cloned()
                     .ok_or_else(|| {
-                        DbError::new(ErrorCode::SchemaChanged, "indexed column ownership changed")
+                        DbError::new(
+                            ErrorCode::SchemaChanged,
+                            "indexed column definition changed",
+                        )
                     })
             })
             .collect::<Result<Box<[_]>>>()?;
         (relation, columns)
     };
+    // Eight bounded key buffers cover encoding, prefix bounds/cursor copies,
+    // a probed physical key and decoded key payload; Value bodies are separate.
+    let key_scratch = 8 * key::INDEX_KEY_BUFFER_BYTES as u64
+        + 256
+        + columns.len() as u64 * std::mem::size_of::<Value>() as u64;
+    let row_budget = work_bytes.checked_sub(key_scratch).ok_or_else(|| {
+        DbError::new(
+            ErrorCode::ResourceLimit,
+            "index build scratch exceeds work memory",
+        )
+    })?;
+    let mut scan = relation.scan_with_work_budget(row_budget)?;
     let checkpoint = batch.statement_checkpoint()?;
     let result = (|| {
         let mut catalog = CatalogWriter::bootstrap(batch)?;
@@ -101,7 +126,6 @@ pub(crate) fn create_index(batch: &mut WriteBatch, spec: &IndexSpec) -> Result<I
         );
         // ROWID order, one decoded row and one physical key at a time. There is
         // no retained key collection, sort, or spill file; NULLs are inserted too.
-        let mut scan = relation.scan(usize::MAX);
         while let Some(row) = scan.next_batch(batch)? {
             let entry = storage.prepare(row.values(), row.rowid())?;
             storage.check_unique(batch, &entry, None)?;
@@ -119,7 +143,12 @@ pub(crate) fn create_index(batch: &mut WriteBatch, spec: &IndexSpec) -> Result<I
         // This writes all four record kinds and enables the feature in the
         // gated candidate. Neither is published until the version bump and
         // writer finish succeed; the outer scope restores all on any failure.
-        catalog.insert_index_definition(batch, &definition, &spec.columns)?;
+        let column_ids = spec
+            .columns
+            .iter()
+            .map(ColumnDef::id)
+            .collect::<Vec<ColumnId>>();
+        catalog.insert_index_definition(batch, &definition, &column_ids)?;
         catalog.bump_table_schema_version(batch, spec.table_id)?;
         catalog.finish(batch)?;
         Ok(id)
@@ -195,25 +224,20 @@ impl IndexStorage {
     /// Values are the complete table row, not a preselected index-key tuple.
     /// Preparation (including the physical key size limit) never mutates pages.
     pub(crate) fn prepare(&self, values: &[Value], rowid: RowId) -> Result<PreparedIndexEntry> {
-        let selected = self
-            .schema
-            .columns
-            .iter()
-            .map(|column| {
-                values
-                    .get(usize::from(column.ordinal()))
-                    .cloned()
-                    .ok_or_else(|| {
-                        DbError::new(ErrorCode::Type, "row is missing an indexed column")
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let encoded = IndexKeyCodec::encode(&self.schema.columns, &selected, rowid)?;
+        let selected = self.schema.columns.iter().map(|column| {
+            values
+                .get(usize::from(column.ordinal()))
+                .ok_or_else(|| DbError::new(ErrorCode::Type, "row is missing an indexed column"))
+        });
+        let encoded = IndexKeyCodec::encode_borrowed(&self.schema.columns, selected, rowid)?;
+        let logical_len = encoded.logical().len();
+        let contains_null = encoded.contains_null();
+        let rowid = encoded.rowid();
         Ok(PreparedIndexEntry {
-            physical: encoded.physical().to_vec(),
-            logical_len: encoded.logical().len(),
-            contains_null: encoded.contains_null(),
-            rowid: encoded.rowid(),
+            physical: encoded.into_physical(),
+            logical_len,
+            contains_null,
+            rowid,
         })
     }
 
@@ -300,7 +324,7 @@ fn corruption(message: &'static str) -> DbError {
 mod tests {
     use std::ops::Bound;
 
-    use super::{IndexSpec, IndexStorage, create_index, key::IndexKeyCodec};
+    use super::{IndexSpec, IndexStorage, key::IndexKeyCodec};
     use crate::storage::{
         OpenMode, Pager, PagerConfig, WriteBatch,
         btree::{BTree, TreeKind},
@@ -317,11 +341,15 @@ mod tests {
     };
     use crate::{ErrorCode, Result, Value};
 
+    fn create_index(batch: &mut WriteBatch, spec: &IndexSpec) -> Result<IndexId> {
+        super::create_index(batch, spec, 64 * 1024 * 1024)
+    }
+
     fn create_fixture(
         types: &[ColumnType],
         version: u64,
         rows: &[Vec<Value>],
-    ) -> (TempDatabase, Pager, WriteBatch, TableId, Vec<ColumnId>) {
+    ) -> (TempDatabase, Pager, WriteBatch, TableId, Vec<ColumnDef>) {
         let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let mut catalog = CatalogWriter::bootstrap(&mut batch).unwrap();
@@ -351,7 +379,7 @@ mod tests {
             catalog
                 .insert_column_definition(&mut batch, &column)
                 .unwrap();
-            ids.push(id);
+            ids.push(column);
         }
         catalog.finish(&mut batch).unwrap();
         let mut writer = TableWrite::open(&mut batch, table_id).unwrap();
@@ -379,7 +407,7 @@ mod tests {
         let (temp, pager, mut batch, table, ids) =
             create_fixture(&[ColumnType::Int64, ColumnType::Int64], 1, &rows);
         assert_eq!(batch.feature_bits(), CATALOG_V1);
-        let columns = vec![ids[1], ids[0]];
+        let columns = vec![ids[1].clone(), ids[0].clone()];
         let spec = IndexSpec::new(
             CatalogName::new("UX_T").unwrap(),
             table,
@@ -414,7 +442,7 @@ mod tests {
                 .columns_for_index(index)
                 .map(ColumnDef::id)
                 .collect::<Vec<_>>(),
-            columns
+            columns.iter().map(ColumnDef::id).collect::<Vec<_>>()
         );
         let storage = IndexStorage::open(&catalog, index).unwrap();
         let mut scan = storage
@@ -577,13 +605,26 @@ mod tests {
         // Invalid shape/ownership is rejected before taking the catalog gate.
         let (_temp, _pager, mut batch, table, ids) = create_fixture(&[ColumnType::Int64], 1, &[]);
         let name = CatalogName::new("IX_T").unwrap();
-        for columns in [vec![], vec![ids[0], ids[0]], vec![ids[0]; 1001]] {
+        for columns in [
+            vec![],
+            vec![ids[0].clone(), ids[0].clone()],
+            vec![ids[0].clone(); 1001],
+        ] {
             assert!(
                 matches!(IndexSpec::new(name.clone(), table, columns, false), Err(error) if error.code() == ErrorCode::Type)
             );
         }
         let before = batch.checkpoint_mutation().unwrap();
-        let spec = IndexSpec::new(name, table, vec![ColumnId::new(999).unwrap()], false).unwrap();
+        let absent = ColumnDef::new(
+            ColumnId::new(999).unwrap(),
+            table,
+            0,
+            ColumnType::Int64,
+            true,
+            CatalogName::new("C0").unwrap(),
+        )
+        .unwrap();
+        let spec = IndexSpec::new(name, table, vec![absent], false).unwrap();
         assert_eq!(
             create_index(&mut batch, &spec).unwrap_err().code(),
             ErrorCode::SchemaChanged

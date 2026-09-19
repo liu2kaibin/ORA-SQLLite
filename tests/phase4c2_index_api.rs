@@ -5,6 +5,95 @@ mod support;
 use ora_sqllite::{Database, ErrorCode, Options, Parameters, Value};
 
 #[test]
+fn create_index_low_memory_rejects_indexed_and_unindexed_payloads_and_can_continue() {
+    // Both a small physical key over a large unindexed row and an indexable
+    // 900-byte text key must obey the connection's budget, not just key length.
+    for (target, payload_len, limit) in [("B", 900, 10_000), ("A", 20_000, 16_384)] {
+        let (files, database) = support::new_database("index-low-memory");
+        let mut setup = database.connect().unwrap();
+        support::execute_sql(&mut setup, "CREATE TABLE T (A INT64, B TEXT)");
+        support::execute_sql(&mut setup, "INSERT INTO T VALUES (1, 'small')");
+        support::execute_sql(
+            &mut setup,
+            &format!("INSERT INTO T VALUES (2, '{}')", "x".repeat(payload_len)),
+        );
+        drop(setup);
+        drop(database);
+        let database = Database::open(
+            files.main(),
+            Options::default().with_max_query_memory_bytes(limit),
+        )
+        .unwrap();
+        let mut connection = database.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let retained = transaction
+            .prepare("INSERT INTO T VALUES (3, 'after')")
+            .unwrap();
+        let create = transaction
+            .prepare(&format!("CREATE INDEX IX_T ON T ({target})"))
+            .unwrap();
+        assert_eq!(
+            transaction
+                .execute(&create, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert!(
+            transaction
+                .prepare(&format!("CREATE INDEX IX_T ON T ({target})"))
+                .is_ok()
+        );
+        transaction.execute(&retained, Parameters::none()).unwrap();
+        transaction.commit().unwrap();
+    }
+}
+
+#[test]
+fn create_index_reuses_small_budget_for_each_row() {
+    // The complete payload exceeds this budget. Each individual row and its
+    // unique-key probe fit: the build must reuse, not accumulate, row charges.
+    let (files, database) = support::new_database("index-budget-reuse");
+    let mut setup = database.connect().unwrap();
+    support::execute_sql(&mut setup, "CREATE TABLE T (A INT64, B TEXT)");
+    let mut transaction = setup.begin_write().unwrap();
+    for id in 0..120 {
+        let insert = transaction
+            .prepare(&format!(
+                "INSERT INTO T VALUES ({id}, '{}')",
+                "x".repeat(100)
+            ))
+            .unwrap();
+        transaction.execute(&insert, Parameters::none()).unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(setup);
+    drop(database);
+    let database = Database::open(
+        files.main(),
+        Options::default().with_max_query_memory_bytes(10_000),
+    )
+    .unwrap();
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX IX_T ON T (A, B)");
+    drop(connection);
+    drop(database);
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A FROM T").len(),
+        120
+    );
+    assert_eq!(
+        connection
+            .prepare("CREATE INDEX IX_T ON T (A)")
+            .unwrap_err()
+            .code(),
+        ErrorCode::Bind
+    );
+}
+
+#[test]
 fn create_index_backfills_commits_reopens_and_invalidates_old_table_plans() {
     // A missing executor, schema-version bump, or durable catalog publication
     // must fail through the real public API, not just a catalog constructor.

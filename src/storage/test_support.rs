@@ -151,6 +151,100 @@ pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture 
     phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum IndexColumnChange {
+    Identity,
+    Owner,
+    Ordinal,
+    LogicalType,
+    Nullability,
+}
+
+pub(crate) fn assert_batch_unchanged_after<T>(
+    batch: &mut WriteBatch,
+    operation: impl FnOnce(&mut WriteBatch) -> T,
+) -> T {
+    let before = batch.checkpoint_mutation().unwrap();
+    let result = operation(batch);
+    before.assert_matches_batch_for_test(batch);
+    result
+}
+
+/// Rebuild only the empty USERS/ORDERS test relations, keeping table identity
+/// and schema version fixed while changing one retained column property.
+pub(crate) fn change_empty_index_fixture_column(
+    batch: &mut WriteBatch,
+    change: IndexColumnChange,
+) -> Result<()> {
+    let reader = batch.catalog_reader()?;
+    let users = reader
+        .find_table_by_name(&CatalogName::new("USERS")?)
+        .unwrap()
+        .clone();
+    let orders = reader
+        .find_table_by_name(&CatalogName::new("ORDERS")?)
+        .unwrap()
+        .clone();
+    let tables = [users, orders];
+    let originals = tables
+        .iter()
+        .map(|table| {
+            reader
+                .columns_for_table(table.id())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut writer = CatalogWriter::bootstrap(batch)?;
+    let new_id = if matches!(change, IndexColumnChange::Identity) {
+        Some(ColumnId::new(writer.allocate_object_id(batch)?.get())?)
+    } else {
+        None
+    };
+    for (table, columns) in tables.iter().zip(&originals) {
+        assert_eq!(
+            table.next_rowid().get(),
+            1,
+            "fixture helper requires empty relations"
+        );
+        writer.remove_relation(batch, table, columns)?;
+    }
+    for table in &tables {
+        let rebuilt = TableDef::new(
+            table.id(),
+            table.schema_version(),
+            BTree::create(batch, TreeKind::Table)?.root(),
+            table.next_rowid(),
+            table.column_count(),
+            table.name().clone(),
+        )?;
+        writer.insert_table_definition(batch, &rebuilt)?;
+    }
+    for column in originals.iter().flatten() {
+        let user = column.table_id() == tables[0].id();
+        let id_column = column.name().as_str() == "ID";
+        let mut id = column.id();
+        let mut owner = column.table_id();
+        let mut ordinal = column.ordinal();
+        let mut ty = column.column_type();
+        let mut nullable = column.nullable();
+        match change {
+            IndexColumnChange::Identity if user && id_column => id = new_id.unwrap(),
+            IndexColumnChange::Owner if id_column => {
+                owner = if user { tables[1].id() } else { tables[0].id() }
+            }
+            IndexColumnChange::Ordinal if user && ordinal < 2 => ordinal = 1 - ordinal,
+            IndexColumnChange::LogicalType if user && id_column => ty = ColumnType::Text,
+            IndexColumnChange::Nullability if user && id_column => nullable = !nullable,
+            _ => {}
+        }
+        let changed = ColumnDef::new(id, owner, ordinal, ty, nullable, column.name().clone())?;
+        writer.insert_column_definition(batch, &changed)?;
+    }
+    writer.finish(batch)?;
+    batch.catalog_reader()?.validate_deep_batch(batch)
+}
+
 /// A Phase 4B catalog with one explicit USERS(ID) index for SQL front-end tests.
 ///
 /// This deliberately remains test support: production index DDL is planned by

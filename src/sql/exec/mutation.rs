@@ -80,11 +80,30 @@ pub(crate) fn execute_validated_write_plan(
                 plan.table().table_id(),
                 plan.columns()
                     .iter()
-                    .map(|column| column.column_id())
-                    .collect(),
+                    .map(|target| {
+                        let column =
+                            catalog
+                                .find_column_by_id(target.column_id())
+                                .ok_or_else(|| {
+                                    DbError::new(
+                                        ErrorCode::SchemaChanged,
+                                        "prepared indexed column no longer exists",
+                                    )
+                                    .with_sql_location(target.location())
+                                })?;
+                        target.validate_catalog_column(column)?;
+                        Ok(column.clone())
+                    })
+                    .collect::<Result<Vec<_>>>()?,
                 plan.unique(),
             )?;
-            create_index(batch, &spec)?;
+            // Lend the remaining query budget to the storage lifecycle. It
+            // bounds simultaneous raw/decoded rows and key/probe scratch.
+            let available = memory.remaining();
+            memory.reserve(available)?;
+            let result = create_index(batch, &spec, available);
+            memory.release(available)?;
+            result?;
             Ok(ExecutionResult::new(0))
         }
         PlanKind::DropTable { table_id } => {
@@ -499,6 +518,97 @@ mod tests {
                 .is_some()
         );
         batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_identity() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Identity,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_owner() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Owner,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_ordinal() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Ordinal,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_logical_type() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::LogicalType,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_nullability() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Nullability,
+        );
+    }
+
+    fn assert_create_index_rejects_changed_column(
+        change: crate::storage::test_support::IndexColumnChange,
+    ) {
+        // These fixtures remain valid catalogs with unchanged table versions,
+        // so schema-version checks cannot hide omitted column-shape checks.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let statement = prepare(&pager, "CREATE INDEX IX_STALE ON USERS (ID)");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        crate::storage::test_support::change_empty_index_fixture_column(&mut batch, change)
+            .unwrap();
+        let result =
+            crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+                execute_validated_write_plan(batch, validated)
+            });
+        assert_eq!(result.unwrap_err().code(), ErrorCode::SchemaChanged);
+        batch.catalog_reader().unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn create_index_low_memory_restores_every_batch_field() {
+        // A per-key limit alone cannot account for an unindexed overflow value,
+        // or the simultaneous raw/decoded/key allocations of an indexable row.
+        for (target, length, limit) in [("NAME", 900, 10_000), ("ID", 20_000, 16_384)] {
+            let payload = "x".repeat(length);
+            let fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[
+                (1, "small"),
+                (2, &payload),
+            ]);
+            let pager = fixture.pager();
+            let statement = prepare(
+                &pager,
+                &format!("CREATE INDEX IX_MEMORY ON USERS ({target})"),
+            );
+            let mut batch = pager.begin_write().unwrap();
+            let validated =
+                validate_write_execution(&mut batch, &statement, Parameters::none(), limit)
+                    .unwrap();
+            let result =
+                crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+                    execute_validated_write_plan(batch, validated)
+                });
+            assert_eq!(result.unwrap_err().code(), ErrorCode::ResourceLimit);
+            batch.catalog_reader().unwrap();
+            let good = prepare(&pager, "INSERT INTO USERS (ID) VALUES (9)");
+            let validated =
+                validate_write_execution(&mut batch, &good, Parameters::none(), limit).unwrap();
+            execute_validated_write_plan(&mut batch, validated).unwrap();
+            batch.commit().unwrap();
+        }
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub(crate) struct RelationScan {
     relation: Relation,
     state: BTreeScanState,
     max_row_bytes: usize,
+    bounded_materialization: bool,
 }
 
 pub(crate) struct StoredRow {
@@ -207,7 +208,31 @@ impl Relation {
             relation: self.clone(),
             state,
             max_row_bytes,
+            bounded_materialization: false,
         }
+    }
+
+    /// Conservative peak for raw materialization + decoded payload + directory
+    /// and Value bodies. Unlike ordinary scans, enforce this before value I/O.
+    pub(crate) fn scan_with_work_budget(&self, work_bytes: u64) -> Result<RelationScan> {
+        let per_column = std::mem::size_of::<Value>() as u64
+            + std::mem::size_of::<Option<(usize, usize)>>() as u64;
+        let containers = 128_u64 + self.columns.len() as u64 * per_column;
+        let raw_limit = work_bytes.checked_sub(containers).ok_or_else(|| {
+            DbError::new(
+                ErrorCode::ResourceLimit,
+                "row containers exceed work memory",
+            )
+        })? / 3;
+        let raw_limit = usize::try_from(raw_limit).map_err(|_| {
+            DbError::new(
+                ErrorCode::ResourceLimit,
+                "row memory budget exceeds platform size",
+            )
+        })?;
+        let mut scan = self.scan(raw_limit);
+        scan.bounded_materialization = true;
+        Ok(scan)
     }
 }
 
@@ -255,7 +280,13 @@ impl RelationScan {
     }
 
     fn next_from(&mut self, source: &mut impl PageSource) -> Result<Option<StoredRow>> {
-        let Some((key, bytes)) = self.state.next(source)? else {
+        let next = if self.bounded_materialization {
+            self.state
+                .next_value_limited(source, self.max_row_bytes as u64)?
+        } else {
+            self.state.next(source)?
+        };
+        let Some((key, bytes)) = next else {
             return Ok(None);
         };
         let rowid = decode_rowid_key(&key)?;
