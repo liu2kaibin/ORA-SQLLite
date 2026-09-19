@@ -81,6 +81,10 @@ impl BoundStatement {
             }
         }
 
+        if let BoundStatementKind::DropIndex { index_id, table } = &self.kind {
+            validate_drop_index_identity(catalog, *index_id, table.table_id)?;
+        }
+
         self.validate_column_identities(catalog)?;
 
         for created_name in &self.created_names {
@@ -162,6 +166,29 @@ impl BoundStatement {
         }
         validate_expression_columns(catalog, expressions)
     }
+}
+
+fn validate_drop_index_identity(
+    catalog: &CatalogReader,
+    index_id: IndexId,
+    table_id: TableId,
+) -> Result<()> {
+    if !catalog.object_id_exists(ObjectKind::Index, index_id.into()) {
+        return Err(schema_changed(
+            "prepared index identity is no longer present",
+        ));
+    }
+    let Some(index) = catalog.find_index_by_id(index_id) else {
+        return Err(schema_changed(
+            "prepared index identity is no longer present",
+        ));
+    };
+    if index.table_id() != table_id {
+        return Err(schema_changed(
+            "prepared index identity belongs to another table",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_expression_columns(catalog: &CatalogReader, roots: Vec<&BoundExpr>) -> Result<()> {
@@ -264,11 +291,9 @@ pub(crate) enum BoundStatementKind {
         columns: Vec<BoundColumn>,
         unique: bool,
     },
-    /// V1 does not persist index records, so the binder cannot construct this
-    /// variant yet. Keeping an `IndexId` rather than a name prevents a Phase 4C
-    /// executor from accidentally late-binding a replacement index.
     DropIndex {
         index_id: IndexId,
+        table: BoundTable,
     },
     Begin,
     Commit,

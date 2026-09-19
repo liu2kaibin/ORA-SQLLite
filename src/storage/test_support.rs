@@ -22,7 +22,8 @@ use super::{
     catalog::{
         CatalogReader, CatalogWriter,
         types::{
-            CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef, TableId,
+            CatalogName, ColumnDef, ColumnId, ColumnType, IndexDef, IndexId, IndexOwnership, RowId,
+            SchemaVersion, TableDef, TableId,
         },
     },
     checksum::stamp_page_checksum,
@@ -148,6 +149,86 @@ impl Phase4bCatalogFixture {
 
 pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
     phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
+}
+
+/// A Phase 4B catalog with one explicit USERS(ID) index for SQL front-end tests.
+///
+/// This deliberately remains test support: production index DDL is planned by
+/// Phase 4C2-A and its storage lifecycle belongs to a later task.
+pub(crate) struct Phase4bExplicitIndexFixture {
+    fixture: Phase4bCatalogFixture,
+    index_id: IndexId,
+}
+
+impl Phase4bExplicitIndexFixture {
+    pub(crate) fn pager(&self) -> Pager {
+        self.fixture.pager()
+    }
+
+    pub(crate) const fn users_id(&self) -> TableId {
+        self.fixture.users_id()
+    }
+
+    pub(crate) const fn index_id(&self) -> IndexId {
+        self.index_id
+    }
+}
+
+pub(crate) fn phase_4b_catalog_fixture_with_explicit_index(
+    page_size: u32,
+    name: &str,
+) -> Phase4bExplicitIndexFixture {
+    let fixture = phase_4b_catalog_fixture(page_size);
+    let pager = fixture.pager();
+    let mut snapshot = pager
+        .begin_read()
+        .expect("read explicit-index fixture catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("open explicit-index fixture catalog");
+    let id_column = catalog
+        .find_column_by_name(fixture.users_id(), &CatalogName::new("ID").unwrap())
+        .expect("USERS(ID) in explicit-index fixture")
+        .id();
+    drop(catalog);
+    drop(snapshot);
+
+    let mut batch = pager
+        .begin_write()
+        .expect("begin explicit-index fixture write");
+    let mut writer =
+        CatalogWriter::bootstrap(&mut batch).expect("bootstrap explicit-index fixture catalog");
+    let index_id = IndexId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate explicit index id")
+            .get(),
+    )
+    .expect("explicit index id is nonzero");
+    let root = BTree::create(&mut batch, TreeKind::Index)
+        .expect("create explicit index tree")
+        .root();
+    let index = IndexDef::new(
+        index_id,
+        fixture.users_id(),
+        root,
+        1,
+        true,
+        IndexOwnership::Explicit,
+        CatalogName::new(name).expect("explicit index name"),
+    )
+    .expect("build explicit index definition");
+    writer
+        .insert_index_definition(&mut batch, &index, &[id_column])
+        .expect("insert explicit index definition");
+    writer
+        .finish(&mut batch)
+        .expect("finish explicit-index fixture catalog");
+    batch
+        .commit()
+        .expect("commit explicit-index fixture catalog");
+
+    Phase4bExplicitIndexFixture { fixture, index_id }
 }
 
 fn phase_4b_catalog_fixture_with_uuid(

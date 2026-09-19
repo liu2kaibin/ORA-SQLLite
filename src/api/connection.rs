@@ -165,7 +165,9 @@ impl Connection {
                 | PlanKind::Update(_)
                 | PlanKind::Delete(_)
                 | PlanKind::CreateTable(_)
-                | PlanKind::DropTable { .. } => self.execute_autocommit(statement, parameters),
+                | PlanKind::DropTable { .. }
+                | PlanKind::CreateIndex(_)
+                | PlanKind::DropIndex(_) => self.execute_autocommit(statement, parameters),
             },
             ConnectionStateKind::SqlWrite => match statement.plan().kind() {
                 PlanKind::Begin => Err(transaction_state_error()),
@@ -497,8 +499,9 @@ mod tests {
     use crate::{
         Database, ErrorCode, Options, Parameters, SqlLimits, Value,
         storage::test_support::{
-            TempDatabase, phase_4b_catalog_fixture, phase_4c1_commit_io_fault_pager,
-            phase_4c1_corrupt_batch_catalog, phase_4c1_corrupt_query_relation_fixture,
+            TempDatabase, phase_4b_catalog_fixture, phase_4b_catalog_fixture_with_explicit_index,
+            phase_4c1_commit_io_fault_pager, phase_4c1_corrupt_batch_catalog,
+            phase_4c1_corrupt_query_relation_fixture,
         },
     };
 
@@ -510,6 +513,44 @@ mod tests {
     ) -> crate::Result<crate::ExecutionResult> {
         let statement = connection.prepare(sql)?;
         connection.execute(&statement, Parameters::none())
+    }
+
+    #[test]
+    fn index_ddl_plans_route_through_autocommit_and_sql_write_dispatch() {
+        // Production break caught: classifying index DDL as control or a
+        // deferred plan skips the write validation/transaction path before a
+        // later task supplies the storage lifecycle.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let mut connection = Connection::from_test_pager(fixture.pager());
+        let create = connection
+            .prepare("CREATE UNIQUE INDEX UX_USERS_NAME ON USERS (NAME)")
+            .unwrap();
+        let drop = connection.prepare("DROP INDEX IX_USERS_ID").unwrap();
+        assert!(matches!(
+            create.plan().kind(),
+            crate::sql::plan::PlanKind::CreateIndex(_)
+        ));
+        assert!(matches!(
+            drop.plan().kind(),
+            crate::sql::plan::PlanKind::DropIndex(_)
+        ));
+
+        assert_eq!(
+            connection
+                .execute(&create, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+        execute_sql(&mut connection, "BEGIN").unwrap();
+        assert_eq!(
+            connection
+                .execute(&drop, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+        execute_sql(&mut connection, "ROLLBACK").unwrap();
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::{
         SqlType,
         bound::{BoundAssignment, BoundColumn, BoundColumnDefinition, BoundExpr, BoundTable},
     },
-    storage::catalog::types::{CatalogName, ColumnId, ColumnType, SchemaVersion, TableId},
+    storage::catalog::types::{CatalogName, ColumnId, ColumnType, IndexId, SchemaVersion, TableId},
 };
 
 /// Logical identities only: never a physical root or a retained catalog reader.
@@ -193,6 +193,73 @@ impl DeletePlan {
     }
     pub(crate) fn selection(&self) -> Option<&ExecExpr> {
         self.selection.as_ref()
+    }
+}
+
+/// An immutable CREATE INDEX request retaining only catalog identities.
+pub(crate) struct CreateIndexPlan {
+    name: CatalogName,
+    table: TableTarget,
+    columns: Box<[ColumnTarget]>,
+    unique: bool,
+}
+
+impl CreateIndexPlan {
+    pub(super) fn from_bound(
+        name: &CatalogName,
+        table: &BoundTable,
+        columns: &[BoundColumn],
+        unique: bool,
+        expressions: &mut ExprCompiler<'_, '_, '_>,
+    ) -> Result<Self> {
+        Ok(Self {
+            name: name.clone(),
+            table: TableTarget::from_bound(table, expressions)?,
+            columns: columns
+                .iter()
+                .map(|column| ColumnTarget::from_bound(column, expressions))
+                .collect::<Result<_>>()?,
+            unique,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &CatalogName {
+        &self.name
+    }
+    pub(crate) fn table(&self) -> &TableTarget {
+        &self.table
+    }
+    pub(crate) fn columns(&self) -> &[ColumnTarget] {
+        &self.columns
+    }
+    pub(crate) const fn unique(&self) -> bool {
+        self.unique
+    }
+}
+
+/// An immutable DROP INDEX request retaining the bound index and owner table.
+pub(crate) struct DropIndexPlan {
+    index_id: IndexId,
+    table: TableTarget,
+}
+
+impl DropIndexPlan {
+    pub(super) fn from_bound(
+        index_id: IndexId,
+        table: &BoundTable,
+        expressions: &ExprCompiler<'_, '_, '_>,
+    ) -> Result<Self> {
+        Ok(Self {
+            index_id,
+            table: TableTarget::from_bound(table, expressions)?,
+        })
+    }
+
+    pub(crate) const fn index_id(&self) -> IndexId {
+        self.index_id
+    }
+    pub(crate) fn table(&self) -> &TableTarget {
+        &self.table
     }
 }
 
