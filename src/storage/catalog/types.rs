@@ -212,6 +212,11 @@ impl TableDef {
         self.next_rowid = next_rowid;
         self
     }
+
+    pub(super) fn with_schema_version(mut self, schema_version: SchemaVersion) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

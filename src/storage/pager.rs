@@ -1294,6 +1294,23 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// An index root replacement must name an exact current registered Index root.
+    pub(super) fn require_tracked_index_root(&mut self, root: PageRef) -> Result<()> {
+        self.require_active()?;
+        self.require_current_catalog_root(root)?;
+        if !self.tracked_trees.contains(&(TreeKind::Index, root)) {
+            return Err(corruption(
+                "index root must be a registered current Index B+Tree root",
+            ));
+        }
+        if TreeKind::from_root_page_type(self.read(root)?.header().page_type())
+            != Some(TreeKind::Index)
+        {
+            return Err(corruption("index root must reference an Index B+Tree page"));
+        }
+        Ok(())
+    }
+
     pub(super) fn refresh_tree(
         &mut self,
         kind: TreeKind,
@@ -2270,8 +2287,8 @@ mod tests {
             decode_internal_leftmost, encode_internal_leftmost,
         },
         catalog::{
-            CatalogWriter,
-            types::{CatalogName, ColumnType},
+            CatalogReader, CatalogWriter,
+            types::{CatalogName, ColumnType, IndexDef, IndexId, IndexOwnership},
         },
         features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
@@ -3598,6 +3615,162 @@ mod tests {
                 .contains(&(TreeKind::Table, old_growing_root))
         );
         assert_eq!(batch.tracked_trees.len(), 2);
+    }
+
+    #[test]
+    fn nested_statement_restore_preserves_prior_index_roots_only() {
+        // Production break caught: restoring an inner checkpoint must retain
+        // roots added by its outer scope, while restoring the outer scope must
+        // still remove every root it introduced.
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
+        let mut batch = pager.begin_write().expect("begin write");
+        let mut base = BTree::create(&mut batch, TreeKind::Index).expect("create base index");
+        base.insert(&mut batch, b"base", b"value")
+            .expect("track base index");
+        let base_root = base.root();
+
+        let outer = batch.statement_checkpoint().expect("outer checkpoint");
+        let mut outer_tree =
+            BTree::create(&mut batch, TreeKind::Index).expect("create outer index");
+        outer_tree
+            .insert(&mut batch, b"outer", b"value")
+            .expect("track outer index");
+        let outer_root = outer_tree.root();
+
+        let inner = batch.statement_checkpoint().expect("inner checkpoint");
+        let mut inner_tree =
+            BTree::create(&mut batch, TreeKind::Index).expect("create inner index");
+        inner_tree
+            .insert(&mut batch, b"inner", b"value")
+            .expect("track inner index");
+        let inner_root = inner_tree.root();
+        batch.restore_statement(inner);
+
+        batch
+            .require_tracked_index_root(base_root)
+            .expect("base root survives inner restore");
+        batch
+            .require_tracked_index_root(outer_root)
+            .expect("outer root survives inner restore");
+        assert!(!batch.tracked_trees.contains(&(TreeKind::Index, inner_root)));
+
+        batch.restore_statement(outer);
+        batch
+            .require_tracked_index_root(base_root)
+            .expect("base root survives outer restore");
+        assert!(!batch.tracked_trees.contains(&(TreeKind::Index, outer_root)));
+    }
+
+    #[test]
+    fn tracked_index_root_requires_current_index_kind() {
+        let (_temp, pager) = test_pager(4096).expect("create test pager");
+        let mut batch = pager.begin_write().expect("begin write");
+        let index = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        assert_eq!(
+            batch.require_tracked_index_root(index).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        batch.track_tree(TreeKind::Index, index).unwrap();
+        batch.require_tracked_index_root(index).unwrap();
+
+        let table = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        batch.track_tree(TreeKind::Index, table).unwrap();
+        assert_eq!(
+            batch.require_tracked_index_root(table).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        batch.release_btree_later(index).unwrap();
+        assert_eq!(
+            batch.require_tracked_index_root(index).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn failed_index_release_restores_catalog_pages_roots_and_pending_releases() {
+        // An I/O failure after the first released page must undo both catalog
+        // deletion and every page/root mutation, not only the failing tree walk.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let spec = TableSpec::new(
+            CatalogName::new("T").unwrap(),
+            vec![ColumnSpec::new(
+                CatalogName::new("C").unwrap(),
+                ColumnType::Int64,
+                false,
+            )],
+        )
+        .unwrap();
+        let table_id = create_relation(&mut batch, &spec).unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        let column_id = catalog.columns_for_table(table_id).next().unwrap().id();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let mut tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        for key in 0_u64..48 {
+            tree.insert(&mut batch, &key.to_be_bytes(), &[1; 300])
+                .unwrap();
+        }
+        tree.insert(&mut batch, b"overflow", &[2; 5000]).unwrap();
+        let index = IndexDef::new(
+            index_id,
+            table_id,
+            tree.root(),
+            1,
+            false,
+            IndexOwnership::Explicit,
+            CatalogName::new("IX_T_C").unwrap(),
+        )
+        .unwrap();
+        writer
+            .insert_index_definition(&mut batch, &index, &[column_id])
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        batch.fail_tree_release_after = Some(2);
+        assert_eq!(
+            writer
+                .remove_index(&mut batch, &index, &[column_id])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Io
+        );
+        before.assert_matches_batch_for_test(&batch);
+        let features = batch.feature_bits();
+        let catalog = CatalogReader::open_candidate(
+            &mut batch,
+            &BTree::from_root(TreeKind::Table, writer.root()),
+            features,
+        )
+        .unwrap();
+        assert_eq!(catalog.find_index_by_id(index_id), Some(&index));
+        catalog.validate_deep_batch(&mut batch).unwrap();
+
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let writer_checkpoint = writer.checkpoint();
+        writer
+            .remove_index(&mut batch, &index, &[column_id])
+            .unwrap();
+        let catalog = CatalogReader::open_candidate(
+            &mut batch,
+            &BTree::from_root(TreeKind::Table, writer.root()),
+            features,
+        )
+        .unwrap();
+        assert!(catalog.find_index_by_id(index_id).is_none());
+        batch.restore_statement(checkpoint);
+        writer.restore(writer_checkpoint);
+        before.assert_matches_batch_for_test(&batch);
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert_eq!(catalog.find_index_by_id(index_id), Some(&index));
+        catalog.validate_deep(&mut read).unwrap();
     }
 
     #[test]
