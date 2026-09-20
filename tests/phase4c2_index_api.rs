@@ -5,6 +5,42 @@ mod support;
 use ora_sqllite::{Database, ErrorCode, Options, Parameters, Value};
 
 #[test]
+fn snapshot_keeps_pre_index_catalog_and_rows_after_index_ddl_and_dml() {
+    // Production break caught: publishing a new catalog/index root or table
+    // root into an already-open read transaction leaks post-commit state.
+    let (_files, database) = support::new_database("snapshot-index-ddl-dml");
+    let mut setup = database.connect().unwrap();
+    support::execute_sql(&mut setup, "CREATE TABLE T (A INT64)");
+    support::execute_sql(&mut setup, "INSERT INTO T VALUES (1)");
+
+    let mut old = setup.begin_read().unwrap();
+    let old_query = old.prepare("SELECT A FROM T").unwrap();
+
+    let mut writer = database.connect().unwrap();
+    let mut transaction = writer.begin_write().unwrap();
+    let create = transaction.prepare("CREATE INDEX IX_T_A ON T (A)").unwrap();
+    transaction.execute(&create, Parameters::none()).unwrap();
+    let update = transaction.prepare("UPDATE T SET A = 2").unwrap();
+    transaction.execute(&update, Parameters::none()).unwrap();
+    transaction.commit().unwrap();
+
+    let mut old_rows = old.query(&old_query, Parameters::none()).unwrap();
+    assert_eq!(
+        old_rows.next().unwrap().unwrap().values(),
+        &[Value::Int64(1)]
+    );
+    assert!(old_rows.next().unwrap().is_none());
+    drop(old_rows);
+    drop(old);
+
+    let mut fresh = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut fresh, "SELECT A FROM T"),
+        vec![vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
 fn drop_index_frees_tree_bumps_schema_and_never_clears_feature_bit() {
     // Storage tests inspect freed pages/feature bits; this public contract
     // catches a missing DROP executor, schema bump, or durable removal.

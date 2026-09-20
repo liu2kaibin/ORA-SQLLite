@@ -231,13 +231,15 @@ impl DatabaseHeader {
     }
 
     pub(super) fn select(slot_a: &[u8], slot_b: &[u8]) -> Result<(Self, SuperblockSlot)> {
-        let decoded_a = Self::decode_slot(slot_a).ok();
-        let decoded_b = Self::decode_slot(slot_b).ok();
+        let decoded_a = Self::decode_slot(slot_a);
+        let decoded_b = Self::decode_slot(slot_b);
         match (decoded_a, decoded_b) {
-            (None, None) => Err(corruption("both database superblock slots are invalid")),
-            (Some(header), None) => Ok((header, SuperblockSlot::A)),
-            (None, Some(header)) => Ok((header, SuperblockSlot::B)),
-            (Some(a), Some(b)) => {
+            (Err(error), _) if error.code() == ErrorCode::Unsupported => Err(error),
+            (_, Err(error)) if error.code() == ErrorCode::Unsupported => Err(error),
+            (Err(_), Err(_)) => Err(corruption("both database superblock slots are invalid")),
+            (Ok(header), Err(_)) => Ok((header, SuperblockSlot::A)),
+            (Err(_), Ok(header)) => Ok((header, SuperblockSlot::B)),
+            (Ok(a), Ok(b)) => {
                 if a.uuid != b.uuid || a.page_size != b.page_size {
                     return Err(corruption(
                         "database superblock slots disagree on database identity",
@@ -390,6 +392,51 @@ fn select_accepts_one_valid_slot_and_rejects_two_invalid_slots() {
     );
     assert_eq!(
         DatabaseHeader::select(&corrupt, &corrupt)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn select_preserves_unknown_feature_bits_without_reclassifying_known_or_invalid_slots() {
+    // A future feature declaration is structurally valid but unsupported;
+    // collapsing it into generic slot corruption hides compatibility state.
+    let valid = DatabaseHeader::new(4096, [2; 16]).unwrap().encode_slot();
+    let mut unknown = valid;
+    unknown[88..96].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    refresh_database_crc(&mut unknown);
+    assert_eq!(
+        DatabaseHeader::select(&unknown, &unknown)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Unsupported
+    );
+
+    let mut known_contradiction = valid;
+    known_contradiction[88..96]
+        .copy_from_slice(&super::features::INDEX_CONSTRAINT_V1.to_le_bytes());
+    refresh_database_crc(&mut known_contradiction);
+    assert_eq!(
+        DatabaseHeader::select(&known_contradiction, &known_contradiction)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+
+    let mut malformed = unknown;
+    malformed[0] ^= 1;
+    assert_eq!(
+        DatabaseHeader::select(&unknown, &malformed)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Unsupported
+    );
+
+    let mut another_malformed = malformed;
+    another_malformed[1] ^= 1;
+    assert_eq!(
+        DatabaseHeader::select(&malformed, &another_malformed)
             .unwrap_err()
             .code(),
         ErrorCode::Corruption

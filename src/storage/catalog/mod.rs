@@ -11,6 +11,7 @@ use super::{
     PageRef,
     btree::{BTree, TreeKind},
     features::{CATALOG_V1, INDEX_CONSTRAINT_V1, validate_feature_bits},
+    index::key::IndexKeyCodec,
     pager::{PageSource, ReadSnapshot, WriteBatch},
     validate::{
         ValidationReport, validate_freelist, validate_relation_roots, validate_relation_trees,
@@ -484,7 +485,26 @@ impl CatalogReader {
             self.image.indexes.values().map(IndexDef::root),
             &mut live,
         )?;
+        self.validate_index_entries(source)?;
         validate_freelist(source, &live).map(|_| ())
+    }
+
+    fn validate_index_entries(&self, source: &mut impl PageSource) -> Result<()> {
+        for index in self.image.indexes.values() {
+            let columns = self
+                .columns_for_index(index.id())
+                .cloned()
+                .collect::<Vec<_>>();
+            let tree = BTree::from_root(TreeKind::Index, index.root());
+            let mut cursor = tree.scan(source, Bound::Unbounded, Bound::Unbounded)?;
+            while let Some((key, value)) = cursor.next()? {
+                if !value.is_empty() {
+                    return Err(corruption("index leaf value must be empty"));
+                }
+                IndexKeyCodec::decode(&columns, &key)?;
+            }
+        }
+        Ok(())
     }
 
     fn require_matching_image(&self, image: &CatalogImage) -> Result<()> {
@@ -1900,6 +1920,106 @@ mod tests {
     }
 
     #[test]
+    fn phase_4c2_index_corruption_rejects_malformed_physical_entries_only_during_deep_validation() {
+        // Production break caught: generic B+Tree validation accepts opaque
+        // bytes, so deep catalog validation must decode every index key with
+        // its declared columns and require empty leaf values.
+        use crate::storage::index::key::IndexKeyCodec;
+
+        let columns = [column(20, 0, "A"), column(21, 1, "B")];
+        let valid = IndexKeyCodec::encode(
+            &columns,
+            &[crate::Value::Int64(7), crate::Value::Int64(9)],
+            RowId::new(1).unwrap(),
+        )
+        .unwrap()
+        .into_physical();
+        let mut zero_rowid = valid.clone();
+        let rowid_start = zero_rowid.len() - 8;
+        zero_rowid[rowid_start..].fill(0);
+
+        for (case, key, value) in [
+            ("malformed key", vec![0], Vec::new()),
+            ("nonempty leaf value", valid, vec![1]),
+            ("missing ROWID", zero_rowid, Vec::new()),
+        ] {
+            let (_temp, pager) = raw_index_catalog_with_entries(&[(key, value)]);
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read)
+                .expect("ordinary open must remain root/catalog-only");
+            assert_eq!(
+                catalog.validate_deep(&mut read).unwrap_err().code(),
+                ErrorCode::Corruption,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_4c2_format2_real_files_open_lazily_and_read_only_preserves_every_byte() {
+        // Production break caught: opening an older format-2 file must not
+        // manufacture catalog/index state, and malformed feature declarations
+        // must be classified without rewriting either persisted file.
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(&temp, 0, false, None);
+
+        let (temp, pager, _) = committed_single_column_catalog();
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(&temp, CATALOG_V1, false, None);
+
+        let (temp, pager, _) = committed_single_column_catalog();
+        let mut batch = pager.begin_write().unwrap();
+        batch.enable_feature_bits(INDEX_CONSTRAINT_V1).unwrap();
+        batch.commit().unwrap();
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            CATALOG_V1 | INDEX_CONSTRAINT_V1,
+            false,
+            None,
+        );
+
+        let (temp, pager) = raw_index_catalog(|_, _, _, _| {});
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            CATALOG_V1 | INDEX_CONSTRAINT_V1,
+            true,
+            None,
+        );
+
+        let (temp, pager) = raw_index_catalog_with_features(CATALOG_V1, |_, _, _, _| {});
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            CATALOG_V1,
+            false,
+            Some(ErrorCode::Corruption),
+        );
+
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        set_real_file_feature_bits(&temp, INDEX_CONSTRAINT_V1);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            INDEX_CONSTRAINT_V1,
+            false,
+            Some(ErrorCode::Corruption),
+        );
+
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        set_real_file_feature_bits(&temp, 1 << 63);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            1 << 63,
+            false,
+            Some(ErrorCode::Unsupported),
+        );
+    }
+
+    #[test]
     fn remove_index_validates_the_unpublished_writer_catalog() {
         // Destructive validation must use the writer's candidate root, not
         // the still-empty header, when CREATE and DROP share a fresh batch.
@@ -2030,11 +2150,17 @@ mod tests {
         let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
         let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
-        for key in 0_u64..96 {
-            tree.insert(&mut batch, &key.to_be_bytes(), &[7; 128])
-                .unwrap();
+        let indexed_column = column(column_id.get(), 0, "C");
+        for key in 0_u64..1_000 {
+            let physical = crate::storage::index::key::IndexKeyCodec::encode(
+                &[indexed_column.clone()],
+                &[crate::Value::Int64(i64::try_from(key).unwrap())],
+                RowId::new(key + 1).unwrap(),
+            )
+            .unwrap()
+            .into_physical();
+            tree.insert(&mut batch, &physical, &[]).unwrap();
         }
-        tree.insert(&mut batch, b"overflow", &[8; 5000]).unwrap();
         let index = IndexDef::new(
             index_id,
             table_id,
@@ -2289,7 +2415,7 @@ mod tests {
         let original_table = old.find_table_by_id(original.table_id()).unwrap().clone();
         let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
         let mut index_tree = BTree::from_root(TreeKind::Index, original.root());
-        split_index_tree(&mut index_tree, &mut batch);
+        split_two_column_index_tree(&mut index_tree, &mut batch);
         let untracked = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
         let wrong_kind = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
         batch.track_tree(TreeKind::Index, wrong_kind).unwrap();
@@ -2637,6 +2763,28 @@ mod tests {
             }
         }
         panic!("fixture must split its index tree root");
+    }
+
+    fn split_two_column_index_tree(tree: &mut BTree, batch: &mut WriteBatch) -> u64 {
+        let old_root = tree.root();
+        let columns = [column(20, 0, "A"), column(21, 1, "B")];
+        for key in 0_u64..200 {
+            let physical = crate::storage::index::key::IndexKeyCodec::encode(
+                &columns,
+                &[
+                    crate::Value::Int64(i64::try_from(key).unwrap()),
+                    crate::Value::Int64(i64::try_from(key).unwrap()),
+                ],
+                RowId::new(key + 1).unwrap(),
+            )
+            .unwrap()
+            .into_physical();
+            tree.insert(batch, &physical, &[]).unwrap();
+            if tree.root() != old_root {
+                return key + 1;
+            }
+        }
+        panic!("fixture must split its two-column index tree root");
     }
 
     // A finished writer must not authorize later releases or stale root pointers.
@@ -3814,6 +3962,79 @@ mod tests {
         publish_with_features(&mut batch, &catalog, feature_bits);
         batch.commit().unwrap();
         (temp, pager)
+    }
+
+    fn raw_index_catalog_with_entries(entries: &[(Vec<u8>, Vec<u8>)]) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut index_tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        for (key, value) in entries {
+            index_tree.insert(&mut batch, key, value).unwrap();
+        }
+        let foreign_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let catalog = raw_tree(
+            &mut batch,
+            index_records(table_root, index_tree.root(), foreign_root),
+        );
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+        (temp, pager)
+    }
+
+    fn set_real_file_feature_bits(temp: &TempDatabase, bits: u64) {
+        let mut bytes = std::fs::read(temp.path()).unwrap();
+        for slot_start in [0, super::super::header::SUPERBLOCK_SLOT_LEN] {
+            bytes[slot_start + 88..slot_start + 96].copy_from_slice(&bits.to_le_bytes());
+            let checksum = crate::storage::checksum::crc32c(
+                &bytes[slot_start..slot_start + super::super::header::SUPERBLOCK_SLOT_LEN - 4],
+            )
+            .to_le_bytes();
+            bytes[slot_start + super::super::header::SUPERBLOCK_SLOT_LEN - 4
+                ..slot_start + super::super::header::SUPERBLOCK_SLOT_LEN]
+                .copy_from_slice(&checksum);
+        }
+        std::fs::write(temp.path(), bytes).unwrap();
+    }
+
+    fn assert_format2_read_only_open_preserves_bytes(
+        temp: &TempDatabase,
+        expected_features: u64,
+        has_index: bool,
+        expected_error: Option<ErrorCode>,
+    ) {
+        let main_before = std::fs::read(temp.path()).unwrap();
+        let wal_path = crate::storage::wal::wal_path(temp.path());
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        match (
+            Pager::open(
+                temp.path(),
+                OpenMode::ReadOnly,
+                PagerConfig::test_default(4096),
+            ),
+            expected_error,
+        ) {
+            (Ok(pager), None) => {
+                let mut read = pager.begin_read().unwrap();
+                assert_eq!(read.feature_bits(), expected_features);
+                let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+                assert_eq!(
+                    catalog
+                        .find_index_by_name(&CatalogName::new("IX_T_AB").unwrap())
+                        .is_some(),
+                    has_index
+                );
+            }
+            (Err(error), Some(expected)) => assert_eq!(error.code(), expected),
+            (Ok(_), Some(expected)) => panic!("format-2 file was accepted, wanted {expected:?}"),
+            (Err(error), None) => panic!("format-2 file was rejected: {error}"),
+        }
+        assert_eq!(std::fs::read(temp.path()).unwrap(), main_before);
+        assert_eq!(std::fs::read(wal_path).unwrap(), wal_before);
     }
 
     fn assert_bad_index_records(
