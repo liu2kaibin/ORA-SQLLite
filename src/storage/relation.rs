@@ -786,7 +786,11 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation};
+    use super::{
+        ColumnSpec, ConstrainedTableWrite, Relation, TableSpec, TableWrite, create_relation,
+        drop_relation,
+    };
+    use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
         Pager,
         btree::{BTree, TreeKind},
@@ -807,6 +811,71 @@ mod tests {
     const LARGE_BLOB_BYTES: usize = 20_000;
     const LARGE_ROW_BYTES: usize = 20_041;
     type RelationContents = (TableDef, Vec<(u64, Vec<Value>)>);
+
+    #[test]
+    fn constrained_writer_reuses_deleted_unique_key_without_schema_bump_and_deep_validates() {
+        // Production breaks caught: leaving an old physical key behind after a
+        // replacement/deletion blocks its reuse; publishing table/index roots
+        // separately can also make a deep catalog validation fail.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("A", ColumnType::Int64, false)]),
+            &[vec![Value::Int64(1)]],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(table_id)
+            .cloned()
+            .collect();
+        create_index(
+            &mut batch,
+            &IndexSpec::new(CatalogName::new("UX_T_A").unwrap(), table_id, columns, true).unwrap(),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let before_version = batch
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_id(table_id)
+            .unwrap()
+            .schema_version();
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
+        writer
+            .replace(&mut batch, row.rowid(), row.values(), &[Value::Int64(2)])
+            .unwrap();
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(
+            writer
+                .delete(&mut batch, row.rowid(), row.values())
+                .unwrap()
+        );
+        writer.insert(&mut batch, &[Value::Int64(1)]).unwrap();
+        writer.finish(&mut batch).unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(
+            catalog.find_table_by_id(table_id).unwrap().schema_version(),
+            before_version
+        );
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        batch.commit().unwrap();
+        assert_eq!(
+            read_relation(&pager, "T").unwrap().1,
+            vec![(2, vec![Value::Int64(1)])]
+        );
+    }
 
     #[test]
     fn relation_prevalidates_complete_rows_without_opening_the_catalog_gate() {

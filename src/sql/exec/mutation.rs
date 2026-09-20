@@ -182,6 +182,10 @@ fn execute_update(
                     })?,
             );
         }
+        // The original EvalRow and replacement are both live here. The saved
+        // old row for index deletion is a third owned copy and must share the
+        // same query-memory ceiling before allocating it.
+        memory.reserve(old_bytes)?;
         let old_for_index = replacement.clone();
         for (assignment, value) in plan.assignments().iter().zip(values) {
             let target = replacement
@@ -206,7 +210,7 @@ fn execute_update(
         )?;
         affected = checked_affected_count(affected)?;
         memory.release(checked_add_bytes(
-            checked_add_bytes(old_bytes, assignment_bytes)?,
+            checked_add_bytes(checked_add_bytes(old_bytes, assignment_bytes)?, old_bytes)?,
             old_bytes,
         )?)?;
     }

@@ -374,8 +374,14 @@ fn every_dml_keeps_one_index_entry_per_visible_row() {
     let mut connection = database.connect().unwrap();
     support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B TEXT)");
     support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_A ON T (A)");
+    let retained_table_plan = connection.prepare("SELECT A FROM T").unwrap();
     support::execute_sql(&mut connection, "INSERT INTO T VALUES (1, 'A')");
     support::execute_sql(&mut connection, "UPDATE T SET A = 2, B = 'B' WHERE A = 1");
+    assert_eq!(
+        support::collect_statement(&mut connection, &retained_table_plan, Parameters::none()),
+        vec![vec![Value::Int64(2)]],
+        "DML must preserve the table SchemaVersion used by this plan",
+    );
     let duplicate = connection
         .prepare("INSERT INTO T VALUES (2, 'duplicate')")
         .unwrap();
@@ -430,5 +436,147 @@ fn dml_late_unique_failure_restores_earlier_rows_and_keeps_transaction_usable() 
             vec![Value::Int64(2)],
             vec![Value::Int64(4)],
         ]
+    );
+}
+
+#[test]
+fn dml_update_counts_the_saved_old_index_row_against_work_memory() {
+    // Production break caught: retaining the original row, replacement row,
+    // and an unaccounted third clone for index deletion lets UPDATE exceed its
+    // configured query-memory ceiling before any tree mutation is attempted.
+    let payload = "x".repeat(20_000);
+    let (files, database) = support::new_database("dml-update-memory");
+    let mut setup = database.connect().unwrap();
+    support::execute_sql(&mut setup, "CREATE TABLE T (A INT64, B TEXT)");
+    support::execute_sql(
+        &mut setup,
+        &format!("INSERT INTO T VALUES (1, '{payload}')"),
+    );
+    support::execute_sql(&mut setup, "CREATE INDEX IX_T_A ON T (A)");
+    drop(setup);
+    drop(database);
+
+    let database = Database::open(
+        files.main(),
+        Options::default().with_max_query_memory_bytes(85_000),
+    )
+    .unwrap();
+    let mut connection = database.connect().unwrap();
+    let update = connection.prepare("UPDATE T SET B = B").unwrap();
+    assert_eq!(
+        connection
+            .execute(&update, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::ResourceLimit
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A, B FROM T"),
+        vec![vec![Value::Int64(1), Value::Text(payload)]],
+    );
+}
+
+#[test]
+fn dml_unique_null_composite_self_update_and_other_row_conflict() {
+    // NULL-containing unique keys may repeat, a self-key UPDATE must not
+    // conflict with itself, and a distinct ROWID with the same composite key
+    // must still be rejected.
+    let (_files, database) = support::new_database("dml-composite-unique");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B INT64)");
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_AB ON T (A, B)");
+    for row in ["NULL, 1", "NULL, 1", "1, 2", "1, 3"] {
+        support::execute_sql(&mut connection, &format!("INSERT INTO T VALUES ({row})"));
+    }
+    assert_eq!(
+        support::execute_sql(&mut connection, "UPDATE T SET A = 1, B = 2 WHERE B = 2")
+            .rows_affected(),
+        1
+    );
+    let conflict = connection
+        .prepare("UPDATE T SET B = 2 WHERE B = 3")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(&conflict, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Constraint
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A, B FROM T ORDER BY B"),
+        vec![
+            vec![Value::Null, Value::Int64(1)],
+            vec![Value::Null, Value::Int64(1)],
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(1), Value::Int64(3)],
+        ]
+    );
+}
+
+#[test]
+fn dml_multi_index_splits_delete_exact_keys_and_reopens_validly() {
+    // Inserting through three explicit indexes forces independent tree growth.
+    // Updating and deleting afterward must remove the exact old physical keys:
+    // the deleted unique key is immediately reusable and a reopen validates the
+    // persisted catalog/tree image before it serves rows.
+    let (files, database) = support::new_database("dml-multi-index-split");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B TEXT, C INT64)");
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_A ON T (A)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_B ON T (B)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_C ON T (C)");
+    for value in 0..96 {
+        support::execute_sql(
+            &mut connection,
+            &format!(
+                "INSERT INTO T VALUES ({value}, '{}', {})",
+                "x".repeat(96),
+                95 - value
+            ),
+        );
+    }
+    support::execute_sql(&mut connection, "UPDATE T SET B = 'changed' WHERE A = 42");
+    support::execute_sql(&mut connection, "DELETE FROM T WHERE A = 42");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (42, 'reused', 42)");
+    drop(connection);
+    drop(database);
+
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT B, C FROM T WHERE A = 42"),
+        vec![vec![Value::Text("reused".into()), Value::Int64(42)]],
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A FROM T").len(),
+        96
+    );
+}
+
+#[test]
+fn dml_oversized_index_key_is_atomic_and_does_not_invalidate_table_plans() {
+    // The physical-key failure happens before ROWID allocation or tree writes:
+    // a retained table plan remains valid and a later normal INSERT succeeds.
+    let (_files, database) = support::new_database("dml-key-limit-atomic");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A TEXT)");
+    support::execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+    let retained = connection.prepare("SELECT A FROM T").unwrap();
+    let oversized = connection
+        .prepare(&format!("INSERT INTO T VALUES ('{}')", "x".repeat(1014)))
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(&oversized, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::ResourceLimit
+    );
+    assert!(support::collect_statement(&mut connection, &retained, Parameters::none()).is_empty());
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES ('after')");
+    assert_eq!(
+        support::collect_statement(&mut connection, &retained, Parameters::none()),
+        vec![vec![Value::Text("after".into())]],
     );
 }
