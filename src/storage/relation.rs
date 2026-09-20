@@ -878,6 +878,88 @@ mod tests {
     }
 
     #[test]
+    fn constrained_insert_key_limit_preserves_catalog_table_index_roots_and_rowid() {
+        // Acceptance enhancement: the existing preflight implementation already
+        // rejects this key before mutation. These direct snapshots guard each
+        // individual root/counter against a future early allocation or split.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("A", ColumnType::Text, false)]),
+            &[],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(table_id)
+            .cloned()
+            .collect();
+        create_index(
+            &mut batch,
+            &IndexSpec::new(
+                CatalogName::new("IX_T_A").unwrap(),
+                table_id,
+                columns,
+                false,
+            )
+            .unwrap(),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let before = {
+            let catalog = batch.catalog_reader().unwrap();
+            let table = catalog.find_table_by_id(table_id).unwrap();
+            (
+                batch.catalog_root(),
+                table.next_rowid(),
+                table.root(),
+                catalog
+                    .indexes_for_table(table_id)
+                    .map(|index| (index.id(), index.root()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        assert_eq!(
+            writer
+                .insert(&mut batch, &[Value::Text("x".repeat(1014))])
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        let after = {
+            let features = batch.feature_bits();
+            let tree = BTree::from_root(TreeKind::Table, writer.catalog.root());
+            let catalog = CatalogReader::open_candidate(&mut batch, &tree, features).unwrap();
+            let table = catalog.find_table_by_id(table_id).unwrap();
+            (
+                batch.catalog_root(),
+                table.next_rowid(),
+                table.root(),
+                catalog
+                    .indexes_for_table(table_id)
+                    .map(|index| (index.id(), index.root()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(after, before);
+
+        assert_eq!(
+            writer
+                .insert(&mut batch, &[Value::Text("after".into())])
+                .unwrap()
+                .get(),
+            1
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
     fn relation_prevalidates_complete_rows_without_opening_the_catalog_gate() {
         // Production break caught: deferring NULL/type/size checks until
         // TableWrite::open can leave the catalog gate open before INSERT fails.
