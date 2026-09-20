@@ -10,8 +10,8 @@ use crate::{
         catalog::types::ObjectKind,
         index::{IndexSpec, create_index, drop_index},
         relation::{
-            ColumnSpec, Relation, RelationValueValidation, TableSpec, TableWrite, create_relation,
-            drop_relation,
+            ColumnSpec, ConstrainedTableWrite, Relation, RelationValueValidation, TableSpec,
+            create_relation, drop_relation,
         },
     },
 };
@@ -140,7 +140,7 @@ fn execute_update(
             ));
         }
     }
-    let mut writer = TableWrite::open(batch, table_id)?;
+    let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
     let mut last = None;
     let mut affected = 0_u64;
     while let Some(stored) = writer
@@ -182,6 +182,7 @@ fn execute_update(
                     })?,
             );
         }
+        let old_for_index = replacement.clone();
         for (assignment, value) in plan.assignments().iter().zip(values) {
             let target = replacement
                 .get_mut(usize::from(assignment.target().ordinal()))
@@ -199,6 +200,7 @@ fn execute_update(
             &mut writer,
             plan,
             rowid,
+            &old_for_index,
             &replacement,
             memory,
         )?;
@@ -244,7 +246,8 @@ fn execute_delete(
     params: &ParameterFrame,
     memory: &mut WorkMemory,
 ) -> Result<ExecutionResult> {
-    let mut writer = TableWrite::open(batch, plan.table().table_id())?;
+    let relation = Relation::open_from_batch(batch, plan.table().table_id())?;
+    let mut writer = ConstrainedTableWrite::open(batch, plan.table().table_id())?;
     let mut last = None;
     let mut affected = 0_u64;
     while let Some(stored) = writer
@@ -261,8 +264,31 @@ fn execute_delete(
         let old_bytes = owned_values_bytes(old_values.iter())?;
         memory.reserve(old_bytes)?;
         let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
-        if predicate_matches(plan.selection(), &old, params)? && writer.delete(batch, rowid)? {
-            affected = checked_affected_count(affected)?;
+        if predicate_matches(plan.selection(), &old, params)? {
+            memory.reserve(old_bytes)?;
+            let old_for_index = (0..relation.column_count())
+                .map(|ordinal| {
+                    let ordinal = u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "DELETE relation column ordinal exceeds its bound",
+                        )
+                    })?;
+                    old.source_value(SourceId(0), ordinal)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::new(
+                                ErrorCode::Internal,
+                                "DELETE old row is missing a relation column",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let deleted = writer.delete(batch, rowid, &old_for_index);
+            memory.release(old_bytes)?;
+            if deleted? {
+                affected = checked_affected_count(affected)?;
+            }
         }
         memory.release(old_bytes)?;
     }
@@ -281,9 +307,10 @@ fn map_row_memory_limit(error: DbError) -> DbError {
 fn validate_and_replace(
     batch: &mut WriteBatch,
     relation: &Relation,
-    writer: &mut TableWrite,
+    writer: &mut ConstrainedTableWrite,
     plan: &UpdatePlan,
     rowid: crate::storage::catalog::types::RowId,
+    old: &[crate::Value],
     replacement: &[crate::Value],
     memory: &mut WorkMemory,
 ) -> Result<()> {
@@ -292,7 +319,7 @@ fn validate_and_replace(
     let max_row_bytes = usize::try_from(row_budget).unwrap_or(usize::MAX);
     let validation = relation.validate_update_values(replacement, max_row_bytes);
     let result = match validation {
-        Ok(RelationValueValidation::Valid) => writer.replace(batch, rowid, replacement),
+        Ok(RelationValueValidation::Valid) => writer.replace(batch, rowid, old, replacement),
         Ok(RelationValueValidation::ExceedsLimit) => Err(resource_limit()),
         Ok(RelationValueValidation::InvalidValue { ordinal, error }) => {
             let assignment = plan
@@ -384,7 +411,7 @@ fn execute_insert(
     }
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
     relation.validate_values(&values, max_row_bytes)?;
-    let mut writer = TableWrite::open(batch, table_id)?;
+    let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
     writer.insert(batch, &values)?;
     writer.finish(batch)?;
     Ok(ExecutionResult::new(1))

@@ -364,3 +364,71 @@ fn create_index_read_only_prepare_and_execute_do_not_change_files() {
         before
     );
 }
+
+#[test]
+fn every_dml_keeps_one_index_entry_per_visible_row() {
+    // Production break caught: UPDATE/DELETE that only change the table tree
+    // leave old explicit-index keys behind, so subsequently reusable unique
+    // keys incorrectly remain blocked.
+    let (_files, database) = support::new_database("dml-index-maintenance");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64, B TEXT)");
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_A ON T (A)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1, 'A')");
+    support::execute_sql(&mut connection, "UPDATE T SET A = 2, B = 'B' WHERE A = 1");
+    let duplicate = connection
+        .prepare("INSERT INTO T VALUES (2, 'duplicate')")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(&duplicate, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Constraint
+    );
+    support::execute_sql(&mut connection, "DELETE FROM T WHERE A = 2");
+    support::execute_sql(
+        &mut connection,
+        "INSERT INTO T VALUES (2, 'reused-after-delete')",
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A, B FROM T ORDER BY A"),
+        vec![vec![
+            Value::Int64(2),
+            Value::Text("reused-after-delete".into())
+        ],]
+    );
+}
+
+#[test]
+fn dml_late_unique_failure_restores_earlier_rows_and_keeps_transaction_usable() {
+    // Production break caught: a later row's unique conflict must restore an
+    // earlier row update from the same SQL statement, while retaining the
+    // caller's explicit transaction for its next statement.
+    let (_files, database) = support::new_database("dml-late-unique-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (A INT64)");
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_A ON T (A)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (2)");
+    let mut transaction = connection.begin_write().unwrap();
+    let update = transaction.prepare("UPDATE T SET A = 3").unwrap();
+    assert_eq!(
+        transaction
+            .execute(&update, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Constraint
+    );
+    let retained = transaction.prepare("INSERT INTO T VALUES (4)").unwrap();
+    transaction.execute(&retained, Parameters::none()).unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT A FROM T ORDER BY A"),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(4)],
+        ]
+    );
+}

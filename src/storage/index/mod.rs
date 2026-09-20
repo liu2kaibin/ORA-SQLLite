@@ -401,6 +401,18 @@ impl IndexStorage {
     pub(crate) const fn root(&self) -> PageRef {
         self.tree.root()
     }
+
+    pub(crate) const fn id(&self) -> IndexId {
+        self.schema.definition.id()
+    }
+
+    pub(crate) fn root_changed(&self) -> bool {
+        self.tree.root() != self.original_root
+    }
+
+    pub(in crate::storage) fn restore_root(&mut self, root: PageRef) {
+        self.tree = BTree::from_root(TreeKind::Index, root);
+    }
 }
 
 fn corruption(message: &'static str) -> DbError {
