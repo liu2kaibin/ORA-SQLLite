@@ -4814,6 +4814,126 @@ mod tests {
     }
 
     #[test]
+    fn old_snapshot_keeps_old_catalog_and_roots_across_index_ddl_and_dml() {
+        // Production break caught: an old snapshot must not observe the
+        // feature/catalog/table-root publication from a later indexed commit.
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let (table, columns) = {
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            (
+                catalog.find_table_by_id(table_id).unwrap().clone(),
+                catalog
+                    .columns_for_table(table_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let first_row =
+            RowCodec::encode(&table, &columns, &[crate::Value::Int64(1)], 1024).unwrap();
+        let first_rowid = {
+            let mut batch = pager.begin_write().unwrap();
+            let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+            let rowid = writer.allocate_rowid(&mut batch, table_id).unwrap();
+            let mut rows = BTree::from_root(TreeKind::Table, table.root());
+            rows.insert(&mut batch, &encode_rowid_key(rowid), &first_row)
+                .unwrap();
+            writer
+                .update_table_root(&mut batch, table_id, rows.root())
+                .unwrap();
+            writer.finish(&mut batch).unwrap();
+            batch.commit().unwrap();
+            rowid
+        };
+
+        let mut old_snapshot = pager.begin_read().unwrap();
+        let old = CatalogReader::open_empty_or_v1(&mut old_snapshot).unwrap();
+        let old_feature_bits = old_snapshot.feature_bits();
+        let old_catalog_root = old_snapshot.catalog_root();
+        let old_table = old.find_table_by_id(table_id).unwrap().clone();
+        let index_name = CatalogName::new("IX_T_C").unwrap();
+        assert!(old.find_index_by_name(&index_name).is_none());
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let mut rows = BTree::from_root(TreeKind::Table, old_table.root());
+        let mut index_tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        for value in 2_i64..=200 {
+            let rowid = writer.allocate_rowid(&mut batch, table_id).unwrap();
+            let row = RowCodec::encode(&old_table, &columns, &[crate::Value::Int64(value)], 1024)
+                .unwrap();
+            rows.insert(&mut batch, &encode_rowid_key(rowid), &row)
+                .unwrap();
+            let key = IndexKeyCodec::encode(&columns, &[crate::Value::Int64(value)], rowid)
+                .unwrap()
+                .into_physical();
+            index_tree.insert(&mut batch, &key, &[]).unwrap();
+        }
+        let original_key = IndexKeyCodec::encode(&columns, &[crate::Value::Int64(1)], first_rowid)
+            .unwrap()
+            .into_physical();
+        index_tree.insert(&mut batch, &original_key, &[]).unwrap();
+        let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let index = IndexDef::new(
+            index_id,
+            table_id,
+            index_tree.root(),
+            1,
+            false,
+            IndexOwnership::Explicit,
+            index_name.clone(),
+        )
+        .unwrap();
+        writer
+            .update_table_root(&mut batch, table_id, rows.root())
+            .unwrap();
+        writer
+            .insert_index_definition(&mut batch, &index, &[columns[0].id()])
+            .unwrap();
+        writer
+            .bump_table_schema_version(&mut batch, table_id)
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(old_snapshot.feature_bits(), old_feature_bits);
+        assert_eq!(old_snapshot.catalog_root(), old_catalog_root);
+        assert!(old.find_index_by_name(&index_name).is_none());
+        assert_eq!(
+            BTree::from_root(TreeKind::Table, old_table.root())
+                .get(&mut old_snapshot, &encode_rowid_key(first_rowid))
+                .unwrap(),
+            Some(first_row)
+        );
+        assert!(
+            BTree::from_root(TreeKind::Table, old_table.root())
+                .get(&mut old_snapshot, &encode_rowid_key(RowId::new(2).unwrap()))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut fresh_snapshot = pager.begin_read().unwrap();
+        let fresh = CatalogReader::open_empty_or_v1(&mut fresh_snapshot).unwrap();
+        let fresh_table = fresh.find_table_by_id(table_id).unwrap();
+        let fresh_index = fresh.find_index_by_name(&index_name).unwrap();
+        assert_eq!(
+            fresh_snapshot.feature_bits(),
+            CATALOG_V1 | INDEX_CONSTRAINT_V1
+        );
+        assert_ne!(fresh_table.root(), old_table.root());
+        assert_eq!(fresh_index.root(), index_tree.root());
+        assert_eq!(
+            BTree::from_root(TreeKind::Table, fresh_table.root())
+                .get(
+                    &mut fresh_snapshot,
+                    &encode_rowid_key(RowId::new(2).unwrap())
+                )
+                .unwrap(),
+            Some(RowCodec::encode(&old_table, &columns, &[crate::Value::Int64(2)], 1024).unwrap())
+        );
+    }
+
+    #[test]
     fn old_catalog_snapshot_survives_new_rows_tables_checkpoint_and_reopen() {
         let (temp, pager, table_id) = committed_single_column_catalog();
         let mut old_snapshot = pager.begin_read().unwrap();
