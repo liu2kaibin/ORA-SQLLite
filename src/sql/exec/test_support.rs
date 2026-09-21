@@ -2689,12 +2689,14 @@ fn phase4c2a_fixture(scenario: Phase4c2aCrashScenario) -> TempDatabase {
     let temp = TempDatabase::new("phase4c2a-crash-fixture");
     let pager = phase_4c2a_create_pager(&temp);
     let mut connection = Connection::from_test_pager(pager.clone());
-    for sql in ["CREATE TABLE T (A INT64, B TEXT, C INT64)"] {
-        assert_eq!(
-            actual_execute(&mut connection, sql, Parameters::none()),
-            Outcome::Affected(0)
-        );
-    }
+    assert_eq!(
+        actual_execute(
+            &mut connection,
+            "CREATE TABLE T (A INT64, B TEXT, C INT64)",
+            Parameters::none(),
+        ),
+        Outcome::Affected(0)
+    );
     let row_count = match scenario {
         Phase4c2aCrashScenario::UpdateSplitTableAndIndexRoots => 37,
         Phase4c2aCrashScenario::DeleteAndCollapseIndexRoot => 96,

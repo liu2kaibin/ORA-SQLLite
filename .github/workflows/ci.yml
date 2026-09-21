@@ -86,6 +86,21 @@ jobs:
           rustup run stable cargo test --profile exhaustive --test phase4c_scale
           phase_4c1_hundred_thousand_row_smoke -- --exact --ignored --nocapture
 
+  phase4c2a-index-storage-ddl:
+    name: Linux Phase 4C2-A index storage and DDL
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run deterministic index model
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2a_fixed_seed_index_model -- --exact --ignored --nocapture
+      - name: Run index crash recovery matrix
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2a_index_crash_recovery_matrix -- --exact --ignored --nocapture
+      - name: Run 100,000-row index smoke
+        run: rustup run stable cargo test --profile exhaustive --test phase4c2_index_scale phase_4c2a_hundred_thousand_row_index_smoke -- --exact --ignored --nocapture
+
   windows:
     name: Windows stable
     runs-on: windows-latest

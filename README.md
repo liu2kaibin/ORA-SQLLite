@@ -9,7 +9,8 @@ ORA-SQLLite is a planned lightweight embedded database written in pure Rust. It 
 - Fixed-size pages, a pager, B+Tree tables and indexes.
 - ACID transactions, crash recovery, multiple readers and one writer.
 - Common Oracle data types, functions, sequences, pagination and NULL semantics.
-- Initial capacity target: databases up to 10 GB and tables up to 10 million rows.
+- The 10 GB database and 10-million-row acceptance target is deferred until all
+  Phase 4C2 phases are complete.
 
 The first release will not implement PL/SQL, packages, a network server, Oracle wire protocols, users and roles, tablespaces, RAC or distributed transactions.
 
@@ -43,6 +44,12 @@ parameterized INSERT, UPDATE, and DELETE, auto-commit, and both SQL and Rust
 transaction entry points. Indexes and constraints remain Phase 4C2 work.
 Oracle-specific type declarations, functions, `DUAL`, `ROWNUM`, pagination, and
 empty-string compatibility behavior remain Phase 5 work.
+
+Phase 4C2-A supports explicit ordinary and unique `CREATE INDEX` and `DROP INDEX`
+DDL, DML index maintenance, and atomic rollback, reopen, and recovery of those
+indexes. `SELECT` still uses `TableScan`, and `UPDATE`/`DELETE` target discovery
+still uses a ROWID `TableScan`. Table constraints, foreign keys, and optimizer
+`IndexScan` remain deferred to Phase 4C2-B/C/D.
 
 Creation synchronizes the main/WAL files and their parent directory entries before
 publishing the format-2 initialization marker. Unix uses a directory file sync;

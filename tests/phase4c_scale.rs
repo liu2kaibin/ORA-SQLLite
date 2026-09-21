@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod support;
 
 use ora_sqllite::{Connection, Parameters, Value};

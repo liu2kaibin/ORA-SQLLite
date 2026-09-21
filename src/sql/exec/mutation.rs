@@ -182,11 +182,6 @@ fn execute_update(
                     })?,
             );
         }
-        // The original EvalRow and replacement are both live here. The saved
-        // old row for index deletion is a third owned copy and must share the
-        // same query-memory ceiling before allocating it.
-        memory.reserve(old_bytes)?;
-        let old_for_index = replacement.clone();
         for (assignment, value) in plan.assignments().iter().zip(values) {
             let target = replacement
                 .get_mut(usize::from(assignment.target().ordinal()))
@@ -198,16 +193,31 @@ fn execute_update(
                 })?;
             *target = value;
         }
-        validate_and_replace(
-            batch,
-            &relation,
-            &mut writer,
-            plan,
-            rowid,
-            &old_for_index,
-            &replacement,
-            memory,
-        )?;
+        validate_update_replacement(&relation, plan, &replacement, old_bytes, memory)?;
+        // Validation must happen before allocating the third owned row so an
+        // invalid assignment keeps its Type diagnostic. On the valid path,
+        // retain the original row for index deletion and account for it before
+        // cloning, while no B+Tree mutation has happened yet.
+        memory.reserve(old_bytes)?;
+        let old_for_index = (0..relation.column_count())
+            .map(|ordinal| {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(
+                        ErrorCode::Internal,
+                        "UPDATE relation column ordinal exceeds its bound",
+                    )
+                })?;
+                old.source_value(SourceId(0), ordinal)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE old row is missing a relation column",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writer.replace(batch, rowid, &old_for_index, &replacement)?;
         affected = checked_affected_count(affected)?;
         memory.release(checked_add_bytes(
             checked_add_bytes(checked_add_bytes(old_bytes, assignment_bytes)?, old_bytes)?,
@@ -308,22 +318,22 @@ fn map_row_memory_limit(error: DbError) -> DbError {
     }
 }
 
-fn validate_and_replace(
-    batch: &mut WriteBatch,
+fn validate_update_replacement(
     relation: &Relation,
-    writer: &mut ConstrainedTableWrite,
     plan: &UpdatePlan,
-    rowid: crate::storage::catalog::types::RowId,
-    old: &[crate::Value],
     replacement: &[crate::Value],
+    planned_old_clone_bytes: u64,
     memory: &mut WorkMemory,
 ) -> Result<()> {
-    let row_budget = memory.remaining();
-    memory.reserve(row_budget)?;
+    // Keep the old row clone in the statement budget before allocating it.
+    // RowCodec checks value shapes before it classifies the bounded length, so
+    // an invalid assignment preserves its Type diagnostic even when the valid
+    // replacement could not coexist with that clone.
+    let row_budget = memory.remaining().saturating_sub(planned_old_clone_bytes);
     let max_row_bytes = usize::try_from(row_budget).unwrap_or(usize::MAX);
     let validation = relation.validate_update_values(replacement, max_row_bytes);
-    let result = match validation {
-        Ok(RelationValueValidation::Valid) => writer.replace(batch, rowid, old, replacement),
+    match validation {
+        Ok(RelationValueValidation::Valid) => Ok(()),
         Ok(RelationValueValidation::ExceedsLimit) => Err(resource_limit()),
         Ok(RelationValueValidation::InvalidValue { ordinal, error }) => {
             let assignment = plan
@@ -342,9 +352,7 @@ fn validate_and_replace(
             }
         }
         Err(error) => Err(error),
-    };
-    memory.release(row_budget)?;
-    result
+    }
 }
 
 fn predicate_matches(

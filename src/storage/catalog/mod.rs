@@ -2153,7 +2153,7 @@ mod tests {
         let indexed_column = column(column_id.get(), 0, "C");
         for key in 0_u64..1_000 {
             let physical = crate::storage::index::key::IndexKeyCodec::encode(
-                &[indexed_column.clone()],
+                std::slice::from_ref(&indexed_column),
                 &[crate::Value::Int64(i64::try_from(key).unwrap())],
                 RowId::new(key + 1).unwrap(),
             )

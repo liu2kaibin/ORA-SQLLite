@@ -630,14 +630,12 @@ mod tests {
             );
         }
 
-        for family in [0x40] {
-            let mut oversized = vec![0; 1025];
-            oversized[0] = family;
-            assert_eq!(
-                decode_key(&oversized).unwrap_err().code(),
-                ErrorCode::Unsupported
-            );
-        }
+        let mut oversized = vec![0; 1025];
+        oversized[0] = 0x40;
+        assert_eq!(
+            decode_key(&oversized).unwrap_err().code(),
+            ErrorCode::Unsupported
+        );
     }
 
     #[test]

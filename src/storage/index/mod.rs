@@ -1106,7 +1106,7 @@ mod tests {
         // oversized first key, including the candidate feature flag.
         let rows = vec![
             vec![Value::Text("small".into())],
-            vec![Value::Text("x".repeat(1014).into())],
+            vec![Value::Text("x".repeat(1014))],
         ];
         let (_temp, _pager, mut batch, table, ids) = create_fixture(&[ColumnType::Text], 1, &rows);
         let before = batch.checkpoint_mutation().unwrap();

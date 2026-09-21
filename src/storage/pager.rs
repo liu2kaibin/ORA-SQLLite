@@ -2288,11 +2288,12 @@ mod tests {
         },
         catalog::{
             CatalogReader, CatalogWriter,
-            types::{CatalogName, ColumnType, IndexDef, IndexId, IndexOwnership},
+            types::{CatalogName, ColumnType, IndexDef, IndexId, IndexOwnership, RowId},
         },
         features::CATALOG_V1,
         file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, read_all_for_test},
         freelist::Freelist,
+        index::key::IndexKeyCodec,
         page::{PageFrame, PageType},
         relation::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation},
         slotted::SlottedPage,
@@ -3703,15 +3704,21 @@ mod tests {
         .unwrap();
         let table_id = create_relation(&mut batch, &spec).unwrap();
         let catalog = batch.catalog_reader().unwrap();
-        let column_id = catalog.columns_for_table(table_id).next().unwrap().id();
+        let indexed_column = catalog.columns_for_table(table_id).next().unwrap().clone();
+        let column_id = indexed_column.id();
         let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
         let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
         let mut tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
-        for key in 0_u64..48 {
-            tree.insert(&mut batch, &key.to_be_bytes(), &[1; 300])
-                .unwrap();
+        for key in 0_u64..1_000 {
+            let physical = IndexKeyCodec::encode(
+                std::slice::from_ref(&indexed_column),
+                &[crate::Value::Int64(i64::try_from(key).unwrap())],
+                RowId::new(key + 1).unwrap(),
+            )
+            .unwrap()
+            .into_physical();
+            tree.insert(&mut batch, &physical, &[]).unwrap();
         }
-        tree.insert(&mut batch, b"overflow", &[2; 5000]).unwrap();
         let index = IndexDef::new(
             index_id,
             table_id,
@@ -3727,6 +3734,16 @@ mod tests {
             .unwrap();
         writer.finish(&mut batch).unwrap();
         batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let pages = validate_tree(&mut read, &BTree::from_root(TreeKind::Index, index.root()))
+            .unwrap()
+            .all_live_pages();
+        assert!(
+            pages.len() > 2,
+            "fixture must stage multiple index releases"
+        );
+        drop(read);
 
         let mut batch = pager.begin_write().unwrap();
         let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
