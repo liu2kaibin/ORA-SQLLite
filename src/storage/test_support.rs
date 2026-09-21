@@ -1925,10 +1925,11 @@ pub(crate) fn phase_4c2a_commit_malformed_index(pager: &Pager, name: &str) -> Re
 
 fn phase4c2a_fd_target_matches(target: &Path, canonical: &Path) -> bool {
     target == canonical
-        || target
-            .to_string_lossy()
-            .strip_suffix(" (deleted)")
-            .is_some_and(|without_suffix| Path::new(without_suffix) == canonical)
+        || (!target.exists()
+            && target
+                .to_string_lossy()
+                .strip_suffix(" (deleted)")
+                .is_some_and(|without_suffix| Path::new(without_suffix) == canonical))
 }
 
 #[cfg(target_os = "linux")]
@@ -1965,17 +1966,20 @@ fn phase4c2a_assert_no_linux_fds(path: &Path) {
 }
 
 #[test]
-fn phase_4c2a_fd_target_matching_handles_linux_deleted_suffix() {
-    let canonical = Path::new("/tmp/ora-sqllite-phase4c2a.db");
-    assert!(phase4c2a_fd_target_matches(canonical, canonical));
-    assert!(phase4c2a_fd_target_matches(
-        Path::new("/tmp/ora-sqllite-phase4c2a.db (deleted)"),
-        canonical
-    ));
-    assert!(!phase4c2a_fd_target_matches(
-        Path::new("/tmp/ora-sqllite-other.db (deleted)"),
-        canonical
-    ));
+fn phase_4c2a_fd_target_matching_rejects_existing_literal_deleted_suffix() {
+    let temp = TempDatabase::new("phase4c2a-literal-deleted-suffix");
+    fs::write(temp.path(), b"base").unwrap();
+    let canonical = fs::canonicalize(temp.path()).unwrap();
+    let literal = PathBuf::from(format!("{} (deleted)", canonical.display()));
+    fs::write(&literal, b"literal").unwrap();
+    let literal_open = fs::File::open(&literal).unwrap();
+
+    assert!(phase4c2a_fd_target_matches(&canonical, &canonical));
+    let matches_base = phase4c2a_fd_target_matches(&literal, &canonical);
+
+    drop(literal_open);
+    fs::remove_file(literal).unwrap();
+    assert!(!matches_base);
 }
 
 #[cfg(target_os = "linux")]
@@ -1997,6 +2001,41 @@ fn phase_4c2a_linux_fd_probe_detects_open_main_and_wal() {
     drop(main);
     drop(wal);
     assert!(phase4c2a_open_linux_fds(&targets).unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn phase_4c2a_linux_fd_probe_distinguishes_unlinked_from_literal_deleted_suffix() {
+    let unlinked = TempDatabase::new("phase4c2a-unlinked-fd");
+    fs::write(unlinked.path(), b"unlinked").unwrap();
+    let unlinked_canonical = fs::canonicalize(unlinked.path()).unwrap();
+    let unlinked_open = fs::File::open(&unlinked_canonical).unwrap();
+    fs::remove_file(&unlinked_canonical).unwrap();
+
+    let open = phase4c2a_open_linux_fds(std::slice::from_ref(&unlinked_canonical)).unwrap();
+    assert!(
+        open.iter()
+            .any(|(_, actual)| { phase4c2a_fd_target_matches(actual, &unlinked_canonical) })
+    );
+    drop(unlinked_open);
+    assert!(
+        phase4c2a_open_linux_fds(std::slice::from_ref(&unlinked_canonical))
+            .unwrap()
+            .is_empty()
+    );
+
+    let base = TempDatabase::new("phase4c2a-literal-fd");
+    fs::write(base.path(), b"base").unwrap();
+    let base_canonical = fs::canonicalize(base.path()).unwrap();
+    let literal = PathBuf::from(format!("{} (deleted)", base_canonical.display()));
+    fs::write(&literal, b"literal").unwrap();
+    let literal_open = fs::File::open(&literal).unwrap();
+
+    let base_fds = phase4c2a_open_linux_fds(std::slice::from_ref(&base_canonical)).unwrap();
+
+    drop(literal_open);
+    fs::remove_file(literal).unwrap();
+    assert!(base_fds.is_empty());
 }
 
 pub(crate) fn phase_4c2a_remove_recovered_files(path: &Path) {
