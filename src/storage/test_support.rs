@@ -1539,6 +1539,7 @@ pub(crate) struct Phase4c2aTableState {
     pub(crate) id: u64,
     pub(crate) schema_version: u64,
     pub(crate) root: Phase4c2aPageRef,
+    pub(crate) height: u64,
     pub(crate) next_rowid: u64,
     pub(crate) rows: Vec<(u64, Vec<Value>)>,
 }
@@ -1555,6 +1556,7 @@ pub(crate) struct Phase4c2aIndexState {
     pub(crate) id: u64,
     pub(crate) table_id: u64,
     pub(crate) root: Phase4c2aPageRef,
+    pub(crate) height: u64,
     pub(crate) unique: bool,
     pub(crate) column_ordinals: Vec<u16>,
     pub(crate) entries: Vec<Phase4c2aIndexEntry>,
@@ -1673,15 +1675,14 @@ fn phase4c2a_pager_state_inner(
     let mut table_pages = BTreeSet::new();
     let mut tables = BTreeMap::new();
     for table in table_defs {
+        let tree = BTree::from_root(TreeKind::Table, table.root());
+        let height = tree_height(&mut snapshot, tree.root())?;
         if deep {
             table_pages.extend(
-                validate_tree(
-                    &mut snapshot,
-                    &BTree::from_root(TreeKind::Table, table.root()),
-                )?
-                .all_live_pages()
-                .into_iter()
-                .map(|page| page.0),
+                validate_tree(&mut snapshot, &tree)?
+                    .all_live_pages()
+                    .into_iter()
+                    .map(|page| page.0),
             );
         }
         let relation = Relation::open(&catalog, table.id())?;
@@ -1696,6 +1697,7 @@ fn phase4c2a_pager_state_inner(
                 id: table.id().get(),
                 schema_version: table.schema_version().get(),
                 root: table.root().into(),
+                height,
                 next_rowid: table.next_rowid().get(),
                 rows,
             },
@@ -1705,15 +1707,14 @@ fn phase4c2a_pager_state_inner(
     let mut index_pages = BTreeSet::new();
     let mut indexes = BTreeMap::new();
     for index in index_defs {
+        let tree = BTree::from_root(TreeKind::Index, index.root());
+        let height = tree_height(&mut snapshot, tree.root())?;
         if deep {
             index_pages.extend(
-                validate_tree(
-                    &mut snapshot,
-                    &BTree::from_root(TreeKind::Index, index.root()),
-                )?
-                .all_live_pages()
-                .into_iter()
-                .map(|page| page.0),
+                validate_tree(&mut snapshot, &tree)?
+                    .all_live_pages()
+                    .into_iter()
+                    .map(|page| page.0),
             );
         }
         let columns = catalog
@@ -1721,7 +1722,6 @@ fn phase4c2a_pager_state_inner(
             .cloned()
             .collect::<Vec<_>>();
         let column_ordinals = columns.iter().map(ColumnDef::ordinal).collect();
-        let tree = BTree::from_root(TreeKind::Index, index.root());
         let mut cursor = tree.scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)?;
         let mut entries = Vec::new();
         while let Some((physical, value)) = cursor.next()? {
@@ -1744,6 +1744,7 @@ fn phase4c2a_pager_state_inner(
                 id: index.id().get(),
                 table_id: index.table_id().get(),
                 root: index.root().into(),
+                height,
                 unique: index.unique(),
                 column_ordinals,
                 entries,
@@ -1922,7 +1923,85 @@ pub(crate) fn phase_4c2a_commit_malformed_index(pager: &Pager, name: &str) -> Re
     batch.commit()
 }
 
+fn phase4c2a_fd_target_matches(target: &Path, canonical: &Path) -> bool {
+    target == canonical
+        || target
+            .to_string_lossy()
+            .strip_suffix(" (deleted)")
+            .is_some_and(|without_suffix| Path::new(without_suffix) == canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn phase4c2a_open_linux_fds(targets: &[PathBuf]) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut open = Vec::new();
+    for entry in fs::read_dir("/proc/self/fd")? {
+        let fd = entry?.path();
+        let target = match fs::read_link(&fd) {
+            Ok(target) => target,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if targets
+            .iter()
+            .any(|canonical| phase4c2a_fd_target_matches(&target, canonical))
+        {
+            open.push((fd, target));
+        }
+    }
+    Ok(open)
+}
+
+#[cfg(target_os = "linux")]
+fn phase4c2a_assert_no_linux_fds(path: &Path) {
+    let targets = [path.to_path_buf(), wal_path(path)]
+        .into_iter()
+        .map(|target| fs::canonicalize(target).expect("canonicalize recovered Phase 4C2-A file"))
+        .collect::<Vec<_>>();
+    let open = phase4c2a_open_linux_fds(&targets).expect("inspect /proc/self/fd");
+    assert!(
+        open.is_empty(),
+        "recovered Phase 4C2-A files still have open Linux descriptors: {open:?}"
+    );
+}
+
+#[test]
+fn phase_4c2a_fd_target_matching_handles_linux_deleted_suffix() {
+    let canonical = Path::new("/tmp/ora-sqllite-phase4c2a.db");
+    assert!(phase4c2a_fd_target_matches(canonical, canonical));
+    assert!(phase4c2a_fd_target_matches(
+        Path::new("/tmp/ora-sqllite-phase4c2a.db (deleted)"),
+        canonical
+    ));
+    assert!(!phase4c2a_fd_target_matches(
+        Path::new("/tmp/ora-sqllite-other.db (deleted)"),
+        canonical
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn phase_4c2a_linux_fd_probe_detects_open_main_and_wal() {
+    let temp = TempDatabase::new("phase4c2a-linux-fd-probe");
+    let pager = phase_4c2a_create_pager(&temp);
+    drop(pager);
+    let main_path = fs::canonicalize(temp.path()).unwrap();
+    let wal_path = fs::canonicalize(wal_path(temp.path())).unwrap();
+    let main = fs::File::open(&main_path).unwrap();
+    let wal = fs::File::open(&wal_path).unwrap();
+    let targets = vec![main_path, wal_path];
+    let open = phase4c2a_open_linux_fds(&targets).unwrap();
+    assert!(targets.iter().all(|target| {
+        open.iter()
+            .any(|(_, actual)| phase4c2a_fd_target_matches(actual, target))
+    }));
+    drop(main);
+    drop(wal);
+    assert!(phase4c2a_open_linux_fds(&targets).unwrap().is_empty());
+}
+
 pub(crate) fn phase_4c2a_remove_recovered_files(path: &Path) {
+    #[cfg(target_os = "linux")]
+    phase4c2a_assert_no_linux_fds(path);
     fs::remove_file(wal_path(path)).expect("remove recovered Phase 4C2-A WAL");
     fs::remove_file(path).expect("remove recovered Phase 4C2-A main file");
 }
