@@ -81,6 +81,26 @@ struct TreeScan {
     pages: Vec<u64>,
 }
 
+#[derive(Debug)]
+struct SubtreeSummary {
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
+    depth: usize,
+}
+
+#[derive(Debug)]
+struct ExplicitIndexDefinition {
+    root: PageRef,
+    unique: bool,
+    columns: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CatalogColumn {
+    table_id: u64,
+    name: String,
+}
+
 pub fn assert_index_model(files: &TestFiles, expected_rows: usize, names: &[&str]) {
     verify_index_model(files, expected_rows, names).unwrap_or_else(|error| {
         panic!("format-2 physical index verification failed: {error}");
@@ -123,11 +143,11 @@ pub fn verify_index_model(
     let mut all_pages = catalog.pages.into_iter().collect::<HashSet<_>>();
     let mut index_page_ids = Vec::new();
     for &name in names {
-        let root = definitions
+        let definition = definitions
             .get(name)
-            .copied()
             .ok_or_else(|| format!("catalog misses expected index {name}"))?;
-        let scan = disk.walk_tree(root, TreeKind::Index, true)?;
+        assert_expected_index_metadata(name, definition)?;
+        let scan = disk.walk_tree(definition.root, TreeKind::Index, true)?;
         if scan.entries.len() != expected_rows {
             return Err(format!(
                 "{name} has {} physical entries, expected {expected_rows}",
@@ -154,8 +174,9 @@ pub fn flip_physical_page_byte(files: &TestFiles, page_id: u64, page_offset: u64
     let bytes = fs::read(files.main()).expect("read database before physical corruption");
     let header = select_header(&bytes).expect("parse database before physical corruption");
     let start = ordinary_page_offset(page_id, header.page_size).expect("valid page offset");
+    let page_offset = usize::try_from(page_offset).expect("physical corruption offset fits");
     let position = start
-        .checked_add(page_offset as usize)
+        .checked_add(page_offset)
         .expect("physical corruption offset fits");
     assert!(
         position < bytes.len(),
@@ -166,11 +187,66 @@ pub fn flip_physical_page_byte(files: &TestFiles, page_id: u64, page_offset: u64
         .write(true)
         .open(files.main())
         .expect("open database for focused verifier corruption");
-    file.seek(SeekFrom::Start(position as u64))
-        .expect("seek physical corruption byte");
+    file.seek(SeekFrom::Start(
+        u64::try_from(position).expect("physical corruption seek position fits"),
+    ))
+    .expect("seek physical corruption byte");
     file.write_all(&[bytes[position] ^ 1])
         .expect("write physical corruption byte");
     file.sync_all().expect("sync physical corruption byte");
+}
+
+pub fn corrupt_first_index_separator_with_valid_checksum(files: &TestFiles, index_name: &str) {
+    let mut bytes = fs::read(files.main()).expect("read database before separator corruption");
+    let header = select_header(&bytes).expect("parse database before separator corruption");
+    let disk = Disk {
+        bytes: &bytes,
+        header,
+    };
+    let catalog = disk
+        .walk_tree(
+            PageRef {
+                id: disk.header.catalog_root,
+                generation: disk
+                    .page_generation(disk.header.catalog_root)
+                    .expect("read catalog root generation"),
+            },
+            TreeKind::Table,
+            false,
+        )
+        .expect("walk catalog before separator corruption");
+    let root = explicit_index_definitions(&catalog.entries)
+        .expect("decode index definitions before separator corruption")
+        .get(index_name)
+        .expect("find target index before separator corruption")
+        .root;
+    let start = ordinary_page_offset(root.id, disk.header.page_size)
+        .expect("locate target index root before separator corruption");
+    let end = start
+        .checked_add(disk.header.page_size)
+        .expect("target index root extent fits");
+    let page = bytes
+        .get_mut(start..end)
+        .expect("target index root lies in the database image");
+    assert_eq!(
+        page[0],
+        TreeKind::Index.internal_type(),
+        "target root is internal"
+    );
+    let first_cell = usize::from(read_u16(page, INTERNAL_METADATA_END).expect("first slot offset"));
+    let key_len = usize::from(read_u16(page, first_cell).expect("first separator length"));
+    let key = page
+        .get_mut(first_cell + 20..first_cell + 20 + key_len)
+        .expect("first separator key lies in the root page");
+    let byte = key
+        .iter_mut()
+        .rev()
+        .find(|byte| **byte != 0)
+        .expect("first separator key is nonzero");
+    *byte -= 1;
+    let checksum = crc32c_parts(&page[..36], &page[40..]);
+    page[36..40].copy_from_slice(&checksum.to_le_bytes());
+    fs::write(files.main(), bytes).expect("write checksum-valid separator corruption");
 }
 
 struct Disk<'a> {
@@ -285,47 +361,23 @@ impl Disk<'_> {
         if root.id == 0 || root.id >= self.header.page_count || root.generation == 0 {
             return Err("tree root is outside accepted page range".into());
         }
-        let mut stack = vec![root];
         let mut visited = HashSet::new();
         let mut pages = Vec::new();
         let mut leaves = Vec::new();
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        while let Some(reference) = stack.pop() {
-            if !visited.insert(reference.id) || visited.len() >= self.header.page_count as usize {
-                return Err("B+Tree contains a cycle or too many pages".into());
-            }
-            let page = self.page(reference.id, Some(reference.generation))?;
-            pages.push(page.id);
-            match page.page_type {
-                value if value == kind.leaf_type() => {
-                    let sibling = decode_leaf_sibling(&page, self.header.page_count)?;
-                    for cell in page.cells {
-                        let (key, value) = decode_leaf_cell(cell)?;
-                        if require_empty_values && !value.is_empty() {
-                            return Err("physical index leaf stores a nonempty value".into());
-                        }
-                        if entries
-                            .last()
-                            .is_some_and(|(prior, _)| key.as_slice() <= prior.as_slice())
-                        {
-                            return Err("B+Tree leaf keys are not strictly ordered".into());
-                        }
-                        entries.push((key, value));
-                    }
-                    leaves.push((reference, sibling));
-                }
-                value if value == kind.internal_type() => {
-                    let (children, keys) = decode_internal_children(&page, self.header.page_count)?;
-                    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
-                        return Err("B+Tree internal keys are not strictly ordered".into());
-                    }
-                    for child in children.into_iter().rev() {
-                        stack.push(child);
-                    }
-                }
-                _ => return Err("B+Tree page kind changes below its root".into()),
-            }
-        }
+        let page_limit =
+            usize::try_from(self.header.page_count).map_err(|_| "page count exceeds platform")?;
+        self.walk_subtree(
+            root,
+            kind,
+            require_empty_values,
+            true,
+            page_limit,
+            &mut visited,
+            &mut pages,
+            &mut leaves,
+            &mut entries,
+        )?;
         for (position, (_, sibling)) in leaves.iter().enumerate() {
             let expected = leaves.get(position + 1).map(|(reference, _)| *reference);
             if *sibling != expected {
@@ -334,61 +386,329 @@ impl Disk<'_> {
         }
         Ok(TreeScan { entries, pages })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_subtree(
+        &self,
+        reference: PageRef,
+        kind: TreeKind,
+        require_empty_values: bool,
+        is_root: bool,
+        page_limit: usize,
+        visited: &mut HashSet<u64>,
+        pages: &mut Vec<u64>,
+        leaves: &mut Vec<(PageRef, Option<PageRef>)>,
+        entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Option<SubtreeSummary>, String> {
+        if !visited.insert(reference.id) || visited.len() >= page_limit {
+            return Err("B+Tree contains a cycle or too many pages".into());
+        }
+        let page = self.page(reference.id, Some(reference.generation))?;
+        pages.push(page.id);
+        match page.page_type {
+            value if value == kind.leaf_type() => {
+                if !is_root && page.cells.is_empty() {
+                    return Err("non-root B+Tree leaf is empty".into());
+                }
+                let sibling = decode_leaf_sibling(&page, self.header.page_count)?;
+                let mut min_key = None;
+                let mut max_key = None;
+                for cell in page.cells {
+                    let (key, value) = decode_leaf_cell(cell)?;
+                    if require_empty_values && !value.is_empty() {
+                        return Err("physical index leaf stores a nonempty value".into());
+                    }
+                    if max_key
+                        .as_ref()
+                        .is_some_and(|prior: &Vec<u8>| key.as_slice() <= prior.as_slice())
+                    {
+                        return Err("B+Tree leaf keys are not strictly ordered".into());
+                    }
+                    if entries
+                        .last()
+                        .is_some_and(|(prior, _)| key.as_slice() <= prior.as_slice())
+                    {
+                        return Err("B+Tree leaf keys are not strictly ordered".into());
+                    }
+                    if min_key.is_none() {
+                        min_key = Some(key.clone());
+                    }
+                    max_key = Some(key.clone());
+                    entries.push((key, value));
+                }
+                leaves.push((reference, sibling));
+                Ok(match (min_key, max_key) {
+                    (Some(min_key), Some(max_key)) => Some(SubtreeSummary {
+                        min_key,
+                        max_key,
+                        depth: 0,
+                    }),
+                    (None, None) if is_root => None,
+                    _ => return Err("B+Tree leaf range is inconsistent".into()),
+                })
+            }
+            value if value == kind.internal_type() => {
+                let (children, keys) = decode_internal_children(&page, self.header.page_count)?;
+                if keys.is_empty() {
+                    return Err("B+Tree internal node is empty".into());
+                }
+                if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err("B+Tree internal keys are not strictly ordered".into());
+                }
+                let mut summaries = Vec::with_capacity(children.len());
+                for child in children {
+                    summaries.push(
+                        self.walk_subtree(
+                            child,
+                            kind,
+                            require_empty_values,
+                            false,
+                            page_limit,
+                            visited,
+                            pages,
+                            leaves,
+                            entries,
+                        )?
+                        .ok_or("non-root B+Tree child is empty")?,
+                    );
+                }
+                let depth = summaries[0].depth;
+                if summaries.iter().any(|summary| summary.depth != depth) {
+                    return Err("B+Tree leaves do not have equal depth".into());
+                }
+                for (position, right) in summaries.iter().enumerate().skip(1) {
+                    let left = &summaries[position - 1];
+                    if left.max_key >= right.min_key {
+                        return Err("B+Tree child key ranges overlap".into());
+                    }
+                    if keys[position - 1] != right.min_key {
+                        return Err(
+                            "B+Tree separator does not equal its right-child minimum".into()
+                        );
+                    }
+                }
+                Ok(Some(SubtreeSummary {
+                    min_key: summaries[0].min_key.clone(),
+                    max_key: summaries
+                        .last()
+                        .expect("nonempty internal node has a final child")
+                        .max_key
+                        .clone(),
+                    depth: depth.checked_add(1).ok_or("B+Tree depth overflow")?,
+                }))
+            }
+            _ => Err("B+Tree page kind changes below its root".into()),
+        }
+    }
 }
 
 fn explicit_index_definitions(
     entries: &[(Vec<u8>, Vec<u8>)],
-) -> Result<BTreeMap<String, PageRef>, String> {
-    let mut result = BTreeMap::new();
+) -> Result<BTreeMap<String, ExplicitIndexDefinition>, String> {
+    struct PendingDefinition {
+        id: u64,
+        table_id: u64,
+        root: PageRef,
+        unique: bool,
+        column_count: u16,
+    }
+
+    let mut definitions = BTreeMap::new();
+    let mut mappings = BTreeMap::<u64, BTreeMap<u16, u64>>::new();
+    let mut columns = BTreeMap::<u64, CatalogColumn>::new();
     for (key, value) in entries {
-        if key.first() != Some(&0x21) {
-            continue;
-        }
-        if key.len() != 9 || value.get(0..2) != Some(&[0x21, 1]) || value.get(2..4) != Some(&[0, 0])
-        {
-            return Err("index catalog record envelope is malformed".into());
-        }
-        let payload_len = read_u32(value, 4)? as usize;
-        if value.len()
-            != 8usize
-                .checked_add(payload_len)
-                .ok_or("catalog payload overflow")?
-        {
-            return Err("index catalog record length disagrees with its envelope".into());
-        }
-        let payload = &value[8..];
-        if payload.len() < 48
-            || payload[35] != 0
-            || read_u16(payload, 36)? != 0
-            || read_u64(payload, 38)? != 0
-        {
-            return Err("explicit index definition is malformed".into());
-        }
-        let id = read_u64(payload, 0)?;
-        if id == 0 || key[1..9] != id.to_be_bytes() || read_u64(payload, 8)? == 0 {
-            return Err("index definition identity disagrees with its catalog key".into());
-        }
-        let root = PageRef {
-            id: read_u64(payload, 16)?,
-            generation: read_u64(payload, 24)?,
-        };
-        if root.id == 0 || root.generation == 0 || read_u16(payload, 32)? == 0 || payload[34] > 1 {
-            return Err("index definition fields are invalid".into());
-        }
-        let name_len = usize::from(read_u16(payload, 46)?);
-        let name_end = 48usize.checked_add(name_len).ok_or("index name overflow")?;
-        let name = payload.get(48..name_end).ok_or("index name is truncated")?;
-        if name_end != payload.len() || name.is_empty() {
-            return Err("index definition name length is invalid".into());
-        }
-        let name = std::str::from_utf8(name)
-            .map_err(|_| "index name is not UTF-8")?
-            .to_owned();
-        if result.insert(name, root).is_some() {
-            return Err("catalog has duplicate explicit index names".into());
+        match key.first() {
+            Some(0x21) => {
+                if key.len() != 9 {
+                    return Err("index definition key is malformed".into());
+                }
+                let payload = catalog_payload(value, 0x21, "index catalog record")?;
+                if payload.len() < 48
+                    || payload[35] != 0
+                    || read_u16(payload, 36)? != 0
+                    || read_u64(payload, 38)? != 0
+                {
+                    return Err("explicit index definition is malformed".into());
+                }
+                let id = read_u64(payload, 0)?;
+                let table_id = read_u64(payload, 8)?;
+                if id == 0 || key[1..9] != id.to_be_bytes() || table_id == 0 {
+                    return Err("index definition identity disagrees with its catalog key".into());
+                }
+                let root = PageRef {
+                    id: read_u64(payload, 16)?,
+                    generation: read_u64(payload, 24)?,
+                };
+                let column_count = read_u16(payload, 32)?;
+                if root.id == 0 || root.generation == 0 || column_count == 0 || payload[34] > 1 {
+                    return Err("index definition fields are invalid".into());
+                }
+                let name = catalog_name(payload, 46, 48, "index")?;
+                if definitions
+                    .insert(
+                        name,
+                        PendingDefinition {
+                            id,
+                            table_id,
+                            root,
+                            unique: payload[34] == 1,
+                            column_count,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("catalog has duplicate explicit index names".into());
+                }
+            }
+            Some(0x23) => {
+                if key.len() != 11 {
+                    return Err("index-column mapping key is malformed".into());
+                }
+                let index_id = u64::from_be_bytes(
+                    key[1..9]
+                        .try_into()
+                        .map_err(|_| "index-column mapping key is truncated")?,
+                );
+                let ordinal = u16::from_be_bytes(
+                    key[9..11]
+                        .try_into()
+                        .map_err(|_| "index-column mapping ordinal is truncated")?,
+                );
+                let payload = catalog_payload(value, 0x23, "index-column mapping")?;
+                if payload.len() != 8 {
+                    return Err("index-column mapping payload is malformed".into());
+                }
+                let column_id = read_u64(payload, 0)?;
+                if index_id == 0 || column_id == 0 {
+                    return Err("index-column mapping identity is invalid".into());
+                }
+                if mappings
+                    .entry(index_id)
+                    .or_default()
+                    .insert(ordinal, column_id)
+                    .is_some()
+                {
+                    return Err("catalog has duplicate index-column mappings".into());
+                }
+            }
+            Some(0x14) => {
+                if key.len() != 9 {
+                    return Err("column definition key is malformed".into());
+                }
+                let payload = catalog_payload(value, 0x14, "column definition")?;
+                if payload.len() < 24 || read_u16(payload, 22)? != 0 {
+                    return Err("column definition payload is malformed".into());
+                }
+                let id = read_u64(payload, 0)?;
+                let table_id = read_u64(payload, 8)?;
+                if id == 0 || table_id == 0 || key[1..9] != id.to_be_bytes() {
+                    return Err("column definition identity disagrees with its catalog key".into());
+                }
+                let name = catalog_name(payload, 20, 24, "column")?;
+                if columns
+                    .insert(id, CatalogColumn { table_id, name })
+                    .is_some()
+                {
+                    return Err("catalog has duplicate column definitions".into());
+                }
+            }
+            _ => {}
         }
     }
+    let mut result = BTreeMap::new();
+    for (name, definition) in definitions {
+        let mappings = mappings
+            .remove(&definition.id)
+            .ok_or("index definition has no index-column mappings")?;
+        if mappings.len() != usize::from(definition.column_count) {
+            return Err("index-column mapping count disagrees with index definition".into());
+        }
+        let mut mapped_columns = Vec::with_capacity(mappings.len());
+        for ordinal in 0..definition.column_count {
+            let column_id = mappings
+                .get(&ordinal)
+                .copied()
+                .ok_or("index-column mappings are not contiguous")?;
+            let column = columns
+                .get(&column_id)
+                .ok_or("index-column mapping names an unknown column")?;
+            if column.table_id != definition.table_id {
+                return Err("index-column mapping names a column from another table".into());
+            }
+            mapped_columns.push(column.name.clone());
+        }
+        result.insert(
+            name,
+            ExplicitIndexDefinition {
+                root: definition.root,
+                unique: definition.unique,
+                columns: mapped_columns,
+            },
+        );
+    }
+    if !mappings.is_empty() {
+        return Err("index-column mapping has no explicit index definition".into());
+    }
     Ok(result)
+}
+
+fn catalog_payload<'a>(value: &'a [u8], kind: u8, label: &str) -> Result<&'a [u8], String> {
+    if value.get(0..2) != Some(&[kind, 1]) || value.get(2..4) != Some(&[0, 0]) {
+        return Err(format!("{label} envelope is malformed"));
+    }
+    let payload_len = usize::try_from(read_u32(value, 4)?)
+        .map_err(|_| format!("{label} payload length exceeds platform"))?;
+    let payload_end = 8usize
+        .checked_add(payload_len)
+        .ok_or_else(|| format!("{label} payload overflow"))?;
+    if value.len() != payload_end {
+        return Err(format!("{label} length disagrees with its envelope"));
+    }
+    Ok(&value[8..])
+}
+
+fn catalog_name(
+    payload: &[u8],
+    length_offset: usize,
+    name_start: usize,
+    label: &str,
+) -> Result<String, String> {
+    let name_len = usize::from(read_u16(payload, length_offset)?);
+    let name_end = name_start
+        .checked_add(name_len)
+        .ok_or_else(|| format!("{label} name overflow"))?;
+    let name = payload
+        .get(name_start..name_end)
+        .ok_or_else(|| format!("{label} name is truncated"))?;
+    if name_end != payload.len() || name.is_empty() {
+        return Err(format!("{label} name length is invalid"));
+    }
+    std::str::from_utf8(name)
+        .map_err(|_| format!("{label} name is not UTF-8"))
+        .map(str::to_owned)
+}
+
+fn assert_expected_index_metadata(
+    name: &str,
+    definition: &ExplicitIndexDefinition,
+) -> Result<(), String> {
+    let (unique, columns): (bool, &[&str]) = match name {
+        "UX_T_ID" => (true, &["ID"]),
+        "IX_T_G_ID" => (false, &["G", "ID"]),
+        _ => return Ok(()),
+    };
+    if definition.unique != unique
+        || definition
+            .columns
+            .iter()
+            .map(String::as_str)
+            .ne(columns.iter().copied())
+    {
+        return Err(format!(
+            "{name} catalog uniqueness or column mapping is incorrect"
+        ));
+    }
+    Ok(())
 }
 
 fn assert_selected_physical_pairs(
@@ -398,13 +718,13 @@ fn assert_selected_physical_pairs(
     let wanted = match name {
         "UX_T_ID" => [1000_i64, 99_000, 99_999]
             .into_iter()
-            .map(|id| physical_int_key(&[id], id as u64 + 1))
+            .map(|id| physical_int_key(&[id], rowid_for_test_id(id)))
             .collect::<Vec<_>>(),
         "IX_T_G_ID" => [1000_i64, 99_000, 99_999]
             .into_iter()
             .map(|id| {
                 let group = id % 101 + i64::from(id >= 99_000);
-                physical_int_key(&[group, id], id as u64 + 1)
+                physical_int_key(&[group, id], rowid_for_test_id(id))
             })
             .collect::<Vec<_>>(),
         _ => return Ok(()),
@@ -423,13 +743,28 @@ fn assert_selected_physical_pairs(
 }
 
 fn physical_int_key(values: &[i64], rowid: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(values.len() * 9 + 8);
+    let component_bytes = values
+        .len()
+        .checked_mul(9)
+        .expect("physical key component bytes fit");
+    let capacity = component_bytes
+        .checked_add(8)
+        .expect("physical key capacity fits");
+    let mut key = Vec::with_capacity(capacity);
     for value in values {
         key.push(0);
-        key.extend_from_slice(&(*value as u64 ^ (1_u64 << 63)).to_be_bytes());
+        let bits = u64::from_be_bytes(value.to_be_bytes());
+        key.extend_from_slice(&(bits ^ (1_u64 << 63)).to_be_bytes());
     }
     key.extend_from_slice(&rowid.to_be_bytes());
     key
+}
+
+fn rowid_for_test_id(id: i64) -> u64 {
+    u64::try_from(id)
+        .expect("selected scale-row id is nonnegative")
+        .checked_add(1)
+        .expect("selected scale-row ROWID fits")
 }
 
 fn decode_leaf_sibling(page: &Page<'_>, page_count: u64) -> Result<Option<PageRef>, String> {
@@ -454,7 +789,8 @@ fn decode_leaf_cell(cell: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     if key_len > 1024 || cell[3] != 0 {
         return Err("leaf cell key length or reserved byte is invalid".into());
     }
-    let value_len = read_u64(cell, 4)? as usize;
+    let value_len =
+        usize::try_from(read_u64(cell, 4)?).map_err(|_| "leaf value length exceeds platform")?;
     if cell[2] != 0 || value_len > 16 * 1024 * 1024 {
         return Err("leaf cell uses unsupported storage or an excessive value".into());
     }
@@ -559,7 +895,8 @@ fn decode_header(bytes: &[u8]) -> Result<Header, String> {
     {
         return Err("unsupported format-2 superblock fields".into());
     }
-    let page_size = read_u32(bytes, 20)? as usize;
+    let page_size = usize::try_from(read_u32(bytes, 20)?)
+        .map_err(|_| "superblock page size exceeds platform")?;
     if !matches!(page_size, 4096 | 8192 | 16384)
         || read_u64(bytes, 40)? == 0
         || read_u64(bytes, 80)? == 0

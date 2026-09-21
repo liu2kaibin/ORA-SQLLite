@@ -67,6 +67,16 @@ fn phase_4c2a_hundred_thousand_row_index_smoke() {
 
     let reopened = support::reopen(&files);
     let mut connection = reopened.connect().unwrap();
+    let duplicate_after_reopen = connection
+        .prepare("INSERT INTO T VALUES (50000, 0, 'duplicate-after-reopen')")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(&duplicate_after_reopen, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Constraint
+    );
     assert_eq!(
         support::collect(&mut connection, "SELECT COUNT(*) FROM T"),
         vec![vec![Value::Int64(99_000)]]
@@ -110,4 +120,30 @@ fn format2_verifier_rejects_a_real_index_page_checksum_corruption() {
     let report = support::verify_index_model(&files, 1, &["UX_T_ID"]).unwrap();
     support::flip_physical_page_byte(&files, report.index_page_ids[0], 80);
     assert!(support::verify_index_model(&files, 1, &["UX_T_ID"]).is_err());
+}
+
+#[test]
+fn format2_verifier_rejects_a_checksum_valid_wrong_parent_separator() {
+    // Breaks caught: local page ordering and checksums alone are insufficient
+    // when an internal separator no longer equals its right child's minimum.
+    let (files, database) = support::new_database("phase4c2-verifier-separator");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID INT64, G INT64, PAYLOAD TEXT)",
+    );
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (:1, :2, :3)")
+        .unwrap();
+    for id in 0..1_000_i64 {
+        support::insert_scale_row(&mut connection, &insert, id, id % 101);
+    }
+    support::execute_sql(&mut connection, "CREATE UNIQUE INDEX UX_T_ID ON T (ID)");
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+
+    support::verify_index_model(&files, 1_000, &["UX_T_ID"]).unwrap();
+    support::corrupt_first_index_separator_with_valid_checksum(&files, "UX_T_ID");
+    assert!(support::verify_index_model(&files, 1_000, &["UX_T_ID"]).is_err());
 }

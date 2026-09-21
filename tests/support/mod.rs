@@ -13,7 +13,10 @@ use ora_sqllite::{Connection, Database, ExecutionResult, Options, Parameters, St
 mod format2;
 
 #[allow(unused_imports)]
-pub use format2::{assert_index_model, flip_physical_page_byte, verify_index_model};
+pub use format2::{
+    assert_index_model, corrupt_first_index_separator_with_valid_checksum, flip_physical_page_byte,
+    verify_index_model,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
