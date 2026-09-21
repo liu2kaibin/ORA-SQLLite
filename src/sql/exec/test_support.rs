@@ -1,8 +1,9 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    fs,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -13,12 +14,17 @@ use crate::{
     storage::{
         Pager,
         test_support::{
-            Phase4c1CrashPathKind, Phase4c1SqlStorageState, TempDatabase, assert_commit_trace,
+            Phase4c1CrashPathKind, Phase4c1SqlStorageState, Phase4c2aStorageState,
+            Phase4c2aWalRecord, TempDatabase, assert_commit_trace,
             phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
             phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
             phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
             phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
             phase_4c1_validate_crash_path, phase_4c1_wal_initialization_trace,
+            phase_4c2a_checkpoint, phase_4c2a_commit_malformed_index, phase_4c2a_create_pager,
+            phase_4c2a_model_state, phase_4c2a_open_pager, phase_4c2a_pager_state,
+            phase_4c2a_recover_and_capture, phase_4c2a_remove_recovered_files,
+            phase_4c2a_wal_records,
         },
     },
 };
@@ -1566,6 +1572,14 @@ fn run_sql_crash_program(pager: Pager, statements: &[&str]) {
 
 fn parse_sql_fault_point(name: &str) -> Option<FaultPoint> {
     [
+        FaultPoint::BeforeMainExtend,
+        FaultPoint::AfterMainExtend,
+        FaultPoint::BeforeMainPageWrite,
+        FaultPoint::AfterMainPageWrite,
+        FaultPoint::BeforeMainSync,
+        FaultPoint::AfterMainSync,
+        FaultPoint::BeforeSuperblockWrite,
+        FaultPoint::AfterSuperblockWrite,
         FaultPoint::BeforeWalDirectorySync,
         FaultPoint::AfterWalDirectorySync,
         FaultPoint::BeforeWalHeaderWrite,
@@ -1578,6 +1592,8 @@ fn parse_sql_fault_point(name: &str) -> Option<FaultPoint> {
         FaultPoint::AfterWalSync,
         FaultPoint::BeforeWalPublish,
         FaultPoint::AfterWalPublish,
+        FaultPoint::BeforeWalTruncate,
+        FaultPoint::AfterWalTruncate,
     ]
     .into_iter()
     .find(|point| format!("{point:?}") == name)
@@ -1756,6 +1772,1206 @@ fn phase_4c1_readers_never_observe_partial_sql_commit() {
             "round {round} fresh snapshot"
         );
     }
+}
+
+#[derive(Debug, Clone)]
+struct IndexModelRow {
+    a: Option<i64>,
+    b: i64,
+    c: String,
+}
+
+impl IndexModelRow {
+    fn values(&self) -> Vec<Value> {
+        vec![
+            self.a.map_or(Value::Null, Value::Int64),
+            Value::Int64(self.b),
+            Value::Text(self.c.clone()),
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexModelDef {
+    columns: Vec<u16>,
+    unique: bool,
+}
+
+struct IndexReferenceModel {
+    temp: TempDatabase,
+    pager: Option<Pager>,
+    connection: Option<Connection>,
+    entropy: u64,
+    step: usize,
+    next_rowid: u64,
+    next_a: i64,
+    rows: BTreeMap<u64, IndexModelRow>,
+    indexes: BTreeMap<String, IndexModelDef>,
+    schema_version: u64,
+    object_counter: u64,
+    feature_bits: u64,
+    last_expected: StepResult,
+    last_actual: StepResult,
+    last_state: Option<Phase4c2aStorageState>,
+    coverage: BTreeMap<&'static str, usize>,
+    previous_table_root: Option<u64>,
+    previous_index_roots: BTreeMap<String, u64>,
+    table_root_changes: usize,
+    index_root_changes: usize,
+    reopens: usize,
+}
+
+impl IndexReferenceModel {
+    fn new(seed: u64) -> Self {
+        let temp = TempDatabase::new("phase4c2a-fixed-seed");
+        let pager = phase_4c2a_create_pager(&temp);
+        let mut connection = Connection::from_test_pager(pager.clone());
+        assert_eq!(
+            actual_execute(
+                &mut connection,
+                "CREATE TABLE T (A INT64, B INT64, C TEXT)",
+                Parameters::none(),
+            ),
+            Outcome::Affected(0)
+        );
+        let state = phase_4c2a_pager_state(&pager, temp.path()).expect("capture model baseline");
+        let table = state.tables.get("T").expect("model table exists");
+        assert_eq!(table.schema_version, 1);
+        assert_eq!(state.object_counter, 5);
+        assert_eq!(state.feature_bits, 1);
+        Self {
+            temp,
+            pager: Some(pager),
+            connection: Some(connection),
+            entropy: seed,
+            step: 0,
+            next_rowid: 0,
+            next_a: 1,
+            rows: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+            schema_version: 1,
+            object_counter: 5,
+            feature_bits: 1,
+            last_expected: StepResult(Vec::new()),
+            last_actual: StepResult(Vec::new()),
+            last_state: None,
+            coverage: BTreeMap::new(),
+            previous_table_root: Some(table.root.page_id),
+            previous_index_roots: BTreeMap::new(),
+            table_root_changes: 0,
+            index_root_changes: 0,
+            reopens: 0,
+        }
+    }
+
+    fn connection(&mut self) -> &mut Connection {
+        self.connection.as_mut().expect("model connection is open")
+    }
+
+    fn next_entropy(&mut self) -> u64 {
+        let mut value = self.entropy;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.entropy = value;
+        value
+    }
+
+    fn record(&mut self, name: &'static str, expected: Vec<Outcome>, actual: Vec<Outcome>) {
+        *self.coverage.entry(name).or_default() += 1;
+        self.last_expected = StepResult(expected);
+        self.last_actual = StepResult(actual);
+    }
+
+    fn execute(&mut self, sql: &str) -> Outcome {
+        actual_execute(self.connection(), sql, Parameters::none())
+    }
+
+    fn usable_probe(&mut self) -> Outcome {
+        actual_query(self.connection(), "SELECT 1", Parameters::none())
+    }
+
+    fn allocate_row(&mut self, a: Option<i64>, b: i64, c: String) -> (u64, IndexModelRow) {
+        self.next_rowid += 1;
+        (self.next_rowid, IndexModelRow { a, b, c })
+    }
+
+    fn insert_sql(row: &IndexModelRow) -> String {
+        let a = row
+            .a
+            .map_or_else(|| "NULL".to_owned(), |value| value.to_string());
+        format!("INSERT INTO T VALUES ({a}, {}, '{}')", row.b, row.c)
+    }
+
+    fn insert_normal(&mut self, label: &'static str, null_a: bool, text_len: usize) {
+        if self.rows.len() >= 32 {
+            self.delete_oldest("bounded-delete");
+            return;
+        }
+        let a = if null_a {
+            None
+        } else {
+            let value = self.next_a;
+            self.next_a += 1;
+            Some(value)
+        };
+        let b = i64::try_from(self.next_entropy() % 17).expect("small deterministic value");
+        let text = if text_len == 0 {
+            format!("v{:016x}", self.next_entropy())
+        } else {
+            "x".repeat(text_len)
+        };
+        let row = IndexModelRow { a, b, c: text };
+        let sql = Self::insert_sql(&row);
+        let actual = self.execute(&sql);
+        let (rowid, row) = self.allocate_row(row.a, row.b, row.c);
+        self.rows.insert(rowid, row);
+        self.record(label, vec![Outcome::Affected(1)], vec![actual]);
+    }
+
+    fn delete_oldest(&mut self, label: &'static str) {
+        let Some((rowid, row)) = self
+            .rows
+            .iter()
+            .next()
+            .map(|(&rowid, row)| (rowid, row.clone()))
+        else {
+            self.insert_normal("insert-empty", false, 0);
+            return;
+        };
+        let predicate = row.a.map_or_else(
+            || format!("A IS NULL AND B = {} AND C = '{}'", row.b, row.c),
+            |a| format!("A = {a}"),
+        );
+        let sql = format!("DELETE FROM T WHERE {predicate}");
+        let actual = self.execute(&sql);
+        let expected_count = if row.a.is_some() {
+            self.rows
+                .values()
+                .filter(|candidate| candidate.a == row.a)
+                .count()
+        } else {
+            1
+        };
+        let remove = self
+            .rows
+            .iter()
+            .filter_map(|(&id, candidate)| {
+                ((row.a.is_some() && candidate.a == row.a) || id == rowid).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        for id in remove {
+            self.rows.remove(&id);
+        }
+        self.record(
+            label,
+            vec![Outcome::Affected(expected_count as u64)],
+            vec![actual],
+        );
+    }
+
+    fn create_index(&mut self, name: &'static str, columns: &[u16], unique: bool) {
+        if self.indexes.contains_key(name) {
+            self.update_one();
+            return;
+        }
+        let column_sql = match columns {
+            [0] => "A",
+            [1] => "B",
+            [1, 2] => "B, C",
+            _ => unreachable!(),
+        };
+        let sql = format!(
+            "CREATE {}INDEX {name} ON T ({column_sql})",
+            if unique { "UNIQUE " } else { "" }
+        );
+        let actual = self.execute(&sql);
+        self.indexes.insert(
+            name.to_owned(),
+            IndexModelDef {
+                columns: columns.to_vec(),
+                unique,
+            },
+        );
+        self.schema_version += 1;
+        self.object_counter += 1;
+        self.feature_bits = 3;
+        self.record("create-index", vec![Outcome::Affected(0)], vec![actual]);
+    }
+
+    fn drop_index(&mut self, name: &'static str) {
+        if self.indexes.remove(name).is_none() {
+            self.insert_normal("insert-instead-of-drop", false, 0);
+            return;
+        }
+        let actual = self.execute(&format!("DROP INDEX {name}"));
+        self.schema_version += 1;
+        self.record("drop-index", vec![Outcome::Affected(0)], vec![actual]);
+    }
+
+    fn update_one(&mut self) {
+        let Some((rowid, before)) = self
+            .rows
+            .iter()
+            .next()
+            .map(|(&rowid, row)| (rowid, row.clone()))
+        else {
+            self.insert_normal("insert-before-update", false, 0);
+            return;
+        };
+        let new_b = before.b + 37;
+        let new_c = format!("u{:016x}", self.next_entropy());
+        let predicate = before.a.map_or_else(
+            || format!("A IS NULL AND B = {} AND C = '{}'", before.b, before.c),
+            |a| format!("A = {a}"),
+        );
+        let actual = self.execute(&format!(
+            "UPDATE T SET B = {new_b}, C = '{new_c}' WHERE {predicate}"
+        ));
+        let expected_count = if before.a.is_some() {
+            self.rows
+                .values()
+                .filter(|candidate| candidate.a == before.a)
+                .count()
+        } else {
+            1
+        };
+        let targets = self
+            .rows
+            .iter()
+            .filter_map(|(&id, candidate)| {
+                ((before.a.is_some() && candidate.a == before.a) || id == rowid).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        for id in targets {
+            let row = self.rows.get_mut(&id).expect("selected model row");
+            row.b = new_b;
+            row.c = new_c.clone();
+        }
+        self.record(
+            "update",
+            vec![Outcome::Affected(expected_count as u64)],
+            vec![actual],
+        );
+    }
+
+    fn duplicate_error(&mut self) {
+        let Some(existing) = self.rows.values().find_map(|row| row.a) else {
+            self.insert_normal("insert-before-duplicate", false, 0);
+            return;
+        };
+        let actual = self.execute(&format!(
+            "INSERT INTO T VALUES ({existing}, 0, 'duplicate')"
+        ));
+        let probe = self.usable_probe();
+        self.record(
+            "duplicate-error",
+            vec![
+                Outcome::Error(ErrorCode::Constraint),
+                Outcome::Rows(vec![vec![Value::Int64(1)]]),
+            ],
+            vec![actual, probe],
+        );
+    }
+
+    fn oversized_error(&mut self) {
+        let actual = self.execute(&format!(
+            "INSERT INTO T VALUES ({}, 7, '{}')",
+            self.next_a,
+            "z".repeat(1014)
+        ));
+        let probe = self.usable_probe();
+        self.record(
+            "key-limit-error",
+            vec![
+                Outcome::Error(ErrorCode::ResourceLimit),
+                Outcome::Rows(vec![vec![Value::Int64(1)]]),
+            ],
+            vec![actual, probe],
+        );
+    }
+
+    fn update_conflict_error(&mut self) {
+        let values = self
+            .rows
+            .values()
+            .filter_map(|row| row.a)
+            .take(2)
+            .collect::<Vec<_>>();
+        if values.len() != 2 {
+            self.insert_normal("insert-before-conflict", false, 0);
+            return;
+        }
+        let actual = self.execute(&format!(
+            "UPDATE T SET A = {} WHERE A = {}",
+            values[0], values[1]
+        ));
+        let probe = self.usable_probe();
+        self.record(
+            "update-conflict",
+            vec![
+                Outcome::Error(ErrorCode::Constraint),
+                Outcome::Rows(vec![vec![Value::Int64(1)]]),
+            ],
+            vec![actual, probe],
+        );
+    }
+
+    fn transaction_commit(&mut self) {
+        if self.rows.len() >= 32 {
+            self.delete_oldest("bounded-delete");
+            return;
+        }
+        let a = self.next_a;
+        self.next_a += 1;
+        let row = IndexModelRow {
+            a: Some(a),
+            b: i64::try_from(self.next_entropy() % 17).unwrap(),
+            c: format!("tx-{a}"),
+        };
+        let outcomes = vec![
+            self.execute("BEGIN"),
+            self.execute(&Self::insert_sql(&row)),
+            self.usable_probe(),
+            self.execute("COMMIT"),
+        ];
+        let (rowid, row) = self.allocate_row(row.a, row.b, row.c);
+        self.rows.insert(rowid, row);
+        self.record(
+            "transaction-commit",
+            vec![
+                Outcome::Affected(0),
+                Outcome::Affected(1),
+                Outcome::Rows(vec![vec![Value::Int64(1)]]),
+                Outcome::Affected(0),
+            ],
+            outcomes,
+        );
+    }
+
+    fn transaction_rollback(&mut self) {
+        let row = IndexModelRow {
+            a: Some(self.next_a),
+            b: 99,
+            c: "rolled-back".to_owned(),
+        };
+        let outcomes = vec![
+            self.execute("BEGIN"),
+            self.execute(&Self::insert_sql(&row)),
+            self.usable_probe(),
+            self.execute("ROLLBACK"),
+        ];
+        self.record(
+            "transaction-rollback",
+            vec![
+                Outcome::Affected(0),
+                Outcome::Affected(1),
+                Outcome::Rows(vec![vec![Value::Int64(1)]]),
+                Outcome::Affected(0),
+            ],
+            outcomes,
+        );
+    }
+
+    fn transaction_error_then_commit(&mut self) {
+        let Some(existing) = self.rows.values().find_map(|row| row.a) else {
+            self.insert_normal("insert-before-transaction-error", false, 0);
+            return;
+        };
+        if self.rows.len() >= 32 {
+            self.delete_oldest("bounded-delete");
+            return;
+        }
+        let a = self.next_a;
+        self.next_a += 1;
+        let row = IndexModelRow {
+            a: Some(a),
+            b: 77,
+            c: "after-error".to_owned(),
+        };
+        let outcomes = vec![
+            self.execute("BEGIN"),
+            self.execute(&format!(
+                "INSERT INTO T VALUES ({existing}, 0, 'duplicate')"
+            )),
+            self.usable_probe(),
+            self.execute(&Self::insert_sql(&row)),
+            self.execute("COMMIT"),
+        ];
+        let (rowid, row) = self.allocate_row(row.a, row.b, row.c);
+        self.rows.insert(rowid, row);
+        self.record(
+            "transaction-error-usable",
+            vec![
+                Outcome::Affected(0),
+                Outcome::Error(ErrorCode::Constraint),
+                Outcome::Rows(vec![vec![Value::Int64(1)]]),
+                Outcome::Affected(1),
+                Outcome::Affected(0),
+            ],
+            outcomes,
+        );
+    }
+
+    fn read_probe(&mut self) {
+        let actual = self.usable_probe();
+        self.record(
+            "read-probe",
+            vec![Outcome::Rows(vec![vec![Value::Int64(1)]])],
+            vec![actual],
+        );
+    }
+
+    fn apply_next_operation(&mut self) {
+        if self.step >= 512 && self.step % 32 != 0 {
+            self.read_probe();
+            self.step += 1;
+            self.last_state = None;
+            return;
+        }
+        match self.step % 21 {
+            0 => self.create_index("IX_T_B", &[1], false),
+            1 => self.create_index("UX_T_A", &[0], true),
+            2 => self.create_index("IX_T_BC", &[1, 2], false),
+            3 => self.insert_normal("insert", false, 0),
+            4 => self.insert_normal("insert-null", true, 0),
+            5 => self.update_one(),
+            6 => self.delete_oldest("delete"),
+            7 => self.transaction_commit(),
+            8 => self.transaction_rollback(),
+            9 => self.duplicate_error(),
+            10 => self.oversized_error(),
+            11 => self.insert_normal("key-limit-boundary", false, 980),
+            12 => self.update_conflict_error(),
+            13 => self.transaction_error_then_commit(),
+            14 => self.drop_index("IX_T_B"),
+            15 => self.create_index("IX_T_B", &[1], false),
+            16 => self.drop_index("IX_T_BC"),
+            17 => self.create_index("IX_T_BC", &[1, 2], false),
+            18 => self.drop_index("UX_T_A"),
+            19 => self.create_index("UX_T_A", &[0], true),
+            20 => self.insert_normal("insert-split-pressure", false, 96),
+            _ => unreachable!(),
+        }
+        self.step += 1;
+        self.last_state = None;
+    }
+
+    fn assert_rows_affected_and_error_class(&self) {
+        assert_eq!(
+            self.last_actual, self.last_expected,
+            "step={} seed-state={:#x}",
+            self.step, self.entropy
+        );
+    }
+
+    fn expected_rows(&self) -> Vec<Vec<Value>> {
+        self.rows.values().map(IndexModelRow::values).collect()
+    }
+
+    fn assert_visible_rows_match_database(&mut self) {
+        let actual = actual_query(
+            self.connection(),
+            "SELECT A, B, C FROM T",
+            Parameters::none(),
+        );
+        assert_eq!(
+            actual,
+            Outcome::Rows(self.expected_rows()),
+            "step={}",
+            self.step
+        );
+        let state = self.capture();
+        let table = state.tables.get("T").expect("model table remains visible");
+        assert_eq!(
+            table.schema_version, self.schema_version,
+            "step={}",
+            self.step
+        );
+        assert_eq!(
+            state.object_counter, self.object_counter,
+            "step={}",
+            self.step
+        );
+        assert_eq!(state.feature_bits, self.feature_bits, "step={}", self.step);
+        let physical_rows = table
+            .rows
+            .iter()
+            .map(|(rowid, values)| (*rowid, values.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let expected = self
+            .rows
+            .iter()
+            .map(|(&rowid, row)| (rowid, row.values()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(physical_rows, expected, "step={}", self.step);
+        if self.previous_table_root.replace(table.root.page_id) != Some(table.root.page_id) {
+            self.table_root_changes += 1;
+        }
+        self.last_state = Some(state);
+    }
+
+    fn capture(&self) -> Phase4c2aStorageState {
+        phase_4c2a_model_state(
+            self.pager.as_ref().expect("model pager is open"),
+            self.temp.path(),
+        )
+        .expect("capture fixed-seed indexed state")
+    }
+
+    fn assert_each_row_has_one_entry_per_index(&mut self) {
+        let state = self
+            .last_state
+            .clone()
+            .expect("visible-row assertion captures this step's physical state");
+        assert_eq!(
+            state.indexes.keys().collect::<Vec<_>>(),
+            self.indexes.keys().collect::<Vec<_>>(),
+            "step={}",
+            self.step
+        );
+        for (name, expected_index) in &self.indexes {
+            let actual = &state.indexes[name];
+            assert_eq!(
+                actual.unique, expected_index.unique,
+                "{name} step={}",
+                self.step
+            );
+            assert_eq!(
+                actual.column_ordinals, expected_index.columns,
+                "{name} step={}",
+                self.step
+            );
+            assert_eq!(
+                actual.entries.len(),
+                self.rows.len(),
+                "{name} step={}",
+                self.step
+            );
+            if self
+                .previous_index_roots
+                .insert(name.clone(), actual.root.page_id)
+                .is_some_and(|previous| previous != actual.root.page_id)
+            {
+                self.index_root_changes += 1;
+            }
+        }
+        self.previous_index_roots
+            .retain(|name, _| self.indexes.contains_key(name));
+    }
+
+    fn assert_each_entry_names_one_visible_row(&self) {
+        let state = self
+            .last_state
+            .as_ref()
+            .expect("visible-row assertion captures this step's physical state");
+        for (name, definition) in &self.indexes {
+            let mut seen = BTreeSet::new();
+            for entry in &state.indexes[name].entries {
+                assert!(!entry.physical.is_empty(), "{name} empty physical key");
+                assert!(
+                    seen.insert(entry.rowid),
+                    "{name} duplicate ROWID {}",
+                    entry.rowid
+                );
+                let row = self.rows.get(&entry.rowid).unwrap_or_else(|| {
+                    panic!("{name} entry names invisible ROWID {}", entry.rowid)
+                });
+                let values = row.values();
+                let logical = definition
+                    .columns
+                    .iter()
+                    .map(|&ordinal| values[usize::from(ordinal)].clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(entry.logical, logical, "{name} ROWID {}", entry.rowid);
+            }
+            assert_eq!(seen, self.rows.keys().copied().collect(), "{name}");
+        }
+    }
+
+    fn reopen_and_recheck(&mut self) {
+        phase_4c2a_checkpoint(self.pager.as_ref().expect("model pager is open"))
+            .expect("checkpoint fixed-seed model before reopen");
+        self.last_state = None;
+        let before = phase_4c2a_pager_state(
+            self.pager.as_ref().expect("model pager is open"),
+            self.temp.path(),
+        )
+        .expect("deep-validate fixed-seed model before reopen");
+        drop(self.connection.take());
+        drop(self.pager.take());
+        let pager = phase_4c2a_open_pager(self.temp.path()).expect("reopen fixed-seed model");
+        let after =
+            phase_4c2a_pager_state(&pager, self.temp.path()).expect("capture reopened model");
+        assert_eq!(
+            after, before,
+            "reopen changed fixed-seed state at step {}",
+            self.step
+        );
+        self.connection = Some(Connection::from_test_pager(pager.clone()));
+        self.pager = Some(pager);
+        self.last_state = None;
+        self.reopens += 1;
+        self.assert_visible_rows_match_database();
+        self.assert_each_row_has_one_entry_per_index();
+        self.assert_each_entry_names_one_visible_row();
+    }
+
+    fn finish(&self) {
+        for required in [
+            "create-index",
+            "drop-index",
+            "insert",
+            "insert-null",
+            "update",
+            "delete",
+            "transaction-commit",
+            "transaction-rollback",
+            "transaction-error-usable",
+            "duplicate-error",
+            "update-conflict",
+            "key-limit-error",
+            "key-limit-boundary",
+            "insert-split-pressure",
+            "read-probe",
+        ] {
+            assert!(
+                self.coverage.get(required).copied().unwrap_or(0) > 0,
+                "missing {required}"
+            );
+        }
+        assert!(
+            self.table_root_changes > 0,
+            "table root never changed under split pressure"
+        );
+        assert!(
+            self.index_root_changes > 0,
+            "index root never changed under split pressure"
+        );
+        eprintln!(
+            "phase4c2a fixed-seed model: steps={} rows={} coverage={:?} table_root_changes={} index_root_changes={} reopens={}",
+            self.step,
+            self.rows.len(),
+            self.coverage,
+            self.table_root_changes,
+            self.index_root_changes,
+            self.reopens,
+        );
+    }
+}
+
+#[test]
+#[ignore = "run by the dedicated Phase 4C2-A CI job"]
+fn phase_4c2a_fixed_seed_index_model() {
+    let mut model = IndexReferenceModel::new(0x4c2a_2026_0918);
+    for step in 0..25_000 {
+        model.apply_next_operation();
+        model.assert_rows_affected_and_error_class();
+        model.assert_visible_rows_match_database();
+        model.assert_each_row_has_one_entry_per_index();
+        model.assert_each_entry_names_one_visible_row();
+        if step % 251 == 0 {
+            model.reopen_and_recheck();
+        }
+        if step > 0 && step % 250 == 0 {
+            eprintln!("phase4c2a fixed-seed progress: {step}/25000");
+        }
+    }
+    model.finish();
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase4c2aCrashScenario {
+    CreateOrdinary,
+    CreateUnique,
+    InsertTwoIndexes,
+    UpdateSplitTableAndIndexRoots,
+    DeleteAndCollapseIndexRoot,
+    DropIndex,
+    DropTableWithIndexes,
+}
+
+impl Phase4c2aCrashScenario {
+    const ALL: [Self; 7] = [
+        Self::CreateOrdinary,
+        Self::CreateUnique,
+        Self::InsertTwoIndexes,
+        Self::UpdateSplitTableAndIndexRoots,
+        Self::DeleteAndCollapseIndexRoot,
+        Self::DropIndex,
+        Self::DropTableWithIndexes,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::CreateOrdinary => "create-ordinary",
+            Self::CreateUnique => "create-unique",
+            Self::InsertTwoIndexes => "insert-two-indexes",
+            Self::UpdateSplitTableAndIndexRoots => "update-split-table-index-roots",
+            Self::DeleteAndCollapseIndexRoot => "delete-collapse-index-root",
+            Self::DropIndex => "drop-index",
+            Self::DropTableWithIndexes => "drop-table-with-indexes",
+        }
+    }
+
+    const fn operation(self) -> &'static [&'static str] {
+        match self {
+            Self::CreateOrdinary => &["CREATE INDEX IX_T_B ON T (B)"],
+            Self::CreateUnique => &["CREATE UNIQUE INDEX UX_T_A ON T (A)"],
+            Self::InsertTwoIndexes => &["INSERT INTO T VALUES (200, 'two-indexes', 200)"],
+            Self::UpdateSplitTableAndIndexRoots => {
+                &["UPDATE T SET B = 'changed-changed-changed-changed-changed-changed'"]
+            }
+            Self::DeleteAndCollapseIndexRoot => &["DELETE FROM T WHERE A < 95"],
+            Self::DropIndex => &["DROP INDEX IX_T_B"],
+            Self::DropTableWithIndexes => &["DROP TABLE T"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase4c2aFaultFamily {
+    CatalogPageFrame,
+    TablePageFrame,
+    IndexPageFrame,
+    CommitRecord,
+    WalSync,
+    Publication,
+    MainSync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Phase4c2aFaultTarget {
+    family: Phase4c2aFaultFamily,
+    point: FaultPoint,
+    occurrence: usize,
+}
+
+const PHASE4C2A_CRASH_CHILD: &str = "sql::exec::test_support::phase_4c2a_index_crash_child";
+const PHASE4C2A_PATH_ENV: &str = "ORA_SQLLITE_PHASE4C2A_PATH";
+const PHASE4C2A_SCENARIO_ENV: &str = "ORA_SQLLITE_PHASE4C2A_SCENARIO";
+const PHASE4C2A_POINT_ENV: &str = "ORA_SQLLITE_PHASE4C2A_POINT";
+const PHASE4C2A_OCCURRENCE_ENV: &str = "ORA_SQLLITE_PHASE4C2A_OCCURRENCE";
+const PHASE4C2A_TRACE_ENV: &str = "ORA_SQLLITE_PHASE4C2A_TRACE";
+
+fn phase4c2a_execute_statements(pager: Pager, statements: &[&str]) {
+    run_sql_crash_program(pager, statements);
+}
+
+fn phase4c2a_fixture(scenario: Phase4c2aCrashScenario) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c2a-crash-fixture");
+    let pager = phase_4c2a_create_pager(&temp);
+    let mut connection = Connection::from_test_pager(pager.clone());
+    for sql in ["CREATE TABLE T (A INT64, B TEXT, C INT64)"] {
+        assert_eq!(
+            actual_execute(&mut connection, sql, Parameters::none()),
+            Outcome::Affected(0)
+        );
+    }
+    let row_count = match scenario {
+        Phase4c2aCrashScenario::UpdateSplitTableAndIndexRoots
+        | Phase4c2aCrashScenario::DeleteAndCollapseIndexRoot => 96,
+        _ => 12,
+    };
+    assert_eq!(
+        actual_execute(&mut connection, "BEGIN", Parameters::none()),
+        Outcome::Affected(0)
+    );
+    for value in 0..row_count {
+        let sql = format!(
+            "INSERT INTO T VALUES ({value}, '{}', {})",
+            "x".repeat(96),
+            row_count - value
+        );
+        assert_eq!(
+            actual_execute(&mut connection, &sql, Parameters::none()),
+            Outcome::Affected(1)
+        );
+    }
+    assert_eq!(
+        actual_execute(&mut connection, "COMMIT", Parameters::none()),
+        Outcome::Affected(0)
+    );
+    let setup_indexes: &[&str] = match scenario {
+        Phase4c2aCrashScenario::CreateOrdinary | Phase4c2aCrashScenario::CreateUnique => &[],
+        Phase4c2aCrashScenario::InsertTwoIndexes => &[
+            "CREATE UNIQUE INDEX UX_T_A ON T (A)",
+            "CREATE INDEX IX_T_B ON T (B)",
+        ],
+        Phase4c2aCrashScenario::UpdateSplitTableAndIndexRoots
+        | Phase4c2aCrashScenario::DeleteAndCollapseIndexRoot
+        | Phase4c2aCrashScenario::DropTableWithIndexes => &[
+            "CREATE UNIQUE INDEX UX_T_A ON T (A)",
+            "CREATE INDEX IX_T_B ON T (B)",
+            "CREATE INDEX IX_T_C ON T (C)",
+        ],
+        Phase4c2aCrashScenario::DropIndex => &["CREATE INDEX IX_T_B ON T (B)"],
+    };
+    for &sql in setup_indexes {
+        assert_eq!(
+            actual_execute(&mut connection, sql, Parameters::none()),
+            Outcome::Affected(0)
+        );
+    }
+    drop(connection);
+    phase_4c2a_checkpoint(&pager).expect("checkpoint crash fixture pre-state");
+    phase_4c2a_pager_state(&pager, temp.path()).expect("deep-valid crash fixture pre-state");
+    drop(pager);
+    temp
+}
+
+fn phase4c2a_wal_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push("-wal");
+    PathBuf::from(value)
+}
+
+fn phase4c2a_trace(
+    fixture: &TempDatabase,
+    scenario: Phase4c2aCrashScenario,
+) -> (
+    Vec<FaultPoint>,
+    Vec<Phase4c2aWalRecord>,
+    Phase4c2aStorageState,
+    Phase4c2aStorageState,
+) {
+    let pre_pager = phase_4c2a_open_pager(fixture.path()).expect("open crash pre-state");
+    let pre = phase_4c2a_pager_state(&pre_pager, fixture.path()).expect("capture crash pre-state");
+    drop(pre_pager);
+    let trace_copy = phase_4c1_copy_crash_pair(fixture.path());
+    let wal_start = fs::metadata(phase4c2a_wal_path(trace_copy.path()))
+        .expect("read trace WAL length")
+        .len();
+    let (pager, faults) = phase_4c1_recording_crash_pager(trace_copy.path());
+    phase4c2a_execute_statements(pager.clone(), scenario.operation());
+    let records = phase_4c2a_wal_records(trace_copy.path(), wal_start)
+        .expect("decode successful Phase 4C2-A transaction records");
+    phase_4c2a_checkpoint(&pager).expect("checkpoint successful crash trace");
+    let trace = faults.observed();
+    let publish_end = trace
+        .iter()
+        .position(|&point| point == FaultPoint::AfterWalPublish)
+        .expect("trace publishes SQL commit");
+    assert_commit_trace(&trace[..=publish_end]);
+    assert_eq!(
+        records.len(),
+        trace[..=publish_end]
+            .iter()
+            .filter(|&&point| point == FaultPoint::AfterWalRecordWrite)
+            .count(),
+        "one trace quartet per WAL record"
+    );
+    let post = phase_4c2a_pager_state(&pager, trace_copy.path()).expect("capture crash post-state");
+    assert_eq!(post.lsn, pre.lsn + 1, "{} commits once", scenario.name());
+    assert_ne!(post, pre, "{} changes captured state", scenario.name());
+    drop(faults);
+    drop(pager);
+    (trace, records, pre, post)
+}
+
+fn phase4c2a_page_family(
+    page_id: u64,
+    pre: &Phase4c2aStorageState,
+    post: &Phase4c2aStorageState,
+) -> Option<Phase4c2aFaultFamily> {
+    if pre.catalog_pages.contains(&page_id) || post.catalog_pages.contains(&page_id) {
+        Some(Phase4c2aFaultFamily::CatalogPageFrame)
+    } else if pre.table_pages.contains(&page_id) || post.table_pages.contains(&page_id) {
+        Some(Phase4c2aFaultFamily::TablePageFrame)
+    } else if pre.index_pages.contains(&page_id) || post.index_pages.contains(&page_id) {
+        Some(Phase4c2aFaultFamily::IndexPageFrame)
+    } else {
+        None
+    }
+}
+
+fn phase4c2a_fault_targets(
+    trace: &[FaultPoint],
+    records: &[Phase4c2aWalRecord],
+    pre: &Phase4c2aStorageState,
+    post: &Phase4c2aStorageState,
+) -> Vec<Phase4c2aFaultTarget> {
+    let mut targets = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let family = match record {
+            Phase4c2aWalRecord::PageFrame(page_id) => phase4c2a_page_family(*page_id, pre, post),
+            Phase4c2aWalRecord::Commit => Some(Phase4c2aFaultFamily::CommitRecord),
+        };
+        if let Some(family) = family {
+            for point in [
+                FaultPoint::AfterWalRecordHeaderPrefixWrite,
+                FaultPoint::AfterWalRecordPayloadPrefixWrite,
+                FaultPoint::AfterWalRecordWrite,
+            ] {
+                targets.push(Phase4c2aFaultTarget {
+                    family,
+                    point,
+                    occurrence: index + 1,
+                });
+            }
+        }
+    }
+    for (family, points) in [
+        (
+            Phase4c2aFaultFamily::WalSync,
+            &[FaultPoint::BeforeWalSync, FaultPoint::AfterWalSync][..],
+        ),
+        (
+            Phase4c2aFaultFamily::Publication,
+            &[FaultPoint::BeforeWalPublish, FaultPoint::AfterWalPublish][..],
+        ),
+        (
+            Phase4c2aFaultFamily::MainSync,
+            &[
+                FaultPoint::BeforeMainPageWrite,
+                FaultPoint::AfterMainPageWrite,
+                FaultPoint::BeforeMainSync,
+                FaultPoint::AfterMainSync,
+                FaultPoint::BeforeSuperblockWrite,
+                FaultPoint::AfterSuperblockWrite,
+            ][..],
+        ),
+    ] {
+        for &point in points {
+            let count = trace.iter().filter(|&&seen| seen == point).count();
+            for occurrence in 1..=count {
+                targets.push(Phase4c2aFaultTarget {
+                    family,
+                    point,
+                    occurrence,
+                });
+            }
+        }
+    }
+    targets
+}
+
+fn phase4c2a_run_child(
+    fixture: &TempDatabase,
+    scenario: Phase4c2aCrashScenario,
+    trace: &[FaultPoint],
+    target: Phase4c2aFaultTarget,
+) -> TempDatabase {
+    let crash_copy = phase_4c1_copy_crash_pair(fixture.path());
+    let path = fs::canonicalize(crash_copy.path()).expect("canonical Phase 4C2-A crash path");
+    let marker = format!("PHASE4C2A_ABORT {}", scenario.name());
+    let mut command = phase_4c1_exact_crash_child_command(PHASE4C2A_CRASH_CHILD);
+    command
+        .env(PHASE4C2A_PATH_ENV, &path)
+        .env(PHASE4C2A_SCENARIO_ENV, scenario.name())
+        .env(PHASE4C2A_POINT_ENV, format!("{:?}", target.point))
+        .env(PHASE4C2A_OCCURRENCE_ENV, target.occurrence.to_string())
+        .env(
+            PHASE4C2A_TRACE_ENV,
+            trace
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    let output = command
+        .output()
+        .expect("synchronously reap Phase 4C2-A crash child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("running 1 test"),
+        "exact child did not run: {stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| { line == format!("{marker} {:?} {}", target.point, target.occurrence) }),
+        "wrong Phase 4C2-A child marker: {stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(6),
+            "child must die from SIGABRT"
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        output.status.code(),
+        Some(-1_073_740_791),
+        "child must die from Windows abort fast-fail 0xC0000409"
+    );
+    crash_copy
+}
+
+fn phase4c2a_recover_case(
+    crash_copy: TempDatabase,
+    scenario: Phase4c2aCrashScenario,
+    target: Phase4c2aFaultTarget,
+    pre: &Phase4c2aStorageState,
+    post: &Phase4c2aStorageState,
+) {
+    let path = fs::canonicalize(crash_copy.path()).expect("canonical recovered crash path");
+    let (accepted_lsn, recovered) = phase_4c2a_recover_and_capture(&path).unwrap_or_else(|error| {
+        panic!("{} {:?}: recovery failed: {error}", scenario.name(), target)
+    });
+    let expected = if accepted_lsn == post.lsn {
+        post
+    } else {
+        assert_eq!(
+            accepted_lsn, pre.lsn,
+            "accepted neither complete pre nor post Commit"
+        );
+        pre
+    };
+    assert_eq!(
+        &recovered,
+        expected,
+        "{} {:?}/{}, family={:?} tore catalog/table/index/freelist/file state",
+        scenario.name(),
+        target.point,
+        target.occurrence,
+        target.family
+    );
+    let (repeat_lsn, repeat) =
+        phase_4c2a_recover_and_capture(&path).expect("repeat Phase 4C2-A recovery succeeds");
+    assert_eq!(repeat_lsn, accepted_lsn, "repeat acceptance changed LSN");
+    assert_eq!(repeat, recovered, "repeat recovery changed state");
+    phase_4c2a_remove_recovered_files(&path);
+    drop(crash_copy);
+}
+
+fn phase4c2a_assert_corrupt_complete_candidate_is_not_hidden() {
+    let temp = TempDatabase::new("phase4c2a-committed-corrupt");
+    let pager = phase_4c2a_create_pager(&temp);
+    let mut connection = Connection::from_test_pager(pager.clone());
+    for sql in [
+        "CREATE TABLE T (A INT64)",
+        "INSERT INTO T VALUES (1)",
+        "CREATE INDEX IX_CORRUPT ON T (A)",
+    ] {
+        assert!(matches!(
+            actual_execute(&mut connection, sql, Parameters::none()),
+            Outcome::Affected(_)
+        ));
+    }
+    drop(connection);
+    let before = phase_4c2a_pager_state(&pager, temp.path()).unwrap().lsn;
+    phase_4c2a_commit_malformed_index(&pager, "IX_CORRUPT")
+        .expect("commit complete malformed index candidate");
+    assert_eq!(
+        phase_4c2a_pager_state(&pager, temp.path())
+            .expect_err("live deep validation must reject malformed index")
+            .code(),
+        ErrorCode::Corruption
+    );
+    drop(pager);
+    let error = match phase_4c2a_open_pager(temp.path()) {
+        Ok(_) => panic!("recovery hid committed malformed index behind LSN {before}"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), ErrorCode::Corruption);
+}
+
+#[test]
+fn phase_4c2a_committed_corrupt_index_candidate_is_not_hidden() {
+    // Production break caught: recovery must reject the newest complete Commit
+    // when its catalog-reachable index entry is malformed, never publish the
+    // older valid indexed commit as a silent fallback.
+    phase4c2a_assert_corrupt_complete_candidate_is_not_hidden();
+}
+
+fn phase4c2a_run_crash_matrix() {
+    let mut family_counts = BTreeMap::<Phase4c2aFaultFamily, usize>::new();
+    let mut scenarios = 0usize;
+    let mut crashes = 0usize;
+    for scenario in Phase4c2aCrashScenario::ALL {
+        let fixture = phase4c2a_fixture(scenario);
+        let (trace, records, pre, post) = phase4c2a_trace(&fixture, scenario);
+        let targets = phase4c2a_fault_targets(&trace, &records, &pre, &post);
+        assert!(
+            !targets.is_empty(),
+            "{} has no crash targets",
+            scenario.name()
+        );
+        for target in targets {
+            let crash_copy = phase4c2a_run_child(&fixture, scenario, &trace, target);
+            phase4c2a_recover_case(crash_copy, scenario, target, &pre, &post);
+            *family_counts.entry(target.family).or_default() += 1;
+            crashes += 1;
+        }
+        scenarios += 1;
+        eprintln!(
+            "phase4c2a crash progress: scenario={} scenarios={} crashes={} family_counts={family_counts:?}",
+            scenario.name(),
+            scenarios,
+            crashes
+        );
+    }
+    for family in [
+        Phase4c2aFaultFamily::CatalogPageFrame,
+        Phase4c2aFaultFamily::TablePageFrame,
+        Phase4c2aFaultFamily::IndexPageFrame,
+        Phase4c2aFaultFamily::CommitRecord,
+        Phase4c2aFaultFamily::WalSync,
+        Phase4c2aFaultFamily::Publication,
+        Phase4c2aFaultFamily::MainSync,
+    ] {
+        assert!(
+            family_counts.get(&family).copied().unwrap_or(0) > 0,
+            "unobserved {family:?}"
+        );
+    }
+    phase4c2a_assert_corrupt_complete_candidate_is_not_hidden();
+    eprintln!(
+        "phase4c2a index crash matrix: scenarios={scenarios} crashes={crashes} family_counts={family_counts:?}; all recovered exactly old or new"
+    );
+}
+
+#[test]
+#[ignore = "only launched with validated parameters by phase_4c2a_index_crash_recovery_matrix"]
+fn phase_4c2a_index_crash_child() {
+    let path = PathBuf::from(
+        std::env::var_os(PHASE4C2A_PATH_ENV)
+            .expect("invalid Phase 4C2-A crash configuration: missing path"),
+    );
+    let scenario_name =
+        std::env::var(PHASE4C2A_SCENARIO_ENV).expect("invalid Phase 4C2-A crash scenario");
+    let scenario = Phase4c2aCrashScenario::ALL
+        .into_iter()
+        .find(|scenario| scenario.name() == scenario_name)
+        .expect("invalid Phase 4C2-A crash scenario");
+    let point = parse_sql_fault_point(
+        &std::env::var(PHASE4C2A_POINT_ENV).expect("invalid Phase 4C2-A crash point"),
+    )
+    .expect("invalid Phase 4C2-A crash point");
+    let occurrence_text =
+        std::env::var(PHASE4C2A_OCCURRENCE_ENV).expect("invalid Phase 4C2-A crash occurrence");
+    let occurrence: usize = occurrence_text
+        .parse()
+        .expect("invalid Phase 4C2-A crash occurrence");
+    assert!(occurrence > 0 && occurrence_text == occurrence.to_string());
+    let trace = std::env::var(PHASE4C2A_TRACE_ENV)
+        .expect("invalid Phase 4C2-A crash trace")
+        .split(',')
+        .map(|name| parse_sql_fault_point(name).expect("invalid Phase 4C2-A trace point"))
+        .collect::<Vec<_>>();
+    assert!(trace.iter().filter(|&&seen| seen == point).count() >= occurrence);
+    let path = phase_4c1_validate_crash_path(path, Phase4c1CrashPathKind::Sql);
+    let pager = phase_4c1_aborting_crash_pager(
+        &path,
+        trace,
+        point,
+        occurrence,
+        format!("PHASE4C2A_ABORT {}", scenario.name()),
+    );
+    phase4c2a_execute_statements(pager.clone(), scenario.operation());
+    phase_4c2a_checkpoint(&pager).expect("checkpoint Phase 4C2-A crash child");
+    panic!("configured Phase 4C2-A crash point was not reached");
+}
+
+#[test]
+#[ignore = "run by the dedicated Phase 4C2-A CI job"]
+fn phase_4c2a_index_crash_recovery_matrix() {
+    phase4c2a_run_crash_matrix();
 }
 
 fn collect_public_rows(rows: &mut crate::Rows<'_>) -> Vec<Vec<Value>> {

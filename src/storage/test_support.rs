@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{ErrorKind, Write},
     ops::Bound,
@@ -28,7 +28,9 @@ use super::{
     },
     checksum::stamp_page_checksum,
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
+    freelist::Freelist,
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
+    index::key::IndexKeyCodec,
     page::{PageFrame, PageType},
     pager::PageSource,
     relation::Relation,
@@ -1515,6 +1517,414 @@ pub(crate) fn phase_4c1_sql_storage_state(path: &Path) -> Phase4c1SqlStorageStat
         next_rowid,
         rows,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Phase4c2aPageRef {
+    pub(crate) page_id: u64,
+    pub(crate) generation: u64,
+}
+
+impl From<PageRef> for Phase4c2aPageRef {
+    fn from(reference: PageRef) -> Self {
+        Self {
+            page_id: reference.page_id().0,
+            generation: reference.generation(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aTableState {
+    pub(crate) id: u64,
+    pub(crate) schema_version: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) next_rowid: u64,
+    pub(crate) rows: Vec<(u64, Vec<Value>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aIndexEntry {
+    pub(crate) physical: Vec<u8>,
+    pub(crate) logical: Vec<Value>,
+    pub(crate) rowid: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aIndexState {
+    pub(crate) id: u64,
+    pub(crate) table_id: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) unique: bool,
+    pub(crate) column_ordinals: Vec<u16>,
+    pub(crate) entries: Vec<Phase4c2aIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Phase4c2aFreelistTrunk {
+    pub(crate) reference: Phase4c2aPageRef,
+    pub(crate) leaves: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aStorageState {
+    pub(crate) lsn: u64,
+    pub(crate) feature_bits: u64,
+    pub(crate) object_counter: u64,
+    pub(crate) catalog_root: Option<Phase4c2aPageRef>,
+    pub(crate) catalog_records: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) tables: BTreeMap<String, Phase4c2aTableState>,
+    pub(crate) indexes: BTreeMap<String, Phase4c2aIndexState>,
+    pub(crate) page_count: u64,
+    pub(crate) freelist_root: u64,
+    pub(crate) freelist: Vec<Phase4c2aFreelistTrunk>,
+    pub(crate) catalog_pages: BTreeSet<u64>,
+    pub(crate) table_pages: BTreeSet<u64>,
+    pub(crate) index_pages: BTreeSet<u64>,
+    pub(crate) main_file_len: u64,
+    pub(crate) wal_file_len: u64,
+}
+
+pub(crate) fn phase_4c2a_create_pager(temp: &TempDatabase) -> Pager {
+    Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create Phase 4C2-A pager")
+}
+
+pub(crate) fn phase_4c2a_open_pager(path: &Path) -> Result<Pager> {
+    Pager::open(path, OpenMode::ReadWrite, PagerConfig::test_default(4096))
+}
+
+pub(crate) fn phase_4c2a_checkpoint(pager: &Pager) -> Result<()> {
+    pager.checkpoint().map(|_| ())
+}
+
+pub(crate) fn phase_4c2a_pager_state(pager: &Pager, path: &Path) -> Result<Phase4c2aStorageState> {
+    phase4c2a_pager_state_inner(pager, path, true)
+}
+
+pub(crate) fn phase_4c2a_model_state(pager: &Pager, path: &Path) -> Result<Phase4c2aStorageState> {
+    phase4c2a_pager_state_inner(pager, path, false)
+}
+
+fn phase4c2a_pager_state_inner(
+    pager: &Pager,
+    path: &Path,
+    deep: bool,
+) -> Result<Phase4c2aStorageState> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    if deep {
+        catalog.validate_deep(&mut snapshot)?;
+    }
+    let catalog_tree = snapshot.catalog_tree(TreeKind::Table)?;
+    let catalog_records = match &catalog_tree {
+        Some(tree) => collect_all(tree, &mut snapshot)?.into_iter().collect(),
+        None => BTreeMap::new(),
+    };
+    let object_counter = match catalog_records.get(&vec![0x00]) {
+        Some(value) => phase4c2a_object_counter(value)?,
+        None if catalog_records.is_empty() => 1,
+        None => {
+            return Err(DbError::new(
+                ErrorCode::Corruption,
+                "Phase 4C2-A state is missing catalog meta",
+            ));
+        }
+    };
+
+    let mut table_defs = Vec::new();
+    let mut index_defs = Vec::new();
+    for key in catalog_records.keys() {
+        if key.len() != 9 {
+            continue;
+        }
+        let id = u64::from_be_bytes(key[1..].try_into().expect("checked catalog key length"));
+        match key[0] {
+            0x11 => table_defs.push(
+                catalog
+                    .find_table_by_id(TableId::new(id)?)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::Corruption, "table definition is not decoded")
+                    })?,
+            ),
+            0x21 => index_defs.push(
+                catalog
+                    .find_index_by_id(IndexId::new(id)?)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::Corruption, "index definition is not decoded")
+                    })?,
+            ),
+            _ => {}
+        }
+    }
+
+    let mut catalog_pages = BTreeSet::new();
+    if deep {
+        if let Some(tree) = &catalog_tree {
+            catalog_pages.extend(
+                validate_tree(&mut snapshot, tree)?
+                    .all_live_pages()
+                    .into_iter()
+                    .map(|page| page.0),
+            );
+        }
+    }
+    let mut table_pages = BTreeSet::new();
+    let mut tables = BTreeMap::new();
+    for table in table_defs {
+        if deep {
+            table_pages.extend(
+                validate_tree(
+                    &mut snapshot,
+                    &BTree::from_root(TreeKind::Table, table.root()),
+                )?
+                .all_live_pages()
+                .into_iter()
+                .map(|page| page.0),
+            );
+        }
+        let relation = Relation::open(&catalog, table.id())?;
+        let mut scan = relation.scan(PHASE_4A_MAX_ROW);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_snapshot(&mut snapshot)? {
+            rows.push((row.rowid().get(), row.values().to_vec()));
+        }
+        tables.insert(
+            table.name().as_str().to_owned(),
+            Phase4c2aTableState {
+                id: table.id().get(),
+                schema_version: table.schema_version().get(),
+                root: table.root().into(),
+                next_rowid: table.next_rowid().get(),
+                rows,
+            },
+        );
+    }
+
+    let mut index_pages = BTreeSet::new();
+    let mut indexes = BTreeMap::new();
+    for index in index_defs {
+        if deep {
+            index_pages.extend(
+                validate_tree(
+                    &mut snapshot,
+                    &BTree::from_root(TreeKind::Index, index.root()),
+                )?
+                .all_live_pages()
+                .into_iter()
+                .map(|page| page.0),
+            );
+        }
+        let columns = catalog
+            .columns_for_index(index.id())
+            .cloned()
+            .collect::<Vec<_>>();
+        let column_ordinals = columns.iter().map(ColumnDef::ordinal).collect();
+        let tree = BTree::from_root(TreeKind::Index, index.root());
+        let mut cursor = tree.scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)?;
+        let mut entries = Vec::new();
+        while let Some((physical, value)) = cursor.next()? {
+            if !value.is_empty() {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "Phase 4C2-A index leaf value is nonempty",
+                ));
+            }
+            let decoded = IndexKeyCodec::decode(&columns, &physical)?;
+            entries.push(Phase4c2aIndexEntry {
+                physical,
+                logical: decoded.values().to_vec(),
+                rowid: decoded.rowid().get(),
+            });
+        }
+        indexes.insert(
+            index.name().as_str().to_owned(),
+            Phase4c2aIndexState {
+                id: index.id().get(),
+                table_id: index.table_id().get(),
+                root: index.root().into(),
+                unique: index.unique(),
+                column_ordinals,
+                entries,
+            },
+        );
+    }
+
+    let freelist_root = snapshot.freelist_root()?.0;
+    let mut freelist = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut next = (freelist_root != 0).then_some(PageId(freelist_root));
+    while let Some(page_id) = next {
+        if !seen.insert(page_id) {
+            return Err(DbError::new(
+                ErrorCode::Corruption,
+                "Phase 4C2-A freelist has a cycle",
+            ));
+        }
+        let frame = snapshot.read_page_by_id(page_id)?;
+        let trunk = Freelist::decode(&frame)?;
+        freelist.push(Phase4c2aFreelistTrunk {
+            reference: Phase4c2aPageRef {
+                page_id: page_id.0,
+                generation: frame.header().generation(),
+            },
+            leaves: trunk.leaves().iter().map(|page| page.0).collect(),
+        });
+        next = trunk.next().map(PageRef::page_id);
+    }
+
+    let main_file_len = fs::metadata(path)
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("read main length: {error}")))?
+        .len();
+    let wal_file_len = fs::metadata(wal_path(path))
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("read WAL length: {error}")))?
+        .len();
+    Ok(Phase4c2aStorageState {
+        lsn: snapshot.lsn().0,
+        feature_bits: snapshot.feature_bits(),
+        object_counter,
+        catalog_root: catalog_tree.map(|tree| tree.root().into()),
+        catalog_records,
+        tables,
+        indexes,
+        page_count: snapshot.page_count()?,
+        freelist_root,
+        freelist,
+        catalog_pages,
+        table_pages,
+        index_pages,
+        main_file_len,
+        wal_file_len,
+    })
+}
+
+fn phase4c2a_object_counter(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 20 || bytes[0] != 0 || bytes[1] != 1 || bytes[8..10] != [1, 0] {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            "Phase 4C2-A catalog meta has an unexpected validated layout",
+        ));
+    }
+    Ok(u64::from_le_bytes(
+        bytes[12..20]
+            .try_into()
+            .expect("validated catalog counter length"),
+    ))
+}
+
+pub(crate) fn phase_4c2a_recovered_lsn(path: &Path) -> Result<u64> {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadOnly, DEFAULT_MAX_DATABASE_BYTES)?;
+    let header = file.header();
+    let mut wal = Wal::open(path, &header, OpenMode::ReadOnly)?;
+    wal.recover(&header, OpenMode::ReadOnly)
+        .map(|recovery| recovery.latest_lsn.0)
+}
+
+pub(crate) fn phase_4c2a_recover_and_capture(path: &Path) -> Result<(u64, Phase4c2aStorageState)> {
+    let accepted_lsn = phase_4c2a_recovered_lsn(path)?;
+    let pager = phase_4c2a_open_pager(path)?;
+    phase_4c2a_checkpoint(&pager)?;
+    let state = phase_4c2a_pager_state(&pager, path)?;
+    drop(pager);
+    Ok((accepted_lsn, state))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase4c2aWalRecord {
+    PageFrame(u64),
+    Commit,
+}
+
+pub(crate) fn phase_4c2a_wal_records(path: &Path, start: u64) -> Result<Vec<Phase4c2aWalRecord>> {
+    let bytes = fs::read(wal_path(path))
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("read Phase 4C2-A WAL: {error}")))?;
+    let mut offset = usize::try_from(start)
+        .map_err(|_| DbError::new(ErrorCode::Corruption, "WAL start exceeds usize"))?;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let header = bytes.get(offset..offset + 64).ok_or_else(|| {
+            DbError::new(ErrorCode::Corruption, "truncated Phase 4C2-A WAL header")
+        })?;
+        if &header[..8] != b"ORAWREC\0" {
+            return Err(DbError::new(
+                ErrorCode::Corruption,
+                "invalid Phase 4C2-A WAL record magic",
+            ));
+        }
+        let payload_len =
+            usize::try_from(u32::from_le_bytes(header[12..16].try_into().unwrap()))
+                .map_err(|_| DbError::new(ErrorCode::Corruption, "WAL payload exceeds usize"))?;
+        records.push(match header[8] {
+            1 => Phase4c2aWalRecord::PageFrame(u64::from_le_bytes(
+                header[32..40].try_into().unwrap(),
+            )),
+            2 => Phase4c2aWalRecord::Commit,
+            _ => {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "unknown Phase 4C2-A WAL record type",
+                ));
+            }
+        });
+        offset = offset
+            .checked_add(64)
+            .and_then(|next| next.checked_add(payload_len))
+            .and_then(|next| next.checked_add((8 - (payload_len & 7)) & 7))
+            .ok_or_else(|| DbError::new(ErrorCode::Corruption, "WAL offset overflow"))?;
+    }
+    if offset != bytes.len() {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            "Phase 4C2-A WAL record crosses EOF",
+        ));
+    }
+    Ok(records)
+}
+
+pub(crate) fn phase_4c2a_commit_malformed_index(pager: &Pager, name: &str) -> Result<()> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let index = catalog
+        .find_index_by_name(&CatalogName::new(name)?)
+        .cloned()
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "missing corrupt-candidate index"))?;
+    let catalog_tree = snapshot
+        .catalog_tree(TreeKind::Table)?
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "missing corrupt-candidate catalog"))?;
+    let index_key = {
+        let mut key = vec![0x21];
+        key.extend_from_slice(&index.id().get().to_be_bytes());
+        key
+    };
+    let mut index_record = collect_all(&catalog_tree, &mut snapshot)?
+        .into_iter()
+        .find_map(|(key, value)| (key == index_key).then_some(value))
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "missing corrupt-candidate definition"))?;
+    drop(snapshot);
+    let mut batch = pager.begin_write()?;
+    // A complete, checksummed 4C2 catalog candidate whose explicit index has
+    // zero columns. This is structurally invalid before any user-tree scan and
+    // must reject the newest Commit instead of falling back to the older image.
+    index_record[40..42].fill(0);
+    let mut updated_catalog = BTree::from_root(TreeKind::Table, catalog_tree.root());
+    let removed = updated_catalog.delete(&mut batch, &index_key)?;
+    if removed.is_none() {
+        return Err(DbError::new(
+            ErrorCode::Internal,
+            "corrupt-candidate definition disappeared before replacement",
+        ));
+    }
+    updated_catalog.insert(&mut batch, &index_key, &index_record)?;
+    batch.track_tree(TreeKind::Table, updated_catalog.root())?;
+    batch.set_catalog_root(updated_catalog.root())?;
+    batch.commit()
+}
+
+pub(crate) fn phase_4c2a_remove_recovered_files(path: &Path) {
+    fs::remove_file(wal_path(path)).expect("remove recovered Phase 4C2-A WAL");
+    fs::remove_file(path).expect("remove recovered Phase 4C2-A main file");
 }
 
 struct Phase4c1AbortAt {
