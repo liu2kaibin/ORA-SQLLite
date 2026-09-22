@@ -5,7 +5,10 @@ use crate::sql::{
     bound::{BoundBinaryOp, BoundUnaryOp},
     plan::{ExecExpr, ExecExprKind},
 };
-use crate::{DbError, Decimal, ErrorCode, OracleDate, Result, Value};
+use crate::{
+    DbError, Decimal, ErrorCode, OracleDate, Result, Value,
+    scalar::{self, ScalarBinaryOp, ScalarUnaryOp},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TruthValue {
@@ -291,30 +294,38 @@ fn decimal_cmp(a: Decimal, b: Decimal) -> Result<Ordering> {
 }
 
 fn unary(op: BoundUnaryOp, value: Value) -> Result<Value> {
-    match op {
-        BoundUnaryOp::Not => Ok(TruthValue::from_value(&value)?.not().into_value()),
-        BoundUnaryOp::Positive | BoundUnaryOp::Negative => {
-            let negative = op == BoundUnaryOp::Negative;
-            match value {
-                Value::Null => Ok(Value::Null),
-                Value::Int64(value) => Ok(Value::Int64(if negative {
-                    value.checked_neg().ok_or_else(numeric_error)?
-                } else {
-                    value
-                })),
-                Value::Decimal(value) => Ok(Value::Decimal(Decimal::new(
-                    value.negative() != negative,
-                    value.scale(),
-                    value.magnitude(),
-                )?)),
-                Value::Float64(value) => Ok(Value::Float64(if negative { -value } else { value })),
-                _ => Err(type_error("numeric operand required")),
-            }
-        }
-    }
+    scalar::eval_unary(
+        match op {
+            BoundUnaryOp::Positive => ScalarUnaryOp::Plus,
+            BoundUnaryOp::Negative => ScalarUnaryOp::Minus,
+            BoundUnaryOp::Not => ScalarUnaryOp::Not,
+        },
+        value,
+    )
 }
 
 fn binary(op: BoundBinaryOp, left: &Value, right: &Value) -> Result<Value> {
+    if op != BoundBinaryOp::Modulo {
+        return scalar::eval_binary(
+            match op {
+                BoundBinaryOp::Add => ScalarBinaryOp::Add,
+                BoundBinaryOp::Subtract => ScalarBinaryOp::Subtract,
+                BoundBinaryOp::Multiply => ScalarBinaryOp::Multiply,
+                BoundBinaryOp::Divide => ScalarBinaryOp::Divide,
+                BoundBinaryOp::Equal => ScalarBinaryOp::Equal,
+                BoundBinaryOp::NotEqual => ScalarBinaryOp::NotEqual,
+                BoundBinaryOp::LessThan => ScalarBinaryOp::LessThan,
+                BoundBinaryOp::LessThanOrEqual => ScalarBinaryOp::LessThanOrEqual,
+                BoundBinaryOp::GreaterThan => ScalarBinaryOp::GreaterThan,
+                BoundBinaryOp::GreaterThanOrEqual => ScalarBinaryOp::GreaterThanOrEqual,
+                BoundBinaryOp::And => ScalarBinaryOp::And,
+                BoundBinaryOp::Or => ScalarBinaryOp::Or,
+                BoundBinaryOp::Modulo => return Err(invalid_eval()),
+            },
+            left,
+            right,
+        );
+    }
     use BoundBinaryOp::*;
     match op {
         And | Or => {

@@ -18,6 +18,7 @@ use super::{
         validate_tree,
     },
 };
+use crate::storage::constraint::program::CheckProgram;
 use crate::{DbError, ErrorCode, Result};
 use key::DecodedCatalogKey;
 use types::{
@@ -514,11 +515,25 @@ impl CatalogImage {
                 }
                 ConstraintKind::NotNull => {}
                 ConstraintKind::Check => {
-                    if constraint.check_program().is_empty()
-                        || constraint.check_program().len() > types::MAX_CHECK_PROGRAM_BYTES
-                    {
-                        return Err(corruption("check constraint program length is invalid"));
-                    }
+                    let program = CheckProgram::from_bytes(
+                        constraint.check_program().to_vec().into_boxed_slice(),
+                    )
+                    .map_err(|_| corruption("check constraint program is invalid"))?;
+                    let columns = self
+                        .column_ordinals
+                        .get(&constraint.table_id())
+                        .into_iter()
+                        .flat_map(|ordinals| ordinals.values())
+                        .map(|id| {
+                            self.columns
+                                .get(id)
+                                .cloned()
+                                .ok_or_else(|| corruption("check table column is missing"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    program
+                        .validate(&columns)
+                        .map_err(|_| corruption("check constraint program is invalid"))?;
                 }
             }
         }
