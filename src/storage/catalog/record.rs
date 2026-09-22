@@ -550,10 +550,10 @@ fn decode_constraint_definition_payload(payload: &[u8]) -> Result<ConstraintDef>
         return Err(corruption("catalog constraint deferred mode is nonzero"));
     }
     if decoder.get_u8()? != 0 {
-        return Err(corruption("catalog constraint update action is nonzero"));
+        return Err(foreign_key_unsupported());
     }
     if decoder.get_u8()? != 0 {
-        return Err(corruption("catalog constraint delete action is nonzero"));
+        return Err(foreign_key_unsupported());
     }
     if decoder.get_u8()? != 0 {
         return Err(corruption("catalog constraint reserved byte is nonzero"));
@@ -1399,7 +1399,7 @@ mod tests {
                 "truncation at {end}"
             );
         }
-        for offset in [25, 52, 53, 54, 55, 62, 63] {
+        for offset in [25, 52, 55, 62, 63] {
             let mut mutated = bytes.clone();
             mutated[offset] = 1;
             assert_constraint_corruption(mutated);
@@ -1478,6 +1478,19 @@ mod tests {
         for range in [36..44, 44..52] {
             let mut mutated = encoded_check_constraint();
             mutated[range].copy_from_slice(&1_u64.to_le_bytes());
+            let error =
+                decode_constraint_definition(ConstraintId::new(7).unwrap(), &mutated).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("foreign-key catalogs require Phase 4C2-C")
+            );
+        }
+
+        for offset in [53, 54] {
+            let mut mutated = encoded_check_constraint();
+            mutated[offset] = 1;
             let error =
                 decode_constraint_definition(ConstraintId::new(7).unwrap(), &mutated).unwrap_err();
             assert_eq!(error.code(), ErrorCode::Unsupported);
