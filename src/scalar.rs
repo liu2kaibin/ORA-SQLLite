@@ -143,7 +143,7 @@ fn date_tuple(date: OracleDate) -> (u16, u8, u8, u8, u8, u8) {
         date.second(),
     )
 }
-fn decimal_cmp(a: Decimal, b: Decimal) -> Result<Ordering> {
+pub(crate) fn decimal_cmp(a: Decimal, b: Decimal) -> Result<Ordering> {
     if a.negative() != b.negative() {
         return Ok(b.negative().cmp(&a.negative()));
     }

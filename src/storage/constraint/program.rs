@@ -142,6 +142,7 @@ pub(crate) enum CheckTemplateInstruction {
         result: CheckType,
     },
 }
+#[derive(Debug)]
 pub(crate) struct CheckProgramTemplate {
     instructions: Box<[CheckTemplateInstruction]>,
 }
@@ -665,18 +666,12 @@ fn validate_instruction(
                 | CheckBinaryOp::Divide => {
                     require_numeric(left)?;
                     require_numeric(right)?;
-                    if left != right
-                        && !(matches!(left, CheckType::Int64 | CheckType::Decimal)
-                            && matches!(right, CheckType::Int64 | CheckType::Decimal))
-                    {
+                    if !comparison_compatible(left, right) {
                         return Err(corruption("binary numeric operand types are incompatible"));
                     }
                 }
                 _ => {
-                    if left != right
-                        && !(matches!(left, CheckType::Int64 | CheckType::Decimal)
-                            && matches!(right, CheckType::Int64 | CheckType::Decimal))
-                    {
+                    if !comparison_compatible(left, right) {
                         return Err(corruption("comparison operand types are incompatible"));
                     }
                 }
@@ -728,7 +723,7 @@ fn validate_instruction(
             let first = pop_type(stack)?;
             for _ in 0..*count {
                 let candidate = pop_type(stack)?;
-                if candidate != first {
+                if !comparison_compatible(candidate, first) {
                     return Err(corruption("IN operand types are incompatible"));
                 }
             }
@@ -742,7 +737,7 @@ fn validate_instruction(
             let high = pop_type(stack)?;
             let low = pop_type(stack)?;
             let value = pop_type(stack)?;
-            if high != value || low != value {
+            if !comparison_compatible(high, value) || !comparison_compatible(low, value) {
                 return Err(corruption("BETWEEN operand types are incompatible"));
             }
             require(instruction.result, CheckType::Bool)?;
@@ -808,6 +803,11 @@ fn require_numeric(value: CheckType) -> Result<()> {
     } else {
         Err(corruption("check numeric operand type is invalid"))
     }
+}
+fn comparison_compatible(left: CheckType, right: CheckType) -> bool {
+    left == right
+        || (matches!(left, CheckType::Int64 | CheckType::Decimal)
+            && matches!(right, CheckType::Int64 | CheckType::Decimal))
 }
 fn binary_opcode(op: CheckBinaryOp) -> u8 {
     match op {
@@ -1199,5 +1199,314 @@ mod tests {
             p.evaluate(&columns(), &[Value::Null], &mut m).unwrap(),
             TruthValue::Unknown
         );
+    }
+
+    #[test]
+    fn malformed_versions_headers_opcodes_and_scalar_values_are_rejected() {
+        let bytes = program().as_bytes().to_vec();
+        let mut future = bytes.clone();
+        future[0] = VERSION + 1;
+        assert_eq!(
+            CheckProgram::from_bytes(future.into()).unwrap_err().code(),
+            ErrorCode::Unsupported
+        );
+        for mut invalid in [
+            {
+                let mut value = bytes.clone();
+                value[1] = 1;
+                value
+            },
+            {
+                let mut value = bytes.clone();
+                value[8] = 0xff;
+                value
+            },
+            {
+                let mut value = bytes.clone();
+                value.push(0);
+                value
+            },
+        ] {
+            assert_eq!(
+                CheckProgram::from_bytes(invalid.split_off(0).into())
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+        let nan = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Float64(f64::NAN),
+                result: CheckType::Float64,
+            },
+            CheckTemplateInstruction::IsNull {
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap();
+        assert_eq!(nan.resolve(&[]).unwrap_err().code(), ErrorCode::Type);
+    }
+
+    #[test]
+    fn size_count_stack_and_final_result_boundaries_are_checked() {
+        assert_eq!(
+            CheckProgram::from_bytes(vec![0; MAX_CHECK_PROGRAM_BYTES + 1].into())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        let mut overflow = vec![VERSION, 0];
+        overflow.extend_from_slice(&u32::MAX.to_le_bytes());
+        overflow.extend_from_slice(&0_u16.to_le_bytes());
+        assert_eq!(
+            CheckProgram::from_bytes(overflow.into())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        let two_values = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Bool(true),
+                result: CheckType::Bool,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Bool(false),
+                result: CheckType::Bool,
+            },
+        ]);
+        assert_eq!(two_values.unwrap_err().code(), ErrorCode::Type);
+        let underflow = CheckProgram::from_bytes(
+            vec![
+                VERSION,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x12,
+                CheckType::Bool.code(),
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+            .into(),
+        );
+        assert_eq!(underflow.unwrap_err().code(), ErrorCode::Corruption);
+    }
+
+    #[test]
+    fn mixed_integer_decimal_in_and_between_share_comparison_compatibility() {
+        let decimal = Decimal::new(false, 0, 1).unwrap();
+        let in_program = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Int64(1),
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Decimal(decimal),
+                result: CheckType::Decimal,
+            },
+            CheckTemplateInstruction::InList {
+                value_count: 1,
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+        let between_program = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Int64(2),
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Decimal(decimal),
+                result: CheckType::Decimal,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Int64(3),
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Between {
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+        let mut memory = Memory {
+            limit: 100_000,
+            used: 0,
+        };
+        assert_eq!(
+            in_program.evaluate(&[], &[], &mut memory).unwrap(),
+            TruthValue::True
+        );
+        assert_eq!(
+            between_program.evaluate(&[], &[], &mut memory).unwrap(),
+            TruthValue::True
+        );
+        assert_eq!(memory.used, 0);
+    }
+
+    #[test]
+    fn check_predicate_negation_and_three_valued_cases_match_sql() {
+        let cases = [
+            (
+                vec![
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Int64(1),
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Int64(2),
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::InList {
+                        value_count: 1,
+                        negated: true,
+                        result: CheckType::Bool,
+                    },
+                ],
+                TruthValue::True,
+            ),
+            (
+                vec![
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Int64(2),
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Int64(1),
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Int64(3),
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::Between {
+                        negated: true,
+                        result: CheckType::Bool,
+                    },
+                ],
+                TruthValue::False,
+            ),
+            (
+                vec![
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Text("a".into()),
+                        result: CheckType::Text,
+                    },
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Text("a".into()),
+                        result: CheckType::Text,
+                    },
+                    CheckTemplateInstruction::Like {
+                        negated: true,
+                        result: CheckType::Bool,
+                    },
+                ],
+                TruthValue::False,
+            ),
+            (
+                vec![
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Null,
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::Literal {
+                        value: Value::Int64(1),
+                        result: CheckType::Int64,
+                    },
+                    CheckTemplateInstruction::Binary {
+                        op: CheckBinaryOp::Equal,
+                        result: CheckType::Bool,
+                    },
+                ],
+                TruthValue::Unknown,
+            ),
+        ];
+        let mut memory = Memory {
+            limit: 100_000,
+            used: 0,
+        };
+        for (instructions, expected) in cases {
+            let check = CheckProgramTemplate::new(instructions)
+                .unwrap()
+                .resolve(&[])
+                .unwrap();
+            assert_eq!(check.evaluate(&[], &[], &mut memory).unwrap(), expected);
+            assert_eq!(memory.used, 0);
+        }
+    }
+
+    #[test]
+    fn evaluation_checks_rows_foreign_columns_deep_stacks_and_memory_cleanup() {
+        let foreign = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Column {
+                ordinal: 0,
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::IsNull {
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap()
+        .resolve(&[ColumnId::new(99).unwrap()])
+        .unwrap();
+        assert_eq!(
+            foreign.validate(&columns()).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        let mut memory = Memory { limit: 1, used: 0 };
+        assert_eq!(
+            program()
+                .evaluate(&columns(), &[Value::Int64(1)], &mut memory)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(memory.used, 0);
+        let mut memory = Memory {
+            limit: 100_000,
+            used: 0,
+        };
+        assert_eq!(
+            program()
+                .evaluate(&columns(), &[], &mut memory)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        let mut instructions = vec![CheckTemplateInstruction::Literal {
+            value: Value::Bool(true),
+            result: CheckType::Bool,
+        }];
+        instructions.extend((0..4_000).map(|_| CheckTemplateInstruction::Unary {
+            op: CheckUnaryOp::Not,
+            result: CheckType::Bool,
+        }));
+        let deep = CheckProgramTemplate::new(instructions)
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        let mut memory = Memory {
+            limit: 2_000_000,
+            used: 0,
+        };
+        assert_eq!(
+            deep.evaluate(&[], &[], &mut memory).unwrap(),
+            TruthValue::True
+        );
+        assert_eq!(memory.used, 0);
     }
 }

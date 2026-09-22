@@ -518,7 +518,7 @@ impl CatalogImage {
                     let program = CheckProgram::from_bytes(
                         constraint.check_program().to_vec().into_boxed_slice(),
                     )
-                    .map_err(|_| corruption("check constraint program is invalid"))?;
+                    .map_err(normalize_check_program_error)?;
                     let columns = self
                         .column_ordinals
                         .get(&constraint.table_id())
@@ -533,7 +533,7 @@ impl CatalogImage {
                         .collect::<Result<Vec<_>>>()?;
                     program
                         .validate(&columns)
-                        .map_err(|_| corruption("check constraint program is invalid"))?;
+                        .map_err(normalize_check_program_error)?;
                 }
             }
         }
@@ -567,6 +567,14 @@ impl CatalogImage {
             }
         }
         Ok(())
+    }
+}
+
+fn normalize_check_program_error(error: DbError) -> DbError {
+    if error.code() == ErrorCode::Corruption {
+        corruption("check constraint program is invalid")
+    } else {
+        error
     }
 }
 
@@ -2225,6 +2233,22 @@ mod tests {
             test_support::{TempDatabase, test_pager},
         },
     };
+
+    #[test]
+    fn check_program_error_normalization_preserves_non_corruption_codes() {
+        assert_eq!(
+            normalize_check_program_error(DbError::new(ErrorCode::Unsupported, "future")).code(),
+            ErrorCode::Unsupported
+        );
+        assert_eq!(
+            normalize_check_program_error(DbError::new(ErrorCode::ResourceLimit, "limit")).code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(
+            normalize_check_program_error(DbError::new(ErrorCode::Corruption, "bad")).code(),
+            ErrorCode::Corruption
+        );
+    }
 
     #[test]
     fn uninitialized_snapshot_is_an_immutable_empty_catalog() {

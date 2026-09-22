@@ -1,66 +1,18 @@
-use std::cmp::Ordering;
-
 use super::{EvalRow, ParameterFrame};
 use crate::sql::{
     bound::{BoundBinaryOp, BoundUnaryOp},
     plan::{ExecExpr, ExecExprKind},
 };
 use crate::{
-    DbError, Decimal, ErrorCode, OracleDate, Result, Value,
+    DbError, Decimal, ErrorCode, Result, Value,
     scalar::{self, ScalarBinaryOp, ScalarUnaryOp},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TruthValue {
-    True,
-    False,
-    Unknown,
-}
-
-impl TruthValue {
-    pub(crate) fn from_value(value: &Value) -> Result<Self> {
-        match value {
-            Value::Bool(true) => Ok(Self::True),
-            Value::Bool(false) => Ok(Self::False),
-            Value::Null => Ok(Self::Unknown),
-            _ => Err(type_error("boolean value required")),
-        }
-    }
-    pub(crate) const fn into_value(self) -> Value {
-        match self {
-            Self::True => Value::Bool(true),
-            Self::False => Value::Bool(false),
-            Self::Unknown => Value::Null,
-        }
-    }
-    fn not(self) -> Self {
-        match self {
-            Self::True => Self::False,
-            Self::False => Self::True,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, Self::True) => Self::True,
-            _ => Self::Unknown,
-        }
-    }
-    fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::True, _) | (_, Self::True) => Self::True,
-            (Self::False, Self::False) => Self::False,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-impl From<bool> for TruthValue {
-    fn from(value: bool) -> Self {
-        if value { Self::True } else { Self::False }
-    }
-}
+use crate::scalar::decimal_cmp;
+pub(super) use crate::scalar::int_decimal;
+pub(crate) use crate::scalar::{
+    TruthValue, like, sql_equal, sql_total_cmp, validate_sql_float, validate_value,
+};
 
 /// Explicit postorder stacks: neither normal evaluation nor errors recurse.
 pub(crate) fn eval(expr: &ExecExpr, row: &EvalRow, params: &ParameterFrame) -> Result<Value> {
@@ -178,7 +130,7 @@ fn eval_ready(
                 (Value::Text(text), Value::Text(pattern)) => {
                     Ok(Value::Bool(like(text, pattern) != *negated))
                 }
-                _ => Err(type_error("LIKE requires Text operands")),
+                _ => Err(DbError::new(ErrorCode::Type, "LIKE requires Text operands")),
             }
         }
     }
@@ -193,104 +145,8 @@ fn invalid_eval() -> DbError {
         "expression operand or row slot is absent",
     )
 }
-fn type_error(message: &'static str) -> DbError {
-    DbError::new(ErrorCode::Type, message)
-}
-fn numeric_error() -> DbError {
-    type_error("arithmetic result is not exactly representable")
-}
-
-pub(crate) fn validate_sql_float(value: f64) -> Result<()> {
-    if value.is_finite() {
-        Ok(())
-    } else {
-        Err(type_error("SQL requires finite Float64 values"))
-    }
-}
-
-pub(crate) fn validate_value(value: &Value) -> Result<()> {
-    match value {
-        Value::Float64(value) => validate_sql_float(*value),
-        _ => Ok(()),
-    }
-}
-
-pub(super) fn int_decimal(value: i64) -> Result<Decimal> {
-    Decimal::new(value < 0, 0, u128::from(value.unsigned_abs()))
-}
-
-pub(crate) fn sql_equal(left: &Value, right: &Value) -> Result<TruthValue> {
-    validate_value(left)?;
-    validate_value(right)?;
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return Ok(TruthValue::Unknown);
-    }
-    Ok((sql_total_cmp(left, right)? == Ordering::Equal).into())
-}
-
 pub(crate) fn sql_group_equal(left: &Value, right: &Value) -> Result<bool> {
-    Ok(sql_total_cmp(left, right)? == Ordering::Equal)
-}
-
-/// NULL sorts first here; ORDER BY's direction/NULL placement is applied by its
-/// later operator. Blob ordering is for keys only, never relational predicates.
-pub(crate) fn sql_total_cmp(left: &Value, right: &Value) -> Result<Ordering> {
-    validate_value(left)?;
-    validate_value(right)?;
-    match (left, right) {
-        (Value::Null, Value::Null) => Ok(Ordering::Equal),
-        (Value::Null, _) => Ok(Ordering::Less),
-        (_, Value::Null) => Ok(Ordering::Greater),
-        (Value::Int64(a), Value::Int64(b)) => Ok(a.cmp(b)),
-        (Value::Decimal(a), Value::Decimal(b)) => decimal_cmp(*a, *b),
-        (Value::Int64(a), Value::Decimal(b)) => decimal_cmp(int_decimal(*a)?, *b),
-        (Value::Decimal(a), Value::Int64(b)) => decimal_cmp(*a, int_decimal(*b)?),
-        (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b).ok_or_else(numeric_error),
-        (Value::Text(a), Value::Text(b)) => Ok(a.cmp(b)),
-        (Value::Blob(a), Value::Blob(b)) => Ok(a.cmp(b)),
-        (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
-        (Value::Date(a), Value::Date(b)) => Ok(date_tuple(*a).cmp(&date_tuple(*b))),
-        (Value::Timestamp(a), Value::Timestamp(b)) => Ok((
-            date_tuple(a.date()),
-            a.micros(),
-            a.offset_minutes(),
-        )
-            .cmp(&(date_tuple(b.date()), b.micros(), b.offset_minutes()))),
-        _ => Err(type_error("values have incompatible SQL comparison types")),
-    }
-}
-
-fn date_tuple(date: OracleDate) -> (u16, u8, u8, u8, u8, u8) {
-    (
-        date.year(),
-        date.month(),
-        date.day(),
-        date.hour(),
-        date.minute(),
-        date.second(),
-    )
-}
-
-fn decimal_cmp(a: Decimal, b: Decimal) -> Result<Ordering> {
-    if a.negative() != b.negative() {
-        return Ok(b.negative().cmp(&a.negative()));
-    }
-    let order = if a.magnitude() == 0 || b.magnitude() == 0 {
-        a.magnitude().cmp(&b.magnitude())
-    } else {
-        let a_digits = a.magnitude().ilog10() + 1;
-        let b_digits = b.magnitude().ilog10() + 1;
-        let order = (i64::from(a_digits) - i64::from(a.scale()))
-            .cmp(&(i64::from(b_digits) - i64::from(b.scale())));
-        if order == Ordering::Equal {
-            let digits = a_digits.max(b_digits);
-            scale_magnitude(a.magnitude(), digits - a_digits)?
-                .cmp(&scale_magnitude(b.magnitude(), digits - b_digits)?)
-        } else {
-            order
-        }
-    };
-    Ok(if a.negative() { order.reverse() } else { order })
+    Ok(sql_total_cmp(left, right)? == std::cmp::Ordering::Equal)
 }
 
 fn unary(op: BoundUnaryOp, value: Value) -> Result<Value> {
@@ -305,275 +161,51 @@ fn unary(op: BoundUnaryOp, value: Value) -> Result<Value> {
 }
 
 fn binary(op: BoundBinaryOp, left: &Value, right: &Value) -> Result<Value> {
-    if op != BoundBinaryOp::Modulo {
-        return scalar::eval_binary(
-            match op {
-                BoundBinaryOp::Add => ScalarBinaryOp::Add,
-                BoundBinaryOp::Subtract => ScalarBinaryOp::Subtract,
-                BoundBinaryOp::Multiply => ScalarBinaryOp::Multiply,
-                BoundBinaryOp::Divide => ScalarBinaryOp::Divide,
-                BoundBinaryOp::Equal => ScalarBinaryOp::Equal,
-                BoundBinaryOp::NotEqual => ScalarBinaryOp::NotEqual,
-                BoundBinaryOp::LessThan => ScalarBinaryOp::LessThan,
-                BoundBinaryOp::LessThanOrEqual => ScalarBinaryOp::LessThanOrEqual,
-                BoundBinaryOp::GreaterThan => ScalarBinaryOp::GreaterThan,
-                BoundBinaryOp::GreaterThanOrEqual => ScalarBinaryOp::GreaterThanOrEqual,
-                BoundBinaryOp::And => ScalarBinaryOp::And,
-                BoundBinaryOp::Or => ScalarBinaryOp::Or,
-                BoundBinaryOp::Modulo => return Err(invalid_eval()),
-            },
-            left,
-            right,
-        );
-    }
-    use BoundBinaryOp::*;
-    match op {
-        And | Or => {
-            let a = TruthValue::from_value(left)?;
-            let b = TruthValue::from_value(right)?;
-            Ok(if op == And { a.and(b) } else { a.or(b) }.into_value())
-        }
-        Equal | NotEqual => {
-            let truth = sql_equal(left, right)?;
-            Ok(if op == NotEqual { truth.not() } else { truth }.into_value())
-        }
-        LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                return Ok(Value::Null);
-            }
-            if matches!(left, Value::Blob(_)) || matches!(right, Value::Blob(_)) {
-                return Err(type_error("Blob supports only equality predicates"));
-            }
-            let order = sql_total_cmp(left, right)?;
-            Ok(Value::Bool(match op {
-                LessThan => order.is_lt(),
-                LessThanOrEqual => order.is_le(),
-                GreaterThan => order.is_gt(),
-                GreaterThanOrEqual => order.is_ge(),
-                _ => return Err(invalid_eval()),
-            }))
-        }
-        Add | Subtract | Multiply | Divide | Modulo => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                return Ok(Value::Null);
-            }
-            match (left, right) {
-                (Value::Int64(a), Value::Int64(b)) => {
-                    let value = match op {
-                        Add => a.checked_add(*b),
-                        Subtract => a.checked_sub(*b),
-                        Multiply => a.checked_mul(*b),
-                        Divide => a.checked_div(*b),
-                        Modulo => a.checked_rem(*b),
-                        _ => return Err(invalid_eval()),
-                    };
-                    Ok(Value::Int64(value.ok_or_else(numeric_error)?))
-                }
-                (Value::Decimal(a), Value::Decimal(b)) => {
-                    Ok(Value::Decimal(decimal_arithmetic(op, *a, *b)?))
-                }
-                (Value::Int64(a), Value::Decimal(b)) => Ok(Value::Decimal(decimal_arithmetic(
-                    op,
-                    int_decimal(*a)?,
-                    *b,
-                )?)),
-                (Value::Decimal(a), Value::Int64(b)) => Ok(Value::Decimal(decimal_arithmetic(
-                    op,
-                    *a,
-                    int_decimal(*b)?,
-                )?)),
-                (Value::Float64(a), Value::Float64(b)) => {
-                    if matches!(op, Divide | Modulo) && *b == 0.0 {
-                        return Err(type_error("division by zero"));
-                    }
-                    let value = match op {
-                        Add => a + b,
-                        Subtract => a - b,
-                        Multiply => a * b,
-                        Divide => a / b,
-                        Modulo => a % b,
-                        _ => return Err(invalid_eval()),
-                    };
-                    validate_sql_float(value)?;
-                    Ok(Value::Float64(value))
-                }
-                _ => Err(type_error("numeric operands have incompatible types")),
-            }
-        }
-    }
-}
-
-fn scale_magnitude(value: u128, digits: u32) -> Result<u128> {
-    if value == 0 {
-        return Ok(0);
-    }
-    value
-        .checked_mul(10_u128.checked_pow(digits).ok_or_else(numeric_error)?)
-        .ok_or_else(numeric_error)
-}
-
-/// Canonical exact result: remove trailing zeros, but never round discarded digits.
-fn decimal_result(negative: bool, mut magnitude: u128, mut scale: i16) -> Result<Decimal> {
-    if magnitude == 0 {
-        return Decimal::new(false, 0, 0);
-    }
-    while magnitude % 10 == 0 && scale > -38 {
-        magnitude /= 10;
-        scale -= 1;
-    }
-    if scale < -38 {
-        magnitude = scale_magnitude(
-            magnitude,
-            u32::try_from(-38 - scale).map_err(|_| numeric_error())?,
-        )?;
-        scale = -38;
-    }
-    Decimal::new(
-        negative,
-        i8::try_from(scale).map_err(|_| numeric_error())?,
-        magnitude,
+    scalar::eval_binary(
+        match op {
+            BoundBinaryOp::Add => ScalarBinaryOp::Add,
+            BoundBinaryOp::Subtract => ScalarBinaryOp::Subtract,
+            BoundBinaryOp::Multiply => ScalarBinaryOp::Multiply,
+            BoundBinaryOp::Divide => ScalarBinaryOp::Divide,
+            BoundBinaryOp::Modulo => ScalarBinaryOp::Modulo,
+            BoundBinaryOp::Equal => ScalarBinaryOp::Equal,
+            BoundBinaryOp::NotEqual => ScalarBinaryOp::NotEqual,
+            BoundBinaryOp::LessThan => ScalarBinaryOp::LessThan,
+            BoundBinaryOp::LessThanOrEqual => ScalarBinaryOp::LessThanOrEqual,
+            BoundBinaryOp::GreaterThan => ScalarBinaryOp::GreaterThan,
+            BoundBinaryOp::GreaterThanOrEqual => ScalarBinaryOp::GreaterThanOrEqual,
+            BoundBinaryOp::And => ScalarBinaryOp::And,
+            BoundBinaryOp::Or => ScalarBinaryOp::Or,
+        },
+        left,
+        right,
     )
 }
 
-/// Exact-only Decimal math. No rounding mode is introduced in Phase 4C1.
 pub(crate) fn decimal_arithmetic(op: BoundBinaryOp, a: Decimal, b: Decimal) -> Result<Decimal> {
-    use BoundBinaryOp::*;
-    match op {
-        Add | Subtract | Modulo => {
-            if op == Modulo && b.magnitude() == 0 {
-                return Err(type_error("division by zero"));
+    scalar::decimal_arithmetic(
+        match op {
+            BoundBinaryOp::Add => ScalarBinaryOp::Add,
+            BoundBinaryOp::Subtract => ScalarBinaryOp::Subtract,
+            BoundBinaryOp::Multiply => ScalarBinaryOp::Multiply,
+            BoundBinaryOp::Divide => ScalarBinaryOp::Divide,
+            BoundBinaryOp::Modulo => ScalarBinaryOp::Modulo,
+            _ => {
+                return Err(DbError::new(
+                    ErrorCode::Type,
+                    "not a Decimal arithmetic operator",
+                ));
             }
-            let scale = i16::from(a.scale().max(b.scale()));
-            let left = scale_magnitude(
-                a.magnitude(),
-                u32::try_from(scale - i16::from(a.scale())).map_err(|_| numeric_error())?,
-            )?;
-            let right = scale_magnitude(
-                b.magnitude(),
-                u32::try_from(scale - i16::from(b.scale())).map_err(|_| numeric_error())?,
-            )?;
-            if op == Modulo {
-                return decimal_result(
-                    a.negative(),
-                    left.checked_rem(right).ok_or_else(numeric_error)?,
-                    scale,
-                );
-            }
-            let b_negative = b.negative() != (op == Subtract);
-            let (negative, magnitude) = if a.negative() == b_negative {
-                (
-                    a.negative(),
-                    left.checked_add(right).ok_or_else(numeric_error)?,
-                )
-            } else if left >= right {
-                (
-                    a.negative(),
-                    left.checked_sub(right).ok_or_else(numeric_error)?,
-                )
-            } else {
-                (
-                    b_negative,
-                    right.checked_sub(left).ok_or_else(numeric_error)?,
-                )
-            };
-            decimal_result(negative, magnitude, scale)
-        }
-        Multiply => decimal_result(
-            a.negative() != b.negative(),
-            a.magnitude()
-                .checked_mul(b.magnitude())
-                .ok_or_else(numeric_error)?,
-            i16::from(a.scale()) + i16::from(b.scale()),
-        ),
-        Divide => decimal_divide(a, b),
-        Equal | NotEqual | LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual | And
-        | Or => Err(type_error("not a Decimal arithmetic operator")),
-    }
-}
-
-fn decimal_divide(a: Decimal, b: Decimal) -> Result<Decimal> {
-    if b.magnitude() == 0 {
-        return Err(type_error("division by zero"));
-    }
-    if a.magnitude() == 0 {
-        return Decimal::new(false, 0, 0);
-    }
-    let mut x = a.magnitude();
-    let mut y = b.magnitude();
-    while y != 0 {
-        let remainder = x % y;
-        x = y;
-        y = remainder;
-    }
-    let mut numerator = a.magnitude() / x;
-    let mut denominator = b.magnitude() / x;
-    let mut twos = 0_u32;
-    let mut fives = 0_u32;
-    while denominator % 2 == 0 {
-        denominator /= 2;
-        twos += 1;
-    }
-    while denominator % 5 == 0 {
-        denominator /= 5;
-        fives += 1;
-    }
-    if denominator != 1 {
-        return Err(numeric_error());
-    }
-    let digits = twos.max(fives);
-    numerator = numerator
-        .checked_mul(
-            2_u128
-                .checked_pow(digits - twos)
-                .ok_or_else(numeric_error)?,
-        )
-        .ok_or_else(numeric_error)?;
-    numerator = numerator
-        .checked_mul(
-            5_u128
-                .checked_pow(digits - fives)
-                .ok_or_else(numeric_error)?,
-        )
-        .ok_or_else(numeric_error)?;
-    decimal_result(
-        a.negative() != b.negative(),
-        numerator,
-        i16::from(a.scale()) - i16::from(b.scale())
-            + i16::try_from(digits).map_err(|_| numeric_error())?,
+        },
+        a,
+        b,
     )
-}
-
-/// Greedy wildcard matching with scalar iterators, constant auxiliary space and
-/// no recursive backtracking. Backslash is an ordinary character (no ESCAPE).
-fn like(text: &str, pattern: &str) -> bool {
-    let mut text = text.chars();
-    let mut pattern = pattern.chars();
-    let mut star = None;
-    loop {
-        let next_text = text.clone().next();
-        let next_pattern = pattern.clone().next();
-        if next_pattern == Some('%') {
-            pattern.next();
-            star = Some((pattern.clone(), text.clone()));
-        } else if next_text.is_some() && (next_pattern == Some('_') || next_text == next_pattern) {
-            text.next();
-            pattern.next();
-        } else if next_text.is_none() && next_pattern.is_none() {
-            return true;
-        } else if let Some((saved_pattern, saved_text)) = &mut star {
-            if saved_text.next().is_none() {
-                return false;
-            }
-            text = saved_text.clone();
-            pattern = saved_pattern.clone();
-        } else {
-            return false;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
     use crate::sql::{
         SqlSpan, SqlType,
