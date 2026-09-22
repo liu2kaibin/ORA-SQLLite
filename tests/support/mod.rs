@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     ffi::OsString,
     fs,
@@ -7,6 +9,14 @@ use std::{
 };
 
 use ora_sqllite::{Connection, Database, ExecutionResult, Options, Parameters, Statement, Value};
+
+mod format2;
+
+#[allow(unused_imports)]
+pub use format2::{
+    assert_index_model, corrupt_first_index_separator_with_valid_checksum, flip_physical_page_byte,
+    verify_index_model,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -119,4 +129,33 @@ pub fn collect_statement(
         values.push(row.values().to_vec());
     }
     values
+}
+
+pub fn insert_scale_row(connection: &mut Connection, statement: &Statement, id: i64, group: i64) {
+    // This is deliberately a public-API insert so the scale gate exercises the
+    // same executor and DML-maintained indexes as callers do. Reusing the
+    // prepared statement keeps the gate about storage correctness, not parsing.
+    let values = [
+        Value::Int64(id).into(),
+        Value::Int64(group).into(),
+        Value::Text(format!("row-{id}")).into(),
+    ];
+    connection
+        .execute(statement, Parameters::positional(&values))
+        .unwrap();
+}
+
+pub fn checkpoint_accepted_state(files: &TestFiles) {
+    // A commit is WAL-first. Reopen through the public API and acquire a writer
+    // with a one-byte checkpoint threshold so the already accepted WAL image is
+    // materialized before the independent verifier reads only the main file.
+    let database = Database::open(
+        files.main(),
+        Options::default().with_checkpoint_wal_bytes(1),
+    )
+    .unwrap();
+    let mut connection = database.connect().unwrap();
+    connection.begin_write().unwrap().rollback().unwrap();
+    drop(connection);
+    drop(database);
 }

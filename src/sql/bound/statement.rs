@@ -81,6 +81,10 @@ impl BoundStatement {
             }
         }
 
+        if let BoundStatementKind::DropIndex { index_id, table } = &self.kind {
+            validate_drop_index_identity(catalog, *index_id, table.table_id)?;
+        }
+
         self.validate_column_identities(catalog)?;
 
         for created_name in &self.created_names {
@@ -162,6 +166,29 @@ impl BoundStatement {
         }
         validate_expression_columns(catalog, expressions)
     }
+}
+
+fn validate_drop_index_identity(
+    catalog: &CatalogReader,
+    index_id: IndexId,
+    table_id: TableId,
+) -> Result<()> {
+    if !catalog.object_id_exists(ObjectKind::Index, index_id.into()) {
+        return Err(schema_changed(
+            "prepared index identity is no longer present",
+        ));
+    }
+    let Some(index) = catalog.find_index_by_id(index_id) else {
+        return Err(schema_changed(
+            "prepared index identity is no longer present",
+        ));
+    };
+    if index.table_id() != table_id {
+        return Err(schema_changed(
+            "prepared index identity belongs to another table",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_expression_columns(catalog: &CatalogReader, roots: Vec<&BoundExpr>) -> Result<()> {
@@ -264,11 +291,9 @@ pub(crate) enum BoundStatementKind {
         columns: Vec<BoundColumn>,
         unique: bool,
     },
-    /// V1 does not persist index records, so the binder cannot construct this
-    /// variant yet. Keeping an `IndexId` rather than a name prevents a Phase 4C
-    /// executor from accidentally late-binding a replacement index.
     DropIndex {
         index_id: IndexId,
+        table: BoundTable,
     },
     Begin,
     Commit,
@@ -362,4 +387,91 @@ pub(crate) struct CreatedNameDependency {
 
 fn schema_changed(message: &'static str) -> DbError {
     DbError::new(ErrorCode::SchemaChanged, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BoundStatement;
+    use crate::{
+        ErrorCode, SqlLimits,
+        sql::bind_sql,
+        storage::{
+            catalog::bump_users_schema_version,
+            test_support::{
+                Phase4bExplicitIndexFixture, phase_4b_catalog_fixture_with_explicit_index,
+                phase_4b_rehome_explicit_index_to_orders, phase_4b_remove_explicit_index,
+            },
+        },
+    };
+
+    fn bind_drop_index(pager: &crate::storage::Pager) -> (BoundStatement, [u8; 16]) {
+        let database_uuid = pager.database_uuid().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let bound = bind_sql(
+            "DROP INDEX IX_USERS_ID",
+            &SqlLimits::default(),
+            &catalog,
+            database_uuid,
+        )
+        .unwrap();
+        drop(catalog);
+        drop(snapshot);
+        (bound, database_uuid)
+    }
+
+    #[test]
+    fn drop_index_revalidation_rejects_a_missing_bound_index_id() {
+        // Production break caught: a missing index must not become a
+        // name-based DROP against a later object.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let (bound, database_uuid) = bind_drop_index(&pager);
+        phase_4b_remove_explicit_index(&pager, fixture.index_id()).unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_eq!(
+            bound
+                .validate_schema(database_uuid, &catalog)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+    }
+
+    #[test]
+    fn drop_index_revalidation_rejects_an_index_rehomed_to_another_table() {
+        // Production break caught: checking only IndexId lets an index moved
+        // to another table satisfy a prepared DROP for the original owner.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let (bound, database_uuid) = bind_drop_index(&pager);
+        phase_4b_rehome_explicit_index_to_orders(&pager, &fixture).unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_eq!(
+            bound
+                .validate_schema(database_uuid, &catalog)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+    }
+
+    #[test]
+    fn drop_index_revalidation_rejects_an_owner_table_version_change() {
+        // Production break caught: index DDL must invalidate old plans for
+        // its table through the table SchemaVersion dependency.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let (bound, database_uuid) = bind_drop_index(&pager);
+        let changed = bump_users_schema_version(&pager).unwrap();
+        assert_eq!(
+            bound
+                .validate_schema(database_uuid, &changed)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+    }
 }

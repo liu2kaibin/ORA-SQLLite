@@ -10,17 +10,19 @@ use std::{
 use super::{
     PageRef,
     btree::{BTree, TreeKind},
-    features::{CATALOG_V1, validate_feature_bits},
+    features::{CATALOG_V1, INDEX_CONSTRAINT_V1, validate_feature_bits},
+    index::key::IndexKeyCodec,
     pager::{PageSource, ReadSnapshot, WriteBatch},
     validate::{
-        ValidationReport, validate_freelist, validate_table_roots, validate_table_trees,
+        ValidationReport, validate_freelist, validate_relation_roots, validate_relation_trees,
         validate_tree,
     },
 };
 use crate::{DbError, ErrorCode, Result};
 use key::DecodedCatalogKey;
 use types::{
-    CatalogMeta, CatalogName, ColumnDef, ColumnId, ObjectId, ObjectKind, RowId, TableDef, TableId,
+    CatalogMeta, CatalogName, ColumnDef, ColumnId, IndexDef, IndexId, IndexOwnership, ObjectId,
+    ObjectKind, RowId, SchemaVersion, TableDef, TableId,
 };
 
 /// A fully decoded and cross-checked image. No page source is retained.
@@ -32,6 +34,10 @@ pub(crate) struct CatalogImage {
     columns: BTreeMap<ColumnId, ColumnDef>,
     column_names: BTreeMap<TableId, BTreeMap<String, ColumnId>>,
     column_ordinals: BTreeMap<TableId, BTreeMap<u16, ColumnId>>,
+    indexes: BTreeMap<IndexId, IndexDef>,
+    index_names: BTreeMap<String, IndexId>,
+    table_indexes: BTreeMap<TableId, BTreeSet<IndexId>>,
+    index_columns: BTreeMap<IndexId, BTreeMap<u16, ColumnId>>,
 }
 
 impl CatalogImage {
@@ -43,14 +49,24 @@ impl CatalogImage {
             columns: BTreeMap::new(),
             column_names: BTreeMap::new(),
             column_ordinals: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+            index_names: BTreeMap::new(),
+            table_indexes: BTreeMap::new(),
+            index_columns: BTreeMap::new(),
         }
     }
 
-    fn decode(source: &mut impl PageSource, tree: &BTree) -> Result<Self> {
+    fn decode(source: &mut impl PageSource, tree: &BTree, feature_bits: u64) -> Result<Self> {
         let mut image = Self::empty();
         let mut meta = None;
         let mut cursor = tree.scan(source, Bound::Unbounded, Bound::Unbounded)?;
         while let Some((key, value)) = cursor.next()? {
+            if key
+                .first()
+                .is_some_and(|family| (0x20..=0x34).contains(family))
+            {
+                require_index_feature(feature_bits)?;
+            }
             match key::decode_key(&key)? {
                 DecodedCatalogKey::CatalogMeta => {
                     if meta.replace(record::decode_catalog_meta(&value)?).is_some() {
@@ -91,6 +107,60 @@ impl CatalogImage {
                         id,
                         record::decode_column_definition(id, &value)?,
                     )?;
+                }
+                DecodedCatalogKey::IndexName(name) => {
+                    require_index_feature(feature_bits)?;
+                    insert_unique(
+                        &mut image.index_names,
+                        name.to_owned(),
+                        record::decode_index_name_mapping(&value)?,
+                    )?;
+                }
+                DecodedCatalogKey::IndexDefinition(id) => {
+                    require_index_feature(feature_bits)?;
+                    let index = record::decode_index_definition(id, &value)?;
+                    if matches!(index.ownership(), IndexOwnership::Constraint(_)) {
+                        return Err(DbError::new(
+                            ErrorCode::Unsupported,
+                            "constraint-owned indexes require constraint catalog validation",
+                        ));
+                    }
+                    insert_unique(&mut image.indexes, id, index)?;
+                }
+                DecodedCatalogKey::TableIndex { table_id, index_id } => {
+                    require_index_feature(feature_bits)?;
+                    if record::decode_table_index_mapping(&value)? != index_id {
+                        return Err(corruption("table index mapping does not match its key"));
+                    }
+                    if !image
+                        .table_indexes
+                        .entry(table_id)
+                        .or_default()
+                        .insert(index_id)
+                    {
+                        return Err(corruption(
+                            "catalog contains a duplicate table index mapping",
+                        ));
+                    }
+                }
+                DecodedCatalogKey::IndexColumn { index_id, ordinal } => {
+                    require_index_feature(feature_bits)?;
+                    insert_unique(
+                        image.index_columns.entry(index_id).or_default(),
+                        ordinal,
+                        record::decode_index_column_mapping(&value)?,
+                    )?;
+                }
+                DecodedCatalogKey::ConstraintName(_)
+                | DecodedCatalogKey::ConstraintDefinition(_)
+                | DecodedCatalogKey::TableConstraint { .. }
+                | DecodedCatalogKey::ConstraintColumn { .. }
+                | DecodedCatalogKey::ReferencedBy { .. } => {
+                    require_index_feature(feature_bits)?;
+                    return Err(DbError::new(
+                        ErrorCode::Unsupported,
+                        "constraint catalog records are not implemented",
+                    ));
                 }
             }
         }
@@ -180,6 +250,100 @@ impl CatalogImage {
                 }
             }
         }
+        for (name, id) in &self.index_names {
+            if self
+                .indexes
+                .get(id)
+                .is_none_or(|index| index.name().as_str() != name)
+            {
+                return Err(corruption("index name mapping has no matching definition"));
+            }
+        }
+        for index in self.indexes.values() {
+            if !object_ids.insert(index.id().into()) {
+                return Err(corruption("catalog definitions share a global object ID"));
+            }
+            if !self.tables.contains_key(&index.table_id()) {
+                return Err(corruption("index definition references a missing table"));
+            }
+            if self.index_names.get(index.name().as_str()) != Some(&index.id()) {
+                return Err(corruption("index definition has no matching name mapping"));
+            }
+            if !self
+                .table_indexes
+                .get(&index.table_id())
+                .is_some_and(|indexes| indexes.contains(&index.id()))
+            {
+                return Err(corruption(
+                    "index definition has no matching table index mapping",
+                ));
+            }
+            let columns = self.index_columns.get(&index.id());
+            if columns.map_or(0, BTreeMap::len) != usize::from(index.column_count()) {
+                return Err(corruption(
+                    "index column count does not match ordinal mappings",
+                ));
+            }
+            let mut seen_columns = BTreeSet::new();
+            for (expected, (ordinal, column_id)) in columns
+                .into_iter()
+                .flat_map(|columns| columns.iter())
+                .enumerate()
+            {
+                let expected = u16::try_from(expected)
+                    .map_err(|_| corruption("index column ordinal exceeds u16"))?;
+                if *ordinal != expected {
+                    return Err(corruption(
+                        "index column ordinals are not contiguous from zero",
+                    ));
+                }
+                let column = self.columns.get(column_id).ok_or_else(|| {
+                    corruption("index column mapping references a missing column")
+                })?;
+                if column.table_id() != index.table_id() {
+                    return Err(corruption("index column is not owned by the index table"));
+                }
+                if !seen_columns.insert(*column_id) {
+                    return Err(corruption("index contains a repeated column"));
+                }
+            }
+            if matches!(index.ownership(), IndexOwnership::Constraint(_)) {
+                return Err(DbError::new(
+                    ErrorCode::Unsupported,
+                    "constraint-owned indexes require constraint catalog validation",
+                ));
+            }
+        }
+        for (table_id, indexes) in &self.table_indexes {
+            for index_id in indexes {
+                if self
+                    .indexes
+                    .get(index_id)
+                    .is_none_or(|index| index.table_id() != *table_id)
+                {
+                    return Err(corruption(
+                        "table index mapping has no matching owned definition",
+                    ));
+                }
+            }
+        }
+        for (index_id, columns) in &self.index_columns {
+            let index = self
+                .indexes
+                .get(index_id)
+                .ok_or_else(|| corruption("index column mapping has no matching definition"))?;
+            for column_id in columns.values() {
+                if self
+                    .columns
+                    .get(column_id)
+                    .is_none_or(|column| column.table_id() != index.table_id())
+                {
+                    return Err(corruption(
+                        "index column mapping has no matching owned column",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -191,7 +355,9 @@ pub(crate) struct CatalogReader {
 
 impl CatalogReader {
     pub(super) fn open_empty_or_v1(snapshot: &mut ReadSnapshot) -> Result<Self> {
-        if snapshot.feature_bits() & CATALOG_V1 == 0 {
+        let feature_bits = snapshot.feature_bits();
+        validate_feature_bits(feature_bits)?;
+        if feature_bits & CATALOG_V1 == 0 {
             if snapshot.catalog_root().0 != 0 {
                 return Err(unsupported_legacy());
             }
@@ -202,7 +368,7 @@ impl CatalogReader {
         let (tree, report) = snapshot
             .catalog_tree_with_report(TreeKind::Table)?
             .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
-        Self::open_validated(snapshot, &tree, report)
+        Self::open_validated(snapshot, &tree, report, feature_bits)
     }
 
     pub(super) fn open_empty_or_v1_batch(batch: &mut WriteBatch) -> Result<Self> {
@@ -220,9 +386,12 @@ impl CatalogReader {
             .catalog_tree_with_report(TreeKind::Table)?
             .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
         batch.require_current_catalog_root(tree.root())?;
-        let reader = Self::open_validated(batch, &tree, report)?;
+        let reader = Self::open_validated(batch, &tree, report, feature_bits)?;
         for table in reader.image.tables.values() {
             batch.require_current_catalog_root(table.root())?;
+        }
+        for index in reader.image.indexes.values() {
+            batch.require_current_catalog_root(index.root())?;
         }
         Ok(reader)
     }
@@ -242,9 +411,12 @@ impl CatalogReader {
         }
         batch.require_current_catalog_root(tree.root())?;
         let report = validate_tree(batch, tree)?;
-        let reader = Self::open_validated(batch, tree, report)?;
+        let reader = Self::open_validated(batch, tree, report, feature_bits)?;
         for table in reader.image.tables.values() {
             batch.require_current_catalog_root(table.root())?;
+        }
+        for index in reader.image.indexes.values() {
+            batch.require_current_catalog_root(index.root())?;
         }
         Ok(reader)
     }
@@ -253,10 +425,16 @@ impl CatalogReader {
         source: &mut impl PageSource,
         tree: &BTree,
         report: ValidationReport,
+        feature_bits: u64,
     ) -> Result<Self> {
-        let image = CatalogImage::decode(source, tree)?;
+        let image = CatalogImage::decode(source, tree, feature_bits)?;
         let mut live = report.all_live_pages();
-        validate_table_roots(source, image.tables.values().map(TableDef::root), &mut live)?;
+        validate_relation_roots(
+            source,
+            image.tables.values().map(TableDef::root),
+            image.indexes.values().map(IndexDef::root),
+            &mut live,
+        )?;
         validate_freelist(source, &live)?;
         Ok(Self { image })
     }
@@ -264,8 +442,9 @@ impl CatalogReader {
     /// Explicit, potentially expensive validation. Ordinary open never walks the
     /// user descendants; here every live tree is checked against every other tree.
     pub(super) fn validate_deep(&self, snapshot: &mut ReadSnapshot) -> Result<()> {
-        validate_feature_bits(snapshot.feature_bits())?;
-        if snapshot.feature_bits() & CATALOG_V1 == 0 {
+        let feature_bits = snapshot.feature_bits();
+        validate_feature_bits(feature_bits)?;
+        if feature_bits & CATALOG_V1 == 0 {
             if snapshot.catalog_root().0 != 0 {
                 return Err(unsupported_legacy());
             }
@@ -275,17 +454,18 @@ impl CatalogReader {
         let (tree, report) = snapshot
             .catalog_tree_with_report(TreeKind::Table)?
             .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
-        self.validate_deep_from(snapshot, &tree, report)
+        self.validate_deep_from(snapshot, &tree, report, feature_bits)
     }
 
     /// Validate every table tree in a write batch before a destructive catalog
     /// operation can release pages still reachable through another root.
     pub(super) fn validate_deep_batch(&self, batch: &mut WriteBatch) -> Result<()> {
-        validate_feature_bits(batch.feature_bits())?;
+        let feature_bits = batch.feature_bits();
+        validate_feature_bits(feature_bits)?;
         let (tree, report) = batch
             .catalog_tree_with_report(TreeKind::Table)?
             .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
-        self.validate_deep_from(batch, &tree, report)
+        self.validate_deep_from(batch, &tree, report, feature_bits)
     }
 
     fn validate_deep_from(
@@ -293,17 +473,38 @@ impl CatalogReader {
         source: &mut impl PageSource,
         tree: &BTree,
         report: ValidationReport,
+        feature_bits: u64,
     ) -> Result<()> {
         // A reader retains no snapshot lease. Do not combine its immutable
         // definitions with a different snapshot's catalog, roots, or counters.
-        self.require_matching_image(&CatalogImage::decode(source, tree)?)?;
+        self.require_matching_image(&CatalogImage::decode(source, tree, feature_bits)?)?;
         let mut live = report.all_live_pages();
-        validate_table_trees(
+        validate_relation_trees(
             source,
             self.image.tables.values().map(TableDef::root),
+            self.image.indexes.values().map(IndexDef::root),
             &mut live,
         )?;
+        self.validate_index_entries(source)?;
         validate_freelist(source, &live).map(|_| ())
+    }
+
+    fn validate_index_entries(&self, source: &mut impl PageSource) -> Result<()> {
+        for index in self.image.indexes.values() {
+            let columns = self
+                .columns_for_index(index.id())
+                .cloned()
+                .collect::<Vec<_>>();
+            let tree = BTree::from_root(TreeKind::Index, index.root());
+            let mut cursor = tree.scan(source, Bound::Unbounded, Bound::Unbounded)?;
+            while let Some((key, value)) = cursor.next()? {
+                if !value.is_empty() {
+                    return Err(corruption("index leaf value must be empty"));
+                }
+                IndexKeyCodec::decode(&columns, &key)?;
+            }
+        }
+        Ok(())
     }
 
     fn require_matching_image(&self, image: &CatalogImage) -> Result<()> {
@@ -357,10 +558,47 @@ impl CatalogReader {
         self.image.columns.get(&id)
     }
 
+    pub(crate) fn find_index_by_name(&self, name: &CatalogName) -> Option<&IndexDef> {
+        self.image
+            .index_names
+            .get(name.as_str())
+            .and_then(|id| self.image.indexes.get(id))
+    }
+
+    pub(crate) fn find_index_by_id(&self, id: IndexId) -> Option<&IndexDef> {
+        self.image.indexes.get(&id)
+    }
+
+    pub(crate) fn indexes_for_table(&self, table: TableId) -> impl Iterator<Item = &IndexDef> {
+        self.image
+            .table_indexes
+            .get(&table)
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .map(|id| {
+                self.image
+                    .indexes
+                    .get(id)
+                    .expect("validated table index references an existing index")
+            })
+    }
+
+    pub(crate) fn columns_for_index(&self, index: IndexId) -> impl Iterator<Item = &ColumnDef> {
+        self.image
+            .index_columns
+            .get(&index)
+            .into_iter()
+            .flat_map(|columns| columns.values())
+            .map(|id| {
+                self.image
+                    .columns
+                    .get(id)
+                    .expect("validated index column references an existing column")
+            })
+    }
+
     /// Returns whether a persisted V1 object has this exact typed identity.
     ///
-    /// Index and constraint records deliberately return false until their V1
-    /// record families exist; callers must not substitute an untyped name.
     pub(crate) fn object_id_exists(&self, kind: ObjectKind, object_id: ObjectId) -> bool {
         match kind {
             ObjectKind::Table => TableId::from_object(object_id, kind)
@@ -369,19 +607,20 @@ impl CatalogReader {
             ObjectKind::Column => ColumnId::from_object(object_id, kind)
                 .ok()
                 .is_some_and(|id| self.image.columns.contains_key(&id)),
-            ObjectKind::Index | ObjectKind::Constraint => false,
+            ObjectKind::Index => IndexId::from_object(object_id, kind)
+                .ok()
+                .is_some_and(|id| self.image.indexes.contains_key(&id)),
+            ObjectKind::Constraint => false,
         }
     }
 
     /// Returns whether this object kind's persistent name namespace is occupied.
     ///
-    /// V1 persists table names only. Index and constraint namespaces stay empty
-    /// here until their own record families are added rather than being inferred
-    /// from unrelated table records.
     pub(crate) fn object_name_exists(&self, kind: ObjectKind, name: &CatalogName) -> bool {
         match kind {
             ObjectKind::Table => self.image.table_names.contains_key(name.as_str()),
-            ObjectKind::Column | ObjectKind::Index | ObjectKind::Constraint => false,
+            ObjectKind::Index => self.image.index_names.contains_key(name.as_str()),
+            ObjectKind::Column | ObjectKind::Constraint => false,
         }
     }
 }
@@ -423,7 +662,7 @@ impl CatalogWriter {
                 let (tree, report) = batch
                     .catalog_tree_with_report(TreeKind::Table)?
                     .ok_or_else(|| corruption("catalog V1 feature requires a catalog root"))?;
-                CatalogReader::open_validated(batch, &tree, report)?;
+                CatalogReader::open_validated(batch, &tree, report, features)?;
                 Ok(Self { tree, dirty: false })
             }
         })();
@@ -562,6 +801,97 @@ impl CatalogWriter {
         })
     }
 
+    pub(crate) fn insert_index_definition(
+        &mut self,
+        batch: &mut WriteBatch,
+        index: &IndexDef,
+        columns: &[ColumnId],
+    ) -> Result<()> {
+        self.mutate(batch, |tree, batch| {
+            if index.ownership() != IndexOwnership::Explicit {
+                return Err(DbError::new(
+                    ErrorCode::Unsupported,
+                    "constraint-owned indexes cannot be mutated before constraint catalog support",
+                ));
+            }
+            if columns.len() != usize::from(index.column_count()) {
+                return Err(DbError::new(
+                    ErrorCode::Type,
+                    "index column list does not match the index column count",
+                ));
+            }
+            read_table_definition(tree, batch, index.table_id())?;
+            require_available_object(tree, batch, index.id().into())?;
+            let name_key = key::index_name_key(index.name())?;
+            require_available_key(tree, batch, &name_key, "duplicate index name")?;
+            require_available_key(
+                tree,
+                batch,
+                &key::table_index_key(index.table_id(), index.id()),
+                "duplicate table index mapping",
+            )?;
+            let mut seen = BTreeSet::new();
+            for (ordinal, column_id) in columns.iter().copied().enumerate() {
+                if !seen.insert(column_id) {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "index column list contains a repeated column",
+                    ));
+                }
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
+                })?;
+                let column = read_column_definition(tree, batch, column_id)?;
+                if column.table_id() != index.table_id() {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "index column is not owned by the index table",
+                    ));
+                }
+                require_available_key(
+                    tree,
+                    batch,
+                    &key::index_column_key(index.id(), ordinal),
+                    "duplicate index column ordinal",
+                )?;
+            }
+            if TreeKind::from_root_page_type(batch.read(index.root())?.header().page_type())
+                != Some(TreeKind::Index)
+            {
+                return Err(corruption(
+                    "catalog index root must reference an Index B+Tree",
+                ));
+            }
+            tree.insert(
+                batch,
+                &key::index_definition_key(index.id()),
+                &record::encode_index_definition(index),
+            )?;
+            tree.insert(
+                batch,
+                &name_key,
+                &record::encode_index_name_mapping(index.id()),
+            )?;
+            tree.insert(
+                batch,
+                &key::table_index_key(index.table_id(), index.id()),
+                &record::encode_table_index_mapping(index.id()),
+            )?;
+            for (ordinal, column_id) in columns.iter().copied().enumerate() {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
+                })?;
+                tree.insert(
+                    batch,
+                    &key::index_column_key(index.id(), ordinal),
+                    &record::encode_index_column_mapping(column_id),
+                )?;
+            }
+            batch.track_tree(TreeKind::Index, index.root())?;
+            batch.enable_feature_bits(INDEX_CONSTRAINT_V1)
+        })
+    }
+
     pub(crate) fn update_table_root(
         &mut self,
         batch: &mut WriteBatch,
@@ -576,6 +906,38 @@ impl CatalogWriter {
                 batch,
                 &key::table_definition_key(table_id),
                 &record::encode_table_definition(&table.with_root(root)),
+            )
+        })
+    }
+
+    pub(crate) fn update_index_root(
+        &mut self,
+        batch: &mut WriteBatch,
+        index_id: IndexId,
+        root: PageRef,
+    ) -> Result<()> {
+        self.mutate(batch, |tree, batch| {
+            let index = read_index_definition(tree, batch, index_id)?;
+            if index.ownership() != IndexOwnership::Explicit {
+                return Err(DbError::new(
+                    ErrorCode::Unsupported,
+                    "constraint-owned indexes cannot be mutated before constraint catalog support",
+                ));
+            }
+            batch.require_tracked_index_root(root)?;
+            replace_record(
+                tree,
+                batch,
+                &key::index_definition_key(index_id),
+                &record::encode_index_definition(&IndexDef::new(
+                    index.id(),
+                    index.table_id(),
+                    root,
+                    index.column_count(),
+                    index.unique(),
+                    index.ownership(),
+                    index.name().clone(),
+                )?),
             )
         })
     }
@@ -602,6 +964,73 @@ impl CatalogWriter {
                 &record::encode_table_definition(&table),
             )?;
             Ok(candidate)
+        })
+    }
+
+    pub(crate) fn bump_table_schema_version(
+        &mut self,
+        batch: &mut WriteBatch,
+        table_id: TableId,
+    ) -> Result<SchemaVersion> {
+        self.mutate(batch, |tree, batch| {
+            let table = read_table_definition(tree, batch, table_id)?;
+            let next = table.schema_version().get().checked_add(1).ok_or_else(|| {
+                DbError::new(ErrorCode::Type, "table schema version counter is exhausted")
+            })?;
+            let schema_version = SchemaVersion::new(next)?;
+            replace_record(
+                tree,
+                batch,
+                &key::table_definition_key(table_id),
+                &record::encode_table_definition(&table.with_schema_version(schema_version)),
+            )?;
+            Ok(schema_version)
+        })
+    }
+
+    pub(crate) fn remove_index(
+        &mut self,
+        batch: &mut WriteBatch,
+        index: &IndexDef,
+        columns: &[ColumnId],
+    ) -> Result<()> {
+        let features = batch.feature_bits();
+        let reader = CatalogReader::open_candidate(batch, &self.tree, features)?;
+        // The writer can own an unpublished bootstrap or split root. Validate
+        // that exact candidate, not the previous root still in the header.
+        let report = validate_tree(batch, &self.tree)?;
+        reader.validate_deep_from(batch, &self.tree, report, features)?;
+        self.mutate(batch, |tree, batch| {
+            if index.ownership() != IndexOwnership::Explicit {
+                return Err(DbError::new(
+                    ErrorCode::Unsupported,
+                    "constraint-owned indexes cannot be mutated before constraint catalog support",
+                ));
+            }
+            require_matching_index_record(tree, batch, index, columns)?;
+            for (ordinal, column_id) in columns.iter().copied().enumerate() {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
+                })?;
+                let key = key::index_column_key(index.id(), ordinal);
+                let value = tree.get(batch, &key)?.ok_or_else(|| {
+                    corruption("bound index column mapping is missing before mutation")
+                })?;
+                if record::decode_index_column_mapping(&value)? != column_id {
+                    return Err(corruption(
+                        "bound index column mapping changed before mutation",
+                    ));
+                }
+                delete_required_record(tree, batch, &key)?;
+            }
+            delete_required_record(
+                tree,
+                batch,
+                &key::table_index_key(index.table_id(), index.id()),
+            )?;
+            delete_required_record(tree, batch, &key::index_name_key(index.name())?)?;
+            delete_required_record(tree, batch, &key::index_definition_key(index.id()))?;
+            batch.release_tree_later(TreeKind::Index, index.root())
         })
     }
 
@@ -669,11 +1098,35 @@ fn read_table_definition(tree: &BTree, batch: &mut WriteBatch, id: TableId) -> R
     record::decode_table_definition(id, &bytes)
 }
 
+fn read_column_definition(tree: &BTree, batch: &mut WriteBatch, id: ColumnId) -> Result<ColumnDef> {
+    let bytes = tree
+        .get(batch, &key::column_definition_key(id))?
+        .ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Corruption,
+                format!("catalog column definition {} is missing", id.get()),
+            )
+        })?;
+    record::decode_column_definition(id, &bytes)
+}
+
+fn read_index_definition(tree: &BTree, batch: &mut WriteBatch, id: IndexId) -> Result<IndexDef> {
+    let bytes = tree
+        .get(batch, &key::index_definition_key(id))?
+        .ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Corruption,
+                format!("catalog index definition {} is missing", id.get()),
+            )
+        })?;
+    record::decode_index_definition(id, &bytes)
+}
+
 fn require_available_object(tree: &BTree, batch: &mut WriteBatch, id: ObjectId) -> Result<()> {
-    // V1 defines only table and column objects; their identities share one namespace.
     for key in [
         key::table_definition_key(TableId::new(id.get())?),
         key::column_definition_key(ColumnId::new(id.get())?),
+        key::index_definition_key(IndexId::new(id.get())?),
     ] {
         if tree.get(batch, &key)?.is_some() {
             return Err(DbError::new(
@@ -770,6 +1223,45 @@ fn require_matching_column_record(
     Ok(())
 }
 
+fn require_matching_index_record(
+    tree: &BTree,
+    batch: &mut WriteBatch,
+    expected: &IndexDef,
+    columns: &[ColumnId],
+) -> Result<()> {
+    if columns.len() != usize::from(expected.column_count()) {
+        return Err(corruption(
+            "bound index columns do not match the index column count",
+        ));
+    }
+    let bytes = tree
+        .get(batch, &key::index_definition_key(expected.id()))?
+        .ok_or_else(|| corruption("bound index definition is missing before mutation"))?;
+    if record::decode_index_definition(expected.id(), &bytes)? != *expected {
+        return Err(corruption("bound index definition changed before mutation"));
+    }
+    let name_bytes = tree
+        .get(batch, &key::index_name_key(expected.name())?)?
+        .ok_or_else(|| corruption("bound index name mapping is missing before mutation"))?;
+    if record::decode_index_name_mapping(&name_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound index name mapping changed before mutation",
+        ));
+    }
+    let table_bytes = tree
+        .get(
+            batch,
+            &key::table_index_key(expected.table_id(), expected.id()),
+        )?
+        .ok_or_else(|| corruption("bound table index mapping is missing before mutation"))?;
+    if record::decode_table_index_mapping(&table_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound table index mapping changed before mutation",
+        ));
+    }
+    Ok(())
+}
+
 fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch, key: &[u8]) -> Result<()> {
     if tree.delete(batch, key)?.is_none() {
         return Err(corruption("catalog record is missing during mutation"));
@@ -786,6 +1278,15 @@ fn insert_unique<K: Ord, V>(map: &mut BTreeMap<K, V>, key: K, value: V) -> Resul
 
 fn corruption(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
+}
+
+fn require_index_feature(feature_bits: u64) -> Result<()> {
+    if feature_bits & INDEX_CONSTRAINT_V1 == 0 {
+        return Err(corruption(
+            "index or constraint catalog record requires INDEX_CONSTRAINT_V1",
+        ));
+    }
+    Ok(())
 }
 
 fn unsupported_legacy() -> DbError {
@@ -1245,6 +1746,19 @@ mod tests {
         .unwrap()
     }
 
+    fn explicit_index(root: PageRef) -> IndexDef {
+        IndexDef::new(
+            IndexId::new(30).unwrap(),
+            TableId::new(10).unwrap(),
+            root,
+            2,
+            false,
+            IndexOwnership::Explicit,
+            CatalogName::new("IX_T_AB").unwrap(),
+        )
+        .unwrap()
+    }
+
     fn committed_single_column_catalog() -> (TempDatabase, Pager, TableId) {
         let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
@@ -1260,6 +1774,720 @@ mod tests {
         writer.finish(&mut batch).unwrap();
         batch.commit().unwrap();
         (temp, pager, table.id())
+    }
+
+    #[test]
+    fn catalog_requires_bidirectional_index_records_and_contiguous_columns() {
+        // Production break caught: accepting any incomplete or inconsistent
+        // direction makes the decoded image unsafe for later DDL consumers.
+        let (_temp, pager) = raw_index_catalog(|_, _, _, _| {});
+        let mut read = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        let index_name = CatalogName::new("IX_T_AB").unwrap();
+        let index = catalog.find_index_by_name(&index_name).unwrap();
+        assert!(std::ptr::eq(
+            index,
+            catalog.find_index_by_id(index.id()).unwrap()
+        ));
+        assert_eq!(
+            catalog
+                .indexes_for_table(index.table_id())
+                .map(IndexDef::id)
+                .collect::<Vec<_>>(),
+            [index.id()]
+        );
+        assert_eq!(
+            catalog
+                .columns_for_index(index.id())
+                .map(ColumnDef::id)
+                .collect::<Vec<_>>(),
+            [ColumnId::new(20).unwrap(), ColumnId::new(21).unwrap()]
+        );
+        assert!(catalog.object_id_exists(ObjectKind::Index, index.id().into()));
+        assert!(catalog.object_name_exists(ObjectKind::Index, &index_name));
+        drop(read);
+
+        assert_bad_index_records("missing index name", |rows, _, _, _| {
+            remove_record(
+                rows,
+                &index_name_key(&CatalogName::new("IX_T_AB").unwrap()).unwrap(),
+            );
+        });
+        assert_bad_index_records("missing table index", |rows, _, _, _| {
+            remove_record(
+                rows,
+                &table_index_key(TableId::new(10).unwrap(), IndexId::new(30).unwrap()),
+            );
+        });
+        assert_bad_index_records("missing index column", |rows, _, _, _| {
+            remove_record(rows, &index_column_key(IndexId::new(30).unwrap(), 0));
+        });
+        assert_bad_index_records("repeated index column", |rows, _, _, _| {
+            *record_value_mut(rows, &index_column_key(IndexId::new(30).unwrap(), 1)) =
+                encode_index_column_mapping(ColumnId::new(20).unwrap());
+        });
+        assert_bad_index_records("noncontiguous index columns", |rows, _, _, _| {
+            let value = remove_record(rows, &index_column_key(IndexId::new(30).unwrap(), 1));
+            rows.push((index_column_key(IndexId::new(30).unwrap(), 2), value));
+        });
+        assert_bad_index_records("wrong table index", |rows, _, _, _| {
+            let value = remove_record(
+                rows,
+                &table_index_key(TableId::new(10).unwrap(), IndexId::new(30).unwrap()),
+            );
+            rows.push((
+                table_index_key(TableId::new(40).unwrap(), IndexId::new(30).unwrap()),
+                value,
+            ));
+        });
+        assert_bad_index_records("foreign index column", |rows, _, _, _| {
+            *record_value_mut(rows, &index_column_key(IndexId::new(30).unwrap(), 1)) =
+                encode_index_column_mapping(ColumnId::new(41).unwrap());
+        });
+        assert_bad_index_records(
+            "index reuses a column object ID",
+            |rows, _, index_root, _| {
+                let old_id = IndexId::new(30).unwrap();
+                let colliding_id = IndexId::new(20).unwrap();
+                *record_value_mut(
+                    rows,
+                    &index_name_key(&CatalogName::new("IX_T_AB").unwrap()).unwrap(),
+                ) = encode_index_name_mapping(colliding_id);
+                remove_record(rows, &index_definition_key(old_id));
+                let colliding = IndexDef::new(
+                    colliding_id,
+                    TableId::new(10).unwrap(),
+                    index_root,
+                    2,
+                    false,
+                    IndexOwnership::Explicit,
+                    CatalogName::new("IX_T_AB").unwrap(),
+                )
+                .unwrap();
+                rows.push((
+                    index_definition_key(colliding_id),
+                    encode_index_definition(&colliding),
+                ));
+                remove_record(rows, &table_index_key(TableId::new(10).unwrap(), old_id));
+                rows.push((
+                    table_index_key(TableId::new(10).unwrap(), colliding_id),
+                    encode_table_index_mapping(colliding_id),
+                ));
+                for ordinal in 0..2 {
+                    let value = remove_record(rows, &index_column_key(old_id, ordinal));
+                    rows.push((index_column_key(colliding_id, ordinal), value));
+                }
+            },
+        );
+        assert_bad_index_records("index root has table kind", |rows, table_root, _, _| {
+            let index = explicit_index(table_root);
+            *record_value_mut(rows, &index_definition_key(index.id())) =
+                encode_index_definition(&index);
+        });
+    }
+
+    #[test]
+    fn catalog_rejects_4c2_records_without_the_feature_bit() {
+        let (_temp, pager) = raw_index_catalog_with_features(CATALOG_V1, |_, _, _, _| {});
+        let mut read = pager.begin_read().unwrap();
+        assert_eq!(
+            CatalogReader::open_empty_or_v1(&mut read)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn catalog_requires_feature_bit_for_the_entire_4c2_key_range() {
+        // A future family inside the reserved 4C2 range is unsupported only
+        // after the header has declared that catalog extension.
+        for family in [0x24, 0x2f] {
+            assert_bad_records(
+                "undeclared 4C2 key family",
+                ErrorCode::Corruption,
+                |rows, _| {
+                    rows.push((vec![family], vec![]));
+                },
+            );
+            assert_bad_records_with_features(
+                "declared future 4C2 key family",
+                ErrorCode::Unsupported,
+                CATALOG_V1 | INDEX_CONSTRAINT_V1,
+                |rows, _| rows.push((vec![family], vec![])),
+            );
+        }
+    }
+
+    #[test]
+    fn phase_4c2_index_corruption_rejects_malformed_physical_entries_only_during_deep_validation() {
+        // Production break caught: generic B+Tree validation accepts opaque
+        // bytes, so deep catalog validation must decode every index key with
+        // its declared columns and require empty leaf values.
+        use crate::storage::index::key::IndexKeyCodec;
+
+        let columns = [column(20, 0, "A"), column(21, 1, "B")];
+        let valid = IndexKeyCodec::encode(
+            &columns,
+            &[crate::Value::Int64(7), crate::Value::Int64(9)],
+            RowId::new(1).unwrap(),
+        )
+        .unwrap()
+        .into_physical();
+        let mut zero_rowid = valid.clone();
+        let rowid_start = zero_rowid.len() - 8;
+        zero_rowid[rowid_start..].fill(0);
+
+        for (case, key, value) in [
+            ("malformed key", vec![0], Vec::new()),
+            ("nonempty leaf value", valid, vec![1]),
+            ("missing ROWID", zero_rowid, Vec::new()),
+        ] {
+            let (_temp, pager) = raw_index_catalog_with_entries(&[(key, value)]);
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read)
+                .expect("ordinary open must remain root/catalog-only");
+            assert_eq!(
+                catalog.validate_deep(&mut read).unwrap_err().code(),
+                ErrorCode::Corruption,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_4c2_format2_real_files_open_lazily_and_read_only_preserves_every_byte() {
+        // Production break caught: opening an older format-2 file must not
+        // manufacture catalog/index state, and malformed feature declarations
+        // must be classified without rewriting either persisted file.
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(&temp, 0, false, None);
+
+        let (temp, pager, _) = committed_single_column_catalog();
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(&temp, CATALOG_V1, false, None);
+
+        let (temp, pager, _) = committed_single_column_catalog();
+        let mut batch = pager.begin_write().unwrap();
+        batch.enable_feature_bits(INDEX_CONSTRAINT_V1).unwrap();
+        batch.commit().unwrap();
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            CATALOG_V1 | INDEX_CONSTRAINT_V1,
+            false,
+            None,
+        );
+
+        let (temp, pager) = raw_index_catalog(|_, _, _, _| {});
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            CATALOG_V1 | INDEX_CONSTRAINT_V1,
+            true,
+            None,
+        );
+
+        let (temp, pager) = raw_index_catalog_with_features(CATALOG_V1, |_, _, _, _| {});
+        drop(pager);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            CATALOG_V1,
+            false,
+            Some(ErrorCode::Corruption),
+        );
+
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        set_real_file_feature_bits(&temp, INDEX_CONSTRAINT_V1);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            INDEX_CONSTRAINT_V1,
+            false,
+            Some(ErrorCode::Corruption),
+        );
+
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        set_real_file_feature_bits(&temp, 1 << 63);
+        assert_format2_read_only_open_preserves_bytes(
+            &temp,
+            1 << 63,
+            false,
+            Some(ErrorCode::Unsupported),
+        );
+    }
+
+    #[test]
+    fn remove_index_validates_the_unpublished_writer_catalog() {
+        // Destructive validation must use the writer's candidate root, not
+        // the still-empty header, when CREATE and DROP share a fresh batch.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let table = new_table(1, root, 1, "T");
+        let column = new_column(2, table.id(), 0, "C");
+        writer.insert_table_definition(&mut batch, &table).unwrap();
+        writer
+            .insert_column_definition(&mut batch, &column)
+            .unwrap();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let index = IndexDef::new(
+            IndexId::new(3).unwrap(),
+            table.id(),
+            index_root,
+            1,
+            false,
+            IndexOwnership::Explicit,
+            CatalogName::new("IX_T_C").unwrap(),
+        )
+        .unwrap();
+        writer
+            .insert_index_definition(&mut batch, &index, &[column.id()])
+            .unwrap();
+        writer
+            .remove_index(&mut batch, &index, &[column.id()])
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert!(catalog.find_index_by_id(index.id()).is_none());
+        assert_eq!(catalog.find_table_by_id(table.id()), Some(&table));
+        assert_eq!(read.feature_bits(), CATALOG_V1 | INDEX_CONSTRAINT_V1);
+        catalog.validate_deep(&mut read).unwrap();
+    }
+
+    #[test]
+    fn index_catalog_mutations_restore_records_roots_and_schema_version() {
+        // Production break caught: statement rollback must restore catalog bytes,
+        // feature bits, schema version, and every tracked index-root transition.
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let column_id = {
+            let mut read = pager.begin_read().unwrap();
+            read.catalog_reader()
+                .unwrap()
+                .columns_for_table(table_id)
+                .next()
+                .unwrap()
+                .id()
+        };
+        let mut batch = pager.begin_write().unwrap();
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let mut tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        let old_root = tree.root();
+        let index = IndexDef::new(
+            index_id,
+            table_id,
+            old_root,
+            1,
+            false,
+            IndexOwnership::Explicit,
+            CatalogName::new("IX_T_C").unwrap(),
+        )
+        .unwrap();
+        writer
+            .insert_index_definition(&mut batch, &index, &[column_id])
+            .unwrap();
+        split_index_tree(&mut tree, &mut batch);
+        assert_ne!(tree.root(), old_root);
+        writer
+            .update_index_root(&mut batch, index.id(), tree.root())
+            .unwrap();
+        assert_eq!(
+            writer
+                .bump_table_schema_version(&mut batch, table_id)
+                .unwrap(),
+            SchemaVersion::new(2).unwrap()
+        );
+        writer.finish(&mut batch).unwrap();
+
+        let catalog = batch.catalog_reader().unwrap();
+        let staged = catalog.find_index_by_id(index.id()).unwrap();
+        assert_eq!(staged.root(), tree.root());
+        assert_eq!(
+            catalog.find_table_by_id(table_id).unwrap().schema_version(),
+            SchemaVersion::new(2).unwrap()
+        );
+        assert_eq!(
+            batch.feature_bits(),
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1
+        );
+
+        batch.restore_statement(checkpoint);
+        let restored = batch.catalog_reader().unwrap();
+        assert!(restored.find_index_by_id(index.id()).is_none());
+        assert_eq!(
+            restored
+                .find_table_by_id(table_id)
+                .unwrap()
+                .schema_version(),
+            SchemaVersion::new(1).unwrap()
+        );
+        assert_eq!(batch.feature_bits(), CATALOG_V1);
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn remove_index_requires_exact_records_and_releases_the_complete_tree() {
+        // Production break caught: a partial delete or root-only release leaves
+        // catalog links, descendants, or overflow pages reachable after DROP.
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let column_id = {
+            let mut read = pager.begin_read().unwrap();
+            read.catalog_reader()
+                .unwrap()
+                .columns_for_table(table_id)
+                .next()
+                .unwrap()
+                .id()
+        };
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let mut tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        let indexed_column = column(column_id.get(), 0, "C");
+        for key in 0_u64..1_000 {
+            let physical = crate::storage::index::key::IndexKeyCodec::encode(
+                std::slice::from_ref(&indexed_column),
+                &[crate::Value::Int64(i64::try_from(key).unwrap())],
+                RowId::new(key + 1).unwrap(),
+            )
+            .unwrap()
+            .into_physical();
+            tree.insert(&mut batch, &physical, &[]).unwrap();
+        }
+        let index = IndexDef::new(
+            index_id,
+            table_id,
+            tree.root(),
+            1,
+            true,
+            IndexOwnership::Explicit,
+            CatalogName::new("IX_T_C").unwrap(),
+        )
+        .unwrap();
+        writer
+            .insert_index_definition(&mut batch, &index, &[column_id])
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let (index, index_pages) = {
+            let mut read = pager.begin_read().unwrap();
+            let catalog = read.catalog_reader().unwrap();
+            let index = catalog.find_index_by_id(index_id).unwrap().clone();
+            let pages = validate_tree(&mut read, &BTree::from_root(TreeKind::Index, index.root()))
+                .unwrap()
+                .all_live_pages();
+            assert!(pages.len() > 2);
+            (index, pages)
+        };
+        let committed_page_count = pager.page_count();
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let before = current_records(&writer, &mut batch);
+        assert_eq!(
+            writer
+                .remove_index(
+                    &mut batch,
+                    &index,
+                    &[ColumnId::new(column_id.get() + 100).unwrap()],
+                )
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        assert_eq!(current_records(&writer, &mut batch), before);
+        writer
+            .remove_index(&mut batch, &index, &[column_id])
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert!(catalog.find_index_by_id(index.id()).is_none());
+        assert!(catalog.indexes_for_table(table_id).next().is_none());
+        assert_eq!(
+            read.feature_bits(),
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1
+        );
+        drop(read);
+
+        let mut allocation = pager.begin_write().unwrap();
+        let mut reused = BTreeSet::new();
+        loop {
+            let page = allocation.allocate(PageType::IndexLeaf).unwrap();
+            if page.page_id().0 >= committed_page_count {
+                break;
+            }
+            reused.insert(page.page_id());
+        }
+        assert!(index_pages.is_subset(&reused));
+        allocation.rollback().unwrap();
+    }
+
+    #[test]
+    fn rejected_index_insertions_leave_records_tracking_and_feature_bits_unchanged() {
+        // Every rejected logical insertion must restore the complete batch,
+        // including a failure encountered after catalog records were written.
+        let (_temp, pager) = raw_index_catalog(|_, _, _, _| {});
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let released = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        batch.release_btree_later(released).unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let columns = [ColumnId::new(20).unwrap(), ColumnId::new(21).unwrap()];
+        let foreign = ColumnId::new(41).unwrap();
+        let cases = [
+            (
+                30,
+                10,
+                root,
+                "NEW",
+                columns.to_vec(),
+                IndexOwnership::Explicit,
+                ErrorCode::Constraint,
+            ),
+            (
+                20,
+                10,
+                root,
+                "NEW",
+                columns.to_vec(),
+                IndexOwnership::Explicit,
+                ErrorCode::Constraint,
+            ),
+            (
+                100,
+                10,
+                root,
+                "IX_T_AB",
+                columns.to_vec(),
+                IndexOwnership::Explicit,
+                ErrorCode::Constraint,
+            ),
+            (
+                100,
+                10,
+                root,
+                "NEW",
+                vec![columns[0]],
+                IndexOwnership::Explicit,
+                ErrorCode::Type,
+            ),
+            (
+                100,
+                10,
+                root,
+                "NEW",
+                vec![columns[0]; 2],
+                IndexOwnership::Explicit,
+                ErrorCode::Constraint,
+            ),
+            (
+                100,
+                10,
+                root,
+                "NEW",
+                vec![columns[0], foreign],
+                IndexOwnership::Explicit,
+                ErrorCode::Constraint,
+            ),
+            (
+                100,
+                99,
+                root,
+                "NEW",
+                columns.to_vec(),
+                IndexOwnership::Explicit,
+                ErrorCode::Corruption,
+            ),
+            (
+                100,
+                10,
+                table_root,
+                "NEW",
+                columns.to_vec(),
+                IndexOwnership::Explicit,
+                ErrorCode::Corruption,
+            ),
+            (
+                100,
+                10,
+                released,
+                "NEW",
+                columns.to_vec(),
+                IndexOwnership::Explicit,
+                ErrorCode::Corruption,
+            ),
+            (
+                100,
+                10,
+                root,
+                "NEW",
+                columns.to_vec(),
+                IndexOwnership::Constraint(ConstraintId::new(101).unwrap()),
+                ErrorCode::Unsupported,
+            ),
+        ];
+        for (id, table, root, name, supplied, ownership, expected) in cases {
+            let index = IndexDef::new(
+                IndexId::new(id).unwrap(),
+                TableId::new(table).unwrap(),
+                root,
+                2,
+                false,
+                ownership,
+                CatalogName::new(name).unwrap(),
+            )
+            .unwrap();
+            let records_before = current_records(&writer, &mut batch);
+            let before = batch.checkpoint_mutation().unwrap();
+            let writer_root = writer.root();
+            assert_eq!(
+                writer
+                    .insert_index_definition(&mut batch, &index, &supplied)
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
+            before.assert_matches_batch_for_test(&batch);
+            assert_eq!(writer.root(), writer_root);
+            assert!(!writer.dirty);
+            assert_eq!(current_records(&writer, &mut batch), records_before);
+        }
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn index_object_id_allocation_and_exhausted_schema_counter_are_atomic() {
+        // Allocation must include the index namespace; schema increment must
+        // reject u64::MAX without wrapping or altering any other record.
+        let (_temp, pager) = raw_index_catalog(|rows, table_root, _, _| {
+            *record_value_mut(rows, &catalog_meta_key()) =
+                encode_catalog_meta(&CatalogMeta::new(ObjectId::new(30).unwrap()));
+            let table =
+                table(table_root).with_schema_version(SchemaVersion::new(u64::MAX).unwrap());
+            *record_value_mut(rows, &table_definition_key(table.id())) =
+                encode_table_definition(&table);
+        });
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let before = batch.checkpoint_mutation().unwrap();
+        assert_eq!(
+            writer.allocate_object_id(&mut batch).unwrap_err().code(),
+            ErrorCode::Constraint
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(
+            writer
+                .bump_table_schema_version(&mut batch, TableId::new(10).unwrap())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert!(!writer.dirty);
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn index_root_and_schema_changes_commit_and_reopen_without_changing_other_records() {
+        // Root replacement must reject stale/untracked/wrong-kind references;
+        // successful replacement and schema bump affect only their definitions.
+        let (temp, pager) = raw_index_catalog(|_, _, _, _| {});
+        let mut batch = pager.begin_write().unwrap();
+        let old = batch.catalog_reader().unwrap();
+        let original = old
+            .find_index_by_id(IndexId::new(30).unwrap())
+            .unwrap()
+            .clone();
+        let original_table = old.find_table_by_id(original.table_id()).unwrap().clone();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let mut index_tree = BTree::from_root(TreeKind::Index, original.root());
+        split_two_column_index_tree(&mut index_tree, &mut batch);
+        let untracked = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let wrong_kind = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        batch.track_tree(TreeKind::Index, wrong_kind).unwrap();
+        for root in [
+            original.root(),
+            untracked,
+            wrong_kind,
+            PageRef::new(
+                index_tree.root().page_id(),
+                index_tree.root().generation() + 1,
+            )
+            .unwrap(),
+        ] {
+            let before = batch.checkpoint_mutation().unwrap();
+            assert_eq!(
+                writer
+                    .update_index_root(&mut batch, original.id(), root)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption
+            );
+            before.assert_matches_batch_for_test(&batch);
+        }
+        // Remove the intentionally wrong test registration before publication.
+        batch
+            .refresh_tree(TreeKind::Index, wrong_kind, index_tree.root())
+            .unwrap();
+        let before_records = current_records(&writer, &mut batch);
+        writer
+            .update_index_root(&mut batch, original.id(), index_tree.root())
+            .unwrap();
+        let next = writer
+            .bump_table_schema_version(&mut batch, original.table_id())
+            .unwrap();
+        assert_eq!(next.get(), original_table.schema_version().get() + 1);
+        let after_records = current_records(&writer, &mut batch);
+        let changed_keys = before_records
+            .iter()
+            .zip(&after_records)
+            .filter_map(|(before, after)| (before != after).then_some(before.0.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed_keys,
+            [
+                table_definition_key(original.table_id()),
+                index_definition_key(original.id())
+            ]
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let pager = Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = read.catalog_reader().unwrap();
+            let expected = IndexDef::new(
+                original.id(),
+                original.table_id(),
+                index_tree.root(),
+                original.column_count(),
+                original.unique(),
+                original.ownership(),
+                original.name().clone(),
+            )
+            .unwrap();
+            assert_eq!(catalog.find_index_by_id(original.id()), Some(&expected));
+            assert_eq!(
+                catalog.find_table_by_id(original.table_id()),
+                Some(&original_table.clone().with_schema_version(next))
+            );
+            catalog.validate_deep(&mut read).unwrap();
+        }
     }
 
     fn allocate_then_rollback(pager: &Pager, table_id: TableId) -> RowId {
@@ -1524,6 +2752,39 @@ mod tests {
             }
         }
         panic!("fixture must split its user tree root");
+    }
+
+    fn split_index_tree(tree: &mut BTree, batch: &mut WriteBatch) -> u64 {
+        let old_root = tree.root();
+        for key in 0_u64..200 {
+            tree.insert(batch, &key.to_be_bytes(), &[7; 128]).unwrap();
+            if tree.root() != old_root {
+                return key + 1;
+            }
+        }
+        panic!("fixture must split its index tree root");
+    }
+
+    fn split_two_column_index_tree(tree: &mut BTree, batch: &mut WriteBatch) -> u64 {
+        let old_root = tree.root();
+        let columns = [column(20, 0, "A"), column(21, 1, "B")];
+        for key in 0_u64..200 {
+            let physical = crate::storage::index::key::IndexKeyCodec::encode(
+                &columns,
+                &[
+                    crate::Value::Int64(i64::try_from(key).unwrap()),
+                    crate::Value::Int64(i64::try_from(key).unwrap()),
+                ],
+                RowId::new(key + 1).unwrap(),
+            )
+            .unwrap()
+            .into_physical();
+            tree.insert(batch, &physical, &[]).unwrap();
+            if tree.root() != old_root {
+                return key + 1;
+            }
+        }
+        panic!("fixture must split its two-column index tree root");
     }
 
     // A finished writer must not authorize later releases or stale root pointers.
@@ -2606,6 +3867,200 @@ mod tests {
         records
     }
 
+    fn index_records(table_root: PageRef, index_root: PageRef, foreign_root: PageRef) -> Records {
+        let mut rows = records(table_root);
+        let foreign = new_table(40, foreign_root, 1, "F");
+        let foreign_column = new_column(41, foreign.id(), 0, "Z");
+        let index = explicit_index(index_root);
+        rows.extend([
+            (
+                table_name_key(foreign.name()).unwrap(),
+                encode_table_name_mapping(foreign.id()),
+            ),
+            (
+                table_definition_key(foreign.id()),
+                encode_table_definition(&foreign),
+            ),
+            (
+                column_name_key(foreign.id(), foreign_column.name()).unwrap(),
+                encode_column_name_mapping(foreign_column.id()),
+            ),
+            (
+                column_ordinal_key(foreign.id(), foreign_column.ordinal()),
+                encode_column_ordinal_mapping(foreign_column.id()),
+            ),
+            (
+                column_definition_key(foreign_column.id()),
+                encode_column_definition(&foreign_column),
+            ),
+            (
+                index_name_key(index.name()).unwrap(),
+                encode_index_name_mapping(index.id()),
+            ),
+            (
+                index_definition_key(index.id()),
+                encode_index_definition(&index),
+            ),
+            (
+                table_index_key(index.table_id(), index.id()),
+                encode_table_index_mapping(index.id()),
+            ),
+            (
+                index_column_key(index.id(), 0),
+                encode_index_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                index_column_key(index.id(), 1),
+                encode_index_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+        ]);
+        rows
+    }
+
+    fn remove_record(rows: &mut Records, key: &[u8]) -> Vec<u8> {
+        let position = rows
+            .iter()
+            .position(|(candidate, _)| candidate == key)
+            .unwrap_or_else(|| panic!("fixture record is missing: {key:?}"));
+        rows.remove(position).1
+    }
+
+    fn record_value_mut<'a>(rows: &'a mut Records, key: &[u8]) -> &'a mut Vec<u8> {
+        &mut rows
+            .iter_mut()
+            .find(|(candidate, _)| candidate == key)
+            .unwrap_or_else(|| panic!("fixture record is missing: {key:?}"))
+            .1
+    }
+
+    fn publish_with_features(batch: &mut WriteBatch, tree: &BTree, feature_bits: u64) {
+        batch.enable_feature_bits(feature_bits).unwrap();
+        batch.set_catalog_root(tree.root()).unwrap();
+    }
+
+    fn raw_index_catalog(
+        mutate: impl FnOnce(&mut Records, PageRef, PageRef, PageRef),
+    ) -> (TempDatabase, Pager) {
+        raw_index_catalog_with_features(
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            mutate,
+        )
+    }
+
+    fn raw_index_catalog_with_features(
+        feature_bits: u64,
+        mutate: impl FnOnce(&mut Records, PageRef, PageRef, PageRef),
+    ) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let foreign_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut rows = index_records(table_root, index_root, foreign_root);
+        mutate(&mut rows, table_root, index_root, foreign_root);
+        let catalog = raw_tree(&mut batch, rows);
+        publish_with_features(&mut batch, &catalog, feature_bits);
+        batch.commit().unwrap();
+        (temp, pager)
+    }
+
+    fn raw_index_catalog_with_entries(entries: &[(Vec<u8>, Vec<u8>)]) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut index_tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        for (key, value) in entries {
+            index_tree.insert(&mut batch, key, value).unwrap();
+        }
+        let foreign_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let catalog = raw_tree(
+            &mut batch,
+            index_records(table_root, index_tree.root(), foreign_root),
+        );
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+        (temp, pager)
+    }
+
+    fn set_real_file_feature_bits(temp: &TempDatabase, bits: u64) {
+        let mut bytes = std::fs::read(temp.path()).unwrap();
+        for slot_start in [0, super::super::header::SUPERBLOCK_SLOT_LEN] {
+            bytes[slot_start + 88..slot_start + 96].copy_from_slice(&bits.to_le_bytes());
+            let checksum = crate::storage::checksum::crc32c(
+                &bytes[slot_start..slot_start + super::super::header::SUPERBLOCK_SLOT_LEN - 4],
+            )
+            .to_le_bytes();
+            bytes[slot_start + super::super::header::SUPERBLOCK_SLOT_LEN - 4
+                ..slot_start + super::super::header::SUPERBLOCK_SLOT_LEN]
+                .copy_from_slice(&checksum);
+        }
+        std::fs::write(temp.path(), bytes).unwrap();
+    }
+
+    fn assert_format2_read_only_open_preserves_bytes(
+        temp: &TempDatabase,
+        expected_features: u64,
+        has_index: bool,
+        expected_error: Option<ErrorCode>,
+    ) {
+        let main_before = std::fs::read(temp.path()).unwrap();
+        let wal_path = crate::storage::wal::wal_path(temp.path());
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        match (
+            Pager::open(
+                temp.path(),
+                OpenMode::ReadOnly,
+                PagerConfig::test_default(4096),
+            ),
+            expected_error,
+        ) {
+            (Ok(pager), None) => {
+                let mut read = pager.begin_read().unwrap();
+                assert_eq!(read.feature_bits(), expected_features);
+                let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+                assert_eq!(
+                    catalog
+                        .find_index_by_name(&CatalogName::new("IX_T_AB").unwrap())
+                        .is_some(),
+                    has_index
+                );
+            }
+            (Err(error), Some(expected)) => assert_eq!(error.code(), expected),
+            (Ok(_), Some(expected)) => panic!("format-2 file was accepted, wanted {expected:?}"),
+            (Err(error), None) => panic!("format-2 file was rejected: {error}"),
+        }
+        assert_eq!(std::fs::read(temp.path()).unwrap(), main_before);
+        assert_eq!(std::fs::read(wal_path).unwrap(), wal_before);
+    }
+
+    fn assert_bad_index_records(
+        label: &str,
+        mutate: impl FnOnce(&mut Records, PageRef, PageRef, PageRef),
+    ) {
+        let (temp, pager) = raw_index_catalog(mutate);
+        let mut read = pager.begin_read().unwrap();
+        assert_eq!(
+            CatalogReader::open_empty_or_v1(&mut read)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption,
+            "snapshot: {label}"
+        );
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                Ok(_) => panic!("recovery accepted {label}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Corruption, "recovery: {label}");
+        }
+    }
+
     fn raw_tree(batch: &mut WriteBatch, records: Records) -> BTree {
         let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
         for (key, value) in records {
@@ -2616,8 +4071,7 @@ mod tests {
     }
 
     fn publish(batch: &mut WriteBatch, tree: &BTree) {
-        batch.enable_feature_bits(CATALOG_V1).unwrap();
-        batch.set_catalog_root(tree.root()).unwrap();
+        publish_with_features(batch, tree, CATALOG_V1);
     }
 
     #[test]
@@ -2732,6 +4186,13 @@ mod tests {
         );
         let reader = CatalogReader::open_candidate(&mut batch, &tree, CATALOG_V1).unwrap();
         assert!(reader.find_table_by_id(TableId::new(1).unwrap()).is_none());
+        let reader = CatalogReader::open_candidate(
+            &mut batch,
+            &tree,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        )
+        .unwrap();
+        assert!(reader.find_index_by_id(IndexId::new(1).unwrap()).is_none());
     }
 
     #[test]
@@ -2752,6 +4213,15 @@ mod tests {
         expected: ErrorCode,
         mutate: impl FnOnce(&mut Records, PageRef),
     ) {
+        assert_bad_records_with_features(label, expected, CATALOG_V1, mutate);
+    }
+
+    fn assert_bad_records_with_features(
+        label: &str,
+        expected: ErrorCode,
+        feature_bits: u64,
+        mutate: impl FnOnce(&mut Records, PageRef),
+    ) {
         let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
@@ -2759,13 +4229,13 @@ mod tests {
         mutate(&mut rows, root);
         let tree = raw_tree(&mut batch, rows);
         assert_eq!(
-            CatalogReader::open_candidate(&mut batch, &tree, CATALOG_V1)
+            CatalogReader::open_candidate(&mut batch, &tree, feature_bits)
                 .unwrap_err()
                 .code(),
             expected,
             "candidate: {label}"
         );
-        publish(&mut batch, &tree);
+        publish_with_features(&mut batch, &tree, feature_bits);
         batch.commit().unwrap();
         let mut read = pager.begin_read().unwrap();
         assert_eq!(
@@ -2887,11 +4357,66 @@ mod tests {
 
     #[test]
     fn reserved_families_versions_and_wrong_record_kinds_keep_decoder_classifications() {
-        for family in [0x15, 0x20, 0x21, 0x30, 0xff] {
+        for family in [0x15, 0xff] {
             assert_bad_records("reserved family", ErrorCode::Unsupported, |rows, _| {
                 rows.push((vec![family], vec![]));
             });
         }
+        for family in [0x20, 0x21, 0x30] {
+            assert_bad_records(
+                "malformed known family",
+                ErrorCode::Corruption,
+                |rows, _| {
+                    rows.push((vec![family], vec![]));
+                },
+            );
+        }
+        let reserved_keys = [
+            constraint_name_key(&CatalogName::new("C").unwrap()).unwrap(),
+            constraint_definition_key(ConstraintId::new(50).unwrap()),
+            table_constraint_key(TableId::new(10).unwrap(), ConstraintId::new(50).unwrap()),
+            constraint_column_key(ConstraintId::new(50).unwrap(), 0),
+            referenced_by_key(
+                ConstraintId::new(50).unwrap(),
+                ConstraintId::new(51).unwrap(),
+            ),
+        ];
+        for key in reserved_keys.clone() {
+            assert_bad_records(
+                "4C2 record without feature bit",
+                ErrorCode::Corruption,
+                |rows, _| rows.push((key, vec![])),
+            );
+        }
+        for key in reserved_keys {
+            assert_bad_records_with_features(
+                "well-formed reserved constraint family",
+                ErrorCode::Unsupported,
+                CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+                |rows, _| rows.push((key, vec![])),
+            );
+        }
+        assert_bad_records_with_features(
+            "constraint-owned index",
+            ErrorCode::Unsupported,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            |rows, root| {
+                let index = IndexDef::new(
+                    IndexId::new(30).unwrap(),
+                    TableId::new(10).unwrap(),
+                    root,
+                    1,
+                    true,
+                    IndexOwnership::Constraint(ConstraintId::new(50).unwrap()),
+                    CatalogName::new("IX_C").unwrap(),
+                )
+                .unwrap();
+                rows.push((
+                    index_definition_key(index.id()),
+                    encode_index_definition(&index),
+                ));
+            },
+        );
         assert_bad_records("newer record", ErrorCode::Unsupported, |rows, _| {
             rows[0].1[1] = 2;
         });
@@ -3289,6 +4814,126 @@ mod tests {
     }
 
     #[test]
+    fn old_snapshot_keeps_old_catalog_and_roots_across_index_ddl_and_dml() {
+        // Production break caught: an old snapshot must not observe the
+        // feature/catalog/table-root publication from a later indexed commit.
+        let (_temp, pager, table_id) = committed_single_column_catalog();
+        let (table, columns) = {
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            (
+                catalog.find_table_by_id(table_id).unwrap().clone(),
+                catalog
+                    .columns_for_table(table_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let first_row =
+            RowCodec::encode(&table, &columns, &[crate::Value::Int64(1)], 1024).unwrap();
+        let first_rowid = {
+            let mut batch = pager.begin_write().unwrap();
+            let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+            let rowid = writer.allocate_rowid(&mut batch, table_id).unwrap();
+            let mut rows = BTree::from_root(TreeKind::Table, table.root());
+            rows.insert(&mut batch, &encode_rowid_key(rowid), &first_row)
+                .unwrap();
+            writer
+                .update_table_root(&mut batch, table_id, rows.root())
+                .unwrap();
+            writer.finish(&mut batch).unwrap();
+            batch.commit().unwrap();
+            rowid
+        };
+
+        let mut old_snapshot = pager.begin_read().unwrap();
+        let old = CatalogReader::open_empty_or_v1(&mut old_snapshot).unwrap();
+        let old_feature_bits = old_snapshot.feature_bits();
+        let old_catalog_root = old_snapshot.catalog_root();
+        let old_table = old.find_table_by_id(table_id).unwrap().clone();
+        let index_name = CatalogName::new("IX_T_C").unwrap();
+        assert!(old.find_index_by_name(&index_name).is_none());
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let mut rows = BTree::from_root(TreeKind::Table, old_table.root());
+        let mut index_tree = BTree::create(&mut batch, TreeKind::Index).unwrap();
+        for value in 2_i64..=200 {
+            let rowid = writer.allocate_rowid(&mut batch, table_id).unwrap();
+            let row = RowCodec::encode(&old_table, &columns, &[crate::Value::Int64(value)], 1024)
+                .unwrap();
+            rows.insert(&mut batch, &encode_rowid_key(rowid), &row)
+                .unwrap();
+            let key = IndexKeyCodec::encode(&columns, &[crate::Value::Int64(value)], rowid)
+                .unwrap()
+                .into_physical();
+            index_tree.insert(&mut batch, &key, &[]).unwrap();
+        }
+        let original_key = IndexKeyCodec::encode(&columns, &[crate::Value::Int64(1)], first_rowid)
+            .unwrap()
+            .into_physical();
+        index_tree.insert(&mut batch, &original_key, &[]).unwrap();
+        let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let index = IndexDef::new(
+            index_id,
+            table_id,
+            index_tree.root(),
+            1,
+            false,
+            IndexOwnership::Explicit,
+            index_name.clone(),
+        )
+        .unwrap();
+        writer
+            .update_table_root(&mut batch, table_id, rows.root())
+            .unwrap();
+        writer
+            .insert_index_definition(&mut batch, &index, &[columns[0].id()])
+            .unwrap();
+        writer
+            .bump_table_schema_version(&mut batch, table_id)
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        assert_eq!(old_snapshot.feature_bits(), old_feature_bits);
+        assert_eq!(old_snapshot.catalog_root(), old_catalog_root);
+        assert!(old.find_index_by_name(&index_name).is_none());
+        assert_eq!(
+            BTree::from_root(TreeKind::Table, old_table.root())
+                .get(&mut old_snapshot, &encode_rowid_key(first_rowid))
+                .unwrap(),
+            Some(first_row)
+        );
+        assert!(
+            BTree::from_root(TreeKind::Table, old_table.root())
+                .get(&mut old_snapshot, &encode_rowid_key(RowId::new(2).unwrap()))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut fresh_snapshot = pager.begin_read().unwrap();
+        let fresh = CatalogReader::open_empty_or_v1(&mut fresh_snapshot).unwrap();
+        let fresh_table = fresh.find_table_by_id(table_id).unwrap();
+        let fresh_index = fresh.find_index_by_name(&index_name).unwrap();
+        assert_eq!(
+            fresh_snapshot.feature_bits(),
+            CATALOG_V1 | INDEX_CONSTRAINT_V1
+        );
+        assert_ne!(fresh_table.root(), old_table.root());
+        assert_eq!(fresh_index.root(), index_tree.root());
+        assert_eq!(
+            BTree::from_root(TreeKind::Table, fresh_table.root())
+                .get(
+                    &mut fresh_snapshot,
+                    &encode_rowid_key(RowId::new(2).unwrap())
+                )
+                .unwrap(),
+            Some(RowCodec::encode(&old_table, &columns, &[crate::Value::Int64(2)], 1024).unwrap())
+        );
+    }
+
+    #[test]
     fn old_catalog_snapshot_survives_new_rows_tables_checkpoint_and_reopen() {
         let (temp, pager, table_id) = committed_single_column_catalog();
         let mut old_snapshot = pager.begin_read().unwrap();
@@ -3390,6 +5035,15 @@ mod tests {
 
     fn large_user_tree(batch: &mut WriteBatch) -> BTree {
         let mut tree = BTree::create(batch, TreeKind::Table).unwrap();
+        for key in 0_u64..80 {
+            tree.insert(batch, &key.to_be_bytes(), &[42; 700]).unwrap();
+        }
+        tree.insert(batch, b"overflow", &[43; 5000]).unwrap();
+        tree
+    }
+
+    fn large_index_tree(batch: &mut WriteBatch) -> BTree {
+        let mut tree = BTree::create(batch, TreeKind::Index).unwrap();
         for key in 0_u64..80 {
             tree.insert(batch, &key.to_be_bytes(), &[42; 700]).unwrap();
         }
@@ -3589,7 +5243,8 @@ mod tests {
             snapshot: &mut read,
             reads: BTreeMap::new(),
         };
-        let catalog = CatalogReader::open_validated(&mut source, &tree, report).unwrap();
+        let catalog =
+            CatalogReader::open_validated(&mut source, &tree, report, CATALOG_V1).unwrap();
         assert_eq!(source.reads.get(&user.root().page_id()), Some(&1));
         assert!(
             source
@@ -3600,7 +5255,7 @@ mod tests {
         source.reads.clear();
         let report = validate_tree(&mut source, &tree).unwrap();
         catalog
-            .validate_deep_from(&mut source, &tree, report)
+            .validate_deep_from(&mut source, &tree, report, CATALOG_V1)
             .unwrap();
         assert!(
             user_report
@@ -3610,6 +5265,66 @@ mod tests {
         );
         assert!(catalog_pages.iter().all(|id| source.reads.contains_key(id)));
         catalog.validate_deep(&mut read).unwrap();
+    }
+
+    #[test]
+    fn ordinary_open_is_shallow_but_deep_validation_walks_index_descendants() {
+        // Production break caught: omitting index trees from the deep live-set
+        // accepts corrupt index descendants that table-only validation never sees.
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let foreign_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index = large_index_tree(&mut batch);
+        let report = validate_tree(&mut batch, &index).unwrap();
+        assert!(report.tree_pages.len() > 2);
+        assert!(!report.overflow_pages.is_empty());
+        let catalog = raw_tree(
+            &mut batch,
+            index_records(table_root, index.root(), foreign_root),
+        );
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let leaf_id = *report
+            .tree_pages
+            .iter()
+            .find(|id| {
+                **id != index.root().page_id()
+                    && read.read_page_by_id(**id).unwrap().header().page_type()
+                        == PageType::IndexLeaf
+            })
+            .unwrap();
+        let leaf = read.read_page_by_id(leaf_id).unwrap();
+        let leaf_ref = PageRef::new(leaf_id, leaf.header().generation()).unwrap();
+        drop(read);
+
+        let mut batch = pager.begin_write().unwrap();
+        batch.modify(leaf_ref).unwrap().bytes_mut()[48..56].fill(0xff);
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        assert_eq!(
+            catalog.validate_deep(&mut read).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let pager = Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(
+                catalog.validate_deep(&mut read).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+        }
     }
 
     #[test]
@@ -3758,7 +5473,7 @@ mod tests {
             snapshot: &mut read,
             reads: BTreeMap::new(),
         };
-        CatalogReader::open_validated(&mut source, &tree, report).unwrap();
+        CatalogReader::open_validated(&mut source, &tree, report, CATALOG_V1).unwrap();
         for id in &user_roots {
             assert_eq!(source.reads.get(id), Some(&1));
         }

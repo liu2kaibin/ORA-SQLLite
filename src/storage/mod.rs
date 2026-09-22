@@ -8,6 +8,7 @@ mod features;
 mod file;
 mod freelist;
 mod header;
+pub(crate) mod index;
 mod overflow;
 mod page;
 mod pager;

@@ -177,6 +177,12 @@ impl DatabaseHeader {
     }
 
     pub(super) fn decode_slot(bytes: &[u8]) -> Result<Self> {
+        let header = Self::decode_slot_structural(bytes)?;
+        validate_feature_bits(header.features)?;
+        Ok(header)
+    }
+
+    fn decode_slot_structural(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != SUPERBLOCK_SLOT_LEN {
             return Err(corruption(
                 "database superblock slot must be exactly 4096 bytes",
@@ -226,18 +232,20 @@ impl DatabaseHeader {
             wal_generation,
             features,
         };
-        header.validate_fields()?;
+        header.validate_structural_fields()?;
         Ok(header)
     }
 
     pub(super) fn select(slot_a: &[u8], slot_b: &[u8]) -> Result<(Self, SuperblockSlot)> {
-        let decoded_a = Self::decode_slot(slot_a).ok();
-        let decoded_b = Self::decode_slot(slot_b).ok();
-        match (decoded_a, decoded_b) {
-            (None, None) => Err(corruption("both database superblock slots are invalid")),
-            (Some(header), None) => Ok((header, SuperblockSlot::A)),
-            (None, Some(header)) => Ok((header, SuperblockSlot::B)),
-            (Some(a), Some(b)) => {
+        let decoded_a = Self::decode_slot_structural(slot_a);
+        let decoded_b = Self::decode_slot_structural(slot_b);
+        let (header, slot) = match (decoded_a, decoded_b) {
+            (Err(_), Err(_)) => {
+                return Err(corruption("both database superblock slots are invalid"));
+            }
+            (Ok(header), Err(_)) => (header, SuperblockSlot::A),
+            (Err(_), Ok(header)) => (header, SuperblockSlot::B),
+            (Ok(a), Ok(b)) => {
                 if a.uuid != b.uuid || a.page_size != b.page_size {
                     return Err(corruption(
                         "database superblock slots disagree on database identity",
@@ -249,18 +257,24 @@ impl DatabaseHeader {
                             "database superblock slots reuse a sequence for different state",
                         ));
                     }
-                    return Ok((a, SuperblockSlot::A));
-                }
-                if a.publish_sequence > b.publish_sequence {
-                    Ok((a, SuperblockSlot::A))
+                    (a, SuperblockSlot::A)
+                } else if a.publish_sequence > b.publish_sequence {
+                    (a, SuperblockSlot::A)
                 } else {
-                    Ok((b, SuperblockSlot::B))
+                    (b, SuperblockSlot::B)
                 }
             }
-        }
+        };
+        validate_feature_bits(header.features)?;
+        Ok((header, slot))
     }
 
     fn validate_fields(&self) -> Result<()> {
+        self.validate_structural_fields()?;
+        validate_feature_bits(self.features)
+    }
+
+    fn validate_structural_fields(&self) -> Result<()> {
         if !is_valid_page_size(self.page_size) {
             return Err(corruption("invalid database page size"));
         }
@@ -275,7 +289,6 @@ impl DatabaseHeader {
         if self.wal_generation == 0 {
             return Err(corruption("database WAL generation must be nonzero"));
         }
-        validate_feature_bits(self.features)?;
         Ok(())
     }
 }
@@ -314,7 +327,7 @@ fn database_header_rejects_unknown_feature_bits() {
             .set_features(1 << 63)
             .expect_err("unknown feature bit")
             .code(),
-        ErrorCode::Corruption
+        ErrorCode::Unsupported
     );
     assert_eq!(header.features(), 0);
 }
@@ -390,6 +403,75 @@ fn select_accepts_one_valid_slot_and_rejects_two_invalid_slots() {
     );
     assert_eq!(
         DatabaseHeader::select(&corrupt, &corrupt)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+}
+
+#[test]
+fn select_arbitrates_structure_before_classifying_winning_feature_bits() {
+    // Production break caught: feature compatibility cannot short-circuit
+    // identity/sequence arbitration, or an obsolete unknown slot rejects a
+    // newer supported publication.
+    let mut old = DatabaseHeader::new(4096, [2; 16]).unwrap();
+    old.publish_sequence = 7;
+    let mut newer = old;
+    newer.publish_sequence = 8;
+    let mut unknown_old = old.encode_slot();
+    unknown_old[88..96].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    refresh_database_crc(&mut unknown_old);
+    assert_eq!(
+        DatabaseHeader::select(&unknown_old, &newer.encode_slot()).unwrap(),
+        (newer, SuperblockSlot::B)
+    );
+
+    let mut unknown_newer = newer.encode_slot();
+    unknown_newer[88..96].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    refresh_database_crc(&mut unknown_newer);
+    assert_eq!(
+        DatabaseHeader::select(&old.encode_slot(), &unknown_newer)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Unsupported
+    );
+
+    let mut damaged_fallback = old.encode_slot();
+    damaged_fallback[0] ^= 1;
+    assert_eq!(
+        DatabaseHeader::select(&unknown_newer, &damaged_fallback)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Unsupported
+    );
+
+    let mut same_sequence_unknown = old.encode_slot();
+    same_sequence_unknown[88..96].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    refresh_database_crc(&mut same_sequence_unknown);
+    assert_eq!(
+        DatabaseHeader::select(&same_sequence_unknown, &old.encode_slot())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+
+    let mut known_contradiction = newer.encode_slot();
+    known_contradiction[88..96]
+        .copy_from_slice(&super::features::INDEX_CONSTRAINT_V1.to_le_bytes());
+    refresh_database_crc(&mut known_contradiction);
+    assert_eq!(
+        DatabaseHeader::select(&old.encode_slot(), &known_contradiction)
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+
+    let mut malformed = old.encode_slot();
+    malformed[0] ^= 1;
+    let mut another_malformed = malformed;
+    another_malformed[1] ^= 1;
+    assert_eq!(
+        DatabaseHeader::select(&malformed, &another_malformed)
             .unwrap_err()
             .code(),
         ErrorCode::Corruption

@@ -29,27 +29,39 @@ impl ValidationReport {
 }
 
 /// Normal catalog open checks user root identities only, never their descendants.
-pub(super) fn validate_table_roots(
+pub(super) fn validate_relation_roots(
     source: &mut impl PageSource,
-    roots: impl IntoIterator<Item = PageRef>,
+    tables: impl Iterator<Item = PageRef>,
+    indexes: impl Iterator<Item = PageRef>,
+    live: &mut BTreeSet<PageId>,
+) -> Result<()> {
+    validate_relation_roots_of_kind(source, tables, TreeKind::Table, "table root", live)?;
+    validate_relation_roots_of_kind(source, indexes, TreeKind::Index, "index root", live)
+}
+
+fn validate_relation_roots_of_kind(
+    source: &mut impl PageSource,
+    roots: impl Iterator<Item = PageRef>,
+    kind: TreeKind,
+    label: &str,
     live: &mut BTreeSet<PageId>,
 ) -> Result<()> {
     let page_count = source.page_count().map_err(as_corruption)?;
     for root in roots {
-        validate_page_id(root.page_id(), page_count, "table root")?;
+        validate_page_id(root.page_id(), page_count, label)?;
         if !live.insert(root.page_id()) {
             return Err(corruption(
-                "table root overlaps another live catalog page or table root",
+                "relation root overlaps another live catalog or relation root",
             ));
         }
         let handle = source.read_page(root).map_err(as_corruption)?;
         let header = handle.header();
         if header.page_id() != root.page_id()
             || header.generation() != root.generation()
-            || TreeKind::from_root_page_type(header.page_type()) != Some(TreeKind::Table)
+            || TreeKind::from_root_page_type(header.page_type()) != Some(kind)
         {
             return Err(corruption(
-                "table root has an invalid type or page reference",
+                "relation root has an invalid type or page reference",
             ));
         }
     }
@@ -58,14 +70,24 @@ pub(super) fn validate_table_roots(
 
 /// Extend a catalog's live set only after proving each user tree is disjoint.
 /// Freelist validation is deliberately left to the caller, once for the full set.
-pub(super) fn validate_table_trees(
+pub(super) fn validate_relation_trees(
     source: &mut impl PageSource,
-    roots: impl IntoIterator<Item = PageRef>,
+    tables: impl Iterator<Item = PageRef>,
+    indexes: impl Iterator<Item = PageRef>,
+    live: &mut BTreeSet<PageId>,
+) -> Result<()> {
+    validate_relation_trees_of_kind(source, tables, TreeKind::Table, live)?;
+    validate_relation_trees_of_kind(source, indexes, TreeKind::Index, live)
+}
+
+fn validate_relation_trees_of_kind(
+    source: &mut impl PageSource,
+    roots: impl Iterator<Item = PageRef>,
+    kind: TreeKind,
     live: &mut BTreeSet<PageId>,
 ) -> Result<()> {
     for root in roots {
-        let pages =
-            validate_tree(source, &BTree::from_root(TreeKind::Table, root))?.all_live_pages();
+        let pages = validate_tree(source, &BTree::from_root(kind, root))?.all_live_pages();
         if !live.is_disjoint(&pages) {
             return Err(corruption(
                 "user tree overlaps another live catalog or user tree",
@@ -513,7 +535,9 @@ mod tests {
         pager::PageSource,
         slotted::SlottedPage,
     };
-    use super::{validate_freelist, validate_tree};
+    use super::{
+        validate_freelist, validate_relation_roots, validate_relation_trees, validate_tree,
+    };
     use crate::{DbError, ErrorCode, Result};
 
     #[test]
@@ -525,6 +549,119 @@ mod tests {
         assert!(report.tree_pages.is_disjoint(&report.overflow_pages));
         let free = validate_freelist(&mut source, &report.all_live_pages()).expect("validate free");
         assert!(free.is_disjoint(&report.all_live_pages()));
+    }
+
+    #[test]
+    fn relation_validation_includes_index_pages_and_shared_overflow() {
+        // Ignoring indexes in the relation walk misses both live-page overlap
+        // and overflow references shared with a table or another index.
+        for shared_table in [false, true] {
+            let mut source = valid_source();
+            source.page_count = 13;
+            source.put(index_leaf_frame(reference(11), reference(8)));
+            let mut live = BTreeSet::new();
+            let tables = shared_table.then_some(reference(1)).into_iter();
+            if !shared_table {
+                source.put(index_leaf_frame(reference(12), reference(8)));
+            }
+            let indexes = if shared_table {
+                vec![reference(11)]
+            } else {
+                vec![reference(11), reference(12)]
+            };
+            assert_eq!(
+                validate_relation_trees(&mut source, tables, indexes.into_iter(), &mut live)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+        let mut source = valid_source();
+        source.page_count = 12;
+        source.put(index_leaf_frame(reference(11), reference(8)));
+        let mut live = BTreeSet::from([PageId(8)]);
+        assert_eq!(
+            validate_relation_trees(
+                &mut source,
+                [].into_iter(),
+                [reference(11)].into_iter(),
+                &mut live
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Corruption
+        );
+        live.clear();
+        validate_relation_trees(
+            &mut source,
+            [].into_iter(),
+            [reference(11)].into_iter(),
+            &mut live,
+        )
+        .unwrap();
+        assert_eq!(live, BTreeSet::from([PageId(8), PageId(11)]));
+        source.put(freelist_frame(reference(9), None, &[PageId(8)]));
+        assert_eq!(
+            validate_freelist(&mut source, &live).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn shallow_index_roots_check_identity_kind_bounds_and_overlap() {
+        // Shallow validation must check the index root itself while deliberately
+        // leaving descendant/overflow validation to the explicit deep walk.
+        let mut source = valid_source();
+        source.page_count = 12;
+        source.put(index_leaf_frame(reference(11), reference(8)));
+        for root in [
+            reference(1),
+            reference(12),
+            PageRef::new(PageId(11), 2).unwrap(),
+        ] {
+            assert_eq!(
+                validate_relation_roots(
+                    &mut source,
+                    [].into_iter(),
+                    [root].into_iter(),
+                    &mut BTreeSet::new()
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::Corruption
+            );
+        }
+        assert_eq!(
+            validate_relation_roots(
+                &mut source,
+                [].into_iter(),
+                [reference(11)].into_iter(),
+                &mut BTreeSet::from([PageId(11)])
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Corruption
+        );
+        let mut live = BTreeSet::new();
+        validate_relation_roots(
+            &mut source,
+            [reference(1)].into_iter(),
+            [reference(11)].into_iter(),
+            &mut live,
+        )
+        .unwrap();
+        assert_eq!(live, BTreeSet::from([PageId(1), PageId(11)]));
+    }
+
+    fn index_leaf_frame(reference: PageRef, overflow: PageRef) -> PageFrame {
+        let mut frame = PageFrame::new_zeroed(PageType::IndexLeaf, reference, 4096).unwrap();
+        let cell = LeafCell::overflow(b"index".to_vec(), 1, overflow).unwrap();
+        SlottedPage::open(&mut frame, 56)
+            .unwrap()
+            .insert(0, &cell.encode().unwrap())
+            .unwrap();
+        frame.prepare_for_write().unwrap();
+        frame
     }
 
     #[test]

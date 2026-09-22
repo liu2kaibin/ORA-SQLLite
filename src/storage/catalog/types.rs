@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 use crate::{DbError, ErrorCode, Result, storage::PageRef};
 
 const MAX_CATALOG_NAME_BYTES: usize = 1013;
+pub(super) const MAX_GLOBAL_CATALOG_NAME_BYTES: usize = 128;
 pub(crate) const MAX_COLUMNS: u16 = 1000;
 
 macro_rules! nonzero_id {
@@ -211,6 +212,11 @@ impl TableDef {
         self.next_rowid = next_rowid;
         self
     }
+
+    pub(super) fn with_schema_version(mut self, schema_version: SchemaVersion) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +229,23 @@ pub(crate) struct ColumnDef {
     name: CatalogName,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexOwnership {
+    Explicit,
+    Constraint(ConstraintId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexDef {
+    id: IndexId,
+    table_id: TableId,
+    root: PageRef,
+    column_count: u16,
+    unique: bool,
+    ownership: IndexOwnership,
+    name: CatalogName,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CatalogRecord {
     CatalogMeta(CatalogMeta),
@@ -231,6 +254,60 @@ pub(crate) enum CatalogRecord {
     ColumnName(ColumnId),
     ColumnOrdinal(ColumnId),
     ColumnDefinition(ColumnDef),
+    IndexName(IndexId),
+    IndexDefinition(IndexDef),
+    TableIndex(IndexId),
+    IndexColumn(ColumnId),
+}
+
+impl IndexDef {
+    pub(crate) fn new(
+        id: IndexId,
+        table_id: TableId,
+        root: PageRef,
+        column_count: u16,
+        unique: bool,
+        ownership: IndexOwnership,
+        name: CatalogName,
+    ) -> Result<Self> {
+        if !(1..=MAX_COLUMNS).contains(&column_count) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index column count must be between 1 and 1000",
+            ));
+        }
+        Ok(Self {
+            id,
+            table_id,
+            root,
+            column_count,
+            unique,
+            ownership,
+            name,
+        })
+    }
+
+    pub(crate) const fn id(&self) -> IndexId {
+        self.id
+    }
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+    pub(crate) const fn root(&self) -> PageRef {
+        self.root
+    }
+    pub(crate) const fn column_count(&self) -> u16 {
+        self.column_count
+    }
+    pub(crate) const fn unique(&self) -> bool {
+        self.unique
+    }
+    pub(crate) const fn ownership(&self) -> IndexOwnership {
+        self.ownership
+    }
+    pub(crate) const fn name(&self) -> &CatalogName {
+        &self.name
+    }
 }
 
 impl ColumnDef {
@@ -465,6 +542,37 @@ mod tests {
                 ColumnType::Int64,
                 true,
                 column_name
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+    }
+
+    #[test]
+    fn explicit_index_definition_enforces_nonzero_columns_and_explicit_owner() {
+        let index = IndexDef::new(
+            IndexId::new(5).unwrap(),
+            TableId::new(2).unwrap(),
+            PageRef::new(PageId(7), 1).unwrap(),
+            2,
+            true,
+            IndexOwnership::Explicit,
+            CatalogName::new("UX_T_AB").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(index.column_count(), 2);
+        assert_eq!(index.ownership(), IndexOwnership::Explicit);
+        assert_eq!(
+            IndexDef::new(
+                index.id(),
+                index.table_id(),
+                index.root(),
+                0,
+                false,
+                IndexOwnership::Explicit,
+                index.name().clone(),
             )
             .unwrap_err()
             .code(),

@@ -89,12 +89,7 @@ fn bind_parts(
         }
         AstStatement::DropTable(drop) => bind_drop_table(&drop.name, catalog, database_uuid)?,
         AstStatement::CreateIndex(create) => bind_create_index(create, catalog, database_uuid)?,
-        AstStatement::DropIndex(drop) => {
-            let _ = checked_catalog_name(&drop.name)?;
-            // V1 intentionally has no index record family. A name is never kept
-            // in the bound IR as a fallback for Phase 4C.
-            return Err(bind_error("index is not present in the catalog"));
-        }
+        AstStatement::DropIndex(drop) => bind_drop_index(&drop.name, catalog, database_uuid)?,
         AstStatement::Begin(_) => BoundParts::empty(BoundStatementKind::Begin),
         AstStatement::Commit(_) => BoundParts::empty(BoundStatementKind::Commit),
         AstStatement::Rollback(_) => BoundParts::empty(BoundStatementKind::Rollback),
@@ -539,6 +534,34 @@ fn bind_drop_table(
     })
 }
 
+fn bind_drop_index(
+    name: &Identifier,
+    catalog: &CatalogReader,
+    database_uuid: [u8; 16],
+) -> Result<BoundParts> {
+    let span = name.span();
+    let name = checked_catalog_name(name)?;
+    let index = catalog
+        .find_index_by_name(&name)
+        .ok_or_else(|| bind_error("index is not present in the catalog"))?;
+    let index_id = index.id();
+    let owner_table_id = index.table_id();
+    let table = catalog
+        .find_table_by_id(owner_table_id)
+        .ok_or_else(|| bind_error("index owner table is not present in the catalog"))?;
+    let table = BoundTable {
+        table_id: table.id(),
+        schema_version: table.schema_version(),
+        span,
+    };
+    Ok(BoundParts {
+        kind: BoundStatementKind::DropIndex { index_id, table },
+        dependencies: vec![table_dependency(table, database_uuid)],
+        created_names: Vec::new(),
+        columns: Vec::new(),
+    })
+}
+
 fn bind_target_columns(
     scope: &BindingScope,
     identifiers: &[Identifier],
@@ -848,7 +871,7 @@ mod tests {
                 CatalogReader, add_unrelated_table, bump_users_schema_version,
                 drop_and_recreate_users, replace_users_id_column_id,
             },
-            test_support::Phase4bCatalogFixture,
+            test_support::{Phase4bCatalogFixture, phase_4b_catalog_fixture_with_explicit_index},
         },
     };
 
@@ -1342,6 +1365,30 @@ mod tests {
             drop.kind,
             BoundStatementKind::DropTable { table_id } if table_id.get() == 1
         ));
+    }
+
+    #[test]
+    fn drop_index_binds_stable_index_and_owner_schema_identity() {
+        // Production break caught: retaining the parsed name instead of the
+        // catalog IndexId and owner table can drop a replacement index.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let database_uuid = pager.database_uuid().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let statement = parse_statement("DROP INDEX IX_USERS_ID", &SqlLimits::default()).unwrap();
+        let bound = bind_statement(&statement, &catalog, database_uuid).unwrap();
+
+        let BoundStatementKind::DropIndex { index_id, table } = &bound.kind else {
+            panic!("expected bound DROP INDEX")
+        };
+        assert_eq!(*index_id, fixture.index_id());
+        assert_eq!(table.table_id, fixture.users_id());
+        assert_eq!(bound.dependencies.len(), 1);
+        assert_eq!(bound.dependencies[0].database_uuid, database_uuid);
+        assert_eq!(bound.dependencies[0].table_id, fixture.users_id());
+        assert_eq!(bound.dependencies[0].schema_version, table.schema_version);
+        assert!(bound.validate_schema(database_uuid, &catalog).is_ok());
     }
 
     #[test]

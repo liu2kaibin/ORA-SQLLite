@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{ErrorKind, Write},
     ops::Bound,
@@ -22,12 +22,15 @@ use super::{
     catalog::{
         CatalogReader, CatalogWriter,
         types::{
-            CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef, TableId,
+            CatalogName, ColumnDef, ColumnId, ColumnType, IndexDef, IndexId, IndexOwnership, RowId,
+            SchemaVersion, TableDef, TableId,
         },
     },
     checksum::stamp_page_checksum,
     file::{DEFAULT_MAX_DATABASE_BYTES, DatabaseFile, OpenMode, checked_page_offset},
+    freelist::Freelist,
     header::{SUPERBLOCK_AREA_LEN, SUPERBLOCK_SLOT_LEN, SuperblockSlot},
+    index::key::IndexKeyCodec,
     page::{PageFrame, PageType},
     pager::PageSource,
     relation::Relation,
@@ -148,6 +151,239 @@ impl Phase4bCatalogFixture {
 
 pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
     phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum IndexColumnChange {
+    Identity,
+    Owner,
+    Ordinal,
+    LogicalType,
+    Nullability,
+}
+
+pub(crate) fn assert_batch_unchanged_after<T>(
+    batch: &mut WriteBatch,
+    operation: impl FnOnce(&mut WriteBatch) -> T,
+) -> T {
+    let before = batch.checkpoint_mutation().unwrap();
+    let result = operation(batch);
+    before.assert_matches_batch_for_test(batch);
+    result
+}
+
+/// Rebuild only the empty USERS/ORDERS test relations, keeping table identity
+/// and schema version fixed while changing one retained column property.
+pub(crate) fn change_empty_index_fixture_column(
+    batch: &mut WriteBatch,
+    change: IndexColumnChange,
+) -> Result<()> {
+    let reader = batch.catalog_reader()?;
+    let users = reader
+        .find_table_by_name(&CatalogName::new("USERS")?)
+        .unwrap()
+        .clone();
+    let orders = reader
+        .find_table_by_name(&CatalogName::new("ORDERS")?)
+        .unwrap()
+        .clone();
+    let tables = [users, orders];
+    let originals = tables
+        .iter()
+        .map(|table| {
+            reader
+                .columns_for_table(table.id())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut writer = CatalogWriter::bootstrap(batch)?;
+    let new_id = if matches!(change, IndexColumnChange::Identity) {
+        Some(ColumnId::new(writer.allocate_object_id(batch)?.get())?)
+    } else {
+        None
+    };
+    for (table, columns) in tables.iter().zip(&originals) {
+        assert_eq!(
+            table.next_rowid().get(),
+            1,
+            "fixture helper requires empty relations"
+        );
+        writer.remove_relation(batch, table, columns)?;
+    }
+    for table in &tables {
+        let rebuilt = TableDef::new(
+            table.id(),
+            table.schema_version(),
+            BTree::create(batch, TreeKind::Table)?.root(),
+            table.next_rowid(),
+            table.column_count(),
+            table.name().clone(),
+        )?;
+        writer.insert_table_definition(batch, &rebuilt)?;
+    }
+    for column in originals.iter().flatten() {
+        let user = column.table_id() == tables[0].id();
+        let id_column = column.name().as_str() == "ID";
+        let mut id = column.id();
+        let mut owner = column.table_id();
+        let mut ordinal = column.ordinal();
+        let mut ty = column.column_type();
+        let mut nullable = column.nullable();
+        match change {
+            IndexColumnChange::Identity if user && id_column => id = new_id.unwrap(),
+            IndexColumnChange::Owner if id_column => {
+                owner = if user { tables[1].id() } else { tables[0].id() }
+            }
+            IndexColumnChange::Ordinal if user && ordinal < 2 => ordinal = 1 - ordinal,
+            IndexColumnChange::LogicalType if user && id_column => ty = ColumnType::Text,
+            IndexColumnChange::Nullability if user && id_column => nullable = !nullable,
+            _ => {}
+        }
+        let changed = ColumnDef::new(id, owner, ordinal, ty, nullable, column.name().clone())?;
+        writer.insert_column_definition(batch, &changed)?;
+    }
+    writer.finish(batch)?;
+    batch.catalog_reader()?.validate_deep_batch(batch)
+}
+
+/// A Phase 4B catalog with one explicit USERS(ID) index for SQL front-end tests.
+///
+/// This deliberately remains test support: production index DDL is planned by
+/// Phase 4C2-A and its storage lifecycle belongs to a later task.
+pub(crate) struct Phase4bExplicitIndexFixture {
+    fixture: Phase4bCatalogFixture,
+    index_id: IndexId,
+}
+
+impl Phase4bExplicitIndexFixture {
+    pub(crate) fn pager(&self) -> Pager {
+        self.fixture.pager()
+    }
+
+    pub(crate) const fn users_id(&self) -> TableId {
+        self.fixture.users_id()
+    }
+
+    pub(crate) const fn index_id(&self) -> IndexId {
+        self.index_id
+    }
+}
+
+pub(crate) fn phase_4b_catalog_fixture_with_explicit_index(
+    page_size: u32,
+    name: &str,
+) -> Phase4bExplicitIndexFixture {
+    let fixture = phase_4b_catalog_fixture(page_size);
+    let pager = fixture.pager();
+    let mut snapshot = pager
+        .begin_read()
+        .expect("read explicit-index fixture catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("open explicit-index fixture catalog");
+    let id_column = catalog
+        .find_column_by_name(fixture.users_id(), &CatalogName::new("ID").unwrap())
+        .expect("USERS(ID) in explicit-index fixture")
+        .id();
+    drop(catalog);
+    drop(snapshot);
+
+    let mut batch = pager
+        .begin_write()
+        .expect("begin explicit-index fixture write");
+    let mut writer =
+        CatalogWriter::bootstrap(&mut batch).expect("bootstrap explicit-index fixture catalog");
+    let index_id = IndexId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate explicit index id")
+            .get(),
+    )
+    .expect("explicit index id is nonzero");
+    let root = BTree::create(&mut batch, TreeKind::Index)
+        .expect("create explicit index tree")
+        .root();
+    let index = IndexDef::new(
+        index_id,
+        fixture.users_id(),
+        root,
+        1,
+        true,
+        IndexOwnership::Explicit,
+        CatalogName::new(name).expect("explicit index name"),
+    )
+    .expect("build explicit index definition");
+    writer
+        .insert_index_definition(&mut batch, &index, &[id_column])
+        .expect("insert explicit index definition");
+    writer
+        .finish(&mut batch)
+        .expect("finish explicit-index fixture catalog");
+    batch
+        .commit()
+        .expect("commit explicit-index fixture catalog");
+
+    Phase4bExplicitIndexFixture { fixture, index_id }
+}
+
+/// Removes the explicit fixture index without changing the owner table's
+/// schema version, for prepared-statement identity tests.
+pub(crate) fn phase_4b_remove_explicit_index(pager: &Pager, index_id: IndexId) -> Result<()> {
+    let (index, columns) = explicit_index_parts(pager, index_id)?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    writer.remove_index(&mut batch, &index, &columns)?;
+    writer.finish(&mut batch)?;
+    batch.commit()
+}
+
+/// Rehomes the same explicit fixture IndexId to ORDERS without changing USERS'
+/// schema version, for prepared-statement owner-identity tests.
+pub(crate) fn phase_4b_rehome_explicit_index_to_orders(
+    pager: &Pager,
+    fixture: &Phase4bExplicitIndexFixture,
+) -> Result<()> {
+    let (index, columns) = explicit_index_parts(pager, fixture.index_id())?;
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let orders_id_column = catalog
+        .find_column_by_name(fixture.fixture.orders_id(), &CatalogName::new("ID")?)
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "fixture ORDERS(ID) is missing"))?
+        .id();
+    drop(catalog);
+    drop(snapshot);
+
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    writer.remove_index(&mut batch, &index, &columns)?;
+    let root = BTree::create(&mut batch, TreeKind::Index)?.root();
+    let rehomed = IndexDef::new(
+        index.id(),
+        fixture.fixture.orders_id(),
+        root,
+        1,
+        index.unique(),
+        IndexOwnership::Explicit,
+        index.name().clone(),
+    )?;
+    writer.insert_index_definition(&mut batch, &rehomed, &[orders_id_column])?;
+    writer.finish(&mut batch)?;
+    batch.commit()
+}
+
+fn explicit_index_parts(pager: &Pager, index_id: IndexId) -> Result<(IndexDef, Vec<ColumnId>)> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let index = catalog
+        .find_index_by_id(index_id)
+        .cloned()
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "fixture index is missing"))?;
+    let columns = catalog
+        .columns_for_index(index.id())
+        .map(|column| column.id())
+        .collect();
+    Ok((index, columns))
 }
 
 fn phase_4b_catalog_fixture_with_uuid(
@@ -1281,6 +1517,532 @@ pub(crate) fn phase_4c1_sql_storage_state(path: &Path) -> Phase4c1SqlStorageStat
         next_rowid,
         rows,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Phase4c2aPageRef {
+    pub(crate) page_id: u64,
+    pub(crate) generation: u64,
+}
+
+impl From<PageRef> for Phase4c2aPageRef {
+    fn from(reference: PageRef) -> Self {
+        Self {
+            page_id: reference.page_id().0,
+            generation: reference.generation(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aTableState {
+    pub(crate) id: u64,
+    pub(crate) schema_version: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) height: u64,
+    pub(crate) next_rowid: u64,
+    pub(crate) rows: Vec<(u64, Vec<Value>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aIndexEntry {
+    pub(crate) physical: Vec<u8>,
+    pub(crate) logical: Vec<Value>,
+    pub(crate) rowid: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aIndexState {
+    pub(crate) id: u64,
+    pub(crate) table_id: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) height: u64,
+    pub(crate) unique: bool,
+    pub(crate) column_ordinals: Vec<u16>,
+    pub(crate) entries: Vec<Phase4c2aIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Phase4c2aFreelistTrunk {
+    pub(crate) reference: Phase4c2aPageRef,
+    pub(crate) leaves: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2aStorageState {
+    pub(crate) lsn: u64,
+    pub(crate) feature_bits: u64,
+    pub(crate) object_counter: u64,
+    pub(crate) catalog_root: Option<Phase4c2aPageRef>,
+    pub(crate) catalog_records: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) tables: BTreeMap<String, Phase4c2aTableState>,
+    pub(crate) indexes: BTreeMap<String, Phase4c2aIndexState>,
+    pub(crate) page_count: u64,
+    pub(crate) freelist_root: u64,
+    pub(crate) freelist: Vec<Phase4c2aFreelistTrunk>,
+    pub(crate) catalog_pages: BTreeSet<u64>,
+    pub(crate) table_pages: BTreeSet<u64>,
+    pub(crate) index_pages: BTreeSet<u64>,
+    pub(crate) main_file_len: u64,
+    pub(crate) wal_file_len: u64,
+}
+
+pub(crate) fn phase_4c2a_create_pager(temp: &TempDatabase) -> Pager {
+    Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create Phase 4C2-A pager")
+}
+
+pub(crate) fn phase_4c2a_open_pager(path: &Path) -> Result<Pager> {
+    Pager::open(path, OpenMode::ReadWrite, PagerConfig::test_default(4096))
+}
+
+pub(crate) fn phase_4c2a_checkpoint(pager: &Pager) -> Result<()> {
+    pager.checkpoint().map(|_| ())
+}
+
+pub(crate) fn phase_4c2a_pager_state(pager: &Pager, path: &Path) -> Result<Phase4c2aStorageState> {
+    phase4c2a_pager_state_inner(pager, path, true)
+}
+
+pub(crate) fn phase_4c2a_model_state(pager: &Pager, path: &Path) -> Result<Phase4c2aStorageState> {
+    phase4c2a_pager_state_inner(pager, path, false)
+}
+
+fn phase4c2a_pager_state_inner(
+    pager: &Pager,
+    path: &Path,
+    deep: bool,
+) -> Result<Phase4c2aStorageState> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    if deep {
+        catalog.validate_deep(&mut snapshot)?;
+    }
+    let catalog_tree = snapshot.catalog_tree(TreeKind::Table)?;
+    let catalog_records = match &catalog_tree {
+        Some(tree) => collect_all(tree, &mut snapshot)?.into_iter().collect(),
+        None => BTreeMap::new(),
+    };
+    let object_counter = match catalog_records.get(&vec![0x00]) {
+        Some(value) => phase4c2a_object_counter(value)?,
+        None if catalog_records.is_empty() => 1,
+        None => {
+            return Err(DbError::new(
+                ErrorCode::Corruption,
+                "Phase 4C2-A state is missing catalog meta",
+            ));
+        }
+    };
+
+    let mut table_defs = Vec::new();
+    let mut index_defs = Vec::new();
+    for key in catalog_records.keys() {
+        if key.len() != 9 {
+            continue;
+        }
+        let id = u64::from_be_bytes(key[1..].try_into().expect("checked catalog key length"));
+        match key[0] {
+            0x11 => table_defs.push(
+                catalog
+                    .find_table_by_id(TableId::new(id)?)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::Corruption, "table definition is not decoded")
+                    })?,
+            ),
+            0x21 => index_defs.push(
+                catalog
+                    .find_index_by_id(IndexId::new(id)?)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::Corruption, "index definition is not decoded")
+                    })?,
+            ),
+            _ => {}
+        }
+    }
+
+    let mut catalog_pages = BTreeSet::new();
+    if deep {
+        if let Some(tree) = &catalog_tree {
+            catalog_pages.extend(
+                validate_tree(&mut snapshot, tree)?
+                    .all_live_pages()
+                    .into_iter()
+                    .map(|page| page.0),
+            );
+        }
+    }
+    let mut table_pages = BTreeSet::new();
+    let mut tables = BTreeMap::new();
+    for table in table_defs {
+        let tree = BTree::from_root(TreeKind::Table, table.root());
+        let height = tree_height(&mut snapshot, tree.root())?;
+        if deep {
+            table_pages.extend(
+                validate_tree(&mut snapshot, &tree)?
+                    .all_live_pages()
+                    .into_iter()
+                    .map(|page| page.0),
+            );
+        }
+        let relation = Relation::open(&catalog, table.id())?;
+        let mut scan = relation.scan(PHASE_4A_MAX_ROW);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_snapshot(&mut snapshot)? {
+            rows.push((row.rowid().get(), row.values().to_vec()));
+        }
+        tables.insert(
+            table.name().as_str().to_owned(),
+            Phase4c2aTableState {
+                id: table.id().get(),
+                schema_version: table.schema_version().get(),
+                root: table.root().into(),
+                height,
+                next_rowid: table.next_rowid().get(),
+                rows,
+            },
+        );
+    }
+
+    let mut index_pages = BTreeSet::new();
+    let mut indexes = BTreeMap::new();
+    for index in index_defs {
+        let tree = BTree::from_root(TreeKind::Index, index.root());
+        let height = tree_height(&mut snapshot, tree.root())?;
+        if deep {
+            index_pages.extend(
+                validate_tree(&mut snapshot, &tree)?
+                    .all_live_pages()
+                    .into_iter()
+                    .map(|page| page.0),
+            );
+        }
+        let columns = catalog
+            .columns_for_index(index.id())
+            .cloned()
+            .collect::<Vec<_>>();
+        let column_ordinals = columns.iter().map(ColumnDef::ordinal).collect();
+        let mut cursor = tree.scan(&mut snapshot, Bound::Unbounded, Bound::Unbounded)?;
+        let mut entries = Vec::new();
+        while let Some((physical, value)) = cursor.next()? {
+            if !value.is_empty() {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "Phase 4C2-A index leaf value is nonempty",
+                ));
+            }
+            let decoded = IndexKeyCodec::decode(&columns, &physical)?;
+            entries.push(Phase4c2aIndexEntry {
+                physical,
+                logical: decoded.values().to_vec(),
+                rowid: decoded.rowid().get(),
+            });
+        }
+        indexes.insert(
+            index.name().as_str().to_owned(),
+            Phase4c2aIndexState {
+                id: index.id().get(),
+                table_id: index.table_id().get(),
+                root: index.root().into(),
+                height,
+                unique: index.unique(),
+                column_ordinals,
+                entries,
+            },
+        );
+    }
+
+    let freelist_root = snapshot.freelist_root()?.0;
+    let mut freelist = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut next = (freelist_root != 0).then_some(PageId(freelist_root));
+    while let Some(page_id) = next {
+        if !seen.insert(page_id) {
+            return Err(DbError::new(
+                ErrorCode::Corruption,
+                "Phase 4C2-A freelist has a cycle",
+            ));
+        }
+        let frame = snapshot.read_page_by_id(page_id)?;
+        let trunk = Freelist::decode(&frame)?;
+        freelist.push(Phase4c2aFreelistTrunk {
+            reference: Phase4c2aPageRef {
+                page_id: page_id.0,
+                generation: frame.header().generation(),
+            },
+            leaves: trunk.leaves().iter().map(|page| page.0).collect(),
+        });
+        next = trunk.next().map(PageRef::page_id);
+    }
+
+    let main_file_len = fs::metadata(path)
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("read main length: {error}")))?
+        .len();
+    let wal_file_len = fs::metadata(wal_path(path))
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("read WAL length: {error}")))?
+        .len();
+    Ok(Phase4c2aStorageState {
+        lsn: snapshot.lsn().0,
+        feature_bits: snapshot.feature_bits(),
+        object_counter,
+        catalog_root: catalog_tree.map(|tree| tree.root().into()),
+        catalog_records,
+        tables,
+        indexes,
+        page_count: snapshot.page_count()?,
+        freelist_root,
+        freelist,
+        catalog_pages,
+        table_pages,
+        index_pages,
+        main_file_len,
+        wal_file_len,
+    })
+}
+
+fn phase4c2a_object_counter(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 20 || bytes[0] != 0 || bytes[1] != 1 || bytes[8..10] != [1, 0] {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            "Phase 4C2-A catalog meta has an unexpected validated layout",
+        ));
+    }
+    Ok(u64::from_le_bytes(
+        bytes[12..20]
+            .try_into()
+            .expect("validated catalog counter length"),
+    ))
+}
+
+pub(crate) fn phase_4c2a_recovered_lsn(path: &Path) -> Result<u64> {
+    let file =
+        DatabaseFile::open_for_recovery(path, OpenMode::ReadOnly, DEFAULT_MAX_DATABASE_BYTES)?;
+    let header = file.header();
+    let mut wal = Wal::open(path, &header, OpenMode::ReadOnly)?;
+    wal.recover(&header, OpenMode::ReadOnly)
+        .map(|recovery| recovery.latest_lsn.0)
+}
+
+pub(crate) fn phase_4c2a_recover_and_capture(path: &Path) -> Result<(u64, Phase4c2aStorageState)> {
+    let accepted_lsn = phase_4c2a_recovered_lsn(path)?;
+    let pager = phase_4c2a_open_pager(path)?;
+    phase_4c2a_checkpoint(&pager)?;
+    let state = phase_4c2a_pager_state(&pager, path)?;
+    drop(pager);
+    Ok((accepted_lsn, state))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase4c2aWalRecord {
+    PageFrame(u64),
+    Commit,
+}
+
+pub(crate) fn phase_4c2a_wal_records(path: &Path, start: u64) -> Result<Vec<Phase4c2aWalRecord>> {
+    let bytes = fs::read(wal_path(path))
+        .map_err(|error| DbError::new(ErrorCode::Io, format!("read Phase 4C2-A WAL: {error}")))?;
+    let mut offset = usize::try_from(start)
+        .map_err(|_| DbError::new(ErrorCode::Corruption, "WAL start exceeds usize"))?;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let header = bytes.get(offset..offset + 64).ok_or_else(|| {
+            DbError::new(ErrorCode::Corruption, "truncated Phase 4C2-A WAL header")
+        })?;
+        if &header[..8] != b"ORAWREC\0" {
+            return Err(DbError::new(
+                ErrorCode::Corruption,
+                "invalid Phase 4C2-A WAL record magic",
+            ));
+        }
+        let payload_len =
+            usize::try_from(u32::from_le_bytes(header[12..16].try_into().unwrap()))
+                .map_err(|_| DbError::new(ErrorCode::Corruption, "WAL payload exceeds usize"))?;
+        records.push(match header[8] {
+            1 => Phase4c2aWalRecord::PageFrame(u64::from_le_bytes(
+                header[32..40].try_into().unwrap(),
+            )),
+            2 => Phase4c2aWalRecord::Commit,
+            _ => {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "unknown Phase 4C2-A WAL record type",
+                ));
+            }
+        });
+        offset = offset
+            .checked_add(64)
+            .and_then(|next| next.checked_add(payload_len))
+            .and_then(|next| next.checked_add((8 - (payload_len & 7)) & 7))
+            .ok_or_else(|| DbError::new(ErrorCode::Corruption, "WAL offset overflow"))?;
+    }
+    if offset != bytes.len() {
+        return Err(DbError::new(
+            ErrorCode::Corruption,
+            "Phase 4C2-A WAL record crosses EOF",
+        ));
+    }
+    Ok(records)
+}
+
+pub(crate) fn phase_4c2a_commit_malformed_index(pager: &Pager, name: &str) -> Result<()> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let index = catalog
+        .find_index_by_name(&CatalogName::new(name)?)
+        .cloned()
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "missing corrupt-candidate index"))?;
+    let catalog_tree = snapshot
+        .catalog_tree(TreeKind::Table)?
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "missing corrupt-candidate catalog"))?;
+    let index_key = {
+        let mut key = vec![0x21];
+        key.extend_from_slice(&index.id().get().to_be_bytes());
+        key
+    };
+    let mut index_record = collect_all(&catalog_tree, &mut snapshot)?
+        .into_iter()
+        .find_map(|(key, value)| (key == index_key).then_some(value))
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "missing corrupt-candidate definition"))?;
+    drop(snapshot);
+    let mut batch = pager.begin_write()?;
+    // A complete, checksummed 4C2 catalog candidate whose explicit index has
+    // zero columns. This is structurally invalid before any user-tree scan and
+    // must reject the newest Commit instead of falling back to the older image.
+    index_record[40..42].fill(0);
+    let mut updated_catalog = BTree::from_root(TreeKind::Table, catalog_tree.root());
+    let removed = updated_catalog.delete(&mut batch, &index_key)?;
+    if removed.is_none() {
+        return Err(DbError::new(
+            ErrorCode::Internal,
+            "corrupt-candidate definition disappeared before replacement",
+        ));
+    }
+    updated_catalog.insert(&mut batch, &index_key, &index_record)?;
+    batch.track_tree(TreeKind::Table, updated_catalog.root())?;
+    batch.set_catalog_root(updated_catalog.root())?;
+    batch.commit()
+}
+
+fn phase4c2a_fd_target_matches(target: &Path, canonical: &Path) -> bool {
+    target == canonical
+        || (!target.exists()
+            && target
+                .to_string_lossy()
+                .strip_suffix(" (deleted)")
+                .is_some_and(|without_suffix| Path::new(without_suffix) == canonical))
+}
+
+#[cfg(target_os = "linux")]
+fn phase4c2a_open_linux_fds(targets: &[PathBuf]) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut open = Vec::new();
+    for entry in fs::read_dir("/proc/self/fd")? {
+        let fd = entry?.path();
+        let target = match fs::read_link(&fd) {
+            Ok(target) => target,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if targets
+            .iter()
+            .any(|canonical| phase4c2a_fd_target_matches(&target, canonical))
+        {
+            open.push((fd, target));
+        }
+    }
+    Ok(open)
+}
+
+#[cfg(target_os = "linux")]
+fn phase4c2a_assert_no_linux_fds(path: &Path) {
+    let targets = [path.to_path_buf(), wal_path(path)]
+        .into_iter()
+        .map(|target| fs::canonicalize(target).expect("canonicalize recovered Phase 4C2-A file"))
+        .collect::<Vec<_>>();
+    let open = phase4c2a_open_linux_fds(&targets).expect("inspect /proc/self/fd");
+    assert!(
+        open.is_empty(),
+        "recovered Phase 4C2-A files still have open Linux descriptors: {open:?}"
+    );
+}
+
+#[test]
+fn phase_4c2a_fd_target_matching_rejects_existing_literal_deleted_suffix() {
+    let temp = TempDatabase::new("phase4c2a-literal-deleted-suffix");
+    fs::write(temp.path(), b"base").unwrap();
+    let canonical = fs::canonicalize(temp.path()).unwrap();
+    let literal = PathBuf::from(format!("{} (deleted)", canonical.display()));
+    fs::write(&literal, b"literal").unwrap();
+    let literal_open = fs::File::open(&literal).unwrap();
+
+    assert!(phase4c2a_fd_target_matches(&canonical, &canonical));
+    let matches_base = phase4c2a_fd_target_matches(&literal, &canonical);
+
+    drop(literal_open);
+    fs::remove_file(literal).unwrap();
+    assert!(!matches_base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn phase_4c2a_linux_fd_probe_detects_open_main_and_wal() {
+    let temp = TempDatabase::new("phase4c2a-linux-fd-probe");
+    let pager = phase_4c2a_create_pager(&temp);
+    drop(pager);
+    let main_path = fs::canonicalize(temp.path()).unwrap();
+    let wal_path = fs::canonicalize(wal_path(temp.path())).unwrap();
+    let main = fs::File::open(&main_path).unwrap();
+    let wal = fs::File::open(&wal_path).unwrap();
+    let targets = vec![main_path, wal_path];
+    let open = phase4c2a_open_linux_fds(&targets).unwrap();
+    assert!(targets.iter().all(|target| {
+        open.iter()
+            .any(|(_, actual)| phase4c2a_fd_target_matches(actual, target))
+    }));
+    drop(main);
+    drop(wal);
+    assert!(phase4c2a_open_linux_fds(&targets).unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn phase_4c2a_linux_fd_probe_distinguishes_unlinked_from_literal_deleted_suffix() {
+    let unlinked = TempDatabase::new("phase4c2a-unlinked-fd");
+    fs::write(unlinked.path(), b"unlinked").unwrap();
+    let unlinked_canonical = fs::canonicalize(unlinked.path()).unwrap();
+    let unlinked_open = fs::File::open(&unlinked_canonical).unwrap();
+    fs::remove_file(&unlinked_canonical).unwrap();
+
+    let open = phase4c2a_open_linux_fds(std::slice::from_ref(&unlinked_canonical)).unwrap();
+    assert!(
+        open.iter()
+            .any(|(_, actual)| { phase4c2a_fd_target_matches(actual, &unlinked_canonical) })
+    );
+    drop(unlinked_open);
+    assert!(
+        phase4c2a_open_linux_fds(std::slice::from_ref(&unlinked_canonical))
+            .unwrap()
+            .is_empty()
+    );
+
+    let base = TempDatabase::new("phase4c2a-literal-fd");
+    fs::write(base.path(), b"base").unwrap();
+    let base_canonical = fs::canonicalize(base.path()).unwrap();
+    let literal = PathBuf::from(format!("{} (deleted)", base_canonical.display()));
+    fs::write(&literal, b"literal").unwrap();
+    let literal_open = fs::File::open(&literal).unwrap();
+
+    let base_fds = phase4c2a_open_linux_fds(std::slice::from_ref(&base_canonical)).unwrap();
+
+    drop(literal_open);
+    fs::remove_file(literal).unwrap();
+    assert!(base_fds.is_empty());
+}
+
+pub(crate) fn phase_4c2a_remove_recovered_files(path: &Path) {
+    #[cfg(target_os = "linux")]
+    phase4c2a_assert_no_linux_fds(path);
+    fs::remove_file(wal_path(path)).expect("remove recovered Phase 4C2-A WAL");
+    fs::remove_file(path).expect("remove recovered Phase 4C2-A main file");
 }
 
 struct Phase4c1AbortAt {

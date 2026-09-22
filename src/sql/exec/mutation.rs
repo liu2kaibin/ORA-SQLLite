@@ -3,14 +3,15 @@ use crate::{
     sql::{
         SqlType,
         bound::SourceId,
-        plan::{CreateTablePlan, DeletePlan, InsertPlan, Plan, PlanKind, UpdatePlan},
+        plan::{CreateTablePlan, DeletePlan, InsertPlan, PlanKind, UpdatePlan},
     },
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
+        index::{IndexSpec, create_index, drop_index},
         relation::{
-            ColumnSpec, Relation, RelationValueValidation, TableSpec, TableWrite, create_relation,
-            drop_relation,
+            ColumnSpec, ConstrainedTableWrite, Relation, RelationValueValidation, TableSpec,
+            create_relation, drop_relation,
         },
     },
 };
@@ -26,7 +27,7 @@ use super::{
 
 /// A write plan whose API kind, parameters, and retained schema have all been checked.
 pub(crate) struct ValidatedWrite<'a> {
-    plan: &'a Plan,
+    statement: &'a Statement,
     params: ParameterFrame,
     memory: WorkMemory,
 }
@@ -49,7 +50,7 @@ pub(crate) fn validate_write_execution<'a>(
         return Err(unsupported_4c2());
     }
     Ok(ValidatedWrite {
-        plan: statement.plan(),
+        statement,
         params,
         memory,
     })
@@ -60,16 +61,62 @@ pub(crate) fn execute_validated_write_plan(
     validated: ValidatedWrite<'_>,
 ) -> Result<ExecutionResult> {
     let ValidatedWrite {
-        plan,
+        statement,
         params,
         mut memory,
     } = validated;
-    match plan.kind() {
+    match statement.plan().kind() {
         PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &memory),
         PlanKind::Update(plan) => execute_update(batch, plan, &params, &mut memory),
         PlanKind::Delete(plan) => execute_delete(batch, plan, &params, &mut memory),
         PlanKind::CreateTable(plan) => execute_create_table(batch, plan),
+        PlanKind::CreateIndex(plan) => {
+            // Recheck database identity, owner-table version, and the created
+            // name next to mutation, even for an already validated write plan.
+            let catalog = batch.catalog_reader()?;
+            statement.validate_schema(batch.database_uuid(), &catalog)?;
+            let spec = IndexSpec::new(
+                plan.name().clone(),
+                plan.table().table_id(),
+                plan.columns()
+                    .iter()
+                    .map(|target| {
+                        let column =
+                            catalog
+                                .find_column_by_id(target.column_id())
+                                .ok_or_else(|| {
+                                    DbError::new(
+                                        ErrorCode::SchemaChanged,
+                                        "prepared indexed column no longer exists",
+                                    )
+                                    .with_sql_location(target.location())
+                                })?;
+                        target.validate_catalog_column(column)?;
+                        Ok(column.clone())
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                plan.unique(),
+            )?;
+            // Lend the remaining query budget to the storage lifecycle. It
+            // bounds simultaneous raw/decoded rows and key/probe scratch.
+            let available = memory.remaining();
+            memory.reserve(available)?;
+            let result = create_index(batch, &spec, available);
+            memory.release(available)?;
+            result?;
+            Ok(ExecutionResult::new(0))
+        }
+        PlanKind::DropIndex(plan) => {
+            // Recheck retained database, table version and index owner identity
+            // immediately before mutation, even after earlier validation.
+            let catalog = batch.catalog_reader()?;
+            statement.validate_schema(batch.database_uuid(), &catalog)?;
+            drop_index(batch, plan.index_id())?;
+            Ok(ExecutionResult::new(0))
+        }
         PlanKind::DropTable { table_id } => {
+            let catalog = batch.catalog_reader()?;
+            statement.validate_schema(batch.database_uuid(), &catalog)?;
             drop_relation(batch, *table_id)?;
             Ok(ExecutionResult::new(0))
         }
@@ -93,7 +140,7 @@ fn execute_update(
             ));
         }
     }
-    let mut writer = TableWrite::open(batch, table_id)?;
+    let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
     let mut last = None;
     let mut affected = 0_u64;
     while let Some(stored) = writer
@@ -146,18 +193,34 @@ fn execute_update(
                 })?;
             *target = value;
         }
-        validate_and_replace(
-            batch,
-            &relation,
-            &mut writer,
-            plan,
-            rowid,
-            &replacement,
-            memory,
-        )?;
+        validate_update_replacement(&relation, plan, &replacement, old_bytes, memory)?;
+        // Validation must happen before allocating the third owned row so an
+        // invalid assignment keeps its Type diagnostic. On the valid path,
+        // retain the original row for index deletion and account for it before
+        // cloning, while no B+Tree mutation has happened yet.
+        memory.reserve(old_bytes)?;
+        let old_for_index = (0..relation.column_count())
+            .map(|ordinal| {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(
+                        ErrorCode::Internal,
+                        "UPDATE relation column ordinal exceeds its bound",
+                    )
+                })?;
+                old.source_value(SourceId(0), ordinal)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE old row is missing a relation column",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writer.replace(batch, rowid, &old_for_index, &replacement)?;
         affected = checked_affected_count(affected)?;
         memory.release(checked_add_bytes(
-            checked_add_bytes(old_bytes, assignment_bytes)?,
+            checked_add_bytes(checked_add_bytes(old_bytes, assignment_bytes)?, old_bytes)?,
             old_bytes,
         )?)?;
     }
@@ -197,7 +260,8 @@ fn execute_delete(
     params: &ParameterFrame,
     memory: &mut WorkMemory,
 ) -> Result<ExecutionResult> {
-    let mut writer = TableWrite::open(batch, plan.table().table_id())?;
+    let relation = Relation::open_from_batch(batch, plan.table().table_id())?;
+    let mut writer = ConstrainedTableWrite::open(batch, plan.table().table_id())?;
     let mut last = None;
     let mut affected = 0_u64;
     while let Some(stored) = writer
@@ -214,8 +278,31 @@ fn execute_delete(
         let old_bytes = owned_values_bytes(old_values.iter())?;
         memory.reserve(old_bytes)?;
         let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
-        if predicate_matches(plan.selection(), &old, params)? && writer.delete(batch, rowid)? {
-            affected = checked_affected_count(affected)?;
+        if predicate_matches(plan.selection(), &old, params)? {
+            memory.reserve(old_bytes)?;
+            let old_for_index = (0..relation.column_count())
+                .map(|ordinal| {
+                    let ordinal = u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "DELETE relation column ordinal exceeds its bound",
+                        )
+                    })?;
+                    old.source_value(SourceId(0), ordinal)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::new(
+                                ErrorCode::Internal,
+                                "DELETE old row is missing a relation column",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let deleted = writer.delete(batch, rowid, &old_for_index);
+            memory.release(old_bytes)?;
+            if deleted? {
+                affected = checked_affected_count(affected)?;
+            }
         }
         memory.release(old_bytes)?;
     }
@@ -231,21 +318,22 @@ fn map_row_memory_limit(error: DbError) -> DbError {
     }
 }
 
-fn validate_and_replace(
-    batch: &mut WriteBatch,
+fn validate_update_replacement(
     relation: &Relation,
-    writer: &mut TableWrite,
     plan: &UpdatePlan,
-    rowid: crate::storage::catalog::types::RowId,
     replacement: &[crate::Value],
+    planned_old_clone_bytes: u64,
     memory: &mut WorkMemory,
 ) -> Result<()> {
-    let row_budget = memory.remaining();
-    memory.reserve(row_budget)?;
+    // Keep the old row clone in the statement budget before allocating it.
+    // RowCodec checks value shapes before it classifies the bounded length, so
+    // an invalid assignment preserves its Type diagnostic even when the valid
+    // replacement could not coexist with that clone.
+    let row_budget = memory.remaining().saturating_sub(planned_old_clone_bytes);
     let max_row_bytes = usize::try_from(row_budget).unwrap_or(usize::MAX);
     let validation = relation.validate_update_values(replacement, max_row_bytes);
-    let result = match validation {
-        Ok(RelationValueValidation::Valid) => writer.replace(batch, rowid, replacement),
+    match validation {
+        Ok(RelationValueValidation::Valid) => Ok(()),
         Ok(RelationValueValidation::ExceedsLimit) => Err(resource_limit()),
         Ok(RelationValueValidation::InvalidValue { ordinal, error }) => {
             let assignment = plan
@@ -264,9 +352,7 @@ fn validate_and_replace(
             }
         }
         Err(error) => Err(error),
-    };
-    memory.release(row_budget)?;
-    result
+    }
 }
 
 fn predicate_matches(
@@ -337,7 +423,7 @@ fn execute_insert(
     }
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
     relation.validate_values(&values, max_row_bytes)?;
-    let mut writer = TableWrite::open(batch, table_id)?;
+    let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
     writer.insert(batch, &values)?;
     writer.finish(batch)?;
     Ok(ExecutionResult::new(1))
@@ -481,6 +567,218 @@ mod tests {
                 .is_some()
         );
         batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_identity() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Identity,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_owner() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Owner,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_ordinal() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Ordinal,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_logical_type() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::LogicalType,
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_changed_column_nullability() {
+        assert_create_index_rejects_changed_column(
+            crate::storage::test_support::IndexColumnChange::Nullability,
+        );
+    }
+
+    fn assert_create_index_rejects_changed_column(
+        change: crate::storage::test_support::IndexColumnChange,
+    ) {
+        // These fixtures remain valid catalogs with unchanged table versions,
+        // so schema-version checks cannot hide omitted column-shape checks.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let statement = prepare(&pager, "CREATE INDEX IX_STALE ON USERS (ID)");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        crate::storage::test_support::change_empty_index_fixture_column(&mut batch, change)
+            .unwrap();
+        let result =
+            crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+                execute_validated_write_plan(batch, validated)
+            });
+        assert_eq!(result.unwrap_err().code(), ErrorCode::SchemaChanged);
+        batch.catalog_reader().unwrap();
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn create_index_low_memory_restores_every_batch_field() {
+        // A per-key limit alone cannot account for an unindexed overflow value,
+        // or the simultaneous raw/decoded/key allocations of an indexable row.
+        for (target, length, limit) in [("NAME", 900, 10_000), ("ID", 20_000, 16_384)] {
+            let payload = "x".repeat(length);
+            let fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[
+                (1, "small"),
+                (2, &payload),
+            ]);
+            let pager = fixture.pager();
+            let statement = prepare(
+                &pager,
+                &format!("CREATE INDEX IX_MEMORY ON USERS ({target})"),
+            );
+            let mut batch = pager.begin_write().unwrap();
+            let validated =
+                validate_write_execution(&mut batch, &statement, Parameters::none(), limit)
+                    .unwrap();
+            let result =
+                crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+                    execute_validated_write_plan(batch, validated)
+                });
+            assert_eq!(result.unwrap_err().code(), ErrorCode::ResourceLimit);
+            batch.catalog_reader().unwrap();
+            let good = prepare(&pager, "INSERT INTO USERS (ID) VALUES (9)");
+            let validated =
+                validate_write_execution(&mut batch, &good, Parameters::none(), limit).unwrap();
+            execute_validated_write_plan(&mut batch, validated).unwrap();
+            batch.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn create_index_rechecks_name_version_and_database_after_validation() {
+        // Validation can be separated from execution internally: neither a
+        // name taken on a different table, a version bump, nor a different
+        // database with identical object IDs may reuse the validated request.
+        let fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[]);
+        let pager = fixture.pager();
+        let first = prepare(&pager, "CREATE INDEX IX_SHARED ON USERS (ID)");
+        let same_name = prepare(&pager, "CREATE INDEX IX_SHARED ON ORDERS (ID)");
+        let same_table = prepare(&pager, "CREATE INDEX IX_NEW ON USERS (ID)");
+        let mut batch = pager.begin_write().unwrap();
+        let validated = [&first, &same_name, &same_table].map(|statement| {
+            validate_write_execution(&mut batch, statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap()
+        });
+        let [first, same_name, same_table] = validated;
+        execute_validated_write_plan(&mut batch, first).unwrap();
+        for stale in [same_name, same_table] {
+            assert_eq!(
+                execute_validated_write_plan(&mut batch, stale)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::SchemaChanged
+            );
+        }
+        let catalog = batch.catalog_reader().unwrap();
+        assert!(
+            catalog
+                .find_index_by_name(
+                    &crate::storage::catalog::types::CatalogName::new("IX_NEW").unwrap()
+                )
+                .is_none()
+        );
+        batch.rollback().unwrap();
+
+        let other_fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[]);
+        let other_pager = other_fixture.pager();
+        let mut batch = pager.begin_write().unwrap();
+        let statement = prepare(&pager, "CREATE INDEX IX_DATABASE ON USERS (ID)");
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let mut other = other_pager.begin_write().unwrap();
+        assert_eq!(
+            execute_validated_write_plan(&mut other, validated)
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+        batch.rollback().unwrap();
+        other.rollback().unwrap();
+    }
+
+    #[test]
+    fn drop_index_rechecks_retained_identity_owner_version_and_database_before_mutation() {
+        use crate::storage::test_support::{
+            phase_4b_catalog_fixture_with_explicit_index, phase_4b_rehome_explicit_index_to_orders,
+            phase_4b_remove_explicit_index,
+        };
+        // ValidatedWrite intentionally does not borrow the batch. Swapping to a
+        // later/current batch must still reject stale identities before writes.
+        for change in ["missing", "owner", "version", "database", "same-name"] {
+            let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_T");
+            let pager = fixture.pager();
+            let statement = prepare(&pager, "DROP INDEX IX_T");
+            let mut batch = pager.begin_write().unwrap();
+            let validated = validate_write_execution(
+                &mut batch,
+                &statement,
+                Parameters::none(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            batch.rollback().unwrap();
+            let other_fixture = crate::storage::test_support::phase_4c1_query_relation_fixture(&[]);
+            match change {
+                "missing" | "same-name" => {
+                    phase_4b_remove_explicit_index(&pager, fixture.index_id()).unwrap()
+                }
+                "owner" => phase_4b_rehome_explicit_index_to_orders(&pager, &fixture).unwrap(),
+                _ => {}
+            }
+            if matches!(change, "version" | "same-name") {
+                let create = prepare(
+                    &pager,
+                    if change == "version" {
+                        "CREATE INDEX IX_NEW ON USERS (ID)"
+                    } else {
+                        "CREATE INDEX IX_T ON USERS (ID)"
+                    },
+                );
+                let mut batch = pager.begin_write().unwrap();
+                let create = validate_write_execution(
+                    &mut batch,
+                    &create,
+                    Parameters::none(),
+                    64 * 1024 * 1024,
+                )
+                .unwrap();
+                execute_validated_write_plan(&mut batch, create).unwrap();
+                batch.commit().unwrap();
+            }
+            let target = if change == "database" {
+                other_fixture.pager()
+            } else {
+                pager
+            };
+            let mut batch = target.begin_write().unwrap();
+            crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+                assert_eq!(
+                    execute_validated_write_plan(batch, validated)
+                        .unwrap_err()
+                        .code(),
+                    ErrorCode::SchemaChanged,
+                    "{change}"
+                );
+            });
+            batch.rollback().unwrap();
+        }
     }
 
     #[test]

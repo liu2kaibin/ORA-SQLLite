@@ -165,7 +165,9 @@ impl Connection {
                 | PlanKind::Update(_)
                 | PlanKind::Delete(_)
                 | PlanKind::CreateTable(_)
-                | PlanKind::DropTable { .. } => self.execute_autocommit(statement, parameters),
+                | PlanKind::DropTable { .. }
+                | PlanKind::CreateIndex(_)
+                | PlanKind::DropIndex(_) => self.execute_autocommit(statement, parameters),
             },
             ConnectionStateKind::SqlWrite => match statement.plan().kind() {
                 PlanKind::Begin => Err(transaction_state_error()),
@@ -497,8 +499,9 @@ mod tests {
     use crate::{
         Database, ErrorCode, Options, Parameters, SqlLimits, Value,
         storage::test_support::{
-            TempDatabase, phase_4b_catalog_fixture, phase_4c1_commit_io_fault_pager,
-            phase_4c1_corrupt_batch_catalog, phase_4c1_corrupt_query_relation_fixture,
+            TempDatabase, phase_4b_catalog_fixture, phase_4b_catalog_fixture_with_explicit_index,
+            phase_4c1_commit_io_fault_pager, phase_4c1_corrupt_batch_catalog,
+            phase_4c1_corrupt_query_relation_fixture,
         },
     };
 
@@ -510,6 +513,124 @@ mod tests {
     ) -> crate::Result<crate::ExecutionResult> {
         let statement = connection.prepare(sql)?;
         connection.execute(&statement, Parameters::none())
+    }
+
+    #[test]
+    fn index_ddl_plans_route_through_autocommit_and_sql_write_dispatch() {
+        // Production break caught: classifying index DDL as control or a
+        // deferred plan skips the write validation/transaction path. CREATE
+        // publishes atomically, while DROP also obeys SQL transaction rollback.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let mut connection = Connection::from_test_pager(fixture.pager());
+        let create = connection
+            .prepare("CREATE UNIQUE INDEX UX_USERS_NAME ON USERS (NAME)")
+            .unwrap();
+        let drop = connection.prepare("DROP INDEX IX_USERS_ID").unwrap();
+        assert!(matches!(
+            create.plan().kind(),
+            crate::sql::plan::PlanKind::CreateIndex(_)
+        ));
+        assert!(matches!(
+            drop.plan().kind(),
+            crate::sql::plan::PlanKind::DropIndex(_)
+        ));
+
+        assert_eq!(
+            connection
+                .execute(&create, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        assert_eq!(
+            connection
+                .execute(&drop, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::SchemaChanged
+        );
+        let drop = connection.prepare("DROP INDEX IX_USERS_ID").unwrap();
+        execute_sql(&mut connection, "BEGIN").unwrap();
+        assert_eq!(
+            connection
+                .execute(&drop, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        assert_eq!(
+            connection
+                .prepare("DROP INDEX IX_USERS_ID")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+        execute_sql(
+            &mut connection,
+            "CREATE INDEX IX_USERS_TEMP ON USERS (NAME)",
+        )
+        .unwrap();
+        execute_sql(&mut connection, "ROLLBACK").unwrap();
+        assert!(connection.prepare("DROP INDEX IX_USERS_ID").is_ok());
+        assert!(
+            connection
+                .prepare("CREATE INDEX IX_USERS_TEMP ON USERS (NAME)")
+                .is_ok()
+        );
+        assert_eq!(
+            connection
+                .prepare("CREATE INDEX UX_USERS_NAME ON USERS (NAME)")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Bind
+        );
+    }
+
+    #[test]
+    fn drop_index_plan_survives_ordinary_dml_that_replaces_the_table_root() {
+        // Production break caught: treating a physical root replacement as a
+        // schema change invalidates valid prepared index DDL after normal DML.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let mut connection = Connection::from_test_pager(fixture.pager());
+        let drop_index = connection.prepare("DROP INDEX IX_USERS_ID").unwrap();
+        let before_root = {
+            let mut snapshot = connection.pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            catalog.find_table_by_id(fixture.users_id()).unwrap().root()
+        };
+        let name = "x".repeat(900);
+        for id in 1..=16 {
+            execute_sql(
+                &mut connection,
+                &format!("INSERT INTO USERS (ID, NAME) VALUES ({id}, '{name}')"),
+            )
+            .unwrap();
+        }
+        let database_uuid = connection.pager.database_uuid().unwrap();
+        let mut snapshot = connection.pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        assert_ne!(
+            catalog.find_table_by_id(fixture.users_id()).unwrap().root(),
+            before_root
+        );
+        assert!(drop_index.validate_schema(database_uuid, &catalog).is_ok());
+        drop(catalog);
+        drop(snapshot);
+        assert_eq!(
+            connection
+                .execute(&drop_index, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        let mut snapshot = connection.pager.begin_read().unwrap();
+        assert!(
+            snapshot
+                .catalog_reader()
+                .unwrap()
+                .find_index_by_id(fixture.index_id())
+                .is_none()
+        );
     }
 
     #[test]

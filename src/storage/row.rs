@@ -161,7 +161,11 @@ impl RowCodec {
             return Err(corruption("row header reserved bytes are nonzero"));
         }
 
-        if schema_version == 0 || schema_version != table.schema_version().get() {
+        // Index DDL advances the table's plan-invalidation version without
+        // changing row layout. Older rows remain valid under the exact column,
+        // type, directory and payload checks below. Future ALTER support must
+        // introduce a separate layout-version/migration policy.
+        if schema_version == 0 || schema_version > table.schema_version().get() {
             return Err(corruption("row schema version does not match the table"));
         }
         if column_count > usize::from(MAX_COLUMNS)
@@ -656,6 +660,40 @@ mod tests {
             decode_rowid_key(&[1; 7]).unwrap_err().code(),
             ErrorCode::Corruption
         );
+    }
+
+    #[test]
+    fn create_index_schema_bump_keeps_old_row_layout_readable() {
+        // Metadata-only index DDL advances plan invalidation, not row layout.
+        // Accepting future/zero row versions or weakening layout checks would
+        // instead conceal corruption, so all are checked independently below.
+        let (table, columns) = schema(&[(ColumnType::Int64, false)]);
+        let values = [Value::Int64(42)];
+        let encoded = RowCodec::encode(&table, &columns, &values, MAX_ROW_BYTES).unwrap();
+        let current = TableDef::new(
+            table.id(),
+            SchemaVersion::new(2).unwrap(),
+            table.root(),
+            table.next_rowid(),
+            table.column_count(),
+            table.name().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            RowCodec::decode(&current, &columns, &encoded, MAX_ROW_BYTES).unwrap(),
+            values
+        );
+        for version in [0_u64, 3] {
+            let mut invalid = encoded.clone();
+            invalid[8..16].copy_from_slice(&version.to_le_bytes());
+            assert_corruption(&current, &columns, &invalid);
+        }
+        let mut invalid_count = encoded.clone();
+        invalid_count[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        assert_corruption(&current, &columns, &invalid_count);
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_corruption(&current, &columns, &trailing);
     }
 
     #[test]

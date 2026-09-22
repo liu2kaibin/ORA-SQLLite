@@ -11,10 +11,11 @@ use super::{
     catalog::{
         CatalogReader, CatalogWriter,
         types::{
-            CatalogName, ColumnDef, ColumnId, ColumnType, MAX_COLUMNS, RowId, SchemaVersion,
-            TableDef, TableId,
+            CatalogName, ColumnDef, ColumnId, ColumnType, IndexOwnership, MAX_COLUMNS, RowId,
+            SchemaVersion, TableDef, TableId,
         },
     },
+    index::{IndexStorage, PreparedIndexEntry},
     pager::PageSource,
     row::{RowCodec, RowCodecValidation, decode_rowid_key, encode_rowid_key},
 };
@@ -42,6 +43,7 @@ pub(crate) struct RelationScan {
     relation: Relation,
     state: BTreeScanState,
     max_row_bytes: usize,
+    bounded_materialization: bool,
 }
 
 pub(crate) struct StoredRow {
@@ -60,6 +62,18 @@ pub(crate) struct TableWrite {
     rows: BTree,
     catalog: CatalogWriter,
     original_root: PageRef,
+}
+
+/// The only SQL DML writer. It keeps one table tree, all explicit-owned index
+/// trees, and one catalog writer together so a failed row mutation never
+/// publishes an intermediate root set.
+pub(crate) struct ConstrainedTableWrite {
+    schema: Relation,
+    rows: BTree,
+    indexes: Box<[IndexStorage]>,
+    catalog: CatalogWriter,
+    original_table_root: PageRef,
+    next_rowid: RowId,
 }
 
 #[cfg(test)]
@@ -207,7 +221,31 @@ impl Relation {
             relation: self.clone(),
             state,
             max_row_bytes,
+            bounded_materialization: false,
         }
+    }
+
+    /// Conservative peak for raw materialization + decoded payload + directory
+    /// and Value bodies. Unlike ordinary scans, enforce this before value I/O.
+    pub(crate) fn scan_with_work_budget(&self, work_bytes: u64) -> Result<RelationScan> {
+        let per_column = std::mem::size_of::<Value>() as u64
+            + std::mem::size_of::<Option<(usize, usize)>>() as u64;
+        let containers = 128_u64 + self.columns.len() as u64 * per_column;
+        let raw_limit = work_bytes.checked_sub(containers).ok_or_else(|| {
+            DbError::new(
+                ErrorCode::ResourceLimit,
+                "row containers exceed work memory",
+            )
+        })? / 3;
+        let raw_limit = usize::try_from(raw_limit).map_err(|_| {
+            DbError::new(
+                ErrorCode::ResourceLimit,
+                "row memory budget exceeds platform size",
+            )
+        })?;
+        let mut scan = self.scan(raw_limit);
+        scan.bounded_materialization = true;
+        Ok(scan)
     }
 }
 
@@ -255,7 +293,13 @@ impl RelationScan {
     }
 
     fn next_from(&mut self, source: &mut impl PageSource) -> Result<Option<StoredRow>> {
-        let Some((key, bytes)) = self.state.next(source)? else {
+        let next = if self.bounded_materialization {
+            self.state
+                .next_value_limited(source, self.max_row_bytes as u64)?
+        } else {
+            self.state.next(source)?
+        };
+        let Some((key, bytes)) = next else {
             return Ok(None);
         };
         let rowid = decode_rowid_key(&key)?;
@@ -402,6 +446,255 @@ impl TableWrite {
     }
 }
 
+impl ConstrainedTableWrite {
+    pub(crate) fn open(batch: &mut WriteBatch, table_id: TableId) -> Result<Self> {
+        let (schema, indexes) = {
+            let catalog = batch.catalog_reader()?;
+            let schema = Relation::open(&catalog, table_id)?;
+            let indexes = catalog
+                .indexes_for_table(table_id)
+                .filter(|index| index.ownership() == IndexOwnership::Explicit)
+                .map(|index| IndexStorage::open(&catalog, index.id()))
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice();
+            (schema, indexes)
+        };
+        let original_table_root = schema.table.root();
+        let next_rowid = schema.table.next_rowid();
+        let rows = BTree::from_root(TreeKind::Table, original_table_root);
+        let catalog = CatalogWriter::bootstrap(batch)?;
+        Ok(Self {
+            schema,
+            rows,
+            indexes,
+            catalog,
+            original_table_root,
+            next_rowid,
+        })
+    }
+
+    pub(crate) fn next_after(
+        &mut self,
+        batch: &mut WriteBatch,
+        rowid: Option<RowId>,
+        max_row_bytes: usize,
+    ) -> Result<Option<StoredRow>> {
+        #[cfg(test)]
+        if let Some(error) = injected_next_after_error() {
+            return Err(error);
+        }
+        let mut state = if let Some(rowid) = rowid {
+            let key = encode_rowid_key(rowid);
+            self.rows
+                .scan_state(Bound::Excluded(key.as_slice()), Bound::Unbounded)?
+        } else {
+            self.rows.scan_state(Bound::Unbounded, Bound::Unbounded)?
+        };
+        let Some((key, bytes)) = state.next(batch)? else {
+            return Ok(None);
+        };
+        let rowid = decode_rowid_key(&key)?;
+        let values = RowCodec::decode(
+            &self.schema.table,
+            &self.schema.columns,
+            &bytes,
+            max_row_bytes,
+        )?
+        .into_boxed_slice();
+        Ok(Some(StoredRow { rowid, values }))
+    }
+
+    pub(crate) fn insert(&mut self, batch: &mut WriteBatch, values: &[Value]) -> Result<RowId> {
+        let encoded =
+            RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
+        let rowid = self.next_rowid;
+        let entries = self.prepare_entries(values, rowid)?;
+        self.check_unique(batch, &entries, None)?;
+        let scope = batch.begin_mutation_scope()?;
+        let catalog_checkpoint = self.catalog.checkpoint();
+        let table_root = self.rows.root();
+        let index_roots = self.index_roots();
+        let result = (|| {
+            let allocated = self.catalog.allocate_rowid(batch, self.schema.table.id())?;
+            if allocated != rowid {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "catalog ROWID changed while a table writer was open",
+                ));
+            }
+            self.rows
+                .insert(batch, &encode_rowid_key(rowid), &encoded)?;
+            for (index, entry) in self.indexes.iter_mut().zip(&entries) {
+                index.insert(batch, entry)?;
+            }
+            Ok(rowid)
+        })();
+        match result {
+            Ok(rowid) => {
+                batch.finish_mutation_scope(scope)?;
+                self.next_rowid = RowId::new(rowid.get().checked_add(1).ok_or_else(|| {
+                    DbError::new(ErrorCode::Type, "ROWID counter exhausted for table")
+                })?)?;
+                Ok(rowid)
+            }
+            Err(error) => {
+                batch.rollback_mutation_scope(scope)?;
+                self.restore(catalog_checkpoint, table_root, &index_roots);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        batch: &mut WriteBatch,
+        rowid: RowId,
+        old: &[Value],
+        new: &[Value],
+    ) -> Result<()> {
+        let encoded = RowCodec::encode(&self.schema.table, &self.schema.columns, new, usize::MAX)?;
+        let old_entries = self.prepare_entries(old, rowid)?;
+        let new_entries = self.prepare_entries(new, rowid)?;
+        self.check_unique(batch, &new_entries, Some(rowid))?;
+        let scope = batch.begin_mutation_scope()?;
+        let catalog_checkpoint = self.catalog.checkpoint();
+        let table_root = self.rows.root();
+        let index_roots = self.index_roots();
+        let key = encode_rowid_key(rowid);
+        let result = (|| {
+            for (index, entry) in self.indexes.iter_mut().zip(&old_entries) {
+                index.delete(batch, entry)?;
+            }
+            if self.rows.delete(batch, &key)?.is_none() {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    format!("row ID {} disappeared during replacement", rowid.get()),
+                ));
+            }
+            self.rows.insert(batch, &key, &encoded)?;
+            for (index, entry) in self.indexes.iter_mut().zip(&new_entries) {
+                index.insert(batch, entry)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => batch.finish_mutation_scope(scope),
+            Err(error) => {
+                batch.rollback_mutation_scope(scope)?;
+                self.restore(catalog_checkpoint, table_root, &index_roots);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn delete(
+        &mut self,
+        batch: &mut WriteBatch,
+        rowid: RowId,
+        old: &[Value],
+    ) -> Result<bool> {
+        let entries = self.prepare_entries(old, rowid)?;
+        let key = encode_rowid_key(rowid);
+        if self.rows.get(batch, &key)?.is_none() {
+            return Ok(false);
+        }
+        let scope = batch.begin_mutation_scope()?;
+        let catalog_checkpoint = self.catalog.checkpoint();
+        let table_root = self.rows.root();
+        let index_roots = self.index_roots();
+        let result = (|| {
+            for (index, entry) in self.indexes.iter_mut().zip(&entries) {
+                index.delete(batch, entry)?;
+            }
+            match self.rows.delete(batch, &key)? {
+                Some(_) => Ok(true),
+                None => Err(DbError::new(
+                    ErrorCode::Corruption,
+                    format!("row ID {} disappeared during deletion", rowid.get()),
+                )),
+            }
+        })();
+        match result {
+            Ok(deleted) => {
+                batch.finish_mutation_scope(scope)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                batch.rollback_mutation_scope(scope)?;
+                self.restore(catalog_checkpoint, table_root, &index_roots);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self, batch: &mut WriteBatch) -> Result<()> {
+        let scope = batch.begin_mutation_scope()?;
+        let catalog_checkpoint = self.catalog.checkpoint();
+        let result = (|| {
+            if self.rows.root() != self.original_table_root {
+                self.catalog
+                    .update_table_root(batch, self.schema.table.id(), self.rows.root())?;
+            }
+            for index in &self.indexes {
+                if index.root_changed() {
+                    self.catalog
+                        .update_index_root(batch, index.id(), index.root())?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            batch.rollback_mutation_scope(scope)?;
+            self.catalog.restore(catalog_checkpoint);
+            return Err(error);
+        }
+        let result = self.catalog.finish(batch);
+        match result {
+            Ok(()) => batch.finish_mutation_scope(scope),
+            Err(error) => {
+                batch.rollback_mutation_scope(scope)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_entries(&self, values: &[Value], rowid: RowId) -> Result<Vec<PreparedIndexEntry>> {
+        self.indexes
+            .iter()
+            .map(|index| index.prepare(values, rowid))
+            .collect()
+    }
+
+    fn check_unique(
+        &self,
+        batch: &mut WriteBatch,
+        entries: &[PreparedIndexEntry],
+        exclude: Option<RowId>,
+    ) -> Result<()> {
+        for (index, entry) in self.indexes.iter().zip(entries) {
+            index.check_unique(batch, entry, exclude)?;
+        }
+        Ok(())
+    }
+
+    fn index_roots(&self) -> Vec<PageRef> {
+        self.indexes.iter().map(IndexStorage::root).collect()
+    }
+
+    fn restore(
+        &mut self,
+        catalog_checkpoint: super::catalog::CatalogWriterCheckpoint,
+        table_root: PageRef,
+        index_roots: &[PageRef],
+    ) {
+        self.catalog.restore(catalog_checkpoint);
+        self.rows = BTree::from_root(TreeKind::Table, table_root);
+        for (index, root) in self.indexes.iter_mut().zip(index_roots) {
+            index.restore_root(*root);
+        }
+    }
+}
+
 pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Result<TableId> {
     let checkpoint = batch.statement_checkpoint()?;
     let result = (|| {
@@ -454,13 +747,31 @@ pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Resul
 pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result<()> {
     let checkpoint = batch.statement_checkpoint()?;
     let result = (|| {
-        let relation = {
+        let (relation, indexes) = {
             let catalog = batch.catalog_reader()?;
             let relation = Relation::open(&catalog, table_id)?;
+            let indexes = catalog
+                .indexes_for_table(table_id)
+                .map(|index| {
+                    super::index::require_explicit_owner(index)?;
+                    let columns = catalog
+                        .columns_for_index(index.id())
+                        .map(ColumnDef::id)
+                        .collect::<Vec<_>>();
+                    Ok((index.clone(), columns))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Prove every owned tree and live/free disjointness before any
+            // release. No foreign-key/constraint behavior is introduced here.
             catalog.validate_deep_batch(batch)?;
-            relation
+            (relation, indexes)
         };
         let mut catalog = CatalogWriter::bootstrap(batch)?;
+        for (index, columns) in indexes {
+            catalog.remove_index(batch, &index, &columns)?;
+            #[cfg(test)]
+            super::index::after_index_release_for_test()?;
+        }
         catalog.remove_relation(batch, &relation.table, &relation.columns)?;
         catalog.finish(batch)
     })();
@@ -475,7 +786,11 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation};
+    use super::{
+        ColumnSpec, ConstrainedTableWrite, Relation, TableSpec, TableWrite, create_relation,
+        drop_relation,
+    };
+    use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
         Pager,
         btree::{BTree, TreeKind},
@@ -496,6 +811,153 @@ mod tests {
     const LARGE_BLOB_BYTES: usize = 20_000;
     const LARGE_ROW_BYTES: usize = 20_041;
     type RelationContents = (TableDef, Vec<(u64, Vec<Value>)>);
+
+    #[test]
+    fn constrained_writer_reuses_deleted_unique_key_without_schema_bump_and_deep_validates() {
+        // Production breaks caught: leaving an old physical key behind after a
+        // replacement/deletion blocks its reuse; publishing table/index roots
+        // separately can also make a deep catalog validation fail.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("A", ColumnType::Int64, false)]),
+            &[vec![Value::Int64(1)]],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(table_id)
+            .cloned()
+            .collect();
+        create_index(
+            &mut batch,
+            &IndexSpec::new(CatalogName::new("UX_T_A").unwrap(), table_id, columns, true).unwrap(),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let before_version = batch
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_id(table_id)
+            .unwrap()
+            .schema_version();
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
+        writer
+            .replace(&mut batch, row.rowid(), row.values(), &[Value::Int64(2)])
+            .unwrap();
+        let row = writer
+            .next_after(&mut batch, None, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(
+            writer
+                .delete(&mut batch, row.rowid(), row.values())
+                .unwrap()
+        );
+        writer.insert(&mut batch, &[Value::Int64(1)]).unwrap();
+        writer.finish(&mut batch).unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(
+            catalog.find_table_by_id(table_id).unwrap().schema_version(),
+            before_version
+        );
+        catalog.validate_deep_batch(&mut batch).unwrap();
+        batch.commit().unwrap();
+        assert_eq!(
+            read_relation(&pager, "T").unwrap().1,
+            vec![(2, vec![Value::Int64(1)])]
+        );
+    }
+
+    #[test]
+    fn constrained_insert_key_limit_preserves_catalog_table_index_roots_and_rowid() {
+        // Acceptance enhancement: the existing preflight implementation already
+        // rejects this key before mutation. These direct snapshots guard each
+        // individual root/counter against a future early allocation or split.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let table_id = committed_relation(
+            &pager,
+            table_spec("T", &[("A", ColumnType::Text, false)]),
+            &[],
+        );
+        let mut batch = pager.try_begin_write().unwrap();
+        let columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(table_id)
+            .cloned()
+            .collect();
+        create_index(
+            &mut batch,
+            &IndexSpec::new(
+                CatalogName::new("IX_T_A").unwrap(),
+                table_id,
+                columns,
+                false,
+            )
+            .unwrap(),
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let before = {
+            let catalog = batch.catalog_reader().unwrap();
+            let table = catalog.find_table_by_id(table_id).unwrap();
+            (
+                batch.catalog_root(),
+                table.next_rowid(),
+                table.root(),
+                catalog
+                    .indexes_for_table(table_id)
+                    .map(|index| (index.id(), index.root()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        assert_eq!(
+            writer
+                .insert(&mut batch, &[Value::Text("x".repeat(1014))])
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        let after = {
+            let features = batch.feature_bits();
+            let tree = BTree::from_root(TreeKind::Table, writer.catalog.root());
+            let catalog = CatalogReader::open_candidate(&mut batch, &tree, features).unwrap();
+            let table = catalog.find_table_by_id(table_id).unwrap();
+            (
+                batch.catalog_root(),
+                table.next_rowid(),
+                table.root(),
+                catalog
+                    .indexes_for_table(table_id)
+                    .map(|index| (index.id(), index.root()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(after, before);
+
+        assert_eq!(
+            writer
+                .insert(&mut batch, &[Value::Text("after".into())])
+                .unwrap()
+                .get(),
+            1
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+    }
 
     #[test]
     fn relation_prevalidates_complete_rows_without_opening_the_catalog_gate() {

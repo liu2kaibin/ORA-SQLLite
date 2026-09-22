@@ -281,7 +281,10 @@ fn begin_and_autocommit_are_nonblocking_busy_but_validation_precedes_writer_acqu
     let (_files, database) = support::new_database("connection-writer-conflicts");
     let mut setup = database.connect().unwrap();
     execute_sql(&mut setup, "CREATE TABLE T (ID INT64)");
-    let deferred = setup.prepare("CREATE INDEX IX_T ON T (ID)").unwrap();
+    let create_index = setup.prepare("CREATE INDEX IX_T ON T (ID)").unwrap();
+    let deferred = setup
+        .prepare("CREATE TABLE PENDING (ID INT64 PRIMARY KEY)")
+        .unwrap();
     let insert = setup.prepare("INSERT INTO T VALUES (:1)").unwrap();
     drop(setup);
 
@@ -292,6 +295,13 @@ fn begin_and_autocommit_are_nonblocking_busy_but_validation_precedes_writer_acqu
     assert_eq!(
         contender
             .execute(&begin, Parameters::none())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Busy
+    );
+    assert_eq!(
+        contender
+            .execute(&create_index, Parameters::none())
             .unwrap_err()
             .code(),
         ErrorCode::Busy
@@ -319,6 +329,10 @@ fn begin_and_autocommit_are_nonblocking_busy_but_validation_precedes_writer_acqu
         ErrorCode::Busy
     );
     owner_write.rollback().unwrap();
+    assert_eq!(
+        execute_statement(&mut contender, &create_index, Parameters::none()).rows_affected(),
+        0
+    );
 
     execute_sql(&mut contender, "BEGIN");
     let mut second = database.connect().unwrap();

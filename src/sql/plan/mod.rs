@@ -16,7 +16,9 @@ use crate::{
     storage::catalog::types::TableId,
 };
 pub(crate) use expr::{AggregateDefinition, ExecExpr, ExecExprKind};
-pub(crate) use mutation::{CreateTablePlan, DeletePlan, InsertPlan, UpdatePlan};
+pub(crate) use mutation::{
+    CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan, UpdatePlan,
+};
 pub(crate) use query::{OrderExpression, QueryPlan};
 
 pub(crate) struct Plan {
@@ -39,6 +41,8 @@ pub(crate) enum PlanKind {
     Delete(DeletePlan),
     CreateTable(CreateTablePlan),
     DropTable { table_id: TableId },
+    CreateIndex(CreateIndexPlan),
+    DropIndex(DropIndexPlan),
     Begin,
     Commit,
     Rollback,
@@ -55,6 +59,8 @@ impl PlanKind {
                 | Self::Delete(_)
                 | Self::CreateTable(_)
                 | Self::DropTable { .. }
+                | Self::CreateIndex(_)
+                | Self::DropIndex(_)
         )
     }
 }
@@ -108,12 +114,21 @@ impl Plan {
             BoundStatementKind::DropTable { table_id } => PlanKind::DropTable {
                 table_id: *table_id,
             },
-            BoundStatementKind::CreateIndex { .. } => PlanKind::DeferredUnsupported {
-                required_phase: "4C2",
-            },
-            BoundStatementKind::DropIndex { .. } => PlanKind::DeferredUnsupported {
-                required_phase: "4C2",
-            },
+            BoundStatementKind::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+            } => PlanKind::CreateIndex(CreateIndexPlan::from_bound(
+                name,
+                table,
+                columns,
+                *unique,
+                &mut expressions,
+            )?),
+            BoundStatementKind::DropIndex { index_id, table } => {
+                PlanKind::DropIndex(DropIndexPlan::from_bound(*index_id, table, &expressions)?)
+            }
             BoundStatementKind::Begin => PlanKind::Begin,
             BoundStatementKind::Commit => PlanKind::Commit,
             BoundStatementKind::Rollback => PlanKind::Rollback,
@@ -192,9 +207,16 @@ mod tests {
         error::SqlLocation,
         sql::{
             SqlSpan, SqlType, bind_sql,
-            bound::{BoundExpr, BoundExprKind, BoundStatement, BoundStatementKind, SourceId},
+            bound::{
+                BoundExpr, BoundExprKind, BoundStatement, BoundStatementKind, BoundTable, SourceId,
+            },
         },
-        storage::{catalog::types::IndexId, test_support::phase_4b_catalog_fixture},
+        storage::{
+            catalog::types::{IndexId, SchemaVersion, TableId},
+            test_support::{
+                phase_4b_catalog_fixture, phase_4b_catalog_fixture_with_explicit_index,
+            },
+        },
     };
 
     struct Fixture {
@@ -256,6 +278,11 @@ mod tests {
         let mut drop_index = fixture("BEGIN");
         drop_index.bound.kind = BoundStatementKind::DropIndex {
             index_id: IndexId::new(123).unwrap(),
+            table: BoundTable {
+                table_id: TableId::new(1).unwrap(),
+                schema_version: SchemaVersion::new(1).unwrap(),
+                span: SqlSpan::new(0, 5).unwrap(),
+            },
         };
         cases.push(drop_index);
         cases
@@ -293,14 +320,8 @@ mod tests {
                 BoundStatementKind::DropTable { table_id } => {
                     matches!(self, Self::DropTable { table_id: actual } if actual == table_id)
                 }
-                BoundStatementKind::CreateIndex { .. } | BoundStatementKind::DropIndex { .. } => {
-                    matches!(
-                        self,
-                        Self::DeferredUnsupported {
-                            required_phase: "4C2"
-                        }
-                    )
-                }
+                BoundStatementKind::CreateIndex { .. } => matches!(self, Self::CreateIndex(_)),
+                BoundStatementKind::DropIndex { .. } => matches!(self, Self::DropIndex(_)),
                 BoundStatementKind::Begin => matches!(self, Self::Begin),
                 BoundStatementKind::Commit => matches!(self, Self::Commit),
                 BoundStatementKind::Rollback => matches!(self, Self::Rollback),
@@ -334,15 +355,63 @@ mod tests {
     }
 
     #[test]
-    fn index_and_constrained_table_plans_are_deferred() {
-        for bound in [bound_create_index(), bound_constrained_create_table()] {
-            assert!(matches!(
-                Plan::from_bound(&bound, bound.source()).unwrap().kind(),
-                PlanKind::DeferredUnsupported {
-                    required_phase: "4C2"
-                }
-            ));
-        }
+    fn index_ddl_is_executable_while_constrained_table_stays_deferred() {
+        let create = bound_create_index();
+        assert!(matches!(
+            Plan::from_bound(&create, create.source()).unwrap().kind(),
+            PlanKind::CreateIndex(_)
+        ));
+        let constrained = bound_constrained_create_table();
+        assert!(matches!(
+            Plan::from_bound(&constrained, constrained.source())
+                .unwrap()
+                .kind(),
+            PlanKind::DeferredUnsupported {
+                required_phase: "4C2"
+            }
+        ));
+    }
+
+    #[test]
+    fn create_index_plan_retains_logical_column_identity() {
+        // Production break caught: deferring CREATE INDEX or retaining a
+        // physical index root would make a prepared index DDL plan either
+        // unexecutable or unsafe across a later root split.
+        let plan = plan_sql("CREATE UNIQUE INDEX UX_USERS_ID ON USERS (ID)").unwrap();
+        let PlanKind::CreateIndex(create) = plan.kind() else {
+            panic!("CREATE INDEX must have an immutable index plan")
+        };
+        assert!(create.unique());
+        assert_eq!(create.table().table_id().get(), 1);
+        assert_eq!(create.columns()[0].column_id().get(), 2);
+        assert_eq!(create.columns()[0].ordinal(), 0);
+    }
+
+    #[test]
+    fn drop_index_plan_retains_bound_index_and_owner_identity() {
+        // Production break caught: reopening DROP INDEX by name or retaining
+        // a physical root could target a replacement object after prepare.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let bound = bind_sql(
+            "DROP INDEX IX_USERS_ID",
+            &SqlLimits::default(),
+            &catalog,
+            pager.database_uuid().unwrap(),
+        )
+        .unwrap();
+        let plan = Plan::from_bound(&bound, "DROP INDEX IX_USERS_ID").unwrap();
+        let PlanKind::DropIndex(drop) = plan.kind() else {
+            panic!("DROP INDEX must have an immutable index plan")
+        };
+        assert_eq!(drop.index_id(), fixture.index_id());
+        assert_eq!(drop.table().table_id(), fixture.users_id());
+        assert_eq!(
+            drop.table().location(),
+            SqlLocation::new(11, 1, 12).unwrap()
+        );
     }
 
     #[test]
@@ -714,6 +783,8 @@ mod tests {
                         | BoundStatementKind::Insert { .. }
                         | BoundStatementKind::Update { .. }
                         | BoundStatementKind::Delete { .. }
+                        | BoundStatementKind::CreateIndex { .. }
+                        | BoundStatementKind::DropIndex { .. }
                         | BoundStatementKind::DropTable { .. }
                 ) || matches!(case.kind(), BoundStatementKind::CreateTable { constraints, .. } if constraints.is_empty())
             );
@@ -721,14 +792,13 @@ mod tests {
     }
 
     #[test]
-    fn every_constraint_family_and_index_variant_is_deferred() {
+    fn every_constraint_family_stays_deferred() {
         for sql in [
             "CREATE TABLE N (ID INT64 NOT NULL)",
             "CREATE TABLE N (ID INT64 PRIMARY KEY)",
             "CREATE TABLE N (ID INT64 UNIQUE)",
             "CREATE TABLE N (ID INT64 CHECK (ID > 0))",
             "CREATE TABLE N (ID INT64 REFERENCES USERS(ID))",
-            "CREATE UNIQUE INDEX IX ON USERS(ID)",
         ] {
             assert!(matches!(
                 plan_sql(sql).unwrap().kind(),
