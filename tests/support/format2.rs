@@ -196,57 +196,71 @@ pub fn flip_physical_page_byte(files: &TestFiles, page_id: u64, page_offset: u64
     file.sync_all().expect("sync physical corruption byte");
 }
 
-pub fn corrupt_first_index_separator_with_valid_checksum(files: &TestFiles, index_name: &str) {
-    let mut bytes = fs::read(files.main()).expect("read database before separator corruption");
-    let header = select_header(&bytes).expect("parse database before separator corruption");
-    let disk = Disk {
-        bytes: &bytes,
-        header,
-    };
-    let catalog = disk
-        .walk_tree(
+pub fn corrupt_first_index_separator_with_valid_checksum(
+    files: &TestFiles,
+    index_name: &str,
+) -> Result<(), String> {
+    let mut bytes = fs::read(files.main()).map_err(|error| format!("read database: {error}"))?;
+    let header = select_header(&bytes)?;
+    let (page_size, root) = {
+        let disk = Disk {
+            bytes: &bytes,
+            header,
+        };
+        let catalog = disk.walk_tree(
             PageRef {
                 id: disk.header.catalog_root,
-                generation: disk
-                    .page_generation(disk.header.catalog_root)
-                    .expect("read catalog root generation"),
+                generation: disk.page_generation(disk.header.catalog_root)?,
             },
             TreeKind::Table,
             false,
-        )
-        .expect("walk catalog before separator corruption");
-    let root = explicit_index_definitions(&catalog.entries)
-        .expect("decode index definitions before separator corruption")
-        .get(index_name)
-        .expect("find target index before separator corruption")
-        .root;
-    let start = ordinary_page_offset(root.id, disk.header.page_size)
-        .expect("locate target index root before separator corruption");
+        )?;
+        let root = explicit_index_definitions(&catalog.entries)?
+            .get(index_name)
+            .ok_or_else(|| format!("catalog misses target index {index_name}"))?
+            .root;
+        (disk.header.page_size, root)
+    };
+    let start = ordinary_page_offset(root.id, page_size)?;
     let end = start
-        .checked_add(disk.header.page_size)
-        .expect("target index root extent fits");
+        .checked_add(page_size)
+        .ok_or("target index root extent overflows")?;
     let page = bytes
         .get_mut(start..end)
-        .expect("target index root lies in the database image");
-    assert_eq!(
-        page[0],
-        TreeKind::Index.internal_type(),
-        "target root is internal"
-    );
-    let first_cell = usize::from(read_u16(page, INTERNAL_METADATA_END).expect("first slot offset"));
-    let key_len = usize::from(read_u16(page, first_cell).expect("first separator length"));
+        .ok_or("target index root lies outside the database image")?;
+    if page.first() != Some(&TreeKind::Index.internal_type()) {
+        return Err("target index root is not internal".into());
+    }
+    let first_cell = usize::from(read_u16(page, INTERNAL_METADATA_END)?);
+    let key_len = usize::from(read_u16(page, first_cell)?);
+    let key_start = first_cell
+        .checked_add(20)
+        .ok_or("first separator key offset overflows")?;
+    let key_end = key_start
+        .checked_add(key_len)
+        .ok_or("first separator key extent overflows")?;
     let key = page
-        .get_mut(first_cell + 20..first_cell + 20 + key_len)
-        .expect("first separator key lies in the root page");
+        .get_mut(key_start..key_end)
+        .ok_or("first separator key lies outside the root page")?;
     let byte = key
         .iter_mut()
         .rev()
         .find(|byte| **byte != 0)
-        .expect("first separator key is nonzero");
-    *byte -= 1;
-    let checksum = crc32c_parts(&page[..36], &page[40..]);
-    page[36..40].copy_from_slice(&checksum.to_le_bytes());
-    fs::write(files.main(), bytes).expect("write checksum-valid separator corruption");
+        .ok_or("first separator key is all zero")?;
+    *byte = byte
+        .checked_sub(1)
+        .ok_or("first separator key cannot be decremented")?;
+    let checksum = crc32c_parts(
+        page.get(..36)
+            .ok_or("target index root lacks checksum prefix")?,
+        page.get(40..)
+            .ok_or("target index root lacks checksum suffix")?,
+    );
+    page.get_mut(36..40)
+        .ok_or("target index root lacks checksum field")?
+        .copy_from_slice(&checksum.to_le_bytes());
+    fs::write(files.main(), bytes).map_err(|error| format!("write database: {error}"))?;
+    Ok(())
 }
 
 struct Disk<'a> {

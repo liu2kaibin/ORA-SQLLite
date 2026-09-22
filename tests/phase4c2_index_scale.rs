@@ -144,6 +144,6 @@ fn format2_verifier_rejects_a_checksum_valid_wrong_parent_separator() {
     support::checkpoint_accepted_state(&files);
 
     support::verify_index_model(&files, 1_000, &["UX_T_ID"]).unwrap();
-    support::corrupt_first_index_separator_with_valid_checksum(&files, "UX_T_ID");
+    support::corrupt_first_index_separator_with_valid_checksum(&files, "UX_T_ID").unwrap();
     assert!(support::verify_index_model(&files, 1_000, &["UX_T_ID"]).is_err());
 }
