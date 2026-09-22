@@ -9,8 +9,9 @@ use crate::{
 use super::{
     key::RecordKind,
     types::{
-        CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType, ConstraintId,
-        IndexDef, IndexId, IndexOwnership, ObjectId, RowId, SchemaVersion, TableDef, TableId,
+        CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType, ConstraintDef,
+        ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, MAX_CHECK_PROGRAM_BYTES,
+        MAX_GLOBAL_CATALOG_NAME_BYTES, ObjectId, RowId, SchemaVersion, TableDef, TableId,
     },
 };
 
@@ -102,6 +103,44 @@ pub(super) fn encode_index_definition(index: &IndexDef) -> Vec<u8> {
     encode_envelope(RecordKind::IndexDefinition, payload.into_bytes())
 }
 
+pub(super) fn encode_constraint_name_mapping(id: ConstraintId) -> Vec<u8> {
+    encode_mapping(RecordKind::ConstraintName, id.get())
+}
+
+pub(super) fn encode_table_constraint_mapping(id: ConstraintId) -> Vec<u8> {
+    encode_mapping(RecordKind::TableConstraint, id.get())
+}
+
+pub(super) fn encode_constraint_column_mapping(id: ColumnId) -> Vec<u8> {
+    encode_mapping(RecordKind::ConstraintColumn, id.get())
+}
+
+pub(super) fn encode_constraint_definition(definition: &ConstraintDef) -> Vec<u8> {
+    let mut payload = Encoder::new();
+    payload.put_u64(definition.id().get());
+    payload.put_u64(definition.table_id().get());
+    payload.put_u8(constraint_kind_code(definition.kind()));
+    payload.put_u8(0);
+    payload.put_u16(definition.column_count());
+    payload.put_u64(definition.index_id().map_or(0, IndexId::get));
+    payload.put_u64(0);
+    payload.put_u64(0);
+    payload.put_u8(0);
+    payload.put_u8(0);
+    payload.put_u8(0);
+    payload.put_u8(0);
+    let check_program_len = u32::try_from(definition.check_program().len())
+        .expect("checked constraint program length fits u32");
+    payload.put_u32(check_program_len);
+    let name_len = u16::try_from(definition.name().as_bytes().len())
+        .expect("checked constraint name length fits u16");
+    payload.put_u16(name_len);
+    payload.put_u16(0);
+    payload.put_bytes(definition.check_program());
+    payload.put_bytes(definition.name().as_bytes());
+    encode_envelope(RecordKind::ConstraintDefinition, payload.into_bytes())
+}
+
 pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<CatalogRecord> {
     let payload = decode_envelope(expected, bytes)?;
     match expected {
@@ -127,14 +166,19 @@ pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<Catalo
         RecordKind::IndexColumn => {
             decode_column_id_mapping(payload).map(CatalogRecord::IndexColumn)
         }
-        RecordKind::ConstraintName
-        | RecordKind::ConstraintDefinition
-        | RecordKind::TableConstraint
-        | RecordKind::ConstraintColumn
-        | RecordKind::ReferencedBy => Err(DbError::new(
-            ErrorCode::Unsupported,
-            "index and constraint catalog records are not implemented",
-        )),
+        RecordKind::ConstraintName => {
+            decode_constraint_id_mapping(payload).map(CatalogRecord::ConstraintName)
+        }
+        RecordKind::ConstraintDefinition => {
+            decode_constraint_definition_payload(payload).map(CatalogRecord::ConstraintDefinition)
+        }
+        RecordKind::TableConstraint => {
+            decode_constraint_id_mapping(payload).map(CatalogRecord::TableConstraint)
+        }
+        RecordKind::ConstraintColumn => {
+            decode_column_id_mapping(payload).map(CatalogRecord::ConstraintColumn)
+        }
+        RecordKind::ReferencedBy => Err(foreign_key_unsupported()),
     }
 }
 
@@ -182,6 +226,50 @@ pub(super) fn decode_index_definition(expected_id: IndexId, bytes: &[u8]) -> Res
         )),
         _ => Err(corruption(
             "index definition decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_constraint_name_mapping(bytes: &[u8]) -> Result<ConstraintId> {
+    match decode_record(RecordKind::ConstraintName, bytes)? {
+        CatalogRecord::ConstraintName(id) => Ok(id),
+        _ => Err(corruption(
+            "constraint name decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_table_constraint_mapping(bytes: &[u8]) -> Result<ConstraintId> {
+    match decode_record(RecordKind::TableConstraint, bytes)? {
+        CatalogRecord::TableConstraint(id) => Ok(id),
+        _ => Err(corruption(
+            "table constraint decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_constraint_column_mapping(bytes: &[u8]) -> Result<ColumnId> {
+    match decode_record(RecordKind::ConstraintColumn, bytes)? {
+        CatalogRecord::ConstraintColumn(id) => Ok(id),
+        _ => Err(corruption(
+            "constraint column decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_constraint_definition(
+    expected_id: ConstraintId,
+    bytes: &[u8],
+) -> Result<ConstraintDef> {
+    match decode_record(RecordKind::ConstraintDefinition, bytes)? {
+        CatalogRecord::ConstraintDefinition(definition) if definition.id() == expected_id => {
+            Ok(definition)
+        }
+        CatalogRecord::ConstraintDefinition(_) => Err(corruption(
+            "constraint definition key id does not match its payload id",
+        )),
+        _ => Err(corruption(
+            "constraint definition decoder received a different record kind",
         )),
     }
 }
@@ -347,6 +435,12 @@ fn decode_index_id_mapping(payload: &[u8]) -> Result<IndexId> {
     decode_index_id(decoder.get_u64()?)
 }
 
+fn decode_constraint_id_mapping(payload: &[u8]) -> Result<ConstraintId> {
+    require_mapping_length(payload)?;
+    let mut decoder = Decoder::new(payload);
+    decode_constraint_id(decoder.get_u64()?)
+}
+
 fn require_mapping_length(payload: &[u8]) -> Result<()> {
     if payload.len() != MAPPING_PAYLOAD_LEN {
         return Err(corruption(
@@ -430,6 +524,91 @@ fn decode_index_definition_payload(payload: &[u8]) -> Result<IndexDef> {
         .map_err(|_| corruption("catalog index definition fields are invalid"))
 }
 
+fn decode_constraint_definition_payload(payload: &[u8]) -> Result<ConstraintDef> {
+    let mut decoder = Decoder::new(payload);
+    let id = decode_constraint_id(decoder.get_u64()?)?;
+    let table_id = decode_table_id(decoder.get_u64()?)?;
+    let kind_code = decoder.get_u8()?;
+    if kind_code == 5 {
+        return Err(foreign_key_unsupported());
+    }
+    let kind = decode_constraint_kind(kind_code)?;
+    if decoder.get_u8()? != 0 {
+        return Err(corruption("catalog constraint flags are nonzero"));
+    }
+    let column_count = decoder.get_u16()?;
+    let index_id = match decoder.get_u64()? {
+        0 => None,
+        value => Some(decode_index_id(value)?),
+    };
+    let parent_table_id = decoder.get_u64()?;
+    let parent_constraint_id = decoder.get_u64()?;
+    if parent_table_id != 0 || parent_constraint_id != 0 {
+        return Err(foreign_key_unsupported());
+    }
+    if decoder.get_u8()? != 0 {
+        return Err(corruption("catalog constraint deferred mode is nonzero"));
+    }
+    if decoder.get_u8()? != 0 {
+        return Err(corruption("catalog constraint update action is nonzero"));
+    }
+    if decoder.get_u8()? != 0 {
+        return Err(corruption("catalog constraint delete action is nonzero"));
+    }
+    if decoder.get_u8()? != 0 {
+        return Err(corruption("catalog constraint reserved byte is nonzero"));
+    }
+    let check_program_len = usize::try_from(decoder.get_u32()?)
+        .map_err(|_| corruption("catalog check program length exceeds this platform"))?;
+    if check_program_len > MAX_CHECK_PROGRAM_BYTES {
+        return Err(corruption("catalog check program length exceeds the limit"));
+    }
+    let name_len = usize::from(decoder.get_u16()?);
+    if decoder.get_u16()? != 0 {
+        return Err(corruption(
+            "catalog constraint definition reserved bytes are nonzero",
+        ));
+    }
+    let check_program = decoder
+        .get_bytes(check_program_len)?
+        .to_vec()
+        .into_boxed_slice();
+    let name = decode_name(&mut decoder, name_len)?;
+    if name.as_bytes().len() > MAX_GLOBAL_CATALOG_NAME_BYTES {
+        return Err(corruption("catalog constraint name length is invalid"));
+    }
+    require_eof(&decoder)?;
+    ConstraintDef::new(
+        id,
+        table_id,
+        kind,
+        column_count,
+        index_id,
+        check_program,
+        name,
+    )
+    .map_err(|_| corruption("catalog constraint definition fields are invalid"))
+}
+
+const fn constraint_kind_code(kind: ConstraintKind) -> u8 {
+    match kind {
+        ConstraintKind::PrimaryKey => 1,
+        ConstraintKind::Unique => 2,
+        ConstraintKind::NotNull => 3,
+        ConstraintKind::Check => 4,
+    }
+}
+
+fn decode_constraint_kind(code: u8) -> Result<ConstraintKind> {
+    match code {
+        1 => Ok(ConstraintKind::PrimaryKey),
+        2 => Ok(ConstraintKind::Unique),
+        3 => Ok(ConstraintKind::NotNull),
+        4 => Ok(ConstraintKind::Check),
+        _ => Err(corruption("catalog constraint kind is invalid")),
+    }
+}
+
 fn decode_name(decoder: &mut Decoder<'_>, name_len: usize) -> Result<CatalogName> {
     let bytes = decoder.get_bytes(name_len)?;
     let name = std::str::from_utf8(bytes)
@@ -481,6 +660,13 @@ fn corruption(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
 }
 
+fn foreign_key_unsupported() -> DbError {
+    DbError::new(
+        ErrorCode::Unsupported,
+        "foreign-key catalogs require Phase 4C2-C",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,8 +678,8 @@ mod tests {
                 key::RecordKind,
                 types::{
                     CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType,
-                    ConstraintId, IndexDef, IndexId, IndexOwnership, ObjectId, RowId,
-                    SchemaVersion, TableDef, TableId,
+                    ConstraintDef, ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership,
+                    ObjectId, RowId, SchemaVersion, TableDef, TableId,
                 },
             },
         },
@@ -1043,6 +1229,272 @@ mod tests {
                 .unwrap_err()
                 .code(),
             ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn constraint_def_v1_has_exact_payload_and_round_trips() {
+        let definition = ConstraintDef::new(
+            ConstraintId::new(0x0102_0304_0506_0708).unwrap(),
+            TableId::new(0x1112_1314_1516_1718).unwrap(),
+            ConstraintKind::PrimaryKey,
+            2,
+            Some(IndexId::new(0x2122_2324_2526_2728).unwrap()),
+            Box::new([]),
+            CatalogName::new("PK_T").unwrap(),
+        )
+        .unwrap();
+        let expected = vec![
+            0x31, 0x01, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+            0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x01, 0x00, 0x02, 0x00,
+            0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, b'P', b'K', b'_', b'T',
+        ];
+        let encoded = encode_constraint_definition(&definition);
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            decode_constraint_definition(definition.id(), &encoded).unwrap(),
+            definition
+        );
+    }
+
+    #[test]
+    fn constraint_mappings_have_exact_complete_v1_bytes() {
+        let constraint = ConstraintId::new(0x0102_0304_0506_0708).unwrap();
+        let expected_constraint = vec![
+            0x30, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
+            0x02, 0x01,
+        ];
+        assert_eq!(
+            encode_constraint_name_mapping(constraint),
+            expected_constraint
+        );
+        assert_eq!(
+            decode_constraint_name_mapping(&expected_constraint).unwrap(),
+            constraint
+        );
+
+        let mut expected_table = expected_constraint.clone();
+        expected_table[0] = 0x32;
+        assert_eq!(encode_table_constraint_mapping(constraint), expected_table);
+        assert_eq!(
+            decode_table_constraint_mapping(&expected_table).unwrap(),
+            constraint
+        );
+
+        let column = ColumnId::new(0x1112_1314_1516_1718).unwrap();
+        let expected_column = vec![
+            0x33, 0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+            0x12, 0x11,
+        ];
+        assert_eq!(encode_constraint_column_mapping(column), expected_column);
+        assert_eq!(
+            decode_constraint_column_mapping(&expected_column).unwrap(),
+            column
+        );
+    }
+
+    #[test]
+    fn every_local_constraint_kind_round_trips() {
+        let id = ConstraintId::new(7).unwrap();
+        let table_id = TableId::new(3).unwrap();
+        let index_id = IndexId::new(11).unwrap();
+        let cases = [
+            (ConstraintKind::PrimaryKey, 1, Some(index_id), Vec::new()),
+            (ConstraintKind::Unique, 2, Some(index_id), Vec::new()),
+            (ConstraintKind::NotNull, 1, None, Vec::new()),
+            (ConstraintKind::Check, 0, None, vec![0xaa]),
+        ];
+        for (kind, column_count, index_id, check_program) in cases {
+            let definition = ConstraintDef::new(
+                id,
+                table_id,
+                kind,
+                column_count,
+                index_id,
+                check_program.into_boxed_slice(),
+                CatalogName::new("C_T").unwrap(),
+            )
+            .unwrap();
+            let bytes = encode_constraint_definition(&definition);
+            assert_eq!(
+                decode_constraint_definition(id, &bytes).unwrap(),
+                definition
+            );
+        }
+    }
+
+    #[test]
+    fn constraint_mappings_reject_every_truncation_zero_id_and_future_version() {
+        let records = [
+            (
+                RecordKind::ConstraintName,
+                encode_constraint_name_mapping(ConstraintId::new(7).unwrap()),
+            ),
+            (
+                RecordKind::TableConstraint,
+                encode_table_constraint_mapping(ConstraintId::new(7).unwrap()),
+            ),
+            (
+                RecordKind::ConstraintColumn,
+                encode_constraint_column_mapping(ColumnId::new(9).unwrap()),
+            ),
+        ];
+        for (kind, bytes) in records {
+            for end in 0..bytes.len() {
+                assert_eq!(
+                    decode_record(kind, &bytes[..end]).unwrap_err().code(),
+                    ErrorCode::Corruption
+                );
+            }
+            let mut zero_id = bytes.clone();
+            zero_id[8..16].fill(0);
+            assert_eq!(
+                decode_record(kind, &zero_id).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+            let mut future = bytes;
+            future[1] = 2;
+            assert_eq!(
+                decode_record(kind, &future).unwrap_err().code(),
+                ErrorCode::Unsupported
+            );
+        }
+    }
+
+    fn encoded_check_constraint() -> Vec<u8> {
+        encode_constraint_definition(
+            &ConstraintDef::new(
+                ConstraintId::new(7).unwrap(),
+                TableId::new(3).unwrap(),
+                ConstraintKind::Check,
+                0,
+                None,
+                vec![0xaa, 0xbb].into_boxed_slice(),
+                CatalogName::new("CK_T").unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_constraint_corruption(bytes: Vec<u8>) {
+        assert_eq!(
+            decode_constraint_definition(ConstraintId::new(7).unwrap(), &bytes)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn constraint_definition_rejects_every_truncation_reserved_byte_and_shape_conflict() {
+        let bytes = encoded_check_constraint();
+        for end in 0..bytes.len() {
+            assert_eq!(
+                decode_constraint_definition(ConstraintId::new(7).unwrap(), &bytes[..end])
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption,
+                "truncation at {end}"
+            );
+        }
+        for offset in [25, 52, 53, 54, 55, 62, 63] {
+            let mut mutated = bytes.clone();
+            mutated[offset] = 1;
+            assert_constraint_corruption(mutated);
+        }
+        for (range, replacement) in [
+            (26..28, 1_u16.to_le_bytes().to_vec()),
+            (28..36, 1_u64.to_le_bytes().to_vec()),
+        ] {
+            let mut mutated = bytes.clone();
+            mutated[range].copy_from_slice(&replacement);
+            assert_constraint_corruption(mutated);
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_constraint_corruption(trailing);
+    }
+
+    #[test]
+    fn constraint_definition_rejects_invalid_ids_kind_name_lengths_and_program_lengths() {
+        let valid = encoded_check_constraint();
+        for range in [8..16, 16..24] {
+            let mut mutated = valid.clone();
+            mutated[range].fill(0);
+            assert_constraint_corruption(mutated);
+        }
+        for kind in [0, 6, u8::MAX] {
+            let mut mutated = valid.clone();
+            mutated[24] = kind;
+            assert_constraint_corruption(mutated);
+        }
+
+        let mut wrong_id = valid.clone();
+        wrong_id[8..16].copy_from_slice(&8_u64.to_le_bytes());
+        assert_constraint_corruption(wrong_id);
+
+        let mut invalid_utf8 = valid.clone();
+        invalid_utf8[66] = 0xff;
+        assert_constraint_corruption(invalid_utf8);
+
+        let mut long_name = valid.clone();
+        long_name[60..62].copy_from_slice(&129_u16.to_le_bytes());
+        long_name.truncate(66);
+        long_name.extend(std::iter::repeat_n(b'a', 129));
+        long_name[4..8].copy_from_slice(&187_u32.to_le_bytes());
+        assert_constraint_corruption(long_name);
+
+        for program_len in [0_u32, 3, 1_048_577, u32::MAX] {
+            let mut mutated = valid.clone();
+            mutated[56..60].copy_from_slice(&program_len.to_le_bytes());
+            assert_constraint_corruption(mutated);
+        }
+
+        let mut future = valid;
+        future[1] = 2;
+        assert_eq!(
+            decode_constraint_definition(ConstraintId::new(7).unwrap(), &future)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+    }
+
+    #[test]
+    fn constraint_definition_recognizes_foreign_key_bytes_as_phase_4c2c_unsupported() {
+        let mut bytes = encoded_check_constraint();
+        bytes[24] = 5;
+        let error =
+            decode_constraint_definition(ConstraintId::new(7).unwrap(), &bytes).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("foreign-key catalogs require Phase 4C2-C")
+        );
+
+        for range in [36..44, 44..52] {
+            let mut mutated = encoded_check_constraint();
+            mutated[range].copy_from_slice(&1_u64.to_le_bytes());
+            let error =
+                decode_constraint_definition(ConstraintId::new(7).unwrap(), &mutated).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains("foreign-key catalogs require Phase 4C2-C")
+            );
+        }
+
+        let referenced_by = encode_mapping(RecordKind::ReferencedBy, 7);
+        let error = decode_record(RecordKind::ReferencedBy, &referenced_by).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("foreign-key catalogs require Phase 4C2-C")
         );
     }
 }
