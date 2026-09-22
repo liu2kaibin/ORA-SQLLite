@@ -21,8 +21,9 @@ use super::{
 use crate::{DbError, ErrorCode, Result};
 use key::DecodedCatalogKey;
 use types::{
-    CatalogMeta, CatalogName, ColumnDef, ColumnId, IndexDef, IndexId, IndexOwnership, ObjectId,
-    ObjectKind, RowId, SchemaVersion, TableDef, TableId,
+    CatalogMeta, CatalogName, ColumnDef, ColumnId, ConstraintBundle, ConstraintDef, ConstraintId,
+    ConstraintKind, IndexDef, IndexId, IndexOwnership, ObjectId, ObjectKind, RowId, SchemaVersion,
+    TableDef, TableId,
 };
 
 /// A fully decoded and cross-checked image. No page source is retained.
@@ -38,6 +39,10 @@ pub(crate) struct CatalogImage {
     index_names: BTreeMap<String, IndexId>,
     table_indexes: BTreeMap<TableId, BTreeSet<IndexId>>,
     index_columns: BTreeMap<IndexId, BTreeMap<u16, ColumnId>>,
+    constraints: BTreeMap<ConstraintId, ConstraintDef>,
+    constraint_names: BTreeMap<String, ConstraintId>,
+    table_constraints: BTreeMap<TableId, BTreeSet<ConstraintId>>,
+    constraint_columns: BTreeMap<ConstraintId, BTreeMap<u16, ColumnId>>,
 }
 
 impl CatalogImage {
@@ -53,6 +58,10 @@ impl CatalogImage {
             index_names: BTreeMap::new(),
             table_indexes: BTreeMap::new(),
             index_columns: BTreeMap::new(),
+            constraints: BTreeMap::new(),
+            constraint_names: BTreeMap::new(),
+            table_constraints: BTreeMap::new(),
+            constraint_columns: BTreeMap::new(),
         }
     }
 
@@ -119,12 +128,6 @@ impl CatalogImage {
                 DecodedCatalogKey::IndexDefinition(id) => {
                     require_index_feature(feature_bits)?;
                     let index = record::decode_index_definition(id, &value)?;
-                    if matches!(index.ownership(), IndexOwnership::Constraint(_)) {
-                        return Err(DbError::new(
-                            ErrorCode::Unsupported,
-                            "constraint-owned indexes require constraint catalog validation",
-                        ));
-                    }
                     insert_unique(&mut image.indexes, id, index)?;
                 }
                 DecodedCatalogKey::TableIndex { table_id, index_id } => {
@@ -151,15 +154,59 @@ impl CatalogImage {
                         record::decode_index_column_mapping(&value)?,
                     )?;
                 }
-                DecodedCatalogKey::ConstraintName(_)
-                | DecodedCatalogKey::ConstraintDefinition(_)
-                | DecodedCatalogKey::TableConstraint { .. }
-                | DecodedCatalogKey::ConstraintColumn { .. }
-                | DecodedCatalogKey::ReferencedBy { .. } => {
+                DecodedCatalogKey::ConstraintName(name) => {
+                    require_index_feature(feature_bits)?;
+                    insert_unique(
+                        &mut image.constraint_names,
+                        name.to_owned(),
+                        record::decode_constraint_name_mapping(&value)?,
+                    )?;
+                }
+                DecodedCatalogKey::ConstraintDefinition(id) => {
+                    require_index_feature(feature_bits)?;
+                    insert_unique(
+                        &mut image.constraints,
+                        id,
+                        record::decode_constraint_definition(id, &value)?,
+                    )?;
+                }
+                DecodedCatalogKey::TableConstraint {
+                    table_id,
+                    constraint_id,
+                } => {
+                    require_index_feature(feature_bits)?;
+                    if record::decode_table_constraint_mapping(&value)? != constraint_id {
+                        return Err(corruption(
+                            "table constraint mapping does not match its key",
+                        ));
+                    }
+                    if !image
+                        .table_constraints
+                        .entry(table_id)
+                        .or_default()
+                        .insert(constraint_id)
+                    {
+                        return Err(corruption(
+                            "catalog contains a duplicate table constraint mapping",
+                        ));
+                    }
+                }
+                DecodedCatalogKey::ConstraintColumn {
+                    constraint_id,
+                    ordinal,
+                } => {
+                    require_index_feature(feature_bits)?;
+                    insert_unique(
+                        image.constraint_columns.entry(constraint_id).or_default(),
+                        ordinal,
+                        record::decode_constraint_column_mapping(&value)?,
+                    )?;
+                }
+                DecodedCatalogKey::ReferencedBy { .. } => {
                     require_index_feature(feature_bits)?;
                     return Err(DbError::new(
                         ErrorCode::Unsupported,
-                        "constraint catalog records are not implemented",
+                        "foreign-key catalogs require Phase 4C2-C",
                     ));
                 }
             }
@@ -307,10 +354,14 @@ impl CatalogImage {
                     return Err(corruption("index contains a repeated column"));
                 }
             }
-            if matches!(index.ownership(), IndexOwnership::Constraint(_)) {
-                return Err(DbError::new(
-                    ErrorCode::Unsupported,
-                    "constraint-owned indexes require constraint catalog validation",
+            if let IndexOwnership::Constraint(constraint_id) = index.ownership()
+                && self
+                    .constraints
+                    .get(&constraint_id)
+                    .is_none_or(|constraint| constraint.index_id() != Some(index.id()))
+            {
+                return Err(corruption(
+                    "constraint-owned index has no matching owner constraint",
                 ));
             }
         }
@@ -340,6 +391,162 @@ impl CatalogImage {
                 {
                     return Err(corruption(
                         "index column mapping has no matching owned column",
+                    ));
+                }
+            }
+        }
+        for (name, id) in &self.constraint_names {
+            if self
+                .constraints
+                .get(id)
+                .is_none_or(|constraint| constraint.name().as_str() != name)
+            {
+                return Err(corruption(
+                    "constraint name mapping has no matching definition",
+                ));
+            }
+        }
+        let mut primary_key_tables = BTreeSet::new();
+        for constraint in self.constraints.values() {
+            if !object_ids.insert(constraint.id().into()) {
+                return Err(corruption("catalog definitions share a global object ID"));
+            }
+            if constraint.id().get() >= self.meta.next_object_id().get() {
+                return Err(corruption("constraint ID is not below the next object ID"));
+            }
+            if !self.tables.contains_key(&constraint.table_id()) {
+                return Err(corruption(
+                    "constraint definition references a missing table",
+                ));
+            }
+            if self.constraint_names.get(constraint.name().as_str()) != Some(&constraint.id()) {
+                return Err(corruption(
+                    "constraint definition has no matching name mapping",
+                ));
+            }
+            if !self
+                .table_constraints
+                .get(&constraint.table_id())
+                .is_some_and(|constraints| constraints.contains(&constraint.id()))
+            {
+                return Err(corruption(
+                    "constraint definition has no matching table constraint mapping",
+                ));
+            }
+            let columns = self.constraint_columns.get(&constraint.id());
+            if columns.map_or(0, BTreeMap::len) != usize::from(constraint.column_count()) {
+                return Err(corruption(
+                    "constraint column count does not match ordinal mappings",
+                ));
+            }
+            let mut seen_columns = BTreeSet::new();
+            for (expected, (ordinal, column_id)) in columns
+                .into_iter()
+                .flat_map(|columns| columns.iter())
+                .enumerate()
+            {
+                let expected = u16::try_from(expected)
+                    .map_err(|_| corruption("constraint column ordinal exceeds u16"))?;
+                if *ordinal != expected {
+                    return Err(corruption(
+                        "constraint column ordinals are not contiguous from zero",
+                    ));
+                }
+                let column = self.columns.get(column_id).ok_or_else(|| {
+                    corruption("constraint column mapping references a missing column")
+                })?;
+                if column.table_id() != constraint.table_id() {
+                    return Err(corruption(
+                        "constraint column is not owned by the constraint table",
+                    ));
+                }
+                if !seen_columns.insert(*column_id) {
+                    return Err(corruption("constraint contains a repeated column"));
+                }
+                if matches!(
+                    constraint.kind(),
+                    ConstraintKind::PrimaryKey | ConstraintKind::NotNull
+                ) && column.nullable()
+                {
+                    return Err(corruption(
+                        "primary-key and not-null columns must be non-nullable",
+                    ));
+                }
+            }
+            match constraint.kind() {
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
+                    if constraint.kind() == ConstraintKind::PrimaryKey
+                        && !primary_key_tables.insert(constraint.table_id())
+                    {
+                        return Err(corruption("table has more than one primary key"));
+                    }
+                    let index_id = constraint
+                        .index_id()
+                        .ok_or_else(|| corruption("key constraint has no matching system index"))?;
+                    let index = self.indexes.get(&index_id).ok_or_else(|| {
+                        corruption("key constraint references a missing system index")
+                    })?;
+                    if index.ownership() != IndexOwnership::Constraint(constraint.id()) {
+                        return Err(corruption(
+                            "key constraint system index has the wrong owner",
+                        ));
+                    }
+                    if index.table_id() != constraint.table_id() {
+                        return Err(corruption(
+                            "key constraint system index belongs to the wrong table",
+                        ));
+                    }
+                    if !index.unique() {
+                        return Err(corruption("key constraint system index is not unique"));
+                    }
+                    let index_columns = self.index_columns.get(&index.id());
+                    if columns
+                        .into_iter()
+                        .flat_map(|columns| columns.values())
+                        .ne(index_columns
+                            .into_iter()
+                            .flat_map(|columns| columns.values()))
+                    {
+                        return Err(corruption(
+                            "key constraint and system index column order differs",
+                        ));
+                    }
+                }
+                ConstraintKind::NotNull => {}
+                ConstraintKind::Check => {
+                    if constraint.check_program().is_empty()
+                        || constraint.check_program().len() > types::MAX_CHECK_PROGRAM_BYTES
+                    {
+                        return Err(corruption("check constraint program length is invalid"));
+                    }
+                }
+            }
+        }
+        for (table_id, constraints) in &self.table_constraints {
+            for constraint_id in constraints {
+                if self
+                    .constraints
+                    .get(constraint_id)
+                    .is_none_or(|constraint| constraint.table_id() != *table_id)
+                {
+                    return Err(corruption(
+                        "table constraint mapping has no matching owned definition",
+                    ));
+                }
+            }
+        }
+        for (constraint_id, columns) in &self.constraint_columns {
+            let constraint = self.constraints.get(constraint_id).ok_or_else(|| {
+                corruption("constraint column mapping has no matching definition")
+            })?;
+            for column_id in columns.values() {
+                if self
+                    .columns
+                    .get(column_id)
+                    .is_none_or(|column| column.table_id() != constraint.table_id())
+                {
+                    return Err(corruption(
+                        "constraint column mapping has no matching owned column",
                     ));
                 }
             }
@@ -597,6 +804,51 @@ impl CatalogReader {
             })
     }
 
+    pub(crate) fn find_constraint_by_id(&self, id: ConstraintId) -> Option<&ConstraintDef> {
+        self.image.constraints.get(&id)
+    }
+
+    pub(crate) fn find_constraint_by_name(&self, name: &CatalogName) -> Option<&ConstraintDef> {
+        self.image
+            .constraint_names
+            .get(name.as_str())
+            .and_then(|id| self.image.constraints.get(id))
+    }
+
+    pub(crate) fn constraints_for_table(
+        &self,
+        table: TableId,
+    ) -> impl Iterator<Item = &ConstraintDef> {
+        self.image
+            .table_constraints
+            .get(&table)
+            .into_iter()
+            .flat_map(|constraints| constraints.iter())
+            .map(|id| {
+                self.image
+                    .constraints
+                    .get(id)
+                    .expect("validated table constraint references an existing constraint")
+            })
+    }
+
+    pub(crate) fn columns_for_constraint(
+        &self,
+        constraint: ConstraintId,
+    ) -> impl Iterator<Item = &ColumnDef> {
+        self.image
+            .constraint_columns
+            .get(&constraint)
+            .into_iter()
+            .flat_map(|columns| columns.values())
+            .map(|id| {
+                self.image
+                    .columns
+                    .get(id)
+                    .expect("validated constraint column references an existing column")
+            })
+    }
+
     /// Returns whether a persisted V1 object has this exact typed identity.
     ///
     pub(crate) fn object_id_exists(&self, kind: ObjectKind, object_id: ObjectId) -> bool {
@@ -610,7 +862,9 @@ impl CatalogReader {
             ObjectKind::Index => IndexId::from_object(object_id, kind)
                 .ok()
                 .is_some_and(|id| self.image.indexes.contains_key(&id)),
-            ObjectKind::Constraint => false,
+            ObjectKind::Constraint => ConstraintId::from_object(object_id, kind)
+                .ok()
+                .is_some_and(|id| self.image.constraints.contains_key(&id)),
         }
     }
 
@@ -620,7 +874,8 @@ impl CatalogReader {
         match kind {
             ObjectKind::Table => self.image.table_names.contains_key(name.as_str()),
             ObjectKind::Index => self.image.index_names.contains_key(name.as_str()),
-            ObjectKind::Column | ObjectKind::Constraint => false,
+            ObjectKind::Constraint => self.image.constraint_names.contains_key(name.as_str()),
+            ObjectKind::Column => false,
         }
     }
 }
@@ -892,6 +1147,249 @@ impl CatalogWriter {
         })
     }
 
+    pub(crate) fn insert_constraint_bundle(
+        &mut self,
+        batch: &mut WriteBatch,
+        bundle: &ConstraintBundle,
+    ) -> Result<()> {
+        self.insert_constraint_bundle_with_record_hook(batch, bundle, |_| Ok(()))
+    }
+
+    fn insert_constraint_bundle_with_record_hook(
+        &mut self,
+        batch: &mut WriteBatch,
+        bundle: &ConstraintBundle,
+        mut record_hook: impl FnMut(usize) -> Result<()>,
+    ) -> Result<()> {
+        let features = batch.feature_bits();
+        let current = CatalogReader::open_candidate(batch, &self.tree, features)?;
+        let has_primary_key = current
+            .constraints_for_table(bundle.definition.table_id())
+            .any(|constraint| constraint.kind() == ConstraintKind::PrimaryKey);
+        self.mutate(batch, |tree, batch| {
+            let mut record_number = 0;
+            let mut record_written = || {
+                let completed = record_number;
+                record_number += 1;
+                record_hook(completed)
+            };
+            let definition = &bundle.definition;
+            read_table_definition(tree, batch, definition.table_id())?;
+            require_allocated_object_id(tree, batch, definition.id().into())?;
+            require_available_object(tree, batch, definition.id().into())?;
+            let constraint_name_key = key::constraint_name_key(definition.name())?;
+            let table_constraint_key =
+                key::table_constraint_key(definition.table_id(), definition.id());
+            require_available_key(
+                tree,
+                batch,
+                &constraint_name_key,
+                "duplicate constraint name",
+            )?;
+            require_available_key(
+                tree,
+                batch,
+                &table_constraint_key,
+                "duplicate table constraint mapping",
+            )?;
+            if bundle.columns.len() != usize::from(definition.column_count()) {
+                return Err(DbError::new(
+                    ErrorCode::Type,
+                    "constraint column list does not match the constraint column count",
+                ));
+            }
+            if definition.kind() == ConstraintKind::PrimaryKey && has_primary_key {
+                return Err(DbError::new(
+                    ErrorCode::Constraint,
+                    "table already has a primary key",
+                ));
+            }
+            let mut seen_columns = BTreeSet::new();
+            for (ordinal, column_id) in bundle.columns.iter().copied().enumerate() {
+                if !seen_columns.insert(column_id) {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "constraint column list contains a repeated column",
+                    ));
+                }
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "constraint column ordinal exceeds u16")
+                })?;
+                let column = read_column_definition(tree, batch, column_id)?;
+                if column.table_id() != definition.table_id() {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "constraint column is not owned by the constraint table",
+                    ));
+                }
+                if matches!(
+                    definition.kind(),
+                    ConstraintKind::PrimaryKey | ConstraintKind::NotNull
+                ) && column.nullable()
+                {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "primary-key and not-null columns must be non-nullable",
+                    ));
+                }
+                require_available_key(
+                    tree,
+                    batch,
+                    &key::constraint_column_key(definition.id(), ordinal),
+                    "duplicate constraint column ordinal",
+                )?;
+            }
+
+            let prepared_index = match (&bundle.system_index, definition.index_id()) {
+                (Some((index, index_columns)), Some(index_id)) => {
+                    if index.id() != index_id
+                        || index.table_id() != definition.table_id()
+                        || index.ownership() != IndexOwnership::Constraint(definition.id())
+                    {
+                        return Err(DbError::new(
+                            ErrorCode::Constraint,
+                            "system index identity does not match its owner constraint",
+                        ));
+                    }
+                    if !index.unique() {
+                        return Err(DbError::new(
+                            ErrorCode::Constraint,
+                            "key constraint system index must be unique",
+                        ));
+                    }
+                    if index_columns.as_ref() != bundle.columns.as_ref()
+                        || index_columns.len() != usize::from(index.column_count())
+                    {
+                        return Err(DbError::new(
+                            ErrorCode::Constraint,
+                            "system index columns do not match the owner constraint",
+                        ));
+                    }
+                    if index.id().get() == definition.id().get() {
+                        return Err(DbError::new(
+                            ErrorCode::Constraint,
+                            "catalog definitions share a global object ID",
+                        ));
+                    }
+                    require_allocated_object_id(tree, batch, index.id().into())?;
+                    require_available_object(tree, batch, index.id().into())?;
+                    let index_name_key = key::index_name_key(index.name())?;
+                    let table_index_key = key::table_index_key(index.table_id(), index.id());
+                    require_available_key(tree, batch, &index_name_key, "duplicate index name")?;
+                    require_available_key(
+                        tree,
+                        batch,
+                        &table_index_key,
+                        "duplicate table index mapping",
+                    )?;
+                    for (ordinal, _) in index_columns.iter().enumerate() {
+                        let ordinal = u16::try_from(ordinal).map_err(|_| {
+                            DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
+                        })?;
+                        require_available_key(
+                            tree,
+                            batch,
+                            &key::index_column_key(index.id(), ordinal),
+                            "duplicate index column ordinal",
+                        )?;
+                    }
+                    batch.require_current_catalog_root(index.root())?;
+                    if TreeKind::from_root_page_type(batch.read(index.root())?.header().page_type())
+                        != Some(TreeKind::Index)
+                    {
+                        return Err(corruption(
+                            "catalog index root must reference an Index B+Tree",
+                        ));
+                    }
+                    validate_tree(batch, &BTree::from_root(TreeKind::Index, index.root()))?;
+                    let mut live = validate_tree(batch, tree)?.all_live_pages();
+                    validate_relation_roots(
+                        batch,
+                        current.image.tables.values().map(TableDef::root),
+                        current
+                            .image
+                            .indexes
+                            .values()
+                            .map(IndexDef::root)
+                            .chain([index.root()]),
+                        &mut live,
+                    )?;
+                    Some((index, index_columns, index_name_key, table_index_key))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "constraint and system index presence do not match",
+                    ));
+                }
+            };
+
+            tree.insert(
+                batch,
+                &key::constraint_definition_key(definition.id()),
+                &record::encode_constraint_definition(definition),
+            )?;
+            record_written()?;
+            tree.insert(
+                batch,
+                &constraint_name_key,
+                &record::encode_constraint_name_mapping(definition.id()),
+            )?;
+            record_written()?;
+            tree.insert(
+                batch,
+                &table_constraint_key,
+                &record::encode_table_constraint_mapping(definition.id()),
+            )?;
+            record_written()?;
+            for (ordinal, column_id) in bundle.columns.iter().copied().enumerate() {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "constraint column ordinal exceeds u16")
+                })?;
+                tree.insert(
+                    batch,
+                    &key::constraint_column_key(definition.id(), ordinal),
+                    &record::encode_constraint_column_mapping(column_id),
+                )?;
+                record_written()?;
+            }
+            if let Some((index, index_columns, index_name_key, table_index_key)) = prepared_index {
+                tree.insert(
+                    batch,
+                    &key::index_definition_key(index.id()),
+                    &record::encode_index_definition(index),
+                )?;
+                record_written()?;
+                tree.insert(
+                    batch,
+                    &index_name_key,
+                    &record::encode_index_name_mapping(index.id()),
+                )?;
+                record_written()?;
+                tree.insert(
+                    batch,
+                    &table_index_key,
+                    &record::encode_table_index_mapping(index.id()),
+                )?;
+                record_written()?;
+                for (ordinal, column_id) in index_columns.iter().copied().enumerate() {
+                    let ordinal = u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
+                    })?;
+                    tree.insert(
+                        batch,
+                        &key::index_column_key(index.id(), ordinal),
+                        &record::encode_index_column_mapping(column_id),
+                    )?;
+                    record_written()?;
+                }
+                batch.track_tree(TreeKind::Index, index.root())?;
+            }
+            batch.enable_feature_bits(INDEX_CONSTRAINT_V1)
+        })
+    }
+
     pub(crate) fn update_table_root(
         &mut self,
         batch: &mut WriteBatch,
@@ -918,12 +1416,6 @@ impl CatalogWriter {
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
             let index = read_index_definition(tree, batch, index_id)?;
-            if index.ownership() != IndexOwnership::Explicit {
-                return Err(DbError::new(
-                    ErrorCode::Unsupported,
-                    "constraint-owned indexes cannot be mutated before constraint catalog support",
-                ));
-            }
             batch.require_tracked_index_root(root)?;
             replace_record(
                 tree,
@@ -939,6 +1431,75 @@ impl CatalogWriter {
                     index.name().clone(),
                 )?),
             )
+        })
+    }
+
+    pub(crate) fn remove_constraint(
+        &mut self,
+        batch: &mut WriteBatch,
+        constraint: &ConstraintDef,
+        columns: &[ColumnId],
+    ) -> Result<()> {
+        let features = batch.feature_bits();
+        let reader = CatalogReader::open_candidate(batch, &self.tree, features)?;
+        let report = validate_tree(batch, &self.tree)?;
+        reader.validate_deep_from(batch, &self.tree, report, features)?;
+        self.mutate(batch, |tree, batch| {
+            require_matching_constraint_record(tree, batch, constraint, columns)?;
+            let system_index = if let Some(index_id) = constraint.index_id() {
+                let index = read_index_definition(tree, batch, index_id)?;
+                if index.ownership() != IndexOwnership::Constraint(constraint.id()) {
+                    return Err(corruption(
+                        "bound constraint system index has the wrong owner",
+                    ));
+                }
+                require_matching_index_record(tree, batch, &index, columns)?;
+                Some(index)
+            } else {
+                None
+            };
+            for (ordinal, _) in columns.iter().enumerate() {
+                let ordinal = u16::try_from(ordinal).map_err(|_| {
+                    DbError::new(ErrorCode::Type, "constraint column ordinal exceeds u16")
+                })?;
+                delete_required_record(
+                    tree,
+                    batch,
+                    &key::constraint_column_key(constraint.id(), ordinal),
+                )?;
+            }
+            delete_required_record(
+                tree,
+                batch,
+                &key::table_constraint_key(constraint.table_id(), constraint.id()),
+            )?;
+            delete_required_record(tree, batch, &key::constraint_name_key(constraint.name())?)?;
+            delete_required_record(
+                tree,
+                batch,
+                &key::constraint_definition_key(constraint.id()),
+            )?;
+            if let Some(index) = system_index {
+                for (ordinal, _) in columns.iter().enumerate() {
+                    let ordinal = u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
+                    })?;
+                    delete_required_record(
+                        tree,
+                        batch,
+                        &key::index_column_key(index.id(), ordinal),
+                    )?;
+                }
+                delete_required_record(
+                    tree,
+                    batch,
+                    &key::table_index_key(index.table_id(), index.id()),
+                )?;
+                delete_required_record(tree, batch, &key::index_name_key(index.name())?)?;
+                delete_required_record(tree, batch, &key::index_definition_key(index.id()))?;
+                batch.release_tree_later(TreeKind::Index, index.root())?;
+            }
+            Ok(())
         })
     }
 
@@ -1122,11 +1683,41 @@ fn read_index_definition(tree: &BTree, batch: &mut WriteBatch, id: IndexId) -> R
     record::decode_index_definition(id, &bytes)
 }
 
+fn read_constraint_definition(
+    tree: &BTree,
+    batch: &mut WriteBatch,
+    id: ConstraintId,
+) -> Result<ConstraintDef> {
+    let bytes = tree
+        .get(batch, &key::constraint_definition_key(id))?
+        .ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Corruption,
+                format!("catalog constraint definition {} is missing", id.get()),
+            )
+        })?;
+    record::decode_constraint_definition(id, &bytes)
+}
+
+fn require_allocated_object_id(tree: &BTree, batch: &mut WriteBatch, id: ObjectId) -> Result<()> {
+    let bytes = tree
+        .get(batch, &key::catalog_meta_key())?
+        .ok_or_else(|| corruption("catalog meta record is missing"))?;
+    if id.get() >= record::decode_catalog_meta(&bytes)?.next_object_id().get() {
+        return Err(DbError::new(
+            ErrorCode::Constraint,
+            format!("catalog object ID {} has not been allocated", id.get()),
+        ));
+    }
+    Ok(())
+}
+
 fn require_available_object(tree: &BTree, batch: &mut WriteBatch, id: ObjectId) -> Result<()> {
     for key in [
         key::table_definition_key(TableId::new(id.get())?),
         key::column_definition_key(ColumnId::new(id.get())?),
         key::index_definition_key(IndexId::new(id.get())?),
+        key::constraint_definition_key(ConstraintId::new(id.get())?),
     ] {
         if tree.get(batch, &key)?.is_some() {
             return Err(DbError::new(
@@ -1258,6 +1849,58 @@ fn require_matching_index_record(
         return Err(corruption(
             "bound table index mapping changed before mutation",
         ));
+    }
+    Ok(())
+}
+
+fn require_matching_constraint_record(
+    tree: &BTree,
+    batch: &mut WriteBatch,
+    expected: &ConstraintDef,
+    columns: &[ColumnId],
+) -> Result<()> {
+    if columns.len() != usize::from(expected.column_count()) {
+        return Err(corruption(
+            "bound constraint columns do not match the constraint column count",
+        ));
+    }
+    if read_constraint_definition(tree, batch, expected.id())? != *expected {
+        return Err(corruption(
+            "bound constraint definition changed before mutation",
+        ));
+    }
+    let name_bytes = tree
+        .get(batch, &key::constraint_name_key(expected.name())?)?
+        .ok_or_else(|| corruption("bound constraint name mapping is missing before mutation"))?;
+    if record::decode_constraint_name_mapping(&name_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound constraint name mapping changed before mutation",
+        ));
+    }
+    let table_bytes = tree
+        .get(
+            batch,
+            &key::table_constraint_key(expected.table_id(), expected.id()),
+        )?
+        .ok_or_else(|| corruption("bound table constraint mapping is missing before mutation"))?;
+    if record::decode_table_constraint_mapping(&table_bytes)? != expected.id() {
+        return Err(corruption(
+            "bound table constraint mapping changed before mutation",
+        ));
+    }
+    for (ordinal, column_id) in columns.iter().copied().enumerate() {
+        let ordinal = u16::try_from(ordinal)
+            .map_err(|_| DbError::new(ErrorCode::Type, "constraint column ordinal exceeds u16"))?;
+        let bytes = tree
+            .get(batch, &key::constraint_column_key(expected.id(), ordinal))?
+            .ok_or_else(|| {
+                corruption("bound constraint column mapping is missing before mutation")
+            })?;
+        if record::decode_constraint_column_mapping(&bytes)? != column_id {
+            return Err(corruption(
+                "bound constraint column mapping changed before mutation",
+            ));
+        }
     }
     Ok(())
 }
@@ -3917,6 +4560,343 @@ mod tests {
         rows
     }
 
+    #[test]
+    fn constraint_bundle_insert_remove_and_root_update_restore_exact_candidate() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let table_id = TableId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let table = new_table(table_id.get(), table_root, 1, "T");
+        writer.insert_table_definition(&mut batch, &table).unwrap();
+        let column_id =
+            ColumnId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let column = ColumnDef::new(
+            column_id,
+            table_id,
+            0,
+            ColumnType::Int64,
+            false,
+            CatalogName::new("C").unwrap(),
+        )
+        .unwrap();
+        writer
+            .insert_column_definition(&mut batch, &column)
+            .unwrap();
+        let constraint_id =
+            ConstraintId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let index_id = IndexId::new(writer.allocate_object_id(&mut batch).unwrap().get()).unwrap();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let definition = ConstraintDef::new(
+            constraint_id,
+            table_id,
+            ConstraintKind::PrimaryKey,
+            1,
+            Some(index_id),
+            Box::new([]),
+            CatalogName::new("PK_T").unwrap(),
+        )
+        .unwrap();
+        let index = IndexDef::new(
+            index_id,
+            table_id,
+            index_root,
+            1,
+            true,
+            IndexOwnership::Constraint(constraint_id),
+            CatalogName::new("SYS_PK_T").unwrap(),
+        )
+        .unwrap();
+        let bundle = ConstraintBundle {
+            definition: definition.clone(),
+            columns: vec![column_id].into_boxed_slice(),
+            system_index: Some((index.clone(), vec![column_id].into_boxed_slice())),
+        };
+        let before_insert = current_records(&writer, &mut batch);
+        for fail_after in 0..8 {
+            let checkpoint = batch.checkpoint_mutation().unwrap();
+            let writer_root = writer.root();
+            let error = writer
+                .insert_constraint_bundle_with_record_hook(&mut batch, &bundle, |record_number| {
+                    if record_number == fail_after {
+                        Err(DbError::new(
+                            ErrorCode::Io,
+                            "injected after constraint bundle record",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Io, "record {fail_after}");
+            checkpoint.assert_matches_batch_for_test(&batch);
+            assert_eq!(writer.root(), writer_root);
+            assert_eq!(current_records(&writer, &mut batch), before_insert);
+        }
+        writer
+            .insert_constraint_bundle(&mut batch, &bundle)
+            .unwrap();
+        let records_after_insert = current_records(&writer, &mut batch);
+        let checkpoint = batch.checkpoint_mutation().unwrap();
+        let writer_root = writer.root();
+        assert_eq!(
+            writer
+                .insert_constraint_bundle(&mut batch, &bundle)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Constraint
+        );
+        checkpoint.assert_matches_batch_for_test(&batch);
+        assert_eq!(writer.root(), writer_root);
+        assert_eq!(current_records(&writer, &mut batch), records_after_insert);
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert_eq!(
+            catalog.find_constraint_by_id(constraint_id),
+            Some(&definition)
+        );
+        assert_eq!(
+            catalog.find_constraint_by_name(&CatalogName::new("PK_T").unwrap()),
+            Some(&definition)
+        );
+        assert_eq!(
+            catalog
+                .constraints_for_table(table_id)
+                .map(ConstraintDef::id)
+                .collect::<Vec<_>>(),
+            [constraint_id]
+        );
+        assert_eq!(
+            catalog
+                .columns_for_constraint(constraint_id)
+                .map(ColumnDef::id)
+                .collect::<Vec<_>>(),
+            [column_id]
+        );
+        assert!(catalog.object_id_exists(ObjectKind::Constraint, constraint_id.into()));
+        assert!(
+            catalog.object_name_exists(ObjectKind::Constraint, &CatalogName::new("PK_T").unwrap())
+        );
+        assert!(!catalog.object_name_exists(ObjectKind::Index, &CatalogName::new("PK_T").unwrap()));
+        drop(read);
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        batch.track_tree(TreeKind::Index, index_root).unwrap();
+        writer
+            .update_index_root(&mut batch, index_id, index_root)
+            .unwrap();
+        writer
+            .remove_constraint(&mut batch, &definition, &[column_id])
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert!(catalog.find_constraint_by_id(constraint_id).is_none());
+        assert!(catalog.find_index_by_id(index_id).is_none());
+        assert_eq!(catalog.image.meta.next_object_id().get(), 5);
+    }
+
+    fn local_constraint_records(table_root: PageRef, index_root: PageRef) -> Records {
+        let mut rows = records(table_root);
+        let constraint_id = ConstraintId::new(50).unwrap();
+        let index = IndexDef::new(
+            IndexId::new(30).unwrap(),
+            TableId::new(10).unwrap(),
+            index_root,
+            2,
+            true,
+            IndexOwnership::Constraint(constraint_id),
+            CatalogName::new("PK_T").unwrap(),
+        )
+        .unwrap();
+        let constraint = ConstraintDef::new(
+            constraint_id,
+            TableId::new(10).unwrap(),
+            ConstraintKind::PrimaryKey,
+            2,
+            Some(index.id()),
+            Box::new([]),
+            CatalogName::new("PK_T").unwrap(),
+        )
+        .unwrap();
+        rows.extend([
+            (
+                index_name_key(index.name()).unwrap(),
+                encode_index_name_mapping(index.id()),
+            ),
+            (
+                index_definition_key(index.id()),
+                encode_index_definition(&index),
+            ),
+            (
+                table_index_key(index.table_id(), index.id()),
+                encode_table_index_mapping(index.id()),
+            ),
+            (
+                index_column_key(index.id(), 0),
+                encode_index_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                index_column_key(index.id(), 1),
+                encode_index_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+            (
+                constraint_name_key(constraint.name()).unwrap(),
+                encode_constraint_name_mapping(constraint.id()),
+            ),
+            (
+                constraint_definition_key(constraint.id()),
+                encode_constraint_definition(&constraint),
+            ),
+            (
+                table_constraint_key(constraint.table_id(), constraint.id()),
+                encode_table_constraint_mapping(constraint.id()),
+            ),
+            (
+                constraint_column_key(constraint.id(), 0),
+                encode_constraint_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                constraint_column_key(constraint.id(), 1),
+                encode_constraint_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+        ]);
+        rows
+    }
+
+    #[test]
+    fn catalog_requires_complete_bidirectional_local_constraint_graph() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let complete = local_constraint_records(table_root, index_root);
+        let tree = raw_tree(&mut batch, complete.clone());
+        let features = CATALOG_V1 | INDEX_CONSTRAINT_V1;
+        assert!(CatalogReader::open_candidate(&mut batch, &tree, features).is_ok());
+
+        let required_keys = [
+            constraint_name_key(&CatalogName::new("PK_T").unwrap()).unwrap(),
+            constraint_definition_key(ConstraintId::new(50).unwrap()),
+            table_constraint_key(TableId::new(10).unwrap(), ConstraintId::new(50).unwrap()),
+            constraint_column_key(ConstraintId::new(50).unwrap(), 0),
+            index_definition_key(IndexId::new(30).unwrap()),
+        ];
+        for missing in required_keys {
+            let mut incomplete = complete.clone();
+            remove_record(&mut incomplete, &missing);
+            let tree = raw_tree(&mut batch, incomplete);
+            assert_eq!(
+                CatalogReader::open_candidate(&mut batch, &tree, features)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption,
+                "missing family key {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_two_primary_keys_and_foreign_keys_in_phase_4c2b() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let first_index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let second_index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let mut two_primary_keys = local_constraint_records(table_root, first_index_root);
+        let second_constraint_id = ConstraintId::new(51).unwrap();
+        let second_index = IndexDef::new(
+            IndexId::new(31).unwrap(),
+            TableId::new(10).unwrap(),
+            second_index_root,
+            2,
+            true,
+            IndexOwnership::Constraint(second_constraint_id),
+            CatalogName::new("PK_T_2").unwrap(),
+        )
+        .unwrap();
+        let second_constraint = ConstraintDef::new(
+            second_constraint_id,
+            TableId::new(10).unwrap(),
+            ConstraintKind::PrimaryKey,
+            2,
+            Some(second_index.id()),
+            Box::new([]),
+            CatalogName::new("PK_T_2").unwrap(),
+        )
+        .unwrap();
+        two_primary_keys.extend([
+            (
+                index_name_key(second_index.name()).unwrap(),
+                encode_index_name_mapping(second_index.id()),
+            ),
+            (
+                index_definition_key(second_index.id()),
+                encode_index_definition(&second_index),
+            ),
+            (
+                table_index_key(second_index.table_id(), second_index.id()),
+                encode_table_index_mapping(second_index.id()),
+            ),
+            (
+                index_column_key(second_index.id(), 0),
+                encode_index_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                index_column_key(second_index.id(), 1),
+                encode_index_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+            (
+                constraint_name_key(second_constraint.name()).unwrap(),
+                encode_constraint_name_mapping(second_constraint.id()),
+            ),
+            (
+                constraint_definition_key(second_constraint.id()),
+                encode_constraint_definition(&second_constraint),
+            ),
+            (
+                table_constraint_key(second_constraint.table_id(), second_constraint.id()),
+                encode_table_constraint_mapping(second_constraint.id()),
+            ),
+            (
+                constraint_column_key(second_constraint.id(), 0),
+                encode_constraint_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                constraint_column_key(second_constraint.id(), 1),
+                encode_constraint_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+        ]);
+        let tree = raw_tree(&mut batch, two_primary_keys);
+        let features = CATALOG_V1 | INDEX_CONSTRAINT_V1;
+        assert_eq!(
+            CatalogReader::open_candidate(&mut batch, &tree, features)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let mut foreign_key = local_constraint_records(table_root, first_index_root);
+        let bytes = record_value_mut(
+            &mut foreign_key,
+            &constraint_definition_key(ConstraintId::new(50).unwrap()),
+        );
+        bytes[24] = 5;
+        let tree = raw_tree(&mut batch, foreign_key);
+        let error = CatalogReader::open_candidate(&mut batch, &tree, features).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("foreign-key catalogs require Phase 4C2-C")
+        );
+    }
+
     fn remove_record(rows: &mut Records, key: &[u8]) -> Vec<u8> {
         let position = rows
             .iter()
@@ -4371,34 +5351,44 @@ mod tests {
                 },
             );
         }
-        let reserved_keys = [
+        let local_constraint_keys = [
             constraint_name_key(&CatalogName::new("C").unwrap()).unwrap(),
             constraint_definition_key(ConstraintId::new(50).unwrap()),
             table_constraint_key(TableId::new(10).unwrap(), ConstraintId::new(50).unwrap()),
             constraint_column_key(ConstraintId::new(50).unwrap(), 0),
-            referenced_by_key(
-                ConstraintId::new(50).unwrap(),
-                ConstraintId::new(51).unwrap(),
-            ),
         ];
-        for key in reserved_keys.clone() {
+        let referenced_by = referenced_by_key(
+            ConstraintId::new(50).unwrap(),
+            ConstraintId::new(51).unwrap(),
+        );
+        for key in local_constraint_keys
+            .clone()
+            .into_iter()
+            .chain([referenced_by.clone()])
+        {
             assert_bad_records(
                 "4C2 record without feature bit",
                 ErrorCode::Corruption,
                 |rows, _| rows.push((key, vec![])),
             );
         }
-        for key in reserved_keys {
+        for key in local_constraint_keys {
             assert_bad_records_with_features(
-                "well-formed reserved constraint family",
-                ErrorCode::Unsupported,
+                "malformed or incomplete local constraint family",
+                ErrorCode::Corruption,
                 CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
                 |rows, _| rows.push((key, vec![])),
             );
         }
         assert_bad_records_with_features(
-            "constraint-owned index",
+            "foreign-key reverse edge",
             ErrorCode::Unsupported,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            |rows, _| rows.push((referenced_by, vec![])),
+        );
+        assert_bad_records_with_features(
+            "orphaned constraint-owned index",
+            ErrorCode::Corruption,
             CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
             |rows, root| {
                 let index = IndexDef::new(

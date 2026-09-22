@@ -267,6 +267,13 @@ pub(crate) struct ConstraintDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConstraintBundle {
+    pub(crate) definition: ConstraintDef,
+    pub(crate) columns: Box<[ColumnId]>,
+    pub(crate) system_index: Option<(IndexDef, Box<[ColumnId]>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CatalogRecord {
     CatalogMeta(CatalogMeta),
     TableName(TableId),
