@@ -950,7 +950,10 @@ mod tests {
                 CatalogReader, add_unrelated_table, bump_users_schema_version,
                 drop_and_recreate_users, replace_users_id_column_id,
             },
-            test_support::{Phase4bCatalogFixture, phase_4b_catalog_fixture_with_explicit_index},
+            test_support::{
+                Phase4bCatalogFixture, phase_4b_catalog_fixture_with_constraint,
+                phase_4b_catalog_fixture_with_explicit_index,
+            },
         },
     };
 
@@ -984,6 +987,23 @@ mod tests {
             "CREATE TABLE DUP_DEPS (A INT64 CONSTRAINT DUP_NAME NOT NULL, CONSTRAINT DUP_NAME CHECK (A > 0))",
         )
         .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
+
+    #[test]
+    fn create_table_rejects_an_existing_global_constraint_name() {
+        let fixture = phase_4b_catalog_fixture_with_constraint(4096, "CK_SHARED");
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let statement = parse_statement(
+            "CREATE TABLE T (N INT64, CONSTRAINT CK_SHARED CHECK (N > 0))",
+            &SqlLimits::default(),
+        )
+        .unwrap();
+
+        let error =
+            bind_statement(&statement, &catalog, pager.database_uuid().unwrap()).unwrap_err();
         assert_eq!(error.code(), ErrorCode::Bind);
     }
 

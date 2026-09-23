@@ -587,6 +587,29 @@ mod tests {
     }
 
     #[test]
+    fn constrained_create_is_rejected_before_autocommit_writer_acquisition() {
+        // Production break caught: validating only inside the write batch turns
+        // the Task 5 boundary into a Busy error whenever another writer exists.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let database = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut owner = database.connect().unwrap();
+        let mut contender = database.connect().unwrap();
+        let create = contender
+            .prepare("CREATE TABLE GUARDED (ID INT64 PRIMARY KEY)")
+            .unwrap();
+        let _owner_write = owner.begin_write().unwrap();
+
+        assert_eq!(
+            contender
+                .execute(&create, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+        assert_eq!(contender.state_kind(), ConnectionStateKind::Idle);
+    }
+
+    #[test]
     fn drop_index_plan_survives_ordinary_dml_that_replaces_the_table_root() {
         // Production break caught: treating a physical root replacement as a
         // schema change invalidates valid prepared index DDL after normal DML.

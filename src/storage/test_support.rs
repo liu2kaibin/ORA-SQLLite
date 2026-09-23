@@ -22,8 +22,9 @@ use super::{
     catalog::{
         CatalogReader, CatalogWriter,
         types::{
-            CatalogName, ColumnDef, ColumnId, ColumnType, IndexDef, IndexId, IndexOwnership, RowId,
-            SchemaVersion, TableDef, TableId,
+            CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintBundle, ConstraintDef,
+            ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, RowId, SchemaVersion,
+            TableDef, TableId,
         },
     },
     checksum::stamp_page_checksum,
@@ -151,6 +152,59 @@ impl Phase4bCatalogFixture {
 
 pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
     phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
+}
+
+/// A Phase 4B catalog with an existing global constraint name for binder tests.
+pub(crate) fn phase_4b_catalog_fixture_with_constraint(
+    page_size: u32,
+    name: &str,
+) -> Phase4bCatalogFixture {
+    let fixture = phase_4b_catalog_fixture(page_size);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().expect("read constraint fixture catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("open constraint fixture catalog");
+    let column_id = catalog
+        .find_column_by_name(fixture.users_id(), &CatalogName::new("ID").unwrap())
+        .expect("USERS(ID) in constraint fixture")
+        .id();
+    drop(catalog);
+    drop(snapshot);
+
+    let mut batch = pager.begin_write().expect("begin constraint fixture write");
+    let mut writer =
+        CatalogWriter::bootstrap(&mut batch).expect("bootstrap constraint fixture catalog");
+    let constraint_id = ConstraintId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate fixture constraint id")
+            .get(),
+    )
+    .expect("fixture constraint id is nonzero");
+    let definition = ConstraintDef::new(
+        constraint_id,
+        fixture.users_id(),
+        ConstraintKind::NotNull,
+        1,
+        None,
+        Box::new([]),
+        CatalogName::new(name).expect("fixture constraint name"),
+    )
+    .expect("build fixture constraint definition");
+    let bundle = ConstraintBundle {
+        definition,
+        columns: vec![column_id].into_boxed_slice(),
+        system_index: None,
+    };
+    writer
+        .insert_constraint_bundle(&mut batch, &bundle)
+        .expect("insert fixture constraint definition");
+    writer
+        .finish(&mut batch)
+        .expect("finish constraint fixture catalog");
+    batch.commit().expect("commit constraint fixture catalog");
+    fixture
 }
 
 #[derive(Clone, Copy)]

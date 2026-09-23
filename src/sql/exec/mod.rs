@@ -67,16 +67,16 @@ pub(crate) fn validate_write_before_writer(
         database_uuid,
         max_query_memory_bytes,
     )?;
-    if matches!(
-        statement.plan().kind(),
-        PlanKind::DeferredUnsupported { .. }
-    ) {
-        Err(DbError::new(
+    match statement.plan().kind() {
+        PlanKind::DeferredUnsupported { .. } => Err(DbError::new(
             ErrorCode::Unsupported,
             "statement execution requires Phase 4C2",
-        ))
-    } else {
-        Ok(())
+        )),
+        PlanKind::CreateTable(plan) if !plan.constraints().is_empty() => Err(DbError::new(
+            ErrorCode::Unsupported,
+            "constrained CREATE TABLE execution requires Phase 4C2 Task 5",
+        )),
+        _ => Ok(()),
     }
 }
 
