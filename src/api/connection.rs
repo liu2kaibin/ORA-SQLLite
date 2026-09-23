@@ -587,24 +587,29 @@ mod tests {
     }
 
     #[test]
-    fn constrained_create_is_rejected_before_autocommit_writer_acquisition() {
-        // Production break caught: validating only inside the write batch turns
-        // the Task 5 boundary into a Busy error whenever another writer exists.
+    fn constrained_create_acquires_the_writer_for_real_catalog_mutation() {
+        // Production break caught: retaining the Task 4 pre-writer guard leaves
+        // local constraints unmaterialized even though execution supports them.
         let fixture = phase_4b_catalog_fixture(4096);
         let database = Database::open(fixture.main_path(), Options::default()).unwrap();
-        let mut owner = database.connect().unwrap();
         let mut contender = database.connect().unwrap();
         let create = contender
             .prepare("CREATE TABLE GUARDED (ID INT64 PRIMARY KEY)")
             .unwrap();
-        let _owner_write = owner.begin_write().unwrap();
 
         assert_eq!(
             contender
                 .execute(&create, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        assert_eq!(
+            contender
+                .prepare("CREATE TABLE GUARDED (ID INT64)")
                 .unwrap_err()
                 .code(),
-            ErrorCode::Unsupported
+            ErrorCode::Bind
         );
         assert_eq!(contender.state_kind(), ConnectionStateKind::Idle);
     }

@@ -13,6 +13,7 @@ use crate::{
         CatalogName, ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId,
     },
     storage::constraint::program::CheckProgramTemplate,
+    storage::relation::TableConstraintSpec,
 };
 
 /// Logical identities only: never a physical root or a retained catalog reader.
@@ -391,6 +392,49 @@ impl CreateTablePlan {
 }
 
 impl TableConstraintDefinition {
+    pub(crate) fn storage_spec(&self) -> TableConstraintSpec<'_> {
+        match self {
+            Self::PrimaryKey { name, columns, .. } => TableConstraintSpec::PrimaryKey {
+                name: name.clone(),
+                columns: columns.clone(),
+            },
+            Self::Unique { name, columns, .. } => TableConstraintSpec::Unique {
+                name: name.clone(),
+                columns: columns.clone(),
+            },
+            Self::NotNull { name, column, .. } => TableConstraintSpec::NotNull {
+                name: name.clone(),
+                column: *column,
+            },
+            Self::Check { name, template, .. } => TableConstraintSpec::Check {
+                name: name.clone(),
+                template,
+            },
+        }
+    }
+
+    pub(crate) fn explicit_name(&self) -> Option<&CatalogName> {
+        match self {
+            Self::PrimaryKey { name, .. }
+            | Self::Unique { name, .. }
+            | Self::NotNull { name, .. }
+            | Self::Check { name, .. } => name.as_ref(),
+        }
+    }
+
+    pub(crate) const fn location(&self) -> SqlLocation {
+        match self {
+            Self::PrimaryKey { location, .. }
+            | Self::Unique { location, .. }
+            | Self::NotNull { location, .. }
+            | Self::Check { location, .. } => *location,
+        }
+    }
+
+    pub(crate) const fn is_check(&self) -> bool {
+        matches!(self, Self::Check { .. })
+    }
+
     fn from_bound(constraint: &BoundConstraint, locations: &Locations<'_>) -> Result<Self> {
         match constraint {
             BoundConstraint::PrimaryKey {

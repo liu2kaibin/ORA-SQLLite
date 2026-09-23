@@ -1,4 +1,4 @@
-use std::ops::Bound;
+use std::{collections::BTreeSet, ops::Bound};
 
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
@@ -11,10 +11,12 @@ use super::{
     catalog::{
         CatalogReader, CatalogWriter,
         types::{
-            CatalogName, ColumnDef, ColumnId, ColumnType, IndexOwnership, MAX_COLUMNS, RowId,
-            SchemaVersion, TableDef, TableId,
+            CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintBundle, ConstraintDef,
+            ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, MAX_COLUMNS,
+            ObjectKind, RowId, SchemaVersion, TableDef, TableId,
         },
     },
+    constraint::program::CheckProgramTemplate,
     index::{IndexStorage, PreparedIndexEntry},
     pager::PageSource,
     row::{RowCodec, RowCodecValidation, decode_rowid_key, encode_rowid_key},
@@ -31,6 +33,36 @@ pub(crate) struct ColumnSpec {
 pub(crate) struct TableSpec {
     name: CatalogName,
     columns: Box<[ColumnSpec]>,
+}
+
+pub(crate) struct ConstrainedTableSpec<'a> {
+    table: TableSpec,
+    constraints: Box<[TableConstraintSpec<'a>]>,
+}
+
+pub(crate) enum TableConstraintSpec<'a> {
+    PrimaryKey {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+    },
+    Unique {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+    },
+    NotNull {
+        name: Option<CatalogName>,
+        column: u16,
+    },
+    Check {
+        name: Option<CatalogName>,
+        template: &'a CheckProgramTemplate,
+    },
+}
+
+struct AllocatedConstraint {
+    id: ConstraintId,
+    index_id: Option<IndexId>,
+    name: CatalogName,
 }
 
 #[derive(Clone)]
@@ -149,6 +181,105 @@ impl TableSpec {
 
     pub(crate) const fn columns(&self) -> &[ColumnSpec] {
         &self.columns
+    }
+}
+
+impl<'a> ConstrainedTableSpec<'a> {
+    pub(crate) fn new(table: TableSpec, constraints: Vec<TableConstraintSpec<'a>>) -> Result<Self> {
+        let mut explicit_names = BTreeSet::new();
+        let mut primary_key_seen = false;
+        let mut required_non_nullable = vec![false; table.columns().len()];
+        for constraint in &constraints {
+            if let Some(name) = constraint.explicit_name() {
+                validate_constraint_name(name)?;
+                if !explicit_names.insert(name.as_str()) {
+                    return Err(DbError::new(
+                        ErrorCode::Constraint,
+                        "CREATE TABLE contains a duplicate constraint name",
+                    ));
+                }
+            }
+            match constraint {
+                TableConstraintSpec::PrimaryKey { columns, .. } => {
+                    if primary_key_seen {
+                        return Err(DbError::new(
+                            ErrorCode::Constraint,
+                            "CREATE TABLE contains multiple primary keys",
+                        ));
+                    }
+                    primary_key_seen = true;
+                    validate_key_columns(columns, table.columns().len())?;
+                    for ordinal in columns {
+                        required_non_nullable[usize::from(*ordinal)] = true;
+                    }
+                }
+                TableConstraintSpec::Unique { columns, .. } => {
+                    validate_key_columns(columns, table.columns().len())?;
+                }
+                TableConstraintSpec::NotNull { column, .. } => {
+                    let column = usize::from(*column);
+                    if column >= table.columns().len() {
+                        return Err(DbError::new(
+                            ErrorCode::Type,
+                            "not-null constraint column ordinal is absent",
+                        ));
+                    }
+                    required_non_nullable[column] = true;
+                }
+                // CheckProgramTemplate is structurally validated by its
+                // checked constructor. Its only identity conversion happens
+                // below, after stable ColumnIds have been allocated under the
+                // writer and before any catalog definition is published.
+                TableConstraintSpec::Check { .. } => {}
+            }
+        }
+        for (column, required_non_nullable) in table.columns().iter().zip(required_non_nullable) {
+            if required_non_nullable && column.nullable() {
+                return Err(DbError::new(
+                    ErrorCode::Constraint,
+                    "primary-key and not-null columns must be non-nullable",
+                ));
+            }
+        }
+        Ok(Self {
+            table,
+            constraints: constraints.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) const fn table(&self) -> &TableSpec {
+        &self.table
+    }
+
+    pub(crate) const fn constraints(&self) -> &[TableConstraintSpec<'a>] {
+        &self.constraints
+    }
+}
+
+impl TableConstraintSpec<'_> {
+    fn explicit_name(&self) -> Option<&CatalogName> {
+        match self {
+            Self::PrimaryKey { name, .. }
+            | Self::Unique { name, .. }
+            | Self::NotNull { name, .. }
+            | Self::Check { name, .. } => name.as_ref(),
+        }
+    }
+
+    fn key_columns(&self) -> Option<&[u16]> {
+        match self {
+            Self::PrimaryKey { columns, .. } | Self::Unique { columns, .. } => Some(columns),
+            Self::NotNull { .. } | Self::Check { .. } => None,
+        }
+    }
+
+    fn kind(&self) -> ConstraintKind {
+        match self {
+            Self::PrimaryKey { .. } => ConstraintKind::PrimaryKey,
+            Self::Unique { .. } => ConstraintKind::Unique,
+            Self::NotNull { .. } => ConstraintKind::NotNull,
+            Self::Check { .. } => ConstraintKind::Check,
+        }
     }
 }
 
@@ -744,6 +875,328 @@ pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Resul
     }
 }
 
+/// Atomically materialize a new relation with its local constraints and any
+/// constraint-owned unique indexes. The entire candidate remains behind one
+/// statement checkpoint until the catalog writer validates and publishes it.
+pub(crate) fn create_constrained_relation(
+    batch: &mut WriteBatch,
+    spec: &ConstrainedTableSpec<'_>,
+) -> Result<TableId> {
+    prevalidate_constrained_create(batch, spec)?;
+    let checkpoint = batch.statement_checkpoint()?;
+    let result = (|| {
+        let mut catalog = CatalogWriter::bootstrap(batch)?;
+        let table_id = TableId::new(catalog.allocate_object_id(batch)?.get())?;
+        let columns = spec
+            .table()
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, column)| {
+                ColumnDef::new(
+                    ColumnId::new(catalog.allocate_object_id(batch)?.get())?,
+                    table_id,
+                    u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(ErrorCode::Type, "column ordinal does not fit the catalog")
+                    })?,
+                    column.column_type(),
+                    column.nullable(),
+                    column.name().clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut statement_names = spec
+            .constraints()
+            .iter()
+            .filter_map(TableConstraintSpec::explicit_name)
+            .map(|name| name.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut allocated = Vec::with_capacity(spec.constraints().len());
+        for constraint in spec.constraints() {
+            let id = ConstraintId::new(catalog.allocate_object_id(batch)?.get())?;
+            let index_id = match constraint.kind() {
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
+                    Some(IndexId::new(catalog.allocate_object_id(batch)?.get())?)
+                }
+                ConstraintKind::NotNull | ConstraintKind::Check => None,
+            };
+            let name = match constraint.explicit_name() {
+                Some(name) => name.clone(),
+                None => generate_constraint_name(id, |candidate| {
+                    Ok(statement_names.contains(candidate.as_str())
+                        || catalog.constraint_name_exists(batch, candidate)?)
+                })?,
+            };
+            statement_names.insert(name.as_str().to_owned());
+            allocated.push(AllocatedConstraint { id, index_id, name });
+        }
+
+        let table_tree = BTree::create(batch, TreeKind::Table)?;
+        let table = TableDef::new(
+            table_id,
+            SchemaVersion::new(1)?,
+            table_tree.root(),
+            RowId::new(1)?,
+            u16::try_from(columns.len()).map_err(|_| {
+                DbError::new(
+                    ErrorCode::Type,
+                    "table column count does not fit the catalog",
+                )
+            })?,
+            spec.table().name().clone(),
+        )?;
+        let column_ids = columns.iter().map(ColumnDef::id).collect::<Vec<_>>();
+        let bundles = spec
+            .constraints()
+            .iter()
+            .zip(allocated)
+            .map(|(constraint, allocated)| {
+                build_constraint_bundle(batch, table_id, &column_ids, constraint, allocated)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Do not publish a definition until the complete graph (including all
+        // roots and resolved CHECK programs) is available in memory.
+        catalog.insert_table_definition(batch, &table)?;
+        for column in &columns {
+            catalog.insert_column_definition(batch, column)?;
+        }
+        for bundle in &bundles {
+            catalog.insert_constraint_bundle(batch, bundle)?;
+        }
+        catalog.finish(batch)?;
+        Ok(table_id)
+    })();
+    match result {
+        Ok(table_id) => {
+            batch.finish_statement(checkpoint)?;
+            Ok(table_id)
+        }
+        Err(error) => {
+            batch.restore_statement(checkpoint);
+            Err(error)
+        }
+    }
+}
+
+fn prevalidate_constrained_create(
+    batch: &mut WriteBatch,
+    spec: &ConstrainedTableSpec<'_>,
+) -> Result<()> {
+    let catalog = batch.catalog_reader()?;
+    if catalog.object_name_exists(ObjectKind::Table, spec.table().name()) {
+        return Err(DbError::new(
+            ErrorCode::SchemaChanged,
+            "prepared CREATE name is no longer available",
+        ));
+    }
+    for constraint in spec.constraints() {
+        if let Some(name) = constraint.explicit_name() {
+            if catalog.object_name_exists(ObjectKind::Constraint, name) {
+                return Err(DbError::new(
+                    ErrorCode::SchemaChanged,
+                    "prepared constraint name is no longer available",
+                ));
+            }
+        }
+    }
+    let allocated = required_object_count(spec)?;
+    catalog
+        .next_object_id()
+        .get()
+        .checked_add(allocated)
+        .ok_or_else(|| DbError::new(ErrorCode::Type, "catalog object ID counter is exhausted"))?;
+    Ok(())
+}
+
+fn required_object_count(spec: &ConstrainedTableSpec<'_>) -> Result<u64> {
+    let columns = u64::try_from(spec.table().columns().len()).map_err(|_| {
+        DbError::new(
+            ErrorCode::Type,
+            "table column count exceeds stable ID range",
+        )
+    })?;
+    let constraints = u64::try_from(spec.constraints().len())
+        .map_err(|_| DbError::new(ErrorCode::Type, "constraint count exceeds stable ID range"))?;
+    let system_indexes = u64::try_from(
+        spec.constraints()
+            .iter()
+            .filter(|constraint| constraint.key_columns().is_some())
+            .count(),
+    )
+    .map_err(|_| DbError::new(ErrorCode::Type, "index count exceeds stable ID range"))?;
+    1_u64
+        .checked_add(columns)
+        .and_then(|count| count.checked_add(constraints))
+        .and_then(|count| count.checked_add(system_indexes))
+        .ok_or_else(|| DbError::new(ErrorCode::Type, "catalog object ID counter is exhausted"))
+}
+
+fn validate_constraint_name(name: &CatalogName) -> Result<()> {
+    if name.as_bytes().len() > 128 {
+        return Err(DbError::new(
+            ErrorCode::Type,
+            "constraint name must not exceed 128 UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_key_columns(columns: &[u16], column_count: usize) -> Result<()> {
+    if columns.is_empty() || columns.len() > usize::from(MAX_COLUMNS) {
+        return Err(DbError::new(
+            ErrorCode::Type,
+            "key constraint column count must be between 1 and 1000",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for ordinal in columns {
+        if usize::from(*ordinal) >= column_count {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "key constraint column ordinal is absent",
+            ));
+        }
+        if !seen.insert(*ordinal) {
+            return Err(DbError::new(
+                ErrorCode::Constraint,
+                "key constraint contains a repeated column",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn generate_constraint_name(
+    id: ConstraintId,
+    mut occupied: impl FnMut(&CatalogName) -> Result<bool>,
+) -> Result<CatalogName> {
+    let base = format!("SYS_C{}", id.get());
+    let mut suffix: Option<u64> = None;
+    loop {
+        let candidate = match suffix {
+            None => base.clone(),
+            Some(suffix) => {
+                let suffix = suffix.to_string();
+                let bytes = base
+                    .len()
+                    .checked_add(1)
+                    .and_then(|length| length.checked_add(suffix.len()))
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::Type, "generated constraint name is too long")
+                    })?;
+                if bytes > 128 {
+                    return Err(DbError::new(
+                        ErrorCode::Type,
+                        "generated constraint name must not exceed 128 UTF-8 bytes",
+                    ));
+                }
+                format!("{base}_{suffix}")
+            }
+        };
+        if candidate.len() > 128 {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "generated constraint name must not exceed 128 UTF-8 bytes",
+            ));
+        }
+        let candidate = CatalogName::new(candidate)?;
+        if !occupied(&candidate)? {
+            return Ok(candidate);
+        }
+        suffix = Some(suffix.unwrap_or(0).checked_add(1).ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Type,
+                "generated constraint name suffix is exhausted",
+            )
+        })?);
+    }
+}
+
+fn build_constraint_bundle(
+    batch: &mut WriteBatch,
+    table_id: TableId,
+    column_ids: &[ColumnId],
+    constraint: &TableConstraintSpec<'_>,
+    allocated: AllocatedConstraint,
+) -> Result<ConstraintBundle> {
+    let columns = match constraint {
+        TableConstraintSpec::PrimaryKey { columns, .. }
+        | TableConstraintSpec::Unique { columns, .. } => columns
+            .iter()
+            .map(|ordinal| {
+                column_ids
+                    .get(usize::from(*ordinal))
+                    .copied()
+                    .ok_or_else(|| {
+                        DbError::new(ErrorCode::Type, "key constraint column ordinal is absent")
+                    })
+            })
+            .collect::<Result<Vec<_>>>(),
+        TableConstraintSpec::NotNull { column, .. } => column_ids
+            .get(usize::from(*column))
+            .copied()
+            .map(|column| vec![column])
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Type,
+                    "not-null constraint column ordinal is absent",
+                )
+            }),
+        TableConstraintSpec::Check { .. } => Ok(Vec::new()),
+    }?;
+    let program = match constraint {
+        TableConstraintSpec::Check { template, .. } => Some(
+            template
+                .resolve(column_ids)?
+                .as_bytes()
+                .to_vec()
+                .into_boxed_slice(),
+        ),
+        _ => None,
+    };
+    let definition = ConstraintDef::new(
+        allocated.id,
+        table_id,
+        constraint.kind(),
+        u16::try_from(columns.len()).map_err(|_| {
+            DbError::new(
+                ErrorCode::Type,
+                "constraint column count does not fit the catalog",
+            )
+        })?,
+        allocated.index_id,
+        program.unwrap_or_default(),
+        allocated.name.clone(),
+    )?;
+    let system_index = match allocated.index_id {
+        Some(index_id) => {
+            let tree = BTree::create(batch, TreeKind::Index)?;
+            let index = IndexDef::new(
+                index_id,
+                table_id,
+                tree.root(),
+                u16::try_from(columns.len()).map_err(|_| {
+                    DbError::new(
+                        ErrorCode::Type,
+                        "index column count does not fit the catalog",
+                    )
+                })?,
+                true,
+                IndexOwnership::Constraint(allocated.id),
+                allocated.name,
+            )?;
+            Some((index, columns.clone().into_boxed_slice()))
+        }
+        None => None,
+    };
+    Ok(ConstraintBundle {
+        definition,
+        columns: columns.into_boxed_slice(),
+        system_index,
+    })
+}
+
 pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result<()> {
     let checkpoint = batch.statement_checkpoint()?;
     let result = (|| {
@@ -787,8 +1240,8 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnSpec, ConstrainedTableWrite, Relation, TableSpec, TableWrite, create_relation,
-        drop_relation,
+        ColumnSpec, ConstrainedTableSpec, ConstrainedTableWrite, Relation, TableConstraintSpec,
+        TableSpec, TableWrite, create_constrained_relation, create_relation, drop_relation,
     };
     use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
@@ -797,10 +1250,14 @@ mod tests {
         catalog::{
             CatalogReader, CatalogWriter,
             types::{
-                CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef,
-                TableId,
+                CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintKind, IndexOwnership,
+                RowId, SchemaVersion, TableDef, TableId,
             },
         },
+        constraint::program::{
+            CheckBinaryOp, CheckProgramTemplate, CheckTemplateInstruction, CheckType,
+        },
+        features::INDEX_CONSTRAINT_V1,
         file::OpenMode,
         pager::PagerConfig,
         row::{RowCodec, encode_rowid_key},
@@ -811,6 +1268,122 @@ mod tests {
     const LARGE_BLOB_BYTES: usize = 20_000;
     const LARGE_ROW_BYTES: usize = 20_041;
     type RelationContents = (TableDef, Vec<(u64, Vec<Value>)>);
+
+    #[test]
+    fn constrained_create_allocates_complete_graph_in_one_deterministic_order() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+
+        let table = create_constrained_relation(&mut batch, &constrained_spec()).unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        let constraints = catalog.constraints_for_table(table).collect::<Vec<_>>();
+        assert_eq!(constraints.len(), 4);
+        assert_eq!(
+            constraints[0].name().as_str(),
+            format!("SYS_C{}", constraints[0].id().get())
+        );
+        for constraint in constraints {
+            if matches!(
+                constraint.kind(),
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique
+            ) {
+                let index = catalog
+                    .find_index_by_id(constraint.index_id().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    index.ownership(),
+                    IndexOwnership::Constraint(constraint.id())
+                );
+                assert!(index.unique());
+                assert_eq!(index.name(), constraint.name());
+                assert_eq!(
+                    catalog
+                        .columns_for_index(index.id())
+                        .map(ColumnDef::id)
+                        .collect::<Vec<_>>(),
+                    catalog
+                        .columns_for_constraint(constraint.id())
+                        .map(ColumnDef::id)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_constraint_names_use_checked_collision_suffixes() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+
+        create_constrained_relation(&mut batch, &explicit_name_spec("SYS_C9")).unwrap();
+        create_constrained_relation(&mut batch, &explicit_name_spec("SYS_C9_1")).unwrap();
+        let table =
+            create_constrained_relation(&mut batch, &single_generated_constraint_spec()).unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        let constraint = catalog.constraints_for_table(table).next().unwrap();
+        assert_eq!(constraint.id().get(), 9);
+        assert_eq!(constraint.name().as_str(), "SYS_C9_2");
+    }
+
+    #[test]
+    fn constrained_create_late_check_failure_restores_ids_pages_feature_and_catalog() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let template = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Column {
+                ordinal: 1,
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Int64(0),
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Binary {
+                op: CheckBinaryOp::GreaterThan,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap();
+        let spec = ConstrainedTableSpec::new(
+            table_spec("LATE_CHECK", &[("ID", ColumnType::Int64, true)]),
+            vec![TableConstraintSpec::Check {
+                name: None,
+                template: &template,
+            }],
+        )
+        .unwrap();
+
+        let before = batch.checkpoint_mutation().unwrap();
+        assert_eq!(
+            create_constrained_relation(&mut batch, &spec)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        before.assert_matches_batch_for_test(&batch);
+        assert_eq!(batch.feature_bits() & INDEX_CONSTRAINT_V1, 0);
+        assert!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_name(&CatalogName::new("LATE_CHECK").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn plain_create_does_not_enable_index_constraint_feature() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+
+        create_relation(
+            &mut batch,
+            &table_spec("PLAIN", &[("ID", ColumnType::Int64, false)]),
+        )
+        .unwrap();
+
+        assert_eq!(batch.feature_bits() & INDEX_CONSTRAINT_V1, 0);
+    }
 
     #[test]
     fn constrained_writer_reuses_deleted_unique_key_without_schema_bump_and_deep_validates() {
@@ -1561,6 +2134,60 @@ mod tests {
                     ColumnSpec::new(CatalogName::new(*name).unwrap(), *column_type, *nullable)
                 })
                 .collect(),
+        )
+        .unwrap()
+    }
+
+    fn constrained_spec() -> ConstrainedTableSpec<'static> {
+        ConstrainedTableSpec::new(
+            table_spec(
+                "CONSTRAINED",
+                &[
+                    ("ID", ColumnType::Int64, false),
+                    ("EMAIL", ColumnType::Text, true),
+                    ("REQUIRED", ColumnType::Text, false),
+                ],
+            ),
+            vec![
+                TableConstraintSpec::PrimaryKey {
+                    name: None,
+                    columns: vec![0].into_boxed_slice(),
+                },
+                TableConstraintSpec::Unique {
+                    name: None,
+                    columns: vec![1].into_boxed_slice(),
+                },
+                TableConstraintSpec::NotNull {
+                    name: None,
+                    column: 2,
+                },
+                TableConstraintSpec::NotNull {
+                    name: None,
+                    column: 0,
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    fn explicit_name_spec(name: &str) -> ConstrainedTableSpec<'static> {
+        ConstrainedTableSpec::new(
+            table_spec(name, &[("ID", ColumnType::Int64, false)]),
+            vec![TableConstraintSpec::NotNull {
+                name: Some(CatalogName::new(name).unwrap()),
+                column: 0,
+            }],
+        )
+        .unwrap()
+    }
+
+    fn single_generated_constraint_spec() -> ConstrainedTableSpec<'static> {
+        ConstrainedTableSpec::new(
+            table_spec("GENERATED", &[("ID", ColumnType::Int64, false)]),
+            vec![TableConstraintSpec::NotNull {
+                name: None,
+                column: 0,
+            }],
         )
         .unwrap()
     }

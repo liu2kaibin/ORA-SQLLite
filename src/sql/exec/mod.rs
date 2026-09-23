@@ -72,10 +72,6 @@ pub(crate) fn validate_write_before_writer(
             ErrorCode::Unsupported,
             "statement execution requires Phase 4C2",
         )),
-        PlanKind::CreateTable(plan) if !plan.constraints().is_empty() => Err(DbError::new(
-            ErrorCode::Unsupported,
-            "constrained CREATE TABLE execution requires Phase 4C2 Task 5",
-        )),
         _ => Ok(()),
     }
 }

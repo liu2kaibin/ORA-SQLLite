@@ -901,6 +901,10 @@ impl CatalogReader {
             ObjectKind::Column => false,
         }
     }
+
+    pub(crate) const fn next_object_id(&self) -> ObjectId {
+        self.image.meta.next_object_id()
+    }
 }
 
 /// Batch-local directory identity. Mutations never retain a borrow of the batch.
@@ -1011,6 +1015,20 @@ impl CatalogWriter {
             replace_record(tree, batch, &key, &record::encode_catalog_meta(&meta))?;
             Ok(candidate)
         })
+    }
+
+    /// Check the writer's candidate catalog directly so generated names can be
+    /// selected after their stable constraint ID is allocated but before any
+    /// definition record is published.
+    pub(crate) fn constraint_name_exists(
+        &self,
+        batch: &mut WriteBatch,
+        name: &CatalogName,
+    ) -> Result<bool> {
+        Ok(self
+            .tree
+            .get(batch, &key::constraint_name_key(name)?)?
+            .is_some())
     }
 
     pub(crate) fn insert_table_definition(

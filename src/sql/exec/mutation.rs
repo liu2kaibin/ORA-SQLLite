@@ -10,8 +10,9 @@ use crate::{
         catalog::types::ObjectKind,
         index::{IndexSpec, create_index, drop_index},
         relation::{
-            ColumnSpec, ConstrainedTableWrite, Relation, RelationValueValidation, TableSpec,
-            create_relation, drop_relation,
+            ColumnSpec, ConstrainedTableSpec, ConstrainedTableWrite, Relation,
+            RelationValueValidation, TableSpec, create_constrained_relation, create_relation,
+            drop_relation,
         },
     },
 };
@@ -430,26 +431,28 @@ fn execute_insert(
 }
 
 fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Result<ExecutionResult> {
-    // Task 4 retains local definitions in the immutable plan, but Task 5 is
-    // responsible for atomically materializing them. Never degrade such a
-    // plan into an unconstrained table while that writer path is absent.
-    if !plan.constraints().is_empty() {
-        return Err(DbError::new(
-            ErrorCode::Unsupported,
-            "constrained CREATE TABLE execution requires Phase 4C2 Task 5",
-        ));
-    }
-    // Keep this check adjacent to the mutation facade. Validation already made
-    // the same assertion before the outer statement checkpoint, but execution
-    // must never turn a retained CREATE into a different catalog operation.
-    if batch
-        .catalog_reader()?
-        .object_name_exists(ObjectKind::Table, plan.name())
+    // Keep table and explicit constraint names adjacent to mutation. The
+    // binder checks the same identities earlier, but an already-validated
+    // CREATE must not claim a stale name after another DDL statement wins it.
     {
-        return Err(DbError::new(
-            ErrorCode::SchemaChanged,
-            "prepared CREATE name is no longer available",
-        ));
+        let catalog = batch.catalog_reader()?;
+        if catalog.object_name_exists(ObjectKind::Table, plan.name()) {
+            return Err(DbError::new(
+                ErrorCode::SchemaChanged,
+                "prepared CREATE name is no longer available",
+            ));
+        }
+        for constraint in plan.constraints() {
+            if let Some(name) = constraint.explicit_name() {
+                if catalog.object_name_exists(ObjectKind::Constraint, name) {
+                    return Err(DbError::new(
+                        ErrorCode::SchemaChanged,
+                        "prepared constraint name is no longer available",
+                    )
+                    .with_sql_location(constraint.location()));
+                }
+            }
+        }
     }
     let columns = plan
         .columns()
@@ -463,8 +466,38 @@ fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Resul
         })
         .collect();
     let spec = TableSpec::new(plan.name().clone(), columns)?;
-    create_relation(batch, &spec)?;
+    if plan.constraints().is_empty() {
+        create_relation(batch, &spec)?;
+    } else {
+        let constraints = plan
+            .constraints()
+            .iter()
+            .map(|constraint| constraint.storage_spec())
+            .collect();
+        let constrained = ConstrainedTableSpec::new(spec, constraints)
+            .map_err(|error| map_constraint_error(plan, error, false))?;
+        create_constrained_relation(batch, &constrained)
+            .map_err(|error| map_constraint_error(plan, error, true))?;
+    }
     Ok(ExecutionResult::new(0))
+}
+
+fn map_constraint_error(plan: &CreateTablePlan, error: DbError, check_only: bool) -> DbError {
+    if error.sql_location().is_some() {
+        return error;
+    }
+    if check_only && !matches!(error.code(), ErrorCode::Type | ErrorCode::ResourceLimit) {
+        return error;
+    }
+    if let Some(constraint) = plan
+        .constraints()
+        .iter()
+        .find(|constraint| !check_only || constraint.is_check())
+    {
+        error.with_sql_location(constraint.location())
+    } else {
+        error
+    }
 }
 
 fn reject_wrong_execute_api_kind(kind: &PlanKind) -> Result<()> {
@@ -579,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn constrained_create_is_rejected_without_creating_a_plain_table() {
+    fn constrained_create_persists_the_constraint_graph_without_a_plain_table_fallback() {
         let fixture = phase_4b_catalog_fixture(4096);
         let pager = fixture.pager();
         let statement = prepare(&pager, "CREATE TABLE GUARDED (ID INT64 PRIMARY KEY)");
@@ -589,16 +622,101 @@ mod tests {
                 .unwrap();
         assert_eq!(
             execute_validated_write_plan(&mut batch, validated)
-                .unwrap_err()
-                .code(),
-            ErrorCode::Unsupported
+                .unwrap()
+                .rows_affected(),
+            0
         );
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(
+                &crate::storage::catalog::types::CatalogName::new("GUARDED").unwrap(),
+            )
+            .unwrap();
+        let constraints = catalog
+            .constraints_for_table(table.id())
+            .collect::<Vec<_>>();
+        assert_eq!(constraints.len(), 1);
+        assert!(constraints[0].index_id().is_some());
+        assert!(
+            catalog
+                .find_index_by_id(constraints[0].index_id().unwrap())
+                .is_some()
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn constrained_create_resolves_check_to_persistent_column_ids() {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let statement = prepare(
+            &pager,
+            "CREATE TABLE CHECKED (ID INT64, CONSTRAINT CK_POSITIVE CHECK (ID > 0))",
+        );
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        execute_validated_write_plan(&mut batch, validated).unwrap();
+
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(
+                &crate::storage::catalog::types::CatalogName::new("CHECKED").unwrap(),
+            )
+            .unwrap();
+        let constraint = catalog
+            .find_constraint_by_name(
+                &crate::storage::catalog::types::CatalogName::new("CK_POSITIVE").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(constraint.table_id(), table.id());
+        assert_eq!(
+            constraint.kind(),
+            crate::storage::catalog::types::ConstraintKind::Check
+        );
+        let columns = catalog
+            .columns_for_table(table.id())
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::storage::constraint::program::CheckProgram::from_bytes(
+            constraint.check_program().to_vec().into_boxed_slice(),
+        )
+        .unwrap()
+        .validate(&columns)
+        .unwrap();
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn constrained_create_rechecks_an_explicit_constraint_name_at_mutation() {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let first = prepare(
+            &pager,
+            "CREATE TABLE FIRST_CONSTRAINT (ID INT64 CONSTRAINT CK_STALE NOT NULL)",
+        );
+        let stale = prepare(
+            &pager,
+            "CREATE TABLE STALE_CONSTRAINT (ID INT64 CONSTRAINT CK_STALE NOT NULL)",
+        );
+        let mut batch = pager.begin_write().unwrap();
+        let first =
+            validate_write_execution(&mut batch, &first, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let stale =
+            validate_write_execution(&mut batch, &stale, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        execute_validated_write_plan(&mut batch, first).unwrap();
+        let error = execute_validated_write_plan(&mut batch, stale).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SchemaChanged);
+        assert!(error.sql_location().is_some());
         assert!(
             batch
                 .catalog_reader()
                 .unwrap()
                 .find_table_by_name(
-                    &crate::storage::catalog::types::CatalogName::new("GUARDED").unwrap()
+                    &crate::storage::catalog::types::CatalogName::new("STALE_CONSTRAINT").unwrap(),
                 )
                 .is_none()
         );
