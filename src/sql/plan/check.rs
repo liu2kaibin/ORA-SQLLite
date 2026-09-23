@@ -1,6 +1,6 @@
 use super::{Locations, invalid_plan};
 use crate::{
-    Result,
+    Result, Value,
     error::SqlLocation,
     sql::{
         SqlType,
@@ -55,7 +55,7 @@ pub(super) fn compile_check(
             continue;
         }
 
-        let result = check_type(expression.sql_type)?;
+        let result = check_type(expression.sql_type, &expression.kind)?;
         let instruction = match &expression.kind {
             BoundExprKind::Literal(value) => CheckTemplateInstruction::Literal {
                 value: value.clone(),
@@ -144,7 +144,7 @@ fn check_binary(op: BoundBinaryOp) -> Result<CheckBinaryOp> {
     })
 }
 
-fn check_type(sql_type: SqlType) -> Result<CheckType> {
+fn check_type(sql_type: SqlType, kind: &BoundExprKind) -> Result<CheckType> {
     match sql_type {
         SqlType::Int64 => Ok(CheckType::Int64),
         SqlType::Decimal => Ok(CheckType::Decimal),
@@ -154,6 +154,12 @@ fn check_type(sql_type: SqlType) -> Result<CheckType> {
         SqlType::Date => Ok(CheckType::Date),
         SqlType::Timestamp => Ok(CheckType::Timestamp),
         SqlType::Bool => Ok(CheckType::Bool),
+        SqlType::Null if matches!(kind, BoundExprKind::Literal(Value::Null)) => {
+            // V1 allows a NULL literal to carry any checked scalar type. Bool
+            // is deterministic and valid in all boolean contexts, including
+            // the otherwise untyped `NULL IS NULL` expression.
+            Ok(CheckType::Bool)
+        }
         SqlType::Null | SqlType::Unknown => Err(invalid_plan(
             "CHECK expression has no persistent result type",
         )),

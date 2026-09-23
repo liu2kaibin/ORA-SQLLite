@@ -371,12 +371,15 @@ fn bind_column_type(declaration: &TypeDeclaration) -> Result<ColumnType> {
     }
 }
 
-fn create_constraints(create: &CreateTable) -> impl Iterator<Item = &Constraint> {
-    create
+fn create_constraints(create: &CreateTable) -> Vec<&Constraint> {
+    let mut constraints = create
         .columns
         .iter()
         .flat_map(|column| column.constraints.iter())
         .chain(create.constraints.iter())
+        .collect::<Vec<_>>();
+    constraints.sort_by_key(|constraint| constraint.span().start());
+    constraints
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -942,6 +945,7 @@ mod tests {
             parser::parse_statement,
         },
         storage::{
+            catalog::types::ObjectKind,
             catalog::{
                 CatalogReader, add_unrelated_table, bump_users_schema_version,
                 drop_and_recreate_users, replace_users_id_column_id,
@@ -955,6 +959,31 @@ mod tests {
     #[test]
     fn create_table_rejects_check_parameters_before_planning() {
         let error = prepare_fixture("CREATE TABLE T (N INT64, CHECK (N > :1))").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
+
+    #[test]
+    fn create_table_tracks_explicit_constraint_names_and_rejects_duplicates() {
+        let statement = prepare_fixture(
+            "CREATE TABLE NAME_DEPS (A INT64 CONSTRAINT NN_A NOT NULL, CONSTRAINT CK_A CHECK (A > 0))",
+        )
+        .unwrap();
+        assert_eq!(
+            statement
+                .created_names
+                .iter()
+                .map(|dependency| (dependency.object_kind, dependency.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ObjectKind::Table, "NAME_DEPS"),
+                (ObjectKind::Constraint, "NN_A"),
+                (ObjectKind::Constraint, "CK_A"),
+            ]
+        );
+        let error = prepare_fixture(
+            "CREATE TABLE DUP_DEPS (A INT64 CONSTRAINT DUP_NAME NOT NULL, CONSTRAINT DUP_NAME CHECK (A > 0))",
+        )
+        .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Bind);
     }
 

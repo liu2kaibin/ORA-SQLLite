@@ -430,6 +430,15 @@ fn execute_insert(
 }
 
 fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Result<ExecutionResult> {
+    // Task 4 retains local definitions in the immutable plan, but Task 5 is
+    // responsible for atomically materializing them. Never degrade such a
+    // plan into an unconstrained table while that writer path is absent.
+    if !plan.constraints().is_empty() {
+        return Err(DbError::new(
+            ErrorCode::Unsupported,
+            "constrained CREATE TABLE execution requires Phase 4C2 Task 5",
+        ));
+    }
     // Keep this check adjacent to the mutation facade. Validation already made
     // the same assertion before the outer statement checkpoint, but execution
     // must never turn a retained CREATE into a different catalog operation.
@@ -565,6 +574,33 @@ mod tests {
                     &crate::storage::catalog::types::CatalogName::new("NEW_TABLE").unwrap()
                 )
                 .is_some()
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn constrained_create_is_rejected_without_creating_a_plain_table() {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let statement = prepare(&pager, "CREATE TABLE GUARDED (ID INT64 PRIMARY KEY)");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        assert_eq!(
+            execute_validated_write_plan(&mut batch, validated)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unsupported
+        );
+        assert!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_name(
+                    &crate::storage::catalog::types::CatalogName::new("GUARDED").unwrap()
+                )
+                .is_none()
         );
         batch.rollback().unwrap();
     }

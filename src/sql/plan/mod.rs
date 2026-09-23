@@ -352,6 +352,58 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn local_constraints_retain_mixed_source_and_composite_ordinal_order() {
+        let plan = plan_sql(
+            "CREATE TABLE MIX (A INT64 UNIQUE, B INT64, CONSTRAINT MIX_CK CHECK (B > 0), C INT64 NOT NULL, CONSTRAINT MIX_PK PRIMARY KEY (C, A))",
+        )
+        .unwrap();
+        let PlanKind::CreateTable(create) = plan.kind() else {
+            panic!("CREATE TABLE must retain local constraints")
+        };
+        assert!(matches!(
+            &create.constraints()[0],
+            TableConstraintDefinition::Unique { columns, .. } if columns.as_ref() == [0]
+        ));
+        assert!(matches!(
+            &create.constraints()[1],
+            TableConstraintDefinition::Check { .. }
+        ));
+        assert!(matches!(
+            &create.constraints()[2],
+            TableConstraintDefinition::NotNull { column: 2, .. }
+        ));
+        assert!(matches!(
+            &create.constraints()[3],
+            TableConstraintDefinition::PrimaryKey { columns, .. } if columns.as_ref() == [2, 0]
+        ));
+    }
+
+    #[test]
+    fn null_check_literals_have_a_persistent_template_type() {
+        let plan = plan_sql("CREATE TABLE NULL_CHECK (B BOOL, CHECK (NULL IS NULL))").unwrap();
+        assert!(matches!(plan.kind(), PlanKind::CreateTable(_)));
+    }
+
+    #[test]
+    fn check_template_is_postorder_and_plan_debug_is_redacted() {
+        let plan = plan_sql(
+            "CREATE TABLE SECRET_TABLE (A INT64, CONSTRAINT SECRET_CHECK CHECK (A > 987654321))",
+        )
+        .unwrap();
+        let PlanKind::CreateTable(create) = plan.kind() else {
+            panic!("CREATE TABLE must retain CHECK")
+        };
+        let TableConstraintDefinition::Check { template, .. } = &create.constraints()[0] else {
+            panic!("expected CHECK template")
+        };
+        assert_eq!(
+            format!("{template:?}"),
+            "CheckProgramTemplate { instructions: [Column { ordinal: 0, result: Int64 }, Literal { value: Int64(987654321), result: Int64 }, Binary { op: GreaterThan, result: Bool }] }"
+        );
+        assert_eq!(format!("{plan:?}"), "Plan { .. }");
+    }
+
     impl PlanKind {
         fn matches_bound_kind(&self, bound: &BoundStatementKind) -> bool {
             match bound {
