@@ -1301,6 +1301,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_maximum_program_size_is_valid_and_one_more_instruction_is_limited() {
+        // Header + Text("abc") literal + IS NULL is 32 bytes; each NOT is 8.
+        // This produces precisely MAX_CHECK_PROGRAM_BYTES without padding bytes.
+        let not_count = (MAX_CHECK_PROGRAM_BYTES - 32) / INSTRUCTION_HEADER_LEN;
+        let mut instructions = vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Text("abc".into()),
+                result: CheckType::Text,
+            },
+            CheckTemplateInstruction::IsNull {
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ];
+        instructions.extend((0..not_count).map(|_| CheckTemplateInstruction::Unary {
+            op: CheckUnaryOp::Not,
+            result: CheckType::Bool,
+        }));
+        let maximum = CheckProgramTemplate::new(instructions.clone())
+            .unwrap()
+            .resolve(&[])
+            .unwrap();
+        assert_eq!(maximum.as_bytes().len(), MAX_CHECK_PROGRAM_BYTES);
+        instructions.push(CheckTemplateInstruction::Unary {
+            op: CheckUnaryOp::Not,
+            result: CheckType::Bool,
+        });
+        assert_eq!(
+            CheckProgramTemplate::new(instructions)
+                .unwrap()
+                .resolve(&[])
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
     fn mixed_integer_decimal_in_and_between_share_comparison_compatibility() {
         let decimal = Decimal::new(false, 0, 1).unwrap();
         let in_program = CheckProgramTemplate::new(vec![
@@ -1507,6 +1545,122 @@ mod tests {
             deep.evaluate(&[], &[], &mut memory).unwrap(),
             TruthValue::True
         );
+        assert_eq!(memory.used, 0);
+    }
+
+    struct RecordingMemory {
+        limit: u64,
+        used: u64,
+        reservations: Vec<u64>,
+    }
+
+    impl CheckMemory for RecordingMemory {
+        fn reserve_check_bytes(&mut self, bytes: u64) -> Result<()> {
+            let next = self.used.checked_add(bytes).ok_or_else(resource_limit)?;
+            if next > self.limit {
+                return Err(resource_limit());
+            }
+            self.used = next;
+            self.reservations.push(bytes);
+            Ok(())
+        }
+
+        fn release_check_bytes(&mut self, bytes: u64) -> Result<()> {
+            self.used = self
+                .used
+                .checked_sub(bytes)
+                .ok_or_else(|| DbError::new(ErrorCode::Internal, "underflow"))?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn owned_text_and_blob_charges_are_reserved_and_released_after_late_error() {
+        let text_column = ColumnDef::new(
+            ColumnId::new(43).unwrap(),
+            TableId::new(1).unwrap(),
+            0,
+            ColumnType::Text,
+            true,
+            CatalogName::new("T").unwrap(),
+        )
+        .unwrap();
+        let blob_column = ColumnDef::new(
+            ColumnId::new(44).unwrap(),
+            TableId::new(1).unwrap(),
+            0,
+            ColumnType::Blob,
+            true,
+            CatalogName::new("B").unwrap(),
+        )
+        .unwrap();
+        for (column, result, value, expected_owned) in [
+            (
+                text_column.clone(),
+                CheckType::Text,
+                Value::Text("界".into()),
+                VALUE_BODY_BYTES + 3,
+            ),
+            (
+                blob_column.clone(),
+                CheckType::Blob,
+                Value::Blob(vec![1, 2, 3, 4]),
+                VALUE_BODY_BYTES + 4,
+            ),
+        ] {
+            let check = CheckProgramTemplate::new(vec![
+                CheckTemplateInstruction::Column { ordinal: 0, result },
+                CheckTemplateInstruction::IsNull {
+                    negated: false,
+                    result: CheckType::Bool,
+                },
+            ])
+            .unwrap()
+            .resolve(&[column.id()])
+            .unwrap();
+            let mut memory = RecordingMemory {
+                limit: 100_000,
+                used: 0,
+                reservations: Vec::new(),
+            };
+            assert_eq!(
+                check.evaluate(&[column], &[value], &mut memory).unwrap(),
+                TruthValue::False
+            );
+            assert!(memory.reservations.contains(&expected_owned));
+            assert_eq!(memory.used, 0);
+        }
+        let late_error = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Column {
+                ordinal: 0,
+                result: CheckType::Text,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Text("pattern".into()),
+                result: CheckType::Text,
+            },
+            CheckTemplateInstruction::Like {
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap()
+        .resolve(&[text_column.id()])
+        .unwrap();
+        let mut memory = RecordingMemory {
+            limit: 100_000,
+            used: 0,
+            reservations: Vec::new(),
+        };
+        assert_eq!(
+            late_error
+                .evaluate(&[text_column], &[Value::Blob(vec![9, 8])], &mut memory)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        assert!(memory.reservations.contains(&(VALUE_BODY_BYTES + 2)));
+        assert!(memory.reservations.contains(&(VALUE_BODY_BYTES + 7)));
         assert_eq!(memory.used, 0);
     }
 }
