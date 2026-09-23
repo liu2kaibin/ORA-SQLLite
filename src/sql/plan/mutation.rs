@@ -1,14 +1,18 @@
-use super::{ExecExpr, Locations, expr::ExprCompiler};
+use super::{ExecExpr, Locations, check, expr::ExprCompiler};
 use crate::{
     DbError, ErrorCode, Result,
     error::SqlLocation,
     sql::{
         SqlType,
-        bound::{BoundAssignment, BoundColumn, BoundColumnDefinition, BoundExpr, BoundTable},
+        bound::{
+            BoundAssignment, BoundColumn, BoundColumnDefinition, BoundConstraint, BoundExpr,
+            BoundTable,
+        },
     },
     storage::catalog::types::{
         CatalogName, ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId,
     },
+    storage::constraint::program::CheckProgramTemplate,
 };
 
 /// Logical identities only: never a physical root or a retained catalog reader.
@@ -319,12 +323,40 @@ impl ColumnDefinition {
 pub(crate) struct CreateTablePlan {
     name: CatalogName,
     columns: Box<[ColumnDefinition]>,
+    constraints: Box<[TableConstraintDefinition]>,
+}
+
+/// A persistence-safe, identity-free constraint definition for a new table.
+/// Column references remain logical ordinals until the catalog writer assigns
+/// durable `ColumnId` values.
+pub(crate) enum TableConstraintDefinition {
+    PrimaryKey {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+        location: SqlLocation,
+    },
+    Unique {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+        location: SqlLocation,
+    },
+    NotNull {
+        name: Option<CatalogName>,
+        column: u16,
+        location: SqlLocation,
+    },
+    Check {
+        name: Option<CatalogName>,
+        template: CheckProgramTemplate,
+        location: SqlLocation,
+    },
 }
 
 impl CreateTablePlan {
     pub(super) fn from_bound(
         name: &CatalogName,
         columns: &[BoundColumnDefinition],
+        constraints: &[BoundConstraint],
         locations: &Locations<'_>,
     ) -> Result<Self> {
         Ok(Self {
@@ -341,6 +373,10 @@ impl CreateTablePlan {
                     })
                 })
                 .collect::<Result<_>>()?,
+            constraints: constraints
+                .iter()
+                .map(|constraint| TableConstraintDefinition::from_bound(constraint, locations))
+                .collect::<Result<_>>()?,
         })
     }
     pub(crate) fn name(&self) -> &CatalogName {
@@ -348,5 +384,56 @@ impl CreateTablePlan {
     }
     pub(crate) fn columns(&self) -> &[ColumnDefinition] {
         &self.columns
+    }
+    pub(crate) fn constraints(&self) -> &[TableConstraintDefinition] {
+        &self.constraints
+    }
+}
+
+impl TableConstraintDefinition {
+    fn from_bound(constraint: &BoundConstraint, locations: &Locations<'_>) -> Result<Self> {
+        match constraint {
+            BoundConstraint::PrimaryKey {
+                name,
+                columns,
+                span,
+                ..
+            } => Ok(Self::PrimaryKey {
+                name: name.clone(),
+                columns: columns.clone().into_boxed_slice(),
+                location: locations.resolve(*span)?,
+            }),
+            BoundConstraint::Unique {
+                name,
+                columns,
+                span,
+                ..
+            } => Ok(Self::Unique {
+                name: name.clone(),
+                columns: columns.clone().into_boxed_slice(),
+                location: locations.resolve(*span)?,
+            }),
+            BoundConstraint::NotNull {
+                name, column, span, ..
+            } => Ok(Self::NotNull {
+                name: name.clone(),
+                column: *column,
+                location: locations.resolve(*span)?,
+            }),
+            BoundConstraint::Check {
+                name, expression, ..
+            } => {
+                let (template, location) = check::compile_check(expression, locations)?;
+                Ok(Self::Check {
+                    name: name.clone(),
+                    template,
+                    location,
+                })
+            }
+            BoundConstraint::ForeignKey { .. } => Err(DbError::new(
+                ErrorCode::Internal,
+                "foreign keys must be deferred before local constraint planning",
+            )),
+        }
     }
 }

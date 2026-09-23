@@ -54,6 +54,7 @@ pub(crate) fn bind_statement_with_limits(
         drop(parts);
         parts = bind_parts(statement, catalog, database_uuid, &mut parameters)?;
     }
+    require_persistence_safe_checks(&parts.kind)?;
     Ok(BoundStatement {
         kind: parts.kind,
         database_uuid,
@@ -275,9 +276,24 @@ fn bind_create_table(
     let scope = NewTableScope::new(&columns)?;
     let mut dependencies = Vec::new();
     let mut constraint_names = HashSet::new();
+    let mut created_names = vec![CreatedNameDependency {
+        object_kind: ObjectKind::Table,
+        name: name.clone(),
+    }];
     let mut constraints = Vec::new();
     for constraint in create_constraints(create) {
         let name = checked_constraint_name(constraint, &mut constraint_names)?;
+        if let Some(constraint_name) = &name {
+            if catalog.object_name_exists(ObjectKind::Constraint, constraint_name) {
+                return Err(bind_error(
+                    "constraint name is already present in the catalog",
+                ));
+            }
+            created_names.push(CreatedNameDependency {
+                object_kind: ObjectKind::Constraint,
+                name: constraint_name.clone(),
+            });
+        }
         constraints.push(bind_constraint(
             constraint,
             name,
@@ -297,10 +313,7 @@ fn bind_create_table(
             constraints,
         },
         dependencies,
-        created_names: vec![CreatedNameDependency {
-            object_kind: ObjectKind::Table,
-            name,
-        }],
+        created_names,
         columns: Vec::new(),
     })
 }
@@ -414,6 +427,68 @@ fn bind_constraint(
             dependencies,
         ),
     }
+}
+
+/// Rejects expression nodes that cannot become a persistent, table-local CHECK
+/// program. This is deliberately iterative because statement limits permit
+/// deeply nested expressions.
+fn require_persistence_safe_checks(kind: &BoundStatementKind) -> Result<()> {
+    let BoundStatementKind::CreateTable { constraints, .. } = kind else {
+        return Ok(());
+    };
+    for constraint in constraints {
+        if let BoundConstraint::Check { expression, .. } = constraint {
+            require_persistence_safe_check(expression)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_persistence_safe_check(expression: &BoundExpr) -> Result<()> {
+    let mut work = vec![expression];
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            BoundExprKind::Parameter(_) => {
+                return Err(bind_error("CHECK cannot contain parameters"));
+            }
+            BoundExprKind::Aggregate { .. } => {
+                return Err(bind_error("CHECK cannot contain aggregates"));
+            }
+            BoundExprKind::Column { .. } => {
+                return Err(bind_error("CHECK cannot reference another table"));
+            }
+            BoundExprKind::Binary {
+                op: crate::sql::bound::BoundBinaryOp::Modulo,
+                ..
+            } => {
+                return Err(bind_error("CHECK cannot contain unsupported operators"));
+            }
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+                work.push(expr);
+            }
+            BoundExprKind::Binary { left, right, .. } => {
+                work.push(right);
+                work.push(left);
+            }
+            BoundExprKind::InList { expr, values, .. } => {
+                work.extend(values.iter());
+                work.push(expr);
+            }
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => {
+                work.push(high);
+                work.push(low);
+                work.push(expr);
+            }
+            BoundExprKind::Like { expr, pattern, .. } => {
+                work.push(pattern);
+                work.push(expr);
+            }
+            BoundExprKind::Literal(_) | BoundExprKind::NewTableColumn { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn bind_foreign_key(
@@ -876,6 +951,12 @@ mod tests {
     };
 
     use super::super::test_support::prepare_fixture;
+
+    #[test]
+    fn create_table_rejects_check_parameters_before_planning() {
+        let error = prepare_fixture("CREATE TABLE T (N INT64, CHECK (N > :1))").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
 
     fn prepared_users_select() -> (
         BoundStatement,
