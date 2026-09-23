@@ -109,9 +109,19 @@ pub(crate) struct ConstrainedTableWrite {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConstrainedCreateFaultPoint {
+    SystemIndexRootAllocated,
+    ConstraintRecordFamilyInserted,
+    FeatureEnabled,
+    CatalogFinished,
+}
+
+#[cfg(test)]
 thread_local! {
     static NEXT_AFTER_FAILURE: Cell<Option<(usize, ErrorCode)>> = const { Cell::new(None) };
     static VALUE_VALIDATION_LIMITS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static CONSTRAINED_CREATE_FAILURE: Cell<Option<ConstrainedCreateFaultPoint>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -122,6 +132,11 @@ pub(crate) fn fail_table_write_next_after_for_test(successful_calls: usize, code
 #[cfg(test)]
 pub(crate) fn take_value_validation_limits_for_test() -> Vec<usize> {
     VALUE_VALIDATION_LIMITS.with(|limits| std::mem::take(&mut *limits.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_constrained_create_at_for_test(point: ConstrainedCreateFaultPoint) {
+    CONSTRAINED_CREATE_FAILURE.set(Some(point));
 }
 
 #[cfg(test)]
@@ -136,6 +151,21 @@ fn injected_next_after_error() -> Option<DbError> {
             None
         }
         None => None,
+    })
+}
+
+#[cfg(test)]
+fn constrained_create_fault_for_test(point: ConstrainedCreateFaultPoint) -> Result<()> {
+    CONSTRAINED_CREATE_FAILURE.with(|failure| {
+        if failure.get() == Some(point) {
+            failure.set(None);
+            Err(DbError::new(
+                ErrorCode::Io,
+                "injected constrained CREATE late failure",
+            ))
+        } else {
+            Ok(())
+        }
     })
 }
 
@@ -963,8 +993,16 @@ pub(crate) fn create_constrained_relation(
         }
         for bundle in &bundles {
             catalog.insert_constraint_bundle(batch, bundle)?;
+            #[cfg(test)]
+            constrained_create_fault_for_test(
+                ConstrainedCreateFaultPoint::ConstraintRecordFamilyInserted,
+            )?;
+            #[cfg(test)]
+            constrained_create_fault_for_test(ConstrainedCreateFaultPoint::FeatureEnabled)?;
         }
         catalog.finish(batch)?;
+        #[cfg(test)]
+        constrained_create_fault_for_test(ConstrainedCreateFaultPoint::CatalogFinished)?;
         Ok(table_id)
     })();
     match result {
@@ -1172,6 +1210,10 @@ fn build_constraint_bundle(
     let system_index = match allocated.index_id {
         Some(index_id) => {
             let tree = BTree::create(batch, TreeKind::Index)?;
+            #[cfg(test)]
+            constrained_create_fault_for_test(
+                ConstrainedCreateFaultPoint::SystemIndexRootAllocated,
+            )?;
             let index = IndexDef::new(
                 index_id,
                 table_id,
@@ -1240,8 +1282,9 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnSpec, ConstrainedTableSpec, ConstrainedTableWrite, Relation, TableConstraintSpec,
-        TableSpec, TableWrite, create_constrained_relation, create_relation, drop_relation,
+        ColumnSpec, ConstrainedCreateFaultPoint, ConstrainedTableSpec, ConstrainedTableWrite,
+        Relation, TableConstraintSpec, TableSpec, TableWrite, create_constrained_relation,
+        create_relation, drop_relation, fail_constrained_create_at_for_test,
     };
     use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
@@ -1323,6 +1366,216 @@ mod tests {
         let constraint = catalog.constraints_for_table(table).next().unwrap();
         assert_eq!(constraint.id().get(), 9);
         assert_eq!(constraint.name().as_str(), "SYS_C9_2");
+    }
+
+    #[test]
+    fn generated_constraint_name_skips_committed_base_and_persists_after_reopen() {
+        let (temp, pager) = test_pager(4096).unwrap();
+        {
+            let mut batch = pager.try_begin_write().unwrap();
+            create_constrained_relation(
+                &mut batch,
+                &named_not_null_spec("COMMITTED_OCCUPIER", "SYS_C6"),
+            )
+            .unwrap();
+            batch.commit().unwrap();
+        }
+        drop(pager);
+
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let (generated_id, index_id) = {
+            let mut batch = pager.try_begin_write().unwrap();
+            assert_eq!(batch.catalog_reader().unwrap().next_object_id().get(), 4);
+            let table = create_constrained_relation(
+                &mut batch,
+                &generated_primary_key_spec("AFTER_COMMITTED_COLLISION"),
+            )
+            .unwrap();
+            let (constraint_id, index_id) = {
+                let catalog = batch.catalog_reader().unwrap();
+                assert_eq!(
+                    catalog
+                        .find_constraint_by_name(&CatalogName::new("SYS_C6").unwrap())
+                        .unwrap()
+                        .id()
+                        .get(),
+                    3
+                );
+                let constraint = catalog.constraints_for_table(table).next().unwrap();
+                assert_eq!(constraint.id().get(), 6);
+                assert_eq!(constraint.name().as_str(), "SYS_C6_1");
+                let index = catalog
+                    .find_index_by_id(constraint.index_id().unwrap())
+                    .unwrap();
+                assert_eq!(index.name(), constraint.name());
+                assert_eq!(
+                    catalog
+                        .find_index_by_name(&CatalogName::new("SYS_C6_1").unwrap())
+                        .unwrap()
+                        .id(),
+                    index.id()
+                );
+                (constraint.id().get(), index.id().get())
+            };
+            batch.commit().unwrap();
+            (constraint_id, index_id)
+        };
+        drop(pager);
+
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(
+            catalog
+                .find_constraint_by_name(&CatalogName::new("SYS_C6_1").unwrap())
+                .unwrap()
+                .id()
+                .get(),
+            generated_id
+        );
+        assert_eq!(
+            catalog
+                .find_index_by_name(&CatalogName::new("SYS_C6_1").unwrap())
+                .unwrap()
+                .id()
+                .get(),
+            index_id
+        );
+        assert_ne!(generated_id, index_id);
+    }
+
+    #[test]
+    fn generated_constraint_name_skips_same_create_explicit_name_and_reopens() {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let (generated_id, index_id) = {
+            let mut batch = pager.try_begin_write().unwrap();
+            let table =
+                create_constrained_relation(&mut batch, &same_create_collision_spec()).unwrap();
+            let (constraint_id, index_id) = {
+                let catalog = batch.catalog_reader().unwrap();
+                assert_eq!(
+                    catalog
+                        .find_constraint_by_name(&CatalogName::new("SYS_C4").unwrap())
+                        .unwrap()
+                        .id()
+                        .get(),
+                    3
+                );
+                let constraint = catalog
+                    .constraints_for_table(table)
+                    .find(|constraint| constraint.kind() == ConstraintKind::PrimaryKey)
+                    .unwrap();
+                assert_eq!(constraint.id().get(), 4);
+                assert_eq!(constraint.name().as_str(), "SYS_C4_1");
+                let index = catalog
+                    .find_index_by_id(constraint.index_id().unwrap())
+                    .unwrap();
+                assert_eq!(index.name(), constraint.name());
+                assert_eq!(
+                    catalog
+                        .find_constraint_by_name(&CatalogName::new("SYS_C4_1").unwrap())
+                        .unwrap()
+                        .id(),
+                    constraint.id()
+                );
+                assert_eq!(
+                    catalog
+                        .find_index_by_name(&CatalogName::new("SYS_C4_1").unwrap())
+                        .unwrap()
+                        .id(),
+                    index.id()
+                );
+                (constraint.id().get(), index.id().get())
+            };
+            batch.commit().unwrap();
+            (constraint_id, index_id)
+        };
+        drop(pager);
+
+        let pager = Pager::open(
+            temp.path(),
+            OpenMode::ReadWrite,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(
+            catalog
+                .find_constraint_by_name(&CatalogName::new("SYS_C4_1").unwrap())
+                .unwrap()
+                .id()
+                .get(),
+            generated_id
+        );
+        assert_eq!(
+            catalog
+                .find_index_by_name(&CatalogName::new("SYS_C4_1").unwrap())
+                .unwrap()
+                .id()
+                .get(),
+            index_id
+        );
+        assert_ne!(generated_id, index_id);
+    }
+
+    #[test]
+    fn constrained_create_late_faults_restore_the_complete_candidate() {
+        for point in [
+            ConstrainedCreateFaultPoint::SystemIndexRootAllocated,
+            ConstrainedCreateFaultPoint::ConstraintRecordFamilyInserted,
+            ConstrainedCreateFaultPoint::FeatureEnabled,
+            ConstrainedCreateFaultPoint::CatalogFinished,
+        ] {
+            let (_temp, pager) = test_pager(4096).unwrap();
+            let mut batch = pager.try_begin_write().unwrap();
+            let before = batch.checkpoint_mutation().unwrap();
+            let before_features = batch.feature_bits();
+            let before_catalog_root = batch.catalog_root();
+            let before_next_object_id = batch.catalog_reader().unwrap().next_object_id().get();
+            let table_name = CatalogName::new("FAULTED_CREATE").unwrap();
+            let candidate_name = CatalogName::new("SYS_C3").unwrap();
+
+            fail_constrained_create_at_for_test(point);
+            let error = create_constrained_relation(
+                &mut batch,
+                &generated_primary_key_spec("FAULTED_CREATE"),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code(), ErrorCode::Io, "{point:?}");
+            before.assert_matches_batch_for_test(&batch);
+            assert_eq!(batch.feature_bits(), before_features, "{point:?}");
+            assert_eq!(batch.catalog_root(), before_catalog_root, "{point:?}");
+            let catalog = batch.catalog_reader().unwrap();
+            assert_eq!(
+                catalog.next_object_id().get(),
+                before_next_object_id,
+                "{point:?}"
+            );
+            assert!(
+                catalog.find_table_by_name(&table_name).is_none(),
+                "{point:?}"
+            );
+            assert!(
+                catalog.find_constraint_by_name(&candidate_name).is_none(),
+                "{point:?}"
+            );
+            assert!(
+                catalog.find_index_by_name(&candidate_name).is_none(),
+                "{point:?}"
+            );
+        }
     }
 
     #[test]
@@ -2171,12 +2424,47 @@ mod tests {
     }
 
     fn explicit_name_spec(name: &str) -> ConstrainedTableSpec<'static> {
+        named_not_null_spec(name, name)
+    }
+
+    fn named_not_null_spec(
+        table_name: &str,
+        constraint_name: &str,
+    ) -> ConstrainedTableSpec<'static> {
         ConstrainedTableSpec::new(
-            table_spec(name, &[("ID", ColumnType::Int64, false)]),
+            table_spec(table_name, &[("ID", ColumnType::Int64, false)]),
             vec![TableConstraintSpec::NotNull {
-                name: Some(CatalogName::new(name).unwrap()),
+                name: Some(CatalogName::new(constraint_name).unwrap()),
                 column: 0,
             }],
+        )
+        .unwrap()
+    }
+
+    fn generated_primary_key_spec(table_name: &str) -> ConstrainedTableSpec<'static> {
+        ConstrainedTableSpec::new(
+            table_spec(table_name, &[("ID", ColumnType::Int64, false)]),
+            vec![TableConstraintSpec::PrimaryKey {
+                name: None,
+                columns: vec![0].into_boxed_slice(),
+            }],
+        )
+        .unwrap()
+    }
+
+    fn same_create_collision_spec() -> ConstrainedTableSpec<'static> {
+        ConstrainedTableSpec::new(
+            table_spec("SAME_CREATE_COLLISION", &[("ID", ColumnType::Int64, false)]),
+            vec![
+                TableConstraintSpec::NotNull {
+                    name: Some(CatalogName::new("SYS_C4").unwrap()),
+                    column: 0,
+                },
+                TableConstraintSpec::PrimaryKey {
+                    name: None,
+                    columns: vec![0].into_boxed_slice(),
+                },
+            ],
         )
         .unwrap()
     }
