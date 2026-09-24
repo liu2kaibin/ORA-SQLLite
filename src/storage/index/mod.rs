@@ -121,6 +121,7 @@ pub(crate) fn create_index(
             IndexSchema {
                 definition,
                 columns,
+                unique_violation: UniqueViolationName::ExplicitIndex(spec.name.clone()),
             },
             tree,
         );
@@ -257,6 +258,13 @@ pub(crate) struct IndexSchema {
     definition: IndexDef,
     // Index-key order; each definition retains its stable ID and table ordinal.
     columns: Box<[ColumnDef]>,
+    unique_violation: UniqueViolationName,
+}
+
+#[derive(Clone)]
+enum UniqueViolationName {
+    ExplicitIndex(CatalogName),
+    Constraint(CatalogName),
 }
 
 pub(crate) struct PreparedIndexEntry {
@@ -290,10 +298,27 @@ impl IndexStorage {
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let unique_violation = match definition.ownership() {
+            IndexOwnership::Explicit => {
+                UniqueViolationName::ExplicitIndex(definition.name().clone())
+            }
+            IndexOwnership::Constraint(owner_id) => {
+                let owner = catalog
+                    .find_constraint_by_id(owner_id)
+                    .ok_or_else(|| corruption("constraint-owned index has no owner constraint"))?;
+                if owner.index_id() != Some(index) {
+                    return Err(corruption(
+                        "constraint-owned index does not match its owner constraint",
+                    ));
+                }
+                UniqueViolationName::Constraint(owner.name().clone())
+            }
+        };
         Ok(Self::from_new(
             IndexSchema {
                 definition,
                 columns,
+                unique_violation,
             },
             tree,
         ))
@@ -349,13 +374,7 @@ impl IndexStorage {
             }
             let found = IndexKeyCodec::decode(&self.schema.columns, &physical)?.rowid();
             if Some(found) != exclude {
-                return Err(DbError::new(
-                    ErrorCode::Constraint,
-                    format!(
-                        "unique index {} is violated",
-                        self.schema.definition.name().as_str()
-                    ),
-                ));
+                return Err(self.unique_violation());
             }
         }
         Ok(())
@@ -412,6 +431,19 @@ impl IndexStorage {
 
     pub(in crate::storage) fn restore_root(&mut self, root: PageRef) {
         self.tree = BTree::from_root(TreeKind::Index, root);
+    }
+
+    fn unique_violation(&self) -> DbError {
+        match &self.schema.unique_violation {
+            UniqueViolationName::ExplicitIndex(name) => DbError::new(
+                ErrorCode::Constraint,
+                format!("unique index {} is violated", name.as_str()),
+            ),
+            UniqueViolationName::Constraint(name) => DbError::new(
+                ErrorCode::Constraint,
+                format!("constraint {} is violated", name.as_str()),
+            ),
+        }
     }
 }
 

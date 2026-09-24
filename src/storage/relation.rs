@@ -19,7 +19,10 @@ use super::{
             ObjectKind, RowId, SchemaVersion, TableDef, TableId,
         },
     },
-    constraint::program::CheckProgramTemplate,
+    constraint::{
+        ConstraintCatalog,
+        program::{CheckMemory, CheckProgramTemplate},
+    },
     index::{IndexStorage, PreparedIndexEntry},
     pager::PageSource,
     row::{RowCodec, RowCodecValidation, decode_rowid_key, encode_rowid_key},
@@ -99,11 +102,12 @@ pub(crate) struct TableWrite {
     original_root: PageRef,
 }
 
-/// The only SQL DML writer. It keeps one table tree, all explicit-owned index
-/// trees, and one catalog writer together so a failed row mutation never
-/// publishes an intermediate root set.
+/// The only SQL DML writer. It keeps one table tree, every owned index tree,
+/// and one catalog writer together so a failed row mutation never publishes an
+/// intermediate root set.
 pub(crate) struct ConstrainedTableWrite {
     schema: Relation,
+    constraints: ConstraintCatalog,
     rows: BTree,
     indexes: Box<[IndexStorage]>,
     catalog: CatalogWriter,
@@ -350,6 +354,10 @@ impl Relation {
 
     pub(crate) fn column_count(&self) -> usize {
         self.columns.len()
+    }
+
+    pub(crate) fn columns(&self) -> &[ColumnDef] {
+        &self.columns
     }
 
     pub(crate) fn validate_values(&self, values: &[Value], max_row_bytes: usize) -> Result<()> {
@@ -623,16 +631,16 @@ impl TableWrite {
 
 impl ConstrainedTableWrite {
     pub(crate) fn open(batch: &mut WriteBatch, table_id: TableId) -> Result<Self> {
-        let (schema, indexes) = {
+        let (schema, constraints, indexes) = {
             let catalog = batch.catalog_reader()?;
             let schema = Relation::open(&catalog, table_id)?;
-            let indexes = catalog
+            let constraints = ConstraintCatalog::open(&catalog, table_id)?;
+            let mut indexes = catalog
                 .indexes_for_table(table_id)
-                .filter(|index| index.ownership() == IndexOwnership::Explicit)
                 .map(|index| IndexStorage::open(&catalog, index.id()))
-                .collect::<Result<Vec<_>>>()?
-                .into_boxed_slice();
-            (schema, indexes)
+                .collect::<Result<Vec<_>>>()?;
+            indexes.sort_by_key(IndexStorage::id);
+            (schema, constraints, indexes.into_boxed_slice())
         };
         let original_table_root = schema.table.root();
         let next_rowid = schema.table.next_rowid();
@@ -640,6 +648,7 @@ impl ConstrainedTableWrite {
         let catalog = CatalogWriter::bootstrap(batch)?;
         Ok(Self {
             schema,
+            constraints,
             rows,
             indexes,
             catalog,
@@ -679,9 +688,29 @@ impl ConstrainedTableWrite {
         Ok(Some(StoredRow { rowid, values }))
     }
 
-    pub(crate) fn insert(&mut self, batch: &mut WriteBatch, values: &[Value]) -> Result<RowId> {
-        let encoded =
-            RowCodec::encode(&self.schema.table, &self.schema.columns, values, usize::MAX)?;
+    pub(crate) fn validate_row(
+        &self,
+        values: &[Value],
+        memory: &mut impl CheckMemory,
+    ) -> Result<()> {
+        self.constraints
+            .validate_row(&self.schema.columns, values, memory)
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        batch: &mut WriteBatch,
+        values: &[Value],
+        max_row_bytes: usize,
+        memory: &mut impl CheckMemory,
+    ) -> Result<RowId> {
+        self.validate_row(values, memory)?;
+        let encoded = RowCodec::encode(
+            &self.schema.table,
+            &self.schema.columns,
+            values,
+            max_row_bytes,
+        )?;
         let rowid = self.next_rowid;
         let entries = self.prepare_entries(values, rowid)?;
         self.check_unique(batch, &entries, None)?;
@@ -726,8 +755,12 @@ impl ConstrainedTableWrite {
         rowid: RowId,
         old: &[Value],
         new: &[Value],
+        max_row_bytes: usize,
+        memory: &mut impl CheckMemory,
     ) -> Result<()> {
-        let encoded = RowCodec::encode(&self.schema.table, &self.schema.columns, new, usize::MAX)?;
+        self.validate_row(new, memory)?;
+        let encoded =
+            RowCodec::encode(&self.schema.table, &self.schema.columns, new, max_row_bytes)?;
         let old_entries = self.prepare_entries(old, rowid)?;
         let new_entries = self.prepare_entries(new, rowid)?;
         self.check_unique(batch, &new_entries, Some(rowid))?;
@@ -1696,12 +1729,20 @@ mod tests {
             .unwrap()
             .schema_version();
         let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let mut memory = crate::sql::exec::WorkMemory::new(u64::MAX).unwrap();
         let row = writer
             .next_after(&mut batch, None, usize::MAX)
             .unwrap()
             .unwrap();
         writer
-            .replace(&mut batch, row.rowid(), row.values(), &[Value::Int64(2)])
+            .replace(
+                &mut batch,
+                row.rowid(),
+                row.values(),
+                &[Value::Int64(2)],
+                usize::MAX,
+                &mut memory,
+            )
             .unwrap();
         let row = writer
             .next_after(&mut batch, None, usize::MAX)
@@ -1712,7 +1753,9 @@ mod tests {
                 .delete(&mut batch, row.rowid(), row.values())
                 .unwrap()
         );
-        writer.insert(&mut batch, &[Value::Int64(1)]).unwrap();
+        writer
+            .insert(&mut batch, &[Value::Int64(1)], usize::MAX, &mut memory)
+            .unwrap();
         writer.finish(&mut batch).unwrap();
         let catalog = batch.catalog_reader().unwrap();
         assert_eq!(
@@ -1725,6 +1768,172 @@ mod tests {
             read_relation(&pager, "T").unwrap().1,
             vec![(2, vec![Value::Int64(1)])]
         );
+    }
+
+    #[test]
+    fn constrained_writer_reports_the_persisted_unique_constraint_name() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let spec = ConstrainedTableSpec::new(
+            table_spec("T", &[("ID", ColumnType::Int64, true)]),
+            vec![TableConstraintSpec::Unique {
+                name: Some(CatalogName::new("UQ_T").unwrap()),
+                columns: vec![0].into_boxed_slice(),
+            }],
+        )
+        .unwrap();
+        let table_id = create_constrained_relation(&mut batch, &spec).unwrap();
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let mut memory = crate::sql::exec::WorkMemory::new(u64::MAX).unwrap();
+
+        writer
+            .insert(&mut batch, &[Value::Int64(1)], usize::MAX, &mut memory)
+            .unwrap();
+        let error = writer
+            .insert(&mut batch, &[Value::Int64(1)], usize::MAX, &mut memory)
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("constraint UQ_T is violated"));
+    }
+
+    #[test]
+    fn constrained_writer_reports_persisted_primary_not_null_and_check_names() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let positive = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Column {
+                ordinal: 2,
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Int64(0),
+                result: CheckType::Int64,
+            },
+            CheckTemplateInstruction::Binary {
+                op: CheckBinaryOp::GreaterThan,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let spec = ConstrainedTableSpec::new(
+            table_spec(
+                "T",
+                &[
+                    ("ID", ColumnType::Int64, false),
+                    ("U", ColumnType::Int64, true),
+                    ("N", ColumnType::Int64, false),
+                ],
+            ),
+            vec![
+                TableConstraintSpec::PrimaryKey {
+                    name: Some(CatalogName::new("PK_T").unwrap()),
+                    columns: vec![0].into_boxed_slice(),
+                },
+                TableConstraintSpec::Unique {
+                    name: Some(CatalogName::new("UQ_T").unwrap()),
+                    columns: vec![1].into_boxed_slice(),
+                },
+                TableConstraintSpec::NotNull {
+                    name: Some(CatalogName::new("NN_T").unwrap()),
+                    column: 2,
+                },
+                TableConstraintSpec::Check {
+                    name: Some(CatalogName::new("CK_T").unwrap()),
+                    template: &positive,
+                },
+            ],
+        )
+        .unwrap();
+        let table_id = create_constrained_relation(&mut batch, &spec).unwrap();
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let mut memory = crate::sql::exec::WorkMemory::new(u64::MAX).unwrap();
+
+        writer
+            .insert(
+                &mut batch,
+                &[Value::Int64(1), Value::Int64(1), Value::Int64(1)],
+                usize::MAX,
+                &mut memory,
+            )
+            .unwrap();
+        for (values, name) in [
+            (vec![Value::Null, Value::Int64(2), Value::Int64(1)], "PK_T"),
+            (
+                vec![Value::Int64(2), Value::Int64(1), Value::Int64(1)],
+                "UQ_T",
+            ),
+            (vec![Value::Int64(2), Value::Int64(2), Value::Null], "NN_T"),
+            (
+                vec![Value::Int64(2), Value::Int64(2), Value::Int64(0)],
+                "CK_T",
+            ),
+        ] {
+            let error = writer
+                .insert(&mut batch, &values, usize::MAX, &mut memory)
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Constraint);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("constraint {name} is violated")),
+                "{name} returned {error}"
+            );
+        }
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn constrained_update_excludes_only_its_rowid_and_keeps_the_system_index_consistent() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let spec = ConstrainedTableSpec::new(
+            table_spec("T", &[("ID", ColumnType::Int64, false)]),
+            vec![TableConstraintSpec::PrimaryKey {
+                name: Some(CatalogName::new("PK_T").unwrap()),
+                columns: vec![0].into_boxed_slice(),
+            }],
+        )
+        .unwrap();
+        let table_id = create_constrained_relation(&mut batch, &spec).unwrap();
+        let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let mut memory = crate::sql::exec::WorkMemory::new(u64::MAX).unwrap();
+        let first = writer
+            .insert(&mut batch, &[Value::Int64(1)], usize::MAX, &mut memory)
+            .unwrap();
+        writer
+            .insert(&mut batch, &[Value::Int64(2)], usize::MAX, &mut memory)
+            .unwrap();
+
+        let error = writer
+            .replace(
+                &mut batch,
+                first,
+                &[Value::Int64(1)],
+                &[Value::Int64(2)],
+                usize::MAX,
+                &mut memory,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("constraint PK_T is violated"));
+        writer
+            .replace(
+                &mut batch,
+                first,
+                &[Value::Int64(1)],
+                &[Value::Int64(1)],
+                usize::MAX,
+                &mut memory,
+            )
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch
+            .catalog_reader()
+            .unwrap()
+            .validate_deep_batch(&mut batch)
+            .unwrap();
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]
@@ -1774,9 +1983,15 @@ mod tests {
             )
         };
         let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+        let mut memory = crate::sql::exec::WorkMemory::new(u64::MAX).unwrap();
         assert_eq!(
             writer
-                .insert(&mut batch, &[Value::Text("x".repeat(1014))])
+                .insert(
+                    &mut batch,
+                    &[Value::Text("x".repeat(1014))],
+                    usize::MAX,
+                    &mut memory,
+                )
                 .unwrap_err()
                 .code(),
             ErrorCode::ResourceLimit
@@ -1800,7 +2015,12 @@ mod tests {
 
         assert_eq!(
             writer
-                .insert(&mut batch, &[Value::Text("after".into())])
+                .insert(
+                    &mut batch,
+                    &[Value::Text("after".into())],
+                    usize::MAX,
+                    &mut memory,
+                )
                 .unwrap()
                 .get(),
             1

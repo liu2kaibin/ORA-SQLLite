@@ -8,6 +8,7 @@ use crate::{
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
+        constraint::ConstraintCatalog,
         index::{IndexSpec, create_index, drop_index},
         relation::{
             ColumnSpec, ConstrainedTableSpec, ConstrainedTableWrite, Relation,
@@ -67,7 +68,7 @@ pub(crate) fn execute_validated_write_plan(
         mut memory,
     } = validated;
     match statement.plan().kind() {
-        PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &memory),
+        PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &mut memory),
         PlanKind::Update(plan) => execute_update(batch, plan, &params, &mut memory),
         PlanKind::Delete(plan) => execute_delete(batch, plan, &params, &mut memory),
         PlanKind::CreateTable(plan) => execute_create_table(batch, plan),
@@ -157,73 +158,87 @@ fn execute_update(
         let old_values = stored.into_values();
         let old_bytes = owned_values_bytes(old_values.iter())?;
         memory.reserve(old_bytes)?;
-        let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
-        if !predicate_matches(plan.selection(), &old, params)? {
-            memory.release(old_bytes)?;
-            continue;
-        }
-        let (values, assignment_bytes) = evaluate_update_assignments(plan, &old, params, memory)?;
-        memory.reserve(old_bytes)?;
-        let mut replacement = Vec::with_capacity(relation.column_count());
-        for ordinal in 0..relation.column_count() {
-            let ordinal = u16::try_from(ordinal).map_err(|_| {
-                DbError::new(
-                    ErrorCode::Internal,
-                    "UPDATE relation column ordinal exceeds its bound",
-                )
-            })?;
-            replacement.push(
-                old.source_value(SourceId(0), ordinal)
-                    .cloned()
-                    .ok_or_else(|| {
-                        DbError::new(
-                            ErrorCode::Internal,
-                            "UPDATE old row is missing a relation column",
-                        )
-                    })?,
-            );
-        }
-        for (assignment, value) in plan.assignments().iter().zip(values) {
-            let target = replacement
-                .get_mut(usize::from(assignment.target().ordinal()))
-                .ok_or_else(|| {
-                    DbError::new(
-                        ErrorCode::Internal,
-                        "UPDATE target ordinal is outside the replacement row",
-                    )
-                })?;
-            *target = value;
-        }
-        validate_update_replacement(&relation, plan, &replacement, old_bytes, memory)?;
-        // Validation must happen before allocating the third owned row so an
-        // invalid assignment keeps its Type diagnostic. On the valid path,
-        // retain the original row for index deletion and account for it before
-        // cloning, while no B+Tree mutation has happened yet.
-        memory.reserve(old_bytes)?;
-        let old_for_index = (0..relation.column_count())
-            .map(|ordinal| {
+        let mut row_reserved = old_bytes;
+        let result = (|| {
+            let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
+            if !predicate_matches(plan.selection(), &old, params)? {
+                return Ok(false);
+            }
+            let (values, assignment_bytes) =
+                evaluate_update_assignments(plan, &old, params, memory)?;
+            row_reserved = checked_add_bytes(row_reserved, assignment_bytes)?;
+            memory.reserve(old_bytes)?;
+            row_reserved = checked_add_bytes(row_reserved, old_bytes)?;
+            let mut replacement = Vec::with_capacity(relation.column_count());
+            for ordinal in 0..relation.column_count() {
                 let ordinal = u16::try_from(ordinal).map_err(|_| {
                     DbError::new(
                         ErrorCode::Internal,
                         "UPDATE relation column ordinal exceeds its bound",
                     )
                 })?;
-                old.source_value(SourceId(0), ordinal)
-                    .cloned()
-                    .ok_or_else(|| {
+                replacement.push(old.source_value(SourceId(0), ordinal).cloned().ok_or_else(
+                    || {
                         DbError::new(
                             ErrorCode::Internal,
                             "UPDATE old row is missing a relation column",
                         )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        writer.replace(batch, rowid, &old_for_index, &replacement)?;
-        affected = checked_affected_count(affected)?;
-        memory.release(checked_add_bytes(
-            checked_add_bytes(checked_add_bytes(old_bytes, assignment_bytes)?, old_bytes)?,
-            old_bytes,
-        )?)?;
+                    },
+                )?);
+            }
+            for (assignment, value) in plan.assignments().iter().zip(values) {
+                let target = replacement
+                    .get_mut(usize::from(assignment.target().ordinal()))
+                    .ok_or_else(|| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE target ordinal is outside the replacement row",
+                        )
+                    })?;
+                *target = value;
+            }
+            writer.validate_row(&replacement, memory)?;
+            validate_update_replacement(&relation, plan, &replacement, old_bytes, memory)?;
+            // Validation must happen before allocating the third owned row so an
+            // invalid assignment keeps its Type diagnostic. On the valid path,
+            // retain the original row for index deletion and account for it before
+            // cloning, while no B+Tree mutation has happened yet.
+            memory.reserve(old_bytes)?;
+            row_reserved = checked_add_bytes(row_reserved, old_bytes)?;
+            let old_for_index = (0..relation.column_count())
+                .map(|ordinal| {
+                    let ordinal = u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE relation column ordinal exceeds its bound",
+                        )
+                    })?;
+                    old.source_value(SourceId(0), ordinal)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::new(
+                                ErrorCode::Internal,
+                                "UPDATE old row is missing a relation column",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let max_row_bytes =
+                usize::try_from(memory.remaining().saturating_sub(old_bytes)).unwrap_or(usize::MAX);
+            writer.replace(
+                batch,
+                rowid,
+                &old_for_index,
+                &replacement,
+                max_row_bytes,
+                memory,
+            )?;
+            Ok(true)
+        })();
+        memory.release(row_reserved)?;
+        if result? {
+            affected = checked_affected_count(affected)?;
+        }
     }
     writer.finish(batch)?;
     Ok(ExecutionResult::new(affected))
@@ -241,18 +256,25 @@ fn evaluate_update_assignments(
         checked_array_bytes(count, std::mem::size_of::<crate::Value>() as u64)?,
     )?;
     memory.reserve(bytes)?;
-    let mut values = Vec::with_capacity(plan.assignments().len());
-    for assignment in plan.assignments() {
-        let value = coerce_assignment(
-            eval(assignment.value(), old, params)?,
-            assignment.target().data_type(),
-        )?;
-        let payload = owned_value_payload_bytes(&value)?;
-        memory.reserve(payload)?;
-        bytes = checked_add_bytes(bytes, payload)?;
-        values.push(value);
+    let result = (|| {
+        let mut values = Vec::with_capacity(plan.assignments().len());
+        for assignment in plan.assignments() {
+            let value = coerce_assignment(
+                eval(assignment.value(), old, params)?,
+                assignment.target().data_type(),
+            )?;
+            let payload = owned_value_payload_bytes(&value)?;
+            let next = checked_add_bytes(bytes, payload)?;
+            memory.reserve(payload)?;
+            bytes = next;
+            values.push(value);
+        }
+        Ok((values, bytes))
+    })();
+    if result.is_err() {
+        memory.release(bytes)?;
     }
-    Ok((values, bytes))
+    result
 }
 
 fn execute_delete(
@@ -398,7 +420,7 @@ fn execute_insert(
     batch: &mut WriteBatch,
     plan: &InsertPlan,
     params: &ParameterFrame,
-    memory: &WorkMemory,
+    memory: &mut WorkMemory,
 ) -> Result<ExecutionResult> {
     if plan.targets().len() != plan.values().len() {
         return Err(DbError::new(
@@ -423,9 +445,14 @@ fn execute_insert(
         *slot = value;
     }
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
+    let constraints = {
+        let catalog = batch.catalog_reader()?;
+        ConstraintCatalog::open(&catalog, table_id)?
+    };
+    constraints.validate_row(relation.columns(), &values, memory)?;
     relation.validate_values(&values, max_row_bytes)?;
     let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
-    writer.insert(batch, &values)?;
+    writer.insert(batch, &values, max_row_bytes, memory)?;
     writer.finish(batch)?;
     Ok(ExecutionResult::new(1))
 }
