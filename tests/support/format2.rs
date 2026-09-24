@@ -49,6 +49,8 @@ pub struct RawColumn {
 pub struct RawTable {
     pub id: u64,
     pub root: RawPageRef,
+    /// Physical type of the root page in this checkpointed snapshot.
+    pub root_page_type: u8,
     pub next_rowid: u64,
     pub columns: Vec<RawColumn>,
 }
@@ -58,6 +60,8 @@ pub struct RawIndex {
     pub id: u64,
     pub table_id: u64,
     pub root: RawPageRef,
+    /// Physical type of the root page in this checkpointed snapshot.
+    pub root_page_type: u8,
     pub unique: bool,
     pub owner_constraint_id: Option<u64>,
     pub columns: Vec<u64>,
@@ -171,7 +175,17 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         TreeKind::Table,
         false,
     )?;
-    let parsed = parse_raw_catalog(&catalog.entries)?;
+    let mut parsed = parse_raw_catalog(&catalog.entries)?;
+    for table in parsed.tables.values_mut() {
+        table.root_page_type = disk
+            .page(table.root.id, Some(table.root.generation))?
+            .page_type;
+    }
+    for index in parsed.indexes.values_mut() {
+        index.root_page_type = disk
+            .page(index.root.id, Some(index.root.generation))?
+            .page_type;
+    }
     Ok(RawCatalogCapture {
         feature_bits: disk.header.features,
         catalog_root,
@@ -1080,6 +1094,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             RawTable {
                 id: definition.id,
                 root: definition.root,
+                root_page_type: 0,
                 next_rowid: definition.next_rowid,
                 columns,
             },
@@ -1097,6 +1112,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
                 id: definition.id,
                 table_id: definition.table_id,
                 root: definition.root,
+                root_page_type: 0,
                 unique: definition.unique,
                 owner_constraint_id: definition.owner_constraint_id,
                 columns,

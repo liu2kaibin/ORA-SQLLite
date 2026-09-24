@@ -2361,6 +2361,11 @@ mod tests {
         },
     };
 
+    type ConstraintCandidateMutation = Box<dyn Fn(&mut WriteBatch, &mut Records, PageRef, PageRef)>;
+    type ConstraintCandidateCase = (&'static str, ErrorCode, u64, ConstraintCandidateMutation);
+    type CheckProgramMutation = Box<dyn Fn(&mut Records)>;
+    type CheckProgramCase = (&'static str, ErrorCode, CheckProgramMutation);
+
     #[test]
     fn check_program_error_normalization_preserves_non_corruption_codes() {
         assert_eq!(
@@ -4971,6 +4976,167 @@ mod tests {
         rows
     }
 
+    fn local_not_null_constraint_records(table_root: PageRef) -> Records {
+        let constraint = ConstraintDef::new(
+            ConstraintId::new(50).unwrap(),
+            TableId::new(10).unwrap(),
+            ConstraintKind::NotNull,
+            1,
+            None,
+            Box::new([]),
+            CatalogName::new("NN_T").unwrap(),
+        )
+        .unwrap();
+        let mut rows = records(table_root);
+        rows.extend([
+            (
+                constraint_name_key(constraint.name()).unwrap(),
+                encode_constraint_name_mapping(constraint.id()),
+            ),
+            (
+                constraint_definition_key(constraint.id()),
+                encode_constraint_definition(&constraint),
+            ),
+            (
+                table_constraint_key(constraint.table_id(), constraint.id()),
+                encode_table_constraint_mapping(constraint.id()),
+            ),
+            (
+                constraint_column_key(constraint.id(), 0),
+                encode_constraint_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+        ]);
+        rows
+    }
+
+    fn append_foreign_table(rows: &mut Records, root: PageRef) {
+        let table = new_table(40, root, 1, "F");
+        let column = new_column(41, table.id(), 0, "Z");
+        rows.extend([
+            (
+                table_name_key(table.name()).unwrap(),
+                encode_table_name_mapping(table.id()),
+            ),
+            (
+                table_definition_key(table.id()),
+                encode_table_definition(&table),
+            ),
+            (
+                column_name_key(column.table_id(), column.name()).unwrap(),
+                encode_column_name_mapping(column.id()),
+            ),
+            (
+                column_ordinal_key(column.table_id(), column.ordinal()),
+                encode_column_ordinal_mapping(column.id()),
+            ),
+            (
+                column_definition_key(column.id()),
+                encode_column_definition(&column),
+            ),
+        ]);
+    }
+
+    fn append_second_primary_key(rows: &mut Records, root: PageRef) {
+        let constraint_id = ConstraintId::new(51).unwrap();
+        let index = IndexDef::new(
+            IndexId::new(31).unwrap(),
+            TableId::new(10).unwrap(),
+            root,
+            2,
+            true,
+            IndexOwnership::Constraint(constraint_id),
+            CatalogName::new("SYS_PK_T_2").unwrap(),
+        )
+        .unwrap();
+        let constraint = ConstraintDef::new(
+            constraint_id,
+            TableId::new(10).unwrap(),
+            ConstraintKind::PrimaryKey,
+            2,
+            Some(index.id()),
+            Box::new([]),
+            CatalogName::new("PK_T_2").unwrap(),
+        )
+        .unwrap();
+        rows.extend([
+            (
+                index_name_key(index.name()).unwrap(),
+                encode_index_name_mapping(index.id()),
+            ),
+            (
+                index_definition_key(index.id()),
+                encode_index_definition(&index),
+            ),
+            (
+                table_index_key(index.table_id(), index.id()),
+                encode_table_index_mapping(index.id()),
+            ),
+            (
+                index_column_key(index.id(), 0),
+                encode_index_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                index_column_key(index.id(), 1),
+                encode_index_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+            (
+                constraint_name_key(constraint.name()).unwrap(),
+                encode_constraint_name_mapping(constraint.id()),
+            ),
+            (
+                constraint_definition_key(constraint.id()),
+                encode_constraint_definition(&constraint),
+            ),
+            (
+                table_constraint_key(constraint.table_id(), constraint.id()),
+                encode_table_constraint_mapping(constraint.id()),
+            ),
+            (
+                constraint_column_key(constraint.id(), 0),
+                encode_constraint_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                constraint_column_key(constraint.id(), 1),
+                encode_constraint_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+        ]);
+    }
+
+    fn append_constraint_owned_index_without_reverse(rows: &mut Records, root: PageRef) {
+        let index = IndexDef::new(
+            IndexId::new(31).unwrap(),
+            TableId::new(10).unwrap(),
+            root,
+            2,
+            true,
+            IndexOwnership::Constraint(ConstraintId::new(50).unwrap()),
+            CatalogName::new("SYS_ORPHAN").unwrap(),
+        )
+        .unwrap();
+        rows.extend([
+            (
+                index_name_key(index.name()).unwrap(),
+                encode_index_name_mapping(index.id()),
+            ),
+            (
+                index_definition_key(index.id()),
+                encode_index_definition(&index),
+            ),
+            (
+                table_index_key(index.table_id(), index.id()),
+                encode_table_index_mapping(index.id()),
+            ),
+            (
+                index_column_key(index.id(), 0),
+                encode_index_column_mapping(ColumnId::new(20).unwrap()),
+            ),
+            (
+                index_column_key(index.id(), 1),
+                encode_index_column_mapping(ColumnId::new(21).unwrap()),
+            ),
+        ]);
+    }
+
     #[test]
     fn catalog_requires_complete_bidirectional_local_constraint_graph() {
         let (_temp, pager) = test_pager(4096).unwrap();
@@ -5168,11 +5334,13 @@ mod tests {
         // Production break caught: recovery must reject a complete, malformed
         // local-constraint commit instead of silently choosing the older base
         // catalog.  Each mutation below starts from a valid durable base image.
-        let cases: Vec<(&str, ErrorCode, Box<dyn Fn(&mut Records)>)> = vec![
+        let complete_features = CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1;
+        let cases: Vec<ConstraintCandidateCase> = vec![
             (
                 "missing constraint name",
                 ErrorCode::Corruption,
-                Box::new(|rows| {
+                complete_features,
+                Box::new(|_, rows, _, _| {
                     remove_record(
                         rows,
                         &constraint_name_key(&CatalogName::new("PK_T").unwrap()).unwrap(),
@@ -5180,9 +5348,71 @@ mod tests {
                 }),
             ),
             (
+                "aliased constraint name",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    *record_value_mut(
+                        rows,
+                        &constraint_name_key(&CatalogName::new("PK_T").unwrap()).unwrap(),
+                    ) = encode_constraint_name_mapping(ConstraintId::new(51).unwrap());
+                }),
+            ),
+            (
+                "missing table constraint mapping",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    remove_record(
+                        rows,
+                        &table_constraint_key(
+                            TableId::new(10).unwrap(),
+                            ConstraintId::new(50).unwrap(),
+                        ),
+                    );
+                }),
+            ),
+            (
+                "aliased table constraint mapping",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    *record_value_mut(
+                        rows,
+                        &table_constraint_key(
+                            TableId::new(10).unwrap(),
+                            ConstraintId::new(50).unwrap(),
+                        ),
+                    ) = encode_table_constraint_mapping(ConstraintId::new(51).unwrap());
+                }),
+            ),
+            (
+                "missing constraint column mapping",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    remove_record(
+                        rows,
+                        &constraint_column_key(ConstraintId::new(50).unwrap(), 0),
+                    );
+                }),
+            ),
+            (
+                "duplicate constraint columns",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    *record_value_mut(
+                        rows,
+                        &constraint_column_key(ConstraintId::new(50).unwrap(), 1),
+                    ) = encode_constraint_column_mapping(ColumnId::new(20).unwrap());
+                }),
+            ),
+            (
                 "noncontiguous constraint columns",
                 ErrorCode::Corruption,
-                Box::new(|rows| {
+                complete_features,
+                Box::new(|_, rows, _, _| {
                     let key = constraint_column_key(ConstraintId::new(50).unwrap(), 1);
                     let value = remove_record(rows, &key);
                     rows.push((
@@ -5194,26 +5424,58 @@ mod tests {
             (
                 "wrong constraint column owner",
                 ErrorCode::Corruption,
-                Box::new(|rows| {
-                    record_value_mut(
+                complete_features,
+                Box::new(|batch, rows, _, _| {
+                    let foreign_root = BTree::create(batch, TreeKind::Table).unwrap().root();
+                    append_foreign_table(rows, foreign_root);
+                    *record_value_mut(
                         rows,
                         &constraint_column_key(ConstraintId::new(50).unwrap(), 0),
-                    )[8..16]
-                        .copy_from_slice(&99_u64.to_le_bytes());
+                    ) = encode_constraint_column_mapping(ColumnId::new(41).unwrap());
                 }),
             ),
             (
-                "nonunique primary key index",
+                "wrong constraint table owner",
                 ErrorCode::Corruption,
-                Box::new(|rows| {
-                    record_value_mut(rows, &index_definition_key(IndexId::new(30).unwrap()))[42] =
-                        0;
+                complete_features,
+                Box::new(|batch, rows, _, _| {
+                    let foreign_root = BTree::create(batch, TreeKind::Table).unwrap().root();
+                    append_foreign_table(rows, foreign_root);
+                    let mapping = remove_record(
+                        rows,
+                        &table_constraint_key(
+                            TableId::new(10).unwrap(),
+                            ConstraintId::new(50).unwrap(),
+                        ),
+                    );
+                    rows.push((
+                        table_constraint_key(
+                            TableId::new(40).unwrap(),
+                            ConstraintId::new(50).unwrap(),
+                        ),
+                        mapping,
+                    ));
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[16..24]
+                        .copy_from_slice(&40_u64.to_le_bytes());
                 }),
             ),
             (
-                "orphaned constraint-owned index",
+                "two primary keys",
                 ErrorCode::Corruption,
-                Box::new(|rows| {
+                complete_features,
+                Box::new(|batch, rows, _, _| {
+                    let second_root = BTree::create(batch, TreeKind::Index).unwrap().root();
+                    append_second_primary_key(rows, second_root);
+                }),
+            ),
+            (
+                "primary key without system index",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
                     record_value_mut(
                         rows,
                         &constraint_definition_key(ConstraintId::new(50).unwrap()),
@@ -5222,17 +5484,87 @@ mod tests {
                 }),
             ),
             (
+                "unique constraint without system index",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    let bytes = record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    );
+                    bytes[24] = 2;
+                    bytes[28..36].fill(0);
+                }),
+            ),
+            (
+                "nonunique primary key index",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    record_value_mut(rows, &index_definition_key(IndexId::new(30).unwrap()))[42] =
+                        0;
+                }),
+            ),
+            (
+                "key constraint index belongs to another table",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|batch, rows, _, _| {
+                    let foreign_root = BTree::create(batch, TreeKind::Table).unwrap().root();
+                    append_foreign_table(rows, foreign_root);
+                    record_value_mut(rows, &index_definition_key(IndexId::new(30).unwrap()))
+                        [16..24]
+                        .copy_from_slice(&40_u64.to_le_bytes());
+                }),
+            ),
+            (
+                "key constraint index columns differ",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    *record_value_mut(rows, &index_column_key(IndexId::new(30).unwrap(), 1)) =
+                        encode_index_column_mapping(ColumnId::new(20).unwrap());
+                }),
+            ),
+            (
+                "constraint-owned index has mismatched owner ID",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    record_value_mut(rows, &index_definition_key(IndexId::new(30).unwrap()))
+                        [46..54]
+                        .copy_from_slice(&51_u64.to_le_bytes());
+                }),
+            ),
+            (
+                "constraint-owned index has no reverse constraint link",
+                ErrorCode::Corruption,
+                complete_features,
+                Box::new(|batch, rows, _, _| {
+                    let extra_root = BTree::create(batch, TreeKind::Index).unwrap().root();
+                    append_constraint_owned_index_without_reverse(rows, extra_root);
+                }),
+            ),
+            (
                 "nullable primary-key column",
                 ErrorCode::Corruption,
-                Box::new(|rows| {
+                complete_features,
+                Box::new(|_, rows, _, _| {
                     record_value_mut(rows, &column_definition_key(ColumnId::new(20).unwrap()))
                         [27] = 1;
                 }),
             ),
             (
+                "constraint records without the index feature",
+                ErrorCode::Corruption,
+                CATALOG_V1,
+                Box::new(|_, _, _, _| {}),
+            ),
+            (
                 "future constraint record version",
                 ErrorCode::Unsupported,
-                Box::new(|rows| {
+                complete_features,
+                Box::new(|_, rows, _, _| {
                     record_value_mut(
                         rows,
                         &constraint_definition_key(ConstraintId::new(50).unwrap()),
@@ -5242,17 +5574,34 @@ mod tests {
             (
                 "foreign-key constraint definition",
                 ErrorCode::Unsupported,
-                Box::new(|rows| {
+                complete_features,
+                Box::new(|_, rows, _, _| {
                     record_value_mut(
                         rows,
                         &constraint_definition_key(ConstraintId::new(50).unwrap()),
                     )[24] = 5;
                 }),
             ),
+            (
+                "foreign-key reverse edge",
+                ErrorCode::Unsupported,
+                complete_features,
+                Box::new(|_, rows, _, _| {
+                    rows.push((
+                        referenced_by_key(
+                            ConstraintId::new(50).unwrap(),
+                            ConstraintId::new(51).unwrap(),
+                        ),
+                        vec![],
+                    ));
+                }),
+            ),
         ];
-        for (label, expected, mutate) in cases {
-            let (temp, pager) =
-                raw_local_constraint_candidate_after_base(|rows, _, _| mutate(rows));
+        for (label, expected, feature_bits, mutate) in cases {
+            let (temp, pager) = raw_local_constraint_candidate_after_base(
+                feature_bits,
+                |batch, rows, table_root, index_root| mutate(batch, rows, table_root, index_root),
+            );
             let mut read = pager.begin_read().unwrap();
             assert_eq!(
                 match CatalogReader::open_empty_or_v1(&mut read) {
@@ -5279,7 +5628,7 @@ mod tests {
         // Production break caught: a catalog reader that validates only the
         // outer ConstraintDef can accept a corrupt persisted program until a
         // DML statement happens to execute it.
-        let cases: Vec<(&str, ErrorCode, Box<dyn Fn(&mut Records)>)> = vec![
+        let cases: Vec<CheckProgramCase> = vec![
             (
                 "empty program",
                 ErrorCode::Corruption,
@@ -5425,6 +5774,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn phase_4c2b_constraint_corruption_rejects_invalid_not_null_and_check_shapes() {
+        // A local constraint's type-specific shape is a catalog-open contract,
+        // not a deferred DML error.  Every case below commits after a valid base
+        // image so recovery cannot select that base as a fallback.
+        let not_null = raw_not_null_constraint_candidate_after_base(|rows, _| {
+            record_value_mut(rows, &column_definition_key(ColumnId::new(20).unwrap()))[27] = 1;
+        });
+        assert_committed_constraint_candidate_rejected(
+            "nullable not-null column",
+            ErrorCode::Corruption,
+            not_null,
+        );
+
+        for (label, mutate) in [
+            (
+                "check with constrained columns",
+                Box::new(|rows: &mut Records| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[26..28]
+                        .copy_from_slice(&1_u16.to_le_bytes());
+                }) as Box<dyn Fn(&mut Records)>,
+            ),
+            (
+                "check with a system index",
+                Box::new(|rows: &mut Records| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[28..36]
+                        .copy_from_slice(&30_u64.to_le_bytes());
+                }),
+            ),
+        ] {
+            let candidate = raw_check_constraint_candidate_after_base(|rows, _| mutate(rows));
+            assert_committed_constraint_candidate_rejected(label, ErrorCode::Corruption, candidate);
+        }
+    }
+
+    #[test]
+    fn phase_4c2b_index_feature_without_catalog_rejects_durable_header_in_both_modes() {
+        // `enable_feature_bits` correctly refuses this combination before it
+        // can commit.  A format-2 header can still be durably corrupted, so
+        // recovery must classify it without modifying or accepting the file.
+        let (temp, pager) = test_pager(4096).unwrap();
+        drop(pager);
+        set_real_file_feature_bits(&temp, super::super::features::INDEX_CONSTRAINT_V1);
+        let main = std::fs::read(temp.path()).unwrap();
+        let wal_path = crate::storage::wal::wal_path(temp.path());
+        let wal = std::fs::read(&wal_path).unwrap();
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                Ok(_) => panic!("index feature without catalog V1 was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::Corruption, "mode: {mode:?}");
+            assert_eq!(std::fs::read(temp.path()).unwrap(), main, "mode: {mode:?}");
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal, "mode: {mode:?}");
+        }
+    }
+
     fn rewrite_check_program_as_column(bytes: &mut Vec<u8>, column_id: u64, result: u8) {
         let current_len =
             usize::try_from(u32::from_le_bytes(bytes[56..60].try_into().unwrap())).unwrap();
@@ -5469,7 +5881,8 @@ mod tests {
     }
 
     fn raw_local_constraint_candidate_after_base(
-        mutate: impl FnOnce(&mut Records, PageRef, PageRef),
+        feature_bits: u64,
+        mutate: impl FnOnce(&mut WriteBatch, &mut Records, PageRef, PageRef),
     ) -> (TempDatabase, Pager) {
         let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
@@ -5482,13 +5895,9 @@ mod tests {
         let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
         let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
         let mut rows = local_constraint_records(table_root, index_root);
-        mutate(&mut rows, table_root, index_root);
+        mutate(&mut batch, &mut rows, table_root, index_root);
         let catalog = raw_tree(&mut batch, rows);
-        publish_with_features(
-            &mut batch,
-            &catalog,
-            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
-        );
+        publish_with_features(&mut batch, &catalog, feature_bits);
         batch.commit().unwrap();
         (temp, pager)
     }
@@ -5515,6 +5924,54 @@ mod tests {
         );
         batch.commit().unwrap();
         (temp, pager)
+    }
+
+    fn raw_not_null_constraint_candidate_after_base(
+        mutate: impl FnOnce(&mut Records, PageRef),
+    ) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let base_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let base_catalog = raw_tree(&mut batch, records(base_root));
+        publish(&mut batch, &base_catalog);
+        batch.commit().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut rows = local_not_null_constraint_records(table_root);
+        mutate(&mut rows, table_root);
+        let catalog = raw_tree(&mut batch, rows);
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+        (temp, pager)
+    }
+
+    fn assert_committed_constraint_candidate_rejected(
+        label: &str,
+        expected: ErrorCode,
+        (temp, pager): (TempDatabase, Pager),
+    ) {
+        let mut read = pager.begin_read().unwrap();
+        assert_eq!(
+            CatalogReader::open_empty_or_v1(&mut read)
+                .unwrap_err()
+                .code(),
+            expected,
+            "current snapshot: {label}"
+        );
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                Ok(_) => panic!("recovery accepted {label}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), expected, "recovery: {label}");
+        }
     }
 
     fn raw_index_catalog_with_features(
@@ -6903,6 +7360,77 @@ mod tests {
             assert_eq!(
                 catalog.validate_deep(&mut read).unwrap_err().code(),
                 ErrorCode::Corruption
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_open_is_shallow_but_deep_validation_walks_constraint_system_index_descendants() {
+        // The local-constraint graph must use the same shallow-open boundary as
+        // explicit indexes: a checksummed malformed system-index descendant is
+        // accepted by ordinary open, then rejected only by explicit validation.
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index = large_index_tree(&mut batch);
+        let report = validate_tree(&mut batch, &index).unwrap();
+        assert!(report.tree_pages.len() > 2);
+        let catalog = raw_tree(
+            &mut batch,
+            local_constraint_records(table_root, index.root()),
+        );
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let leaf_id = *report
+            .tree_pages
+            .iter()
+            .find(|id| {
+                **id != index.root().page_id()
+                    && read.read_page_by_id(**id).unwrap().header().page_type()
+                        == PageType::IndexLeaf
+            })
+            .unwrap();
+        let leaf = read.read_page_by_id(leaf_id).unwrap();
+        let leaf_ref = PageRef::new(leaf_id, leaf.header().generation()).unwrap();
+        drop(read);
+
+        let mut batch = pager.begin_write().unwrap();
+        batch.modify(leaf_ref).unwrap().bytes_mut()[48..56].fill(0xff);
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        let constraint = catalog
+            .find_constraint_by_id(ConstraintId::new(50).unwrap())
+            .unwrap();
+        assert_eq!(constraint.index_id(), Some(IndexId::new(30).unwrap()));
+        assert_eq!(
+            catalog
+                .find_index_by_id(IndexId::new(30).unwrap())
+                .unwrap()
+                .ownership(),
+            IndexOwnership::Constraint(constraint.id())
+        );
+        assert_eq!(
+            catalog.validate_deep(&mut read).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let pager = Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(
+                catalog.validate_deep(&mut read).unwrap_err().code(),
+                ErrorCode::Corruption,
+                "mode: {mode:?}"
             );
         }
     }

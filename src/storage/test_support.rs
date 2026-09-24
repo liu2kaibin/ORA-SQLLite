@@ -83,6 +83,155 @@ pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
     Ok((temp, pager))
 }
 
+/// A minimal committed Phase 4C2-B primary-key graph for storage snapshot and
+/// checkpoint tests.  The returned identifiers deliberately remain stable so
+/// callers can compare old and new catalog roots without reconstructing names.
+pub(crate) struct Phase4c2bConstraintFixture {
+    temp: TempDatabase,
+    pager: Pager,
+    table_id: TableId,
+    index_id: IndexId,
+    constraint_id: ConstraintId,
+    constraint_name: CatalogName,
+}
+
+impl Phase4c2bConstraintFixture {
+    pub(crate) const fn temp(&self) -> &TempDatabase {
+        &self.temp
+    }
+
+    pub(crate) const fn pager(&self) -> &Pager {
+        &self.pager
+    }
+
+    pub(crate) fn into_temp(self) -> TempDatabase {
+        self.temp
+    }
+
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) const fn index_id(&self) -> IndexId {
+        self.index_id
+    }
+
+    pub(crate) const fn constraint_id(&self) -> ConstraintId {
+        self.constraint_id
+    }
+
+    pub(crate) fn constraint_name(&self) -> &CatalogName {
+        &self.constraint_name
+    }
+}
+
+pub(crate) fn phase_4c2b_constraint_fixture() -> Phase4c2bConstraintFixture {
+    let (temp, pager) = test_pager(4096).expect("create Phase 4C2-B constraint fixture");
+    let mut batch = pager.begin_write().expect("begin constraint fixture write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("bootstrap constraint catalog");
+    let table_id = TableId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture table ID")
+            .get(),
+    )
+    .expect("fixture table ID is nonzero");
+    let table_root = BTree::create(&mut batch, TreeKind::Table)
+        .expect("create constraint fixture table root")
+        .root();
+    let table = TableDef::new(
+        table_id,
+        SchemaVersion::new(1).expect("fixture schema version"),
+        table_root,
+        RowId::new(1).expect("fixture row ID"),
+        1,
+        CatalogName::new("T").expect("fixture table name"),
+    )
+    .expect("build constraint fixture table");
+    writer
+        .insert_table_definition(&mut batch, &table)
+        .expect("insert constraint fixture table");
+    let column_id = ColumnId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture column ID")
+            .get(),
+    )
+    .expect("fixture column ID is nonzero");
+    let column = ColumnDef::new(
+        column_id,
+        table_id,
+        0,
+        ColumnType::Int64,
+        false,
+        CatalogName::new("ID").expect("fixture column name"),
+    )
+    .expect("build constraint fixture column");
+    writer
+        .insert_column_definition(&mut batch, &column)
+        .expect("insert constraint fixture column");
+    let constraint_id = ConstraintId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture constraint ID")
+            .get(),
+    )
+    .expect("fixture constraint ID is nonzero");
+    let index_id = IndexId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture index ID")
+            .get(),
+    )
+    .expect("fixture index ID is nonzero");
+    let index_root = BTree::create(&mut batch, TreeKind::Index)
+        .expect("create constraint fixture index root")
+        .root();
+    let constraint_name = CatalogName::new("PK_T").expect("fixture constraint name");
+    let definition = ConstraintDef::new(
+        constraint_id,
+        table_id,
+        ConstraintKind::PrimaryKey,
+        1,
+        Some(index_id),
+        Box::new([]),
+        constraint_name.clone(),
+    )
+    .expect("build constraint fixture definition");
+    let index = IndexDef::new(
+        index_id,
+        table_id,
+        index_root,
+        1,
+        true,
+        IndexOwnership::Constraint(constraint_id),
+        CatalogName::new("SYS_PK_T").expect("fixture system-index name"),
+    )
+    .expect("build constraint fixture system index");
+    writer
+        .insert_constraint_bundle(
+            &mut batch,
+            &ConstraintBundle {
+                definition,
+                columns: vec![column_id].into_boxed_slice(),
+                system_index: Some((index, vec![column_id].into_boxed_slice())),
+            },
+        )
+        .expect("insert constraint fixture bundle");
+    writer
+        .finish(&mut batch)
+        .expect("finish constraint fixture");
+    batch.commit().expect("commit constraint fixture");
+    Phase4c2bConstraintFixture {
+        temp,
+        pager,
+        table_id,
+        index_id,
+        constraint_id,
+        constraint_name,
+    }
+}
+
 pub(super) fn create_pager(temp: &TempDatabase) -> Pager {
     Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create pager")
 }

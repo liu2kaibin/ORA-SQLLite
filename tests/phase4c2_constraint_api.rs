@@ -22,6 +22,13 @@ fn legacy_format2_without_feature_opens_and_plain_crud_remains_byte_compatible()
     // Breaks caught: treating the 4C2-B feature bit as a required migration,
     // or writing local-constraint records during ordinary legacy CRUD.
     let files = support::format2::legacy_catalog_fixture();
+    let legacy = support::format2::raw_catalog_capture(files.main())
+        .expect("capture featureless format-2 legacy fixture");
+    assert_eq!(
+        legacy.feature_bits & 2,
+        0,
+        "legacy fixture must not advertise INDEX_CONSTRAINT_V1"
+    );
     let database = ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default())
         .expect("open the persisted format-2 legacy fixture");
     let mut connection = database.connect().expect("connect legacy fixture");
@@ -39,6 +46,13 @@ fn legacy_format2_without_feature_opens_and_plain_crud_remains_byte_compatible()
     drop(connection);
     drop(database);
     support::checkpoint_accepted_state(&files);
+    let after_crud = support::format2::raw_catalog_capture(files.main())
+        .expect("capture legacy format-2 image after ordinary CRUD");
+    assert_eq!(
+        after_crud.feature_bits & 2,
+        0,
+        "ordinary legacy CRUD must not enable INDEX_CONSTRAINT_V1"
+    );
     assert_eq!(
         support::format2::catalog_record_families(files.main()).expect("scan legacy catalog bytes"),
         vec![0x00, 0x10, 0x11, 0x12, 0x13, 0x14]
@@ -89,17 +103,28 @@ fn old_snapshot_keeps_old_catalog_roots_and_rows_across_constraint_dml() {
             CONSTRAINT CK_T CHECK (SCORE BETWEEN 0 AND 100)
         )",
     );
-    for id in 1..=96 {
+    // Keep the held snapshot below the first root split, then cross it while
+    // its reader is pinned.  This makes the paired-root witness observable.
+    for id in 1..=32 {
         execute_sql(
             &mut seed,
             &format!("INSERT INTO T VALUES ({id}, 'before-{id:03}', {id})"),
         );
     }
     drop(seed);
+    drop(database);
+    checkpoint_file(files.main());
+    let old_capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture the checkpointed pre-DML constrained catalog");
+    let database = ora_sqllite::Database::open(
+        files.main(),
+        ora_sqllite::Options::default().with_checkpoint_wal_bytes(1),
+    )
+    .expect("reopen constrained database with an eager checkpoint threshold");
 
     let mut old_connection = database.connect().expect("connect old reader");
     let mut old = old_connection.begin_read().expect("begin old snapshot");
-    let expected_old = (1..=96)
+    let expected_old = (1..=32)
         .map(|id| {
             vec![
                 Value::Int64(id),
@@ -116,18 +141,42 @@ fn old_snapshot_keeps_old_catalog_roots_and_rows_across_constraint_dml() {
     let mut writer = database.connect().expect("connect constraint writer");
     execute_sql(
         &mut writer,
-        "UPDATE T SET EMAIL = 'after-096', SCORE = 100 WHERE ID = 96",
+        "UPDATE T SET EMAIL = 'after-032', SCORE = 100 WHERE ID = 32",
     );
-    for id in 97..=192 {
+    for id in 33..=192 {
         execute_sql(
             &mut writer,
             &format!("INSERT INTO T VALUES ({id}, 'after-{id:03}', 100)"),
         );
     }
+    let mut expected_new = expected_old.clone();
+    expected_new[31] = vec![
+        Value::Int64(32),
+        Value::Text("after-032".into()),
+        Value::Int64(100),
+    ];
+    expected_new.extend((33..=192).map(|id| {
+        vec![
+            Value::Int64(id),
+            Value::Text(format!("after-{id:03}")),
+            Value::Int64(100),
+        ]
+    }));
     assert_eq!(
-        collect(&mut writer, "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID").len(),
-        192
+        collect(&mut writer, "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID"),
+        expected_new
     );
+
+    // The threshold is evaluated before a writer begins.  This writer forces
+    // a checkpoint while the original reader is still registered, so only the
+    // old snapshot may be materialized at this point.
+    let mut checkpoint = database.connect().expect("connect checkpoint session");
+    checkpoint
+        .begin_write()
+        .expect("begin checkpoint-triggering writer")
+        .rollback()
+        .expect("finish checkpoint-triggering writer");
+    drop(checkpoint);
     assert_eq!(
         collect_read_transaction(&mut old, "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID"),
         expected_old
@@ -140,6 +189,50 @@ fn old_snapshot_keeps_old_catalog_roots_and_rows_across_constraint_dml() {
     checkpoint_file(files.main());
     let expected = support::format2::raw_catalog_capture(files.main())
         .expect("capture checkpointed constrained catalog bytes");
+    // The catalog B+Tree root may remain physically stable while its WAL LSN
+    // version changes; the captured table/index roots below must nevertheless
+    // remain internally paired with that snapshot's catalog root.
+    assert_ne!(old_capture.accepted_lsn, expected.accepted_lsn);
+    assert_ne!(
+        old_capture.tables["T"].root_page_type, expected.tables["T"].root_page_type,
+        "the table root must split between the old and new snapshots"
+    );
+    assert_eq!(old_capture.constraints, expected.constraints);
+    let old_system_roots = old_capture
+        .indexes
+        .values()
+        .map(|index| {
+            (
+                index
+                    .owner_constraint_id
+                    .expect("old captured index has a constraint owner"),
+                (index.root, index.root_page_type),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let new_system_roots = expected
+        .indexes
+        .values()
+        .map(|index| {
+            (
+                index
+                    .owner_constraint_id
+                    .expect("new captured index has a constraint owner"),
+                (index.root, index.root_page_type),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        old_system_roots.keys().collect::<Vec<_>>(),
+        new_system_roots.keys().collect::<Vec<_>>(),
+        "the constraint system-index graph must retain the same owners"
+    );
+    assert!(
+        old_system_roots
+            .iter()
+            .all(|(owner, root)| new_system_roots[owner] != *root),
+        "the constrained DML must replace every relevant system-index root"
+    );
     let table = &expected.tables["T"];
     assert_ne!(table.root.id, 0);
     assert_eq!(table.next_rowid, 193);
