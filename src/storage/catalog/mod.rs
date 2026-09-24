@@ -38,9 +38,37 @@ pub(crate) enum ConstraintBundleFaultPoint {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConstraintRemovalFaultPoint {
+    Columns,
+    TableMapping,
+    NameMapping,
+    Definition,
+}
+
+#[cfg(test)]
 thread_local! {
     static CONSTRAINT_BUNDLE_FAILURE: Cell<Option<ConstraintBundleFaultPoint>> = const { Cell::new(None) };
     static CONSTRAINT_BUNDLE_FAULT_OBSERVATIONS: RefCell<Vec<(ConstraintBundleFaultPoint, bool)>> = const { RefCell::new(Vec::new()) };
+    static CONSTRAINT_REMOVAL_FAILURE: Cell<Option<ConstraintRemovalFaultPoint>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ConstraintRemovalFaultGuard;
+
+#[cfg(test)]
+impl Drop for ConstraintRemovalFaultGuard {
+    fn drop(&mut self) {
+        CONSTRAINT_REMOVAL_FAILURE.set(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_constraint_removal_at_for_test(
+    point: ConstraintRemovalFaultPoint,
+) -> ConstraintRemovalFaultGuard {
+    CONSTRAINT_REMOVAL_FAILURE.set(Some(point));
+    ConstraintRemovalFaultGuard
 }
 
 #[cfg(test)]
@@ -72,6 +100,21 @@ fn constraint_bundle_fault_for_test(
             Err(DbError::new(
                 ErrorCode::Io,
                 "injected constraint bundle insertion failure",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(test)]
+fn constraint_removal_fault_for_test(point: ConstraintRemovalFaultPoint) -> Result<()> {
+    CONSTRAINT_REMOVAL_FAILURE.with(|failure| {
+        if failure.get() == Some(point) {
+            failure.set(None);
+            Err(DbError::new(
+                ErrorCode::Io,
+                "injected constraint record-family removal failure",
             ))
         } else {
             Ok(())
@@ -1566,17 +1609,25 @@ impl CatalogWriter {
                     &key::constraint_column_key(constraint.id(), ordinal),
                 )?;
             }
+            #[cfg(test)]
+            constraint_removal_fault_for_test(ConstraintRemovalFaultPoint::Columns)?;
             delete_required_record(
                 tree,
                 batch,
                 &key::table_constraint_key(constraint.table_id(), constraint.id()),
             )?;
+            #[cfg(test)]
+            constraint_removal_fault_for_test(ConstraintRemovalFaultPoint::TableMapping)?;
             delete_required_record(tree, batch, &key::constraint_name_key(constraint.name())?)?;
+            #[cfg(test)]
+            constraint_removal_fault_for_test(ConstraintRemovalFaultPoint::NameMapping)?;
             delete_required_record(
                 tree,
                 batch,
                 &key::constraint_definition_key(constraint.id()),
             )?;
+            #[cfg(test)]
+            constraint_removal_fault_for_test(ConstraintRemovalFaultPoint::Definition)?;
             if let Some(index) = system_index {
                 for (ordinal, _) in columns.iter().enumerate() {
                     let ordinal = u16::try_from(ordinal).map_err(|_| {

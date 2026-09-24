@@ -175,7 +175,18 @@ pub(crate) fn drop_index(batch: &mut WriteBatch, index_id: IndexId) -> Result<()
             let index = catalog.find_index_by_id(index_id).cloned().ok_or_else(|| {
                 DbError::new(ErrorCode::SchemaChanged, "prepared index no longer exists")
             })?;
-            require_explicit_owner(&index)?;
+            let owner_name = if let IndexOwnership::Constraint(owner_id) = index.ownership() {
+                let owner = catalog.find_constraint_by_id(owner_id).ok_or_else(|| {
+                    DbError::new(
+                        ErrorCode::Corruption,
+                        "constraint-owned index references a missing owner constraint",
+                    )
+                })?;
+                Some(owner.name())
+            } else {
+                None
+            };
+            require_explicit_owner(&index, owner_name)?;
             Relation::open(&catalog, index.table_id())?;
             let columns = catalog
                 .columns_for_index(index_id)
@@ -202,11 +213,24 @@ pub(crate) fn drop_index(batch: &mut WriteBatch, index_id: IndexId) -> Result<()
     }
 }
 
-pub(super) fn require_explicit_owner(index: &IndexDef) -> Result<()> {
+pub(super) fn require_explicit_owner(
+    index: &IndexDef,
+    owner_name: Option<&CatalogName>,
+) -> Result<()> {
     if index.ownership() != IndexOwnership::Explicit {
+        let owner_name = owner_name.ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Corruption,
+                "constraint-owned index is missing its owner name",
+            )
+        })?;
         return Err(DbError::new(
             ErrorCode::Constraint,
-            "constraint-owned indexes cannot be dropped independently",
+            format!(
+                "index {} is owned by constraint {} and cannot be dropped independently",
+                index.name().as_str(),
+                owner_name.as_str()
+            ),
         ));
     }
     Ok(())
@@ -623,7 +647,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            super::require_explicit_owner(&owned).unwrap_err().code(),
+            super::require_explicit_owner(&owned, Some(owned.name()))
+                .unwrap_err()
+                .code(),
             ErrorCode::Constraint
         );
         before.assert_matches_batch_for_test(&batch);

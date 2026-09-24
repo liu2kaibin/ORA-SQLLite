@@ -125,10 +125,40 @@ pub(crate) enum ConstrainedCreateFaultPoint {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConstrainedDropFaultPoint {
+    ExplicitIndexRelease,
+    SystemIndexRelease,
+    ConstraintRemoval,
+    TableRelease,
+    CatalogFinished,
+}
+
+#[cfg(test)]
 thread_local! {
     static NEXT_AFTER_FAILURE: Cell<Option<(usize, ErrorCode)>> = const { Cell::new(None) };
     static VALUE_VALIDATION_LIMITS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static CONSTRAINED_CREATE_FAILURE: Cell<Option<ConstrainedCreateFaultPoint>> = const { Cell::new(None) };
+    static CONSTRAINED_DROP_FAILURE: Cell<Option<(ConstrainedDropFaultPoint, usize)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ConstrainedDropFaultGuard;
+
+#[cfg(test)]
+impl Drop for ConstrainedDropFaultGuard {
+    fn drop(&mut self) {
+        CONSTRAINED_DROP_FAILURE.set(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_constrained_drop_at_for_test(
+    point: ConstrainedDropFaultPoint,
+    successful_occurrences: usize,
+) -> ConstrainedDropFaultGuard {
+    CONSTRAINED_DROP_FAILURE.set(Some((point, successful_occurrences)));
+    ConstrainedDropFaultGuard
 }
 
 #[cfg(test)]
@@ -184,6 +214,24 @@ fn constrained_create_fault_for_test(point: ConstrainedCreateFaultPoint) -> Resu
         } else {
             Ok(())
         }
+    })
+}
+
+#[cfg(test)]
+fn constrained_drop_fault_for_test(point: ConstrainedDropFaultPoint) -> Result<()> {
+    CONSTRAINED_DROP_FAILURE.with(|failure| match failure.get() {
+        Some((armed, 0)) if armed == point => {
+            failure.set(None);
+            Err(DbError::new(
+                ErrorCode::Io,
+                "injected constrained DROP late failure",
+            ))
+        }
+        Some((armed, remaining)) if armed == point => {
+            failure.set(Some((armed, remaining - 1)));
+            Ok(())
+        }
+        _ => Ok(()),
     })
 }
 
@@ -1283,33 +1331,108 @@ fn build_constraint_bundle(
 pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result<()> {
     let checkpoint = batch.statement_checkpoint()?;
     let result = (|| {
-        let (relation, indexes) = {
+        let (relation, explicit_indexes, constraints) = {
             let catalog = batch.catalog_reader()?;
             let relation = Relation::open(&catalog, table_id)?;
             let indexes = catalog
                 .indexes_for_table(table_id)
                 .map(|index| {
-                    super::index::require_explicit_owner(index)?;
                     let columns = catalog
                         .columns_for_index(index.id())
                         .map(ColumnDef::id)
                         .collect::<Vec<_>>();
-                    Ok((index.clone(), columns))
+                    (index.clone(), columns)
                 })
-                .collect::<Result<Vec<_>>>()?;
-            // Prove every owned tree and live/free disjointness before any
-            // release. No foreign-key/constraint behavior is introduced here.
+                .collect::<Vec<_>>();
+            let constraints = catalog
+                .constraints_for_table(table_id)
+                .map(|constraint| {
+                    let columns = catalog
+                        .columns_for_constraint(constraint.id())
+                        .map(ColumnDef::id)
+                        .collect::<Vec<_>>();
+                    (constraint.clone(), columns)
+                })
+                .collect::<Vec<_>>();
+            // Prove every catalog relationship, owned tree, and live/free
+            // disjointness before deleting a record or staging a release.
             catalog.validate_deep_batch(batch)?;
-            (relation, indexes)
+            let mut system_owners = BTreeSet::new();
+            let mut explicit_indexes = Vec::new();
+            for (index, columns) in indexes {
+                match index.ownership() {
+                    IndexOwnership::Explicit => explicit_indexes.push((index, columns)),
+                    IndexOwnership::Constraint(owner_id) => {
+                        if !system_owners.insert(owner_id) {
+                            return Err(DbError::new(
+                                ErrorCode::Corruption,
+                                "constraint owns more than one system index",
+                            ));
+                        }
+                        let owner = constraints
+                            .iter()
+                            .find(|(constraint, _)| constraint.id() == owner_id)
+                            .ok_or_else(|| {
+                                DbError::new(
+                                    ErrorCode::Corruption,
+                                    "system index owner is not a local table constraint",
+                                )
+                            })?;
+                        if !matches!(
+                            owner.0.kind(),
+                            ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                        ) || owner.0.index_id() != Some(index.id())
+                        {
+                            return Err(DbError::new(
+                                ErrorCode::Corruption,
+                                "system index is not paired with its key constraint",
+                            ));
+                        }
+                    }
+                }
+            }
+            for (constraint, _) in &constraints {
+                if matches!(
+                    constraint.kind(),
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                ) && !system_owners.contains(&constraint.id())
+                {
+                    return Err(DbError::new(
+                        ErrorCode::Corruption,
+                        "key constraint is not paired with exactly one system index",
+                    ));
+                }
+            }
+            (relation, explicit_indexes, constraints)
         };
         let mut catalog = CatalogWriter::bootstrap(batch)?;
-        for (index, columns) in indexes {
+        for (index, columns) in explicit_indexes {
             catalog.remove_index(batch, &index, &columns)?;
             #[cfg(test)]
-            super::index::after_index_release_for_test()?;
+            {
+                super::index::after_index_release_for_test()?;
+                constrained_drop_fault_for_test(ConstrainedDropFaultPoint::ExplicitIndexRelease)?;
+            }
+        }
+        for (constraint, columns) in constraints {
+            #[cfg(test)]
+            let releases_system_index = constraint.index_id().is_some();
+            catalog.remove_constraint(batch, &constraint, &columns)?;
+            #[cfg(test)]
+            if releases_system_index {
+                super::index::after_index_release_for_test()?;
+                constrained_drop_fault_for_test(ConstrainedDropFaultPoint::SystemIndexRelease)?;
+            }
+            #[cfg(test)]
+            constrained_drop_fault_for_test(ConstrainedDropFaultPoint::ConstraintRemoval)?;
         }
         catalog.remove_relation(batch, &relation.table, &relation.columns)?;
-        catalog.finish(batch)
+        #[cfg(test)]
+        constrained_drop_fault_for_test(ConstrainedDropFaultPoint::TableRelease)?;
+        catalog.finish(batch)?;
+        #[cfg(test)]
+        constrained_drop_fault_for_test(ConstrainedDropFaultPoint::CatalogFinished)?;
+        Ok(())
     })();
     match result {
         Ok(()) => batch.finish_statement(checkpoint),
@@ -1323,16 +1446,18 @@ pub(crate) fn drop_relation(batch: &mut WriteBatch, table_id: TableId) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnSpec, ConstrainedCreateFaultPoint, ConstrainedTableSpec, ConstrainedTableWrite,
-        Relation, TableConstraintSpec, TableSpec, TableWrite, create_constrained_relation,
-        create_relation, drop_relation, fail_constrained_create_at_for_test,
+        ColumnSpec, ConstrainedCreateFaultPoint, ConstrainedDropFaultPoint, ConstrainedTableSpec,
+        ConstrainedTableWrite, Relation, TableConstraintSpec, TableSpec, TableWrite,
+        create_constrained_relation, create_relation, drop_relation,
+        fail_constrained_create_at_for_test, fail_constrained_drop_at_for_test,
     };
     use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
         Pager,
         btree::{BTree, TreeKind},
         catalog::{
-            CatalogReader, CatalogWriter, ConstraintBundleFaultPoint,
+            CatalogReader, CatalogWriter, ConstraintBundleFaultPoint, ConstraintRemovalFaultPoint,
+            fail_constraint_removal_at_for_test,
             take_constraint_bundle_fault_observations_for_test,
             types::{
                 CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintKind, IndexOwnership,
@@ -1393,6 +1518,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn drop_constrained_table_releases_all_local_roots_and_records() {
+        // Production break caught: treating every constraint-owned index like
+        // an independently dropped index rejects the table drop and leaves the
+        // complete local constraint graph live.
+        use crate::storage::validate::{validate_freelist, validate_tree};
+
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+        let table = create_constrained_relation(&mut batch, &constrained_spec()).unwrap();
+        let explicit_columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(table)
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let explicit_index = create_index(
+            &mut batch,
+            &IndexSpec::new(
+                CatalogName::new("IX_CONSTRAINED_ID").unwrap(),
+                table,
+                explicit_columns,
+                false,
+            )
+            .unwrap(),
+            u64::MAX,
+        )
+        .unwrap();
+        let (table_root, index_records, constraint_records, next_object_id) = {
+            let catalog = batch.catalog_reader().unwrap();
+            let table_definition = catalog.find_table_by_id(table).unwrap();
+            (
+                table_definition.root(),
+                catalog
+                    .indexes_for_table(table)
+                    .map(|index| (index.id(), index.root(), index.name().clone()))
+                    .collect::<Vec<_>>(),
+                catalog
+                    .constraints_for_table(table)
+                    .map(|constraint| (constraint.id(), constraint.name().clone()))
+                    .collect::<Vec<_>>(),
+                catalog.next_object_id(),
+            )
+        };
+        assert!(index_records.iter().any(|(id, _, _)| *id == explicit_index));
+        let mut released_pages =
+            validate_tree(&mut batch, &BTree::from_root(TreeKind::Table, table_root))
+                .unwrap()
+                .all_live_pages();
+        for (_, root, _) in &index_records {
+            released_pages.extend(
+                validate_tree(&mut batch, &BTree::from_root(TreeKind::Index, *root))
+                    .unwrap()
+                    .all_live_pages(),
+            );
+        }
+        batch.commit().unwrap();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        drop_relation(&mut batch, table).unwrap();
+        batch.commit().unwrap();
+
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        catalog.validate_deep(&mut snapshot).unwrap();
+        assert!(catalog.find_table_by_id(table).is_none());
+        assert!(catalog.columns_for_table(table).next().is_none());
+        assert!(catalog.indexes_for_table(table).next().is_none());
+        assert!(catalog.constraints_for_table(table).next().is_none());
+        for (id, _, name) in index_records {
+            assert!(catalog.find_index_by_id(id).is_none());
+            assert!(catalog.find_index_by_name(&name).is_none());
+            assert!(catalog.columns_for_index(id).next().is_none());
+        }
+        for (id, name) in constraint_records {
+            assert!(catalog.find_constraint_by_id(id).is_none());
+            assert!(catalog.find_constraint_by_name(&name).is_none());
+            assert!(catalog.columns_for_constraint(id).next().is_none());
+        }
+        assert_eq!(catalog.next_object_id(), next_object_id);
+        assert_ne!(snapshot.feature_bits() & INDEX_CONSTRAINT_V1, 0);
+        let free = validate_freelist(&mut snapshot, &Default::default()).unwrap();
+        assert!(free.is_superset(&released_pages));
+    }
+
+    #[test]
+    fn every_constrained_drop_failure_restores_records_roots_and_release_queue() {
+        // Production break caught: a failure after any dependency teardown
+        // stage must restore the exact statement candidate, including staged
+        // releases and the catalog root selected by a completed writer.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut setup = pager.try_begin_write().unwrap();
+        let table = create_constrained_relation(&mut setup, &constrained_spec()).unwrap();
+        let explicit_columns = setup
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(table)
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        create_index(
+            &mut setup,
+            &IndexSpec::new(
+                CatalogName::new("IX_DROP_FAULT").unwrap(),
+                table,
+                explicit_columns,
+                false,
+            )
+            .unwrap(),
+            u64::MAX,
+        )
+        .unwrap();
+        setup.commit().unwrap();
+
+        let mut batch = pager.try_begin_write().unwrap();
+        let points = [
+            (ConstrainedDropFaultPoint::ExplicitIndexRelease, 0),
+            (ConstrainedDropFaultPoint::SystemIndexRelease, 0),
+            (ConstrainedDropFaultPoint::SystemIndexRelease, 1),
+            (ConstrainedDropFaultPoint::ConstraintRemoval, 0),
+            (ConstrainedDropFaultPoint::ConstraintRemoval, 1),
+            (ConstrainedDropFaultPoint::ConstraintRemoval, 2),
+            (ConstrainedDropFaultPoint::ConstraintRemoval, 3),
+            (ConstrainedDropFaultPoint::TableRelease, 0),
+            (ConstrainedDropFaultPoint::CatalogFinished, 0),
+        ];
+        for (point, occurrence) in points {
+            let before = batch.checkpoint_mutation().unwrap();
+            let _fault = fail_constrained_drop_at_for_test(point, occurrence);
+            let error = drop_relation(&mut batch, table).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Io, "{point:?}[{occurrence}]");
+            before.assert_matches_batch_for_test(&batch);
+            let catalog = batch.catalog_reader().unwrap();
+            assert_eq!(catalog.indexes_for_table(table).count(), 3);
+            assert_eq!(catalog.constraints_for_table(table).count(), 4);
+            catalog.validate_deep_batch(&mut batch).unwrap();
+        }
+        for point in [
+            ConstraintRemovalFaultPoint::Columns,
+            ConstraintRemovalFaultPoint::TableMapping,
+            ConstraintRemovalFaultPoint::NameMapping,
+            ConstraintRemovalFaultPoint::Definition,
+        ] {
+            let before = batch.checkpoint_mutation().unwrap();
+            let _fault = fail_constraint_removal_at_for_test(point);
+            let error = drop_relation(&mut batch, table).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Io, "{point:?}");
+            before.assert_matches_batch_for_test(&batch);
+            let catalog = batch.catalog_reader().unwrap();
+            assert_eq!(catalog.indexes_for_table(table).count(), 3);
+            assert_eq!(catalog.constraints_for_table(table).count(), 4);
+            catalog.validate_deep_batch(&mut batch).unwrap();
+        }
+        batch.rollback().unwrap();
     }
 
     #[test]

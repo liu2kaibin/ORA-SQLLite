@@ -991,6 +991,60 @@ mod tests {
     }
 
     #[test]
+    fn drop_system_index_by_name_is_rejected_without_mutation() {
+        // Production break caught: an independently dropped system index must
+        // identify its persisted owner constraint without opening a mutation.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+        let statement = prepare(&pager, "DROP INDEX PK_KEYED");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+
+        crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+            let error = execute_validated_write_plan(batch, validated).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Constraint);
+            assert!(error.to_string().contains("PK_KEYED"), "{error}");
+        });
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn prepared_system_index_drop_cannot_rebind_to_a_recreated_constraint() {
+        // Production break caught: resolving DROP INDEX by its reused name at
+        // execution time could target a new constraint-owned object.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+        let stale = prepare(&pager, "DROP INDEX PK_KEYED");
+        execute_committed(&pager, "DROP TABLE KEYED");
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+
+        let mut batch = pager.begin_write().unwrap();
+        crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+            let error =
+                match validate_write_execution(batch, &stale, Parameters::none(), 64 * 1024 * 1024)
+                {
+                    Ok(_) => panic!("stale system-index DROP unexpectedly rebound"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.code(), ErrorCode::SchemaChanged);
+        });
+        batch.rollback().unwrap();
+    }
+
+    #[test]
     fn insert_prevalidates_nullability_and_row_size_before_any_write() {
         // Production break caught: opening TableWrite before complete-row
         // validation can alter the catalog gate/root/ROWID on an ordinary error.
