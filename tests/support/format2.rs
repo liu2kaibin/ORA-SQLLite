@@ -7,10 +7,12 @@
 //! entry is accepted.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
 };
+
+use ora_sqllite::{Database, Options, Parameters};
 
 use super::TestFiles;
 
@@ -28,6 +30,162 @@ pub struct IndexVerification {
     pub index_page_ids: Vec<u64>,
 }
 
+/// A raw page identity captured by the test-only format-2 witness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawPageRef {
+    pub id: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawColumn {
+    pub id: u64,
+    pub ordinal: u16,
+    pub nullable: bool,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawTable {
+    pub id: u64,
+    pub root: RawPageRef,
+    pub next_rowid: u64,
+    pub columns: Vec<RawColumn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawIndex {
+    pub id: u64,
+    pub table_id: u64,
+    pub root: RawPageRef,
+    pub unique: bool,
+    pub owner_constraint_id: Option<u64>,
+    pub columns: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawConstraint {
+    pub id: u64,
+    pub table_id: u64,
+    pub kind: u8,
+    pub index_id: Option<u64>,
+    pub columns: Vec<u64>,
+    pub check_program_len: u32,
+    pub check_program_version: Option<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawFreelistTrunk {
+    pub reference: RawPageRef,
+    pub leaves: Vec<u64>,
+}
+
+/// A direct byte-level catalog snapshot.  This deliberately has no dependency
+/// on `ConstraintDef` or `CheckProgram`: all fields below are decoded from
+/// record envelopes and payload offsets owned by this test-only witness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawCatalogCapture {
+    pub feature_bits: u64,
+    pub catalog_root: RawPageRef,
+    /// The accepted LSN once the caller has checkpointed the target snapshot.
+    pub accepted_lsn: u64,
+    pub next_object_id: u64,
+    pub page_count: u64,
+    pub freelist: Vec<RawFreelistTrunk>,
+    pub tables: BTreeMap<String, RawTable>,
+    pub indexes: BTreeMap<String, RawIndex>,
+    pub constraints: BTreeMap<String, RawConstraint>,
+    pub table_constraints: BTreeMap<u64, Vec<u64>>,
+}
+
+/// Creates a committed format-2 catalog that predates the local-constraint
+/// extension.  The fixture uses only base catalog records and checkpoints them
+/// so byte-level witnesses never need a production catalog decoder or WAL.
+pub fn legacy_catalog_fixture() -> TestFiles {
+    let files = TestFiles::new("format2-legacy-catalog");
+    let database =
+        Database::create(files.main(), Options::default()).expect("create legacy format-2 fixture");
+    let mut connection = database.connect().expect("connect legacy fixture");
+    let create = connection
+        .prepare("CREATE TABLE LEGACY (ID INT64, NOTE TEXT)")
+        .expect("prepare legacy table");
+    connection
+        .execute(&create, Parameters::none())
+        .expect("create legacy table");
+    let insert = connection
+        .prepare("INSERT INTO LEGACY VALUES (1, 'before-open')")
+        .expect("prepare legacy seed row");
+    connection
+        .execute(&insert, Parameters::none())
+        .expect("insert legacy seed row");
+    drop(connection);
+    drop(database);
+    super::checkpoint_accepted_state(&files);
+    files
+}
+
+/// Reads the accepted format-2 catalog tree without invoking production
+/// catalog-record decoders.  The sorted, unique families are sufficient to
+/// prove a legacy file remained a base-catalog image after ordinary CRUD.
+pub fn catalog_record_families(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read main file: {error}"))?;
+    let header = select_header(&bytes)?;
+    let disk = Disk {
+        bytes: &bytes,
+        header,
+    };
+    let catalog = disk.walk_tree(
+        PageRef {
+            id: disk.header.catalog_root,
+            generation: disk.page_generation(disk.header.catalog_root)?,
+        },
+        TreeKind::Table,
+        false,
+    )?;
+    let mut families = BTreeSet::new();
+    for (key, _) in catalog.entries {
+        families.insert(*key.first().ok_or("catalog contains an empty key")?);
+    }
+    Ok(families.into_iter().collect())
+}
+
+/// Captures a checkpointed format-2 catalog directly from the main file.
+/// Callers intentionally checkpoint first: this witness does not reuse the
+/// production WAL, catalog, constraint, or check-program decoders.
+pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read main file: {error}"))?;
+    let header = select_header(&bytes)?;
+    let disk = Disk {
+        bytes: &bytes,
+        header,
+    };
+    let catalog_root = RawPageRef {
+        id: disk.header.catalog_root,
+        generation: disk.page_generation(disk.header.catalog_root)?,
+    };
+    let catalog = disk.walk_tree(
+        PageRef {
+            id: catalog_root.id,
+            generation: catalog_root.generation,
+        },
+        TreeKind::Table,
+        false,
+    )?;
+    let parsed = parse_raw_catalog(&catalog.entries)?;
+    Ok(RawCatalogCapture {
+        feature_bits: disk.header.features,
+        catalog_root,
+        accepted_lsn: disk.header.checkpoint_lsn,
+        next_object_id: parsed.next_object_id,
+        page_count: disk.header.page_count,
+        freelist: raw_freelist(&disk)?,
+        tables: parsed.tables,
+        indexes: parsed.indexes,
+        constraints: parsed.constraints,
+        table_constraints: parsed.table_constraints,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PageRef {
     id: u64,
@@ -38,8 +196,10 @@ struct PageRef {
 struct Header {
     page_size: usize,
     publish_sequence: u64,
+    checkpoint_lsn: u64,
     page_count: u64,
     catalog_root: u64,
+    freelist_root: u64,
     features: u64,
 }
 
@@ -666,6 +826,468 @@ fn explicit_index_definitions(
     Ok(result)
 }
 
+struct RawCatalogParts {
+    next_object_id: u64,
+    tables: BTreeMap<String, RawTable>,
+    indexes: BTreeMap<String, RawIndex>,
+    constraints: BTreeMap<String, RawConstraint>,
+    table_constraints: BTreeMap<u64, Vec<u64>>,
+}
+
+#[derive(Clone)]
+struct RawTableDefinition {
+    id: u64,
+    root: RawPageRef,
+    next_rowid: u64,
+    name: String,
+}
+
+#[derive(Clone)]
+struct RawIndexDefinition {
+    id: u64,
+    table_id: u64,
+    root: RawPageRef,
+    unique: bool,
+    owner_constraint_id: Option<u64>,
+    name: String,
+}
+
+#[derive(Clone)]
+struct RawConstraintDefinition {
+    id: u64,
+    table_id: u64,
+    kind: u8,
+    index_id: Option<u64>,
+    check_program_len: u32,
+    check_program_version: Option<u8>,
+    name: String,
+}
+
+fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, String> {
+    let mut next_object_id = None;
+    let mut table_definitions = BTreeMap::new();
+    let mut column_definitions = BTreeMap::new();
+    let mut table_columns = BTreeMap::<u64, BTreeMap<u16, u64>>::new();
+    let mut index_definitions = BTreeMap::new();
+    let mut index_columns = BTreeMap::<u64, BTreeMap<u16, u64>>::new();
+    let mut constraint_definitions = BTreeMap::new();
+    let mut constraint_names = BTreeMap::new();
+    let mut constraint_columns = BTreeMap::<u64, BTreeMap<u16, u64>>::new();
+    let mut table_constraints = BTreeMap::<u64, Vec<u64>>::new();
+
+    for (key, value) in entries {
+        let family = *key.first().ok_or("catalog contains an empty key")?;
+        match family {
+            0x00 => {
+                if key.len() != 1 {
+                    return Err("raw catalog meta key is malformed".into());
+                }
+                let payload = catalog_payload(value, family, "catalog meta")?;
+                if payload.len() != 12 || read_u16(payload, 0)? != 1 || read_u16(payload, 2)? != 0 {
+                    return Err("raw catalog meta payload is malformed".into());
+                }
+                if next_object_id.replace(read_u64(payload, 4)?).is_some() {
+                    return Err("raw catalog has duplicate meta records".into());
+                }
+            }
+            0x11 => {
+                let id = raw_id_key(key, family, "table definition")?;
+                let payload = catalog_payload(value, family, "table definition")?;
+                if payload.len() < 44 || read_u64(payload, 0)? != id {
+                    return Err("raw table definition identity is malformed".into());
+                }
+                let definition = RawTableDefinition {
+                    id,
+                    root: RawPageRef {
+                        id: read_u64(payload, 16)?,
+                        generation: read_u64(payload, 24)?,
+                    },
+                    next_rowid: read_u64(payload, 32)?,
+                    name: catalog_name(payload, 42, 44, "table")?,
+                };
+                if table_definitions.insert(id, definition).is_some() {
+                    return Err("raw catalog has duplicate table definitions".into());
+                }
+            }
+            0x13 => {
+                if key.len() != 11 {
+                    return Err("raw column ordinal key is malformed".into());
+                }
+                let table_id = read_be_u64(key, 1)?;
+                let ordinal = read_be_u16(key, 9)?;
+                let column_id = raw_mapping_id(value, family, "column ordinal")?;
+                if table_columns
+                    .entry(table_id)
+                    .or_default()
+                    .insert(ordinal, column_id)
+                    .is_some()
+                {
+                    return Err("raw catalog has duplicate column ordinals".into());
+                }
+            }
+            0x14 => {
+                let id = raw_id_key(key, family, "column definition")?;
+                let payload = catalog_payload(value, family, "column definition")?;
+                if payload.len() < 24 || read_u64(payload, 0)? != id || read_u16(payload, 22)? != 0
+                {
+                    return Err("raw column definition is malformed".into());
+                }
+                let column = RawColumn {
+                    id,
+                    ordinal: read_u16(payload, 16)?,
+                    nullable: payload[19] & 1 != 0,
+                    name: catalog_name(payload, 20, 24, "column")?,
+                };
+                if column_definitions
+                    .insert(id, (read_u64(payload, 8)?, column))
+                    .is_some()
+                {
+                    return Err("raw catalog has duplicate column definitions".into());
+                }
+            }
+            0x21 => {
+                let id = raw_id_key(key, family, "index definition")?;
+                let payload = catalog_payload(value, family, "index definition")?;
+                if payload.len() < 48 || read_u64(payload, 0)? != id || read_u16(payload, 36)? != 0
+                {
+                    return Err("raw index definition is malformed".into());
+                }
+                let owner_constraint_id = match (payload[35], read_u64(payload, 38)?) {
+                    (0, 0) => None,
+                    (1, id) if id != 0 => Some(id),
+                    _ => return Err("raw index owner is malformed".into()),
+                };
+                let definition = RawIndexDefinition {
+                    id,
+                    table_id: read_u64(payload, 8)?,
+                    root: RawPageRef {
+                        id: read_u64(payload, 16)?,
+                        generation: read_u64(payload, 24)?,
+                    },
+                    unique: match payload[34] {
+                        0 => false,
+                        1 => true,
+                        _ => return Err("raw index uniqueness flag is malformed".into()),
+                    },
+                    owner_constraint_id,
+                    name: catalog_name(payload, 46, 48, "index")?,
+                };
+                if index_definitions.insert(id, definition).is_some() {
+                    return Err("raw catalog has duplicate index definitions".into());
+                }
+            }
+            0x23 => {
+                if key.len() != 11 {
+                    return Err("raw index-column key is malformed".into());
+                }
+                let index_id = read_be_u64(key, 1)?;
+                let ordinal = read_be_u16(key, 9)?;
+                let column_id = raw_mapping_id(value, family, "index-column")?;
+                if index_columns
+                    .entry(index_id)
+                    .or_default()
+                    .insert(ordinal, column_id)
+                    .is_some()
+                {
+                    return Err("raw catalog has duplicate index columns".into());
+                }
+            }
+            0x30 => {
+                let name = raw_global_name_key(key, family, "constraint name")?;
+                let id = raw_mapping_id(value, family, "constraint name")?;
+                if constraint_names.insert(name, id).is_some() {
+                    return Err("raw catalog has duplicate constraint names".into());
+                }
+            }
+            0x31 => {
+                let id = raw_id_key(key, family, "constraint definition")?;
+                let payload = catalog_payload(value, family, "constraint definition")?;
+                if payload.len() < 56 || read_u64(payload, 0)? != id || payload[17] != 0 {
+                    return Err("raw constraint definition is malformed".into());
+                }
+                let check_program_len = read_u32(payload, 48)?;
+                let program_start = 56_usize;
+                let program_end = program_start
+                    .checked_add(
+                        usize::try_from(check_program_len)
+                            .map_err(|_| "raw check program length exceeds this platform")?,
+                    )
+                    .ok_or("raw check program length overflows")?;
+                let check_program = payload
+                    .get(program_start..program_end)
+                    .ok_or("raw check program is truncated")?;
+                let definition = RawConstraintDefinition {
+                    id,
+                    table_id: read_u64(payload, 8)?,
+                    kind: payload[16],
+                    index_id: match read_u64(payload, 20)? {
+                        0 => None,
+                        id => Some(id),
+                    },
+                    check_program_len,
+                    check_program_version: check_program.first().copied(),
+                    name: catalog_name(payload, 52, program_end, "constraint")?,
+                };
+                if constraint_definitions.insert(id, definition).is_some() {
+                    return Err("raw catalog has duplicate constraint definitions".into());
+                }
+            }
+            0x32 => {
+                if key.len() != 17 {
+                    return Err("raw table-constraint key is malformed".into());
+                }
+                let table_id = read_be_u64(key, 1)?;
+                let constraint_id = read_be_u64(key, 9)?;
+                if raw_mapping_id(value, family, "table-constraint")? != constraint_id {
+                    return Err("raw table-constraint mapping disagrees with its key".into());
+                }
+                table_constraints
+                    .entry(table_id)
+                    .or_default()
+                    .push(constraint_id);
+            }
+            0x33 => {
+                if key.len() != 11 {
+                    return Err("raw constraint-column key is malformed".into());
+                }
+                let constraint_id = read_be_u64(key, 1)?;
+                let ordinal = read_be_u16(key, 9)?;
+                let column_id = raw_mapping_id(value, family, "constraint-column")?;
+                if constraint_columns
+                    .entry(constraint_id)
+                    .or_default()
+                    .insert(ordinal, column_id)
+                    .is_some()
+                {
+                    return Err("raw catalog has duplicate constraint columns".into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let next_object_id = next_object_id.ok_or("raw catalog lacks its meta record")?;
+    let mut tables = BTreeMap::new();
+    for definition in table_definitions.into_values() {
+        let columns = raw_ordered_columns(
+            table_columns.remove(&definition.id).unwrap_or_default(),
+            &column_definitions,
+            definition.id,
+            "table",
+        )?;
+        tables.insert(
+            definition.name,
+            RawTable {
+                id: definition.id,
+                root: definition.root,
+                next_rowid: definition.next_rowid,
+                columns,
+            },
+        );
+    }
+    let mut indexes = BTreeMap::new();
+    for definition in index_definitions.into_values() {
+        let columns = raw_ordered_ids(
+            index_columns.remove(&definition.id).unwrap_or_default(),
+            "index",
+        )?;
+        indexes.insert(
+            definition.name,
+            RawIndex {
+                id: definition.id,
+                table_id: definition.table_id,
+                root: definition.root,
+                unique: definition.unique,
+                owner_constraint_id: definition.owner_constraint_id,
+                columns,
+            },
+        );
+    }
+    let mut constraints = BTreeMap::new();
+    for definition in constraint_definitions.into_values() {
+        let name_mapping = constraint_names
+            .get(&definition.name)
+            .copied()
+            .ok_or("raw constraint definition lacks a name mapping")?;
+        if name_mapping != definition.id {
+            return Err("raw constraint name mapping disagrees with definition".into());
+        }
+        constraints.insert(
+            definition.name,
+            RawConstraint {
+                id: definition.id,
+                table_id: definition.table_id,
+                kind: definition.kind,
+                index_id: definition.index_id,
+                columns: raw_ordered_ids(
+                    constraint_columns
+                        .remove(&definition.id)
+                        .unwrap_or_default(),
+                    "constraint",
+                )?,
+                check_program_len: definition.check_program_len,
+                check_program_version: definition.check_program_version,
+            },
+        );
+    }
+    for ids in table_constraints.values_mut() {
+        ids.sort_unstable();
+    }
+    Ok(RawCatalogParts {
+        next_object_id,
+        tables,
+        indexes,
+        constraints,
+        table_constraints,
+    })
+}
+
+fn raw_ordered_columns(
+    ids: BTreeMap<u16, u64>,
+    definitions: &BTreeMap<u64, (u64, RawColumn)>,
+    table_id: u64,
+    label: &str,
+) -> Result<Vec<RawColumn>, String> {
+    let mut result = Vec::with_capacity(ids.len());
+    for (expected, (ordinal, id)) in ids.into_iter().enumerate() {
+        if usize::from(ordinal) != expected {
+            return Err(format!("raw {label} columns are not contiguous"));
+        }
+        let (owner, column) = definitions
+            .get(&id)
+            .ok_or_else(|| format!("raw {label} column is undefined"))?;
+        if *owner != table_id || column.ordinal != ordinal {
+            return Err(format!(
+                "raw {label} column owner or ordinal is inconsistent"
+            ));
+        }
+        result.push(column.clone());
+    }
+    Ok(result)
+}
+
+fn raw_ordered_ids(ids: BTreeMap<u16, u64>, label: &str) -> Result<Vec<u64>, String> {
+    let mut result = Vec::with_capacity(ids.len());
+    for (expected, (ordinal, id)) in ids.into_iter().enumerate() {
+        if usize::from(ordinal) != expected {
+            return Err(format!("raw {label} columns are not contiguous"));
+        }
+        result.push(id);
+    }
+    Ok(result)
+}
+
+fn raw_id_key(key: &[u8], family: u8, label: &str) -> Result<u64, String> {
+    if key.len() != 9 || key.first() != Some(&family) {
+        return Err(format!("raw {label} key is malformed"));
+    }
+    read_be_u64(key, 1)
+}
+
+fn raw_global_name_key(key: &[u8], family: u8, label: &str) -> Result<String, String> {
+    if key.first() != Some(&family) || key.len() < 3 {
+        return Err(format!("raw {label} key is malformed"));
+    }
+    let length = usize::from(read_be_u16(key, 1)?);
+    let end = 3_usize
+        .checked_add(length)
+        .ok_or_else(|| format!("raw {label} name length overflows"))?;
+    if end != key.len() {
+        return Err(format!("raw {label} key length is malformed"));
+    }
+    std::str::from_utf8(&key[3..end])
+        .map(str::to_owned)
+        .map_err(|_| format!("raw {label} name is not UTF-8"))
+}
+
+fn raw_mapping_id(value: &[u8], family: u8, label: &str) -> Result<u64, String> {
+    let payload = catalog_payload(value, family, label)?;
+    if payload.len() != 8 {
+        return Err(format!("raw {label} payload is malformed"));
+    }
+    read_u64(payload, 0)
+}
+
+fn read_be_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let end = offset.checked_add(2).ok_or("integer offset overflow")?;
+    Ok(u16::from_be_bytes(
+        bytes
+            .get(offset..end)
+            .ok_or("truncated disk value")?
+            .try_into()
+            .map_err(|_| "truncated disk value")?,
+    ))
+}
+
+fn read_be_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    let end = offset.checked_add(8).ok_or("integer offset overflow")?;
+    Ok(u64::from_be_bytes(
+        bytes
+            .get(offset..end)
+            .ok_or("truncated disk value")?
+            .try_into()
+            .map_err(|_| "truncated disk value")?,
+    ))
+}
+
+fn raw_freelist(disk: &Disk<'_>) -> Result<Vec<RawFreelistTrunk>, String> {
+    let mut trunks = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = (disk.header.freelist_root != 0).then_some((disk.header.freelist_root, None));
+    while let Some((page_id, expected_generation)) = current {
+        if page_id >= disk.header.page_count || !seen.insert(page_id) {
+            return Err("raw freelist root is outside the accepted page range or cyclic".into());
+        }
+        let start = ordinary_page_offset(page_id, disk.header.page_size)?;
+        let end = start
+            .checked_add(disk.header.page_size)
+            .ok_or("raw freelist page extent overflows")?;
+        let bytes = disk
+            .bytes
+            .get(start..end)
+            .ok_or("raw freelist page lies outside accepted file")?;
+        verify_page_checksum(bytes)?;
+        if byte(bytes, 0)? != 6 || read_u64(bytes, 4)? != page_id {
+            return Err("raw freelist page identity or kind is invalid".into());
+        }
+        let generation = read_u64(bytes, 12)?;
+        if generation == 0 || expected_generation.is_some_and(|expected| expected != generation) {
+            return Err("raw freelist generation is invalid".into());
+        }
+        let next_id = read_u64(bytes, 48)?;
+        let next_generation = read_u64(bytes, 56)?;
+        let leaf_count = usize::try_from(read_u32(bytes, 64)?)
+            .map_err(|_| "raw freelist leaf count exceeds this platform")?;
+        if read_u32(bytes, 68)? != 0 || leaf_count > (bytes.len() - 72) / 8 {
+            return Err("raw freelist body is malformed".into());
+        }
+        let mut leaves = Vec::with_capacity(leaf_count);
+        for position in 0..leaf_count {
+            let offset = 72_usize
+                .checked_add(
+                    position
+                        .checked_mul(8)
+                        .ok_or("raw freelist leaf offset overflows")?,
+                )
+                .ok_or("raw freelist leaf offset overflows")?;
+            leaves.push(read_u64(bytes, offset)?);
+        }
+        current = match (next_id, next_generation) {
+            (0, 0) => None,
+            (id, generation) if id != 0 && generation != 0 => Some((id, Some(generation))),
+            _ => return Err("raw freelist next reference is malformed".into()),
+        };
+        trunks.push(RawFreelistTrunk {
+            reference: RawPageRef {
+                id: page_id,
+                generation,
+            },
+            leaves,
+        });
+    }
+    Ok(trunks)
+}
+
 fn catalog_payload<'a>(value: &'a [u8], kind: u8, label: &str) -> Result<&'a [u8], String> {
     if value.get(0..2) != Some(&[kind, 1]) || value.get(2..4) != Some(&[0, 0]) {
         return Err(format!("{label} envelope is malformed"));
@@ -890,8 +1512,10 @@ impl PartialEq for Header {
     fn eq(&self, other: &Self) -> bool {
         self.page_size == other.page_size
             && self.publish_sequence == other.publish_sequence
+            && self.checkpoint_lsn == other.checkpoint_lsn
             && self.page_count == other.page_count
             && self.catalog_root == other.catalog_root
+            && self.freelist_root == other.freelist_root
             && self.features == other.features
     }
 }
@@ -930,8 +1554,10 @@ fn decode_header(bytes: &[u8]) -> Result<Header, String> {
     Ok(Header {
         page_size,
         publish_sequence: read_u64(bytes, 40)?,
+        checkpoint_lsn: read_u64(bytes, 48)?,
         page_count,
         catalog_root,
+        freelist_root: read_u64(bytes, 72)?,
         features,
     })
 }

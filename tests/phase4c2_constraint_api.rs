@@ -1,4 +1,5 @@
 mod common;
+mod support;
 
 use ora_sqllite::{DataType, ErrorCode, Parameters, Value};
 
@@ -13,6 +14,198 @@ fn assert_unsupported_without_mutation(connection: &mut ora_sqllite::Connection,
             assert_eq!(error.code(), ErrorCode::Unsupported, "{sql}: {error}");
         }
         Err(error) => assert_eq!(error.code(), ErrorCode::Unsupported, "{sql}: {error}"),
+    }
+}
+
+#[test]
+fn legacy_format2_without_feature_opens_and_plain_crud_remains_byte_compatible() {
+    // Breaks caught: treating the 4C2-B feature bit as a required migration,
+    // or writing local-constraint records during ordinary legacy CRUD.
+    let files = support::format2::legacy_catalog_fixture();
+    let database = ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default())
+        .expect("open the persisted format-2 legacy fixture");
+    let mut connection = database.connect().expect("connect legacy fixture");
+    execute_sql(
+        &mut connection,
+        "INSERT INTO LEGACY VALUES (2, 'after-open')",
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, NOTE FROM LEGACY ORDER BY ID"),
+        vec![
+            vec![Value::Int64(1), Value::Text("before-open".into())],
+            vec![Value::Int64(2), Value::Text("after-open".into())],
+        ]
+    );
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    assert_eq!(
+        support::format2::catalog_record_families(files.main()).expect("scan legacy catalog bytes"),
+        vec![0x00, 0x10, 0x11, 0x12, 0x13, 0x14]
+    );
+}
+
+fn collect_read_transaction(
+    transaction: &mut ora_sqllite::ReadTransaction<'_>,
+    sql: &str,
+) -> Vec<Vec<Value>> {
+    let statement = transaction.prepare(sql).expect("prepare snapshot query");
+    let mut rows = transaction
+        .query(&statement, Parameters::none())
+        .expect("query snapshot");
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().expect("advance snapshot rows") {
+        values.push(row.values().to_vec());
+    }
+    values
+}
+
+fn checkpoint_file(path: &std::path::Path) {
+    let database = ora_sqllite::Database::open(
+        path,
+        ora_sqllite::Options::default().with_checkpoint_wal_bytes(1),
+    )
+    .expect("open database to checkpoint accepted state");
+    let mut connection = database.connect().expect("connect checkpoint session");
+    connection
+        .begin_write()
+        .expect("begin checkpoint writer")
+        .rollback()
+        .expect("finish checkpoint writer");
+}
+
+#[test]
+fn old_snapshot_keeps_old_catalog_roots_and_rows_across_constraint_dml() {
+    // Breaks caught: publishing a new constraint-system-index root through an
+    // existing reader, or pairing a previous table root with new index roots.
+    let (files, database) = common::new_database("phase4c2b-snapshot-roots");
+    let mut seed = database.connect().expect("connect seed session");
+    execute_sql(
+        &mut seed,
+        "CREATE TABLE T (
+            ID INT64 CONSTRAINT PK_T PRIMARY KEY,
+            EMAIL TEXT CONSTRAINT UQ_T UNIQUE,
+            SCORE INT64 CONSTRAINT NN_T NOT NULL,
+            CONSTRAINT CK_T CHECK (SCORE BETWEEN 0 AND 100)
+        )",
+    );
+    for id in 1..=96 {
+        execute_sql(
+            &mut seed,
+            &format!("INSERT INTO T VALUES ({id}, 'before-{id:03}', {id})"),
+        );
+    }
+    drop(seed);
+
+    let mut old_connection = database.connect().expect("connect old reader");
+    let mut old = old_connection.begin_read().expect("begin old snapshot");
+    let expected_old = (1..=96)
+        .map(|id| {
+            vec![
+                Value::Int64(id),
+                Value::Text(format!("before-{id:03}")),
+                Value::Int64(id),
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        collect_read_transaction(&mut old, "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID"),
+        expected_old
+    );
+
+    let mut writer = database.connect().expect("connect constraint writer");
+    execute_sql(
+        &mut writer,
+        "UPDATE T SET EMAIL = 'after-096', SCORE = 100 WHERE ID = 96",
+    );
+    for id in 97..=192 {
+        execute_sql(
+            &mut writer,
+            &format!("INSERT INTO T VALUES ({id}, 'after-{id:03}', 100)"),
+        );
+    }
+    assert_eq!(
+        collect(&mut writer, "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID").len(),
+        192
+    );
+    assert_eq!(
+        collect_read_transaction(&mut old, "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID"),
+        expected_old
+    );
+    drop(writer);
+    drop(old);
+    drop(old_connection);
+    drop(database);
+
+    checkpoint_file(files.main());
+    let expected = support::format2::raw_catalog_capture(files.main())
+        .expect("capture checkpointed constrained catalog bytes");
+    let table = &expected.tables["T"];
+    assert_ne!(table.root.id, 0);
+    assert_eq!(table.next_rowid, 193);
+    assert_eq!(
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ID", "EMAIL", "SCORE"]
+    );
+    assert_eq!(expected.indexes.len(), 2);
+    assert_eq!(expected.constraints.len(), 4);
+    let primary = &expected.constraints["PK_T"];
+    assert_eq!(primary.kind, 1);
+    assert_eq!(primary.columns, vec![table.columns[0].id]);
+    let unique = &expected.constraints["UQ_T"];
+    assert_eq!(unique.kind, 2);
+    assert_eq!(unique.columns, vec![table.columns[1].id]);
+    let check = &expected.constraints["CK_T"];
+    assert_eq!(check.kind, 4);
+    assert!(check.check_program_len > 0);
+    assert_eq!(check.check_program_version, Some(1));
+    assert_eq!(
+        expected.table_constraints[&table.id],
+        vec![
+            primary.id,
+            unique.id,
+            expected.constraints["NN_T"].id,
+            check.id
+        ]
+    );
+    for index in expected.indexes.values() {
+        let owner = index
+            .owner_constraint_id
+            .expect("captured system index has a constraint owner");
+        assert!(
+            expected
+                .constraints
+                .values()
+                .any(|constraint| constraint.id == owner)
+        );
+        assert_ne!(index.root, table.root);
+    }
+
+    for reopen in 0..2 {
+        let reopened = common::reopen(&files);
+        let mut connection = reopened.connect().expect("connect reopened database");
+        assert_eq!(
+            collect(
+                &mut connection,
+                "SELECT ID, EMAIL, SCORE FROM T ORDER BY ID"
+            )
+            .len(),
+            192,
+            "reopen {reopen}"
+        );
+        drop(connection);
+        drop(reopened);
+        checkpoint_file(files.main());
+        assert_eq!(
+            support::format2::raw_catalog_capture(files.main())
+                .expect("re-capture checkpointed constrained catalog bytes"),
+            expected,
+            "reopen {reopen}"
+        );
     }
 }
 

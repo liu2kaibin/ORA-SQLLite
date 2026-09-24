@@ -2350,6 +2350,7 @@ mod tests {
         storage::{
             PageId, PageRef,
             btree::{BTree, TreeKind},
+            constraint::program::{CheckProgramTemplate, CheckTemplateInstruction, CheckType},
             features::CATALOG_V1,
             file::OpenMode,
             page::PageType,
@@ -4934,6 +4935,42 @@ mod tests {
         rows
     }
 
+    fn local_check_constraint_records(table_root: PageRef) -> Records {
+        let program = CheckProgramTemplate::new(vec![CheckTemplateInstruction::Literal {
+            value: crate::Value::Bool(true),
+            result: CheckType::Bool,
+        }])
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+        let constraint = ConstraintDef::new(
+            ConstraintId::new(50).unwrap(),
+            TableId::new(10).unwrap(),
+            ConstraintKind::Check,
+            0,
+            None,
+            program.as_bytes().to_vec().into_boxed_slice(),
+            CatalogName::new("CK_T").unwrap(),
+        )
+        .unwrap();
+        let mut rows = records(table_root);
+        rows.extend([
+            (
+                constraint_name_key(constraint.name()).unwrap(),
+                encode_constraint_name_mapping(constraint.id()),
+            ),
+            (
+                constraint_definition_key(constraint.id()),
+                encode_constraint_definition(&constraint),
+            ),
+            (
+                table_constraint_key(constraint.table_id(), constraint.id()),
+                encode_table_constraint_mapping(constraint.id()),
+            ),
+        ]);
+        rows
+    }
+
     #[test]
     fn catalog_requires_complete_bidirectional_local_constraint_graph() {
         let (_temp, pager) = test_pager(4096).unwrap();
@@ -5090,6 +5127,394 @@ mod tests {
             CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
             mutate,
         )
+    }
+
+    #[test]
+    fn phase_4c2b_format2_committed_local_constraint_catalog_reopens_without_migration() {
+        // Production break caught: a persisted 4C2-B catalog must be accepted
+        // as an ordinary format-2 image; open must neither migrate it nor lose
+        // the system-index/constraint graph after recovery.
+        let (temp, pager) = raw_local_constraint_catalog(|_, _, _| {});
+        let mut read = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        assert_eq!(
+            catalog
+                .constraints_for_table(TableId::new(10).unwrap())
+                .count(),
+            1
+        );
+        assert_eq!(
+            catalog.indexes_for_table(TableId::new(10).unwrap()).count(),
+            1
+        );
+        catalog.validate_deep(&mut read).unwrap();
+        drop(read);
+        drop(pager);
+        for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+            let pager = Pager::open(temp.path(), mode, PagerConfig::test_default(4096)).unwrap();
+            let mut read = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+            assert_eq!(
+                catalog
+                    .constraints_for_table(TableId::new(10).unwrap())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn phase_4c2b_constraint_corruption_rejects_committed_candidate_without_fallback() {
+        // Production break caught: recovery must reject a complete, malformed
+        // local-constraint commit instead of silently choosing the older base
+        // catalog.  Each mutation below starts from a valid durable base image.
+        let cases: Vec<(&str, ErrorCode, Box<dyn Fn(&mut Records)>)> = vec![
+            (
+                "missing constraint name",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    remove_record(
+                        rows,
+                        &constraint_name_key(&CatalogName::new("PK_T").unwrap()).unwrap(),
+                    );
+                }),
+            ),
+            (
+                "noncontiguous constraint columns",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    let key = constraint_column_key(ConstraintId::new(50).unwrap(), 1);
+                    let value = remove_record(rows, &key);
+                    rows.push((
+                        constraint_column_key(ConstraintId::new(50).unwrap(), 2),
+                        value,
+                    ));
+                }),
+            ),
+            (
+                "wrong constraint column owner",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_column_key(ConstraintId::new(50).unwrap(), 0),
+                    )[8..16]
+                        .copy_from_slice(&99_u64.to_le_bytes());
+                }),
+            ),
+            (
+                "nonunique primary key index",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(rows, &index_definition_key(IndexId::new(30).unwrap()))[42] =
+                        0;
+                }),
+            ),
+            (
+                "orphaned constraint-owned index",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[28..36]
+                        .fill(0);
+                }),
+            ),
+            (
+                "nullable primary-key column",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(rows, &column_definition_key(ColumnId::new(20).unwrap()))
+                        [27] = 1;
+                }),
+            ),
+            (
+                "future constraint record version",
+                ErrorCode::Unsupported,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[1] = 2;
+                }),
+            ),
+            (
+                "foreign-key constraint definition",
+                ErrorCode::Unsupported,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[24] = 5;
+                }),
+            ),
+        ];
+        for (label, expected, mutate) in cases {
+            let (temp, pager) =
+                raw_local_constraint_candidate_after_base(|rows, _, _| mutate(rows));
+            let mut read = pager.begin_read().unwrap();
+            assert_eq!(
+                match CatalogReader::open_empty_or_v1(&mut read) {
+                    Ok(_) => panic!("current snapshot accepted {label}"),
+                    Err(error) => error.code(),
+                },
+                expected,
+                "current snapshot: {label}"
+            );
+            drop(read);
+            drop(pager);
+            for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                    Ok(_) => panic!("recovery accepted {label}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code(), expected, "recovery: {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn phase_4c2b_constraint_corruption_classifies_committed_check_program_bytes() {
+        // Production break caught: a catalog reader that validates only the
+        // outer ConstraintDef can accept a corrupt persisted program until a
+        // DML statement happens to execute it.
+        let cases: Vec<(&str, ErrorCode, Box<dyn Fn(&mut Records)>)> = vec![
+            (
+                "empty program",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[56..60]
+                        .fill(0);
+                }),
+            ),
+            (
+                "oversized program",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[56..60]
+                        .copy_from_slice(&1_048_577_u32.to_le_bytes());
+                }),
+            ),
+            (
+                "future program version",
+                ErrorCode::Unsupported,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[64] = 2;
+                }),
+            ),
+            (
+                "unknown program opcode",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[72] = 0xff;
+                }),
+            ),
+            (
+                "unknown program result type",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[73] = 0xff;
+                }),
+            ),
+            (
+                "stack underflow",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    let bytes = record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    );
+                    bytes[72] = 0x12;
+                    bytes[73] = 9;
+                    bytes[74..76].copy_from_slice(&1_u16.to_le_bytes());
+                    bytes[76..80].fill(0);
+                }),
+            ),
+            (
+                "non-Bool final value",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    rewrite_check_program_as_column(
+                        record_value_mut(
+                            rows,
+                            &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                        ),
+                        20,
+                        1,
+                    );
+                }),
+            ),
+            (
+                "invalid column ID",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    rewrite_check_program_as_column(
+                        record_value_mut(
+                            rows,
+                            &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                        ),
+                        99,
+                        1,
+                    );
+                }),
+            ),
+            (
+                "truncated instruction stream",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    )[66..70]
+                        .copy_from_slice(&2_u32.to_le_bytes());
+                }),
+            ),
+            (
+                "trailing program bytes",
+                ErrorCode::Corruption,
+                Box::new(|rows| {
+                    let bytes = record_value_mut(
+                        rows,
+                        &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                    );
+                    let program_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+                    let program_end = 64 + usize::try_from(program_len).unwrap();
+                    let old_payload_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    bytes.insert(program_end, 0);
+                    bytes[56..60].copy_from_slice(&(program_len + 1).to_le_bytes());
+                    bytes[4..8].copy_from_slice(&(old_payload_len + 1).to_le_bytes());
+                }),
+            ),
+        ];
+        for (label, expected, mutate) in cases {
+            let (temp, pager) = raw_check_constraint_candidate_after_base(|rows, _| mutate(rows));
+            let mut read = pager.begin_read().unwrap();
+            assert_eq!(
+                match CatalogReader::open_empty_or_v1(&mut read) {
+                    Ok(_) => panic!("current snapshot accepted {label}"),
+                    Err(error) => error.code(),
+                },
+                expected,
+                "current snapshot: {label}"
+            );
+            drop(read);
+            drop(pager);
+            for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+                let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+                    Ok(_) => panic!("recovery accepted {label}"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code(), expected, "recovery: {label}");
+            }
+        }
+    }
+
+    fn rewrite_check_program_as_column(bytes: &mut Vec<u8>, column_id: u64, result: u8) {
+        let current_len =
+            usize::try_from(u32::from_le_bytes(bytes[56..60].try_into().unwrap())).unwrap();
+        let program_start = 64;
+        let program_end = program_start + current_len;
+        let target_len = 24;
+        assert!(
+            current_len <= target_len,
+            "fixture check program remains small"
+        );
+        for _ in current_len..target_len {
+            bytes.insert(program_end, 0);
+        }
+        let payload_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        bytes[4..8].copy_from_slice(
+            &(payload_len + u32::try_from(target_len - current_len).unwrap()).to_le_bytes(),
+        );
+        bytes[56..60].copy_from_slice(&u32::try_from(target_len).unwrap().to_le_bytes());
+        bytes[program_start..program_start + 8].copy_from_slice(&[1, 0, 1, 0, 0, 0, 0, 0]);
+        bytes[program_start + 8..program_start + 16]
+            .copy_from_slice(&[1, result, 0, 0, 8, 0, 0, 0]);
+        bytes[program_start + 16..program_start + 24].copy_from_slice(&column_id.to_be_bytes());
+    }
+
+    fn raw_local_constraint_catalog(
+        mutate: impl FnOnce(&mut Records, PageRef, PageRef),
+    ) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let mut rows = local_constraint_records(table_root, index_root);
+        mutate(&mut rows, table_root, index_root);
+        let catalog = raw_tree(&mut batch, rows);
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+        (temp, pager)
+    }
+
+    fn raw_local_constraint_candidate_after_base(
+        mutate: impl FnOnce(&mut Records, PageRef, PageRef),
+    ) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let base_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let base_catalog = raw_tree(&mut batch, records(base_root));
+        publish(&mut batch, &base_catalog);
+        batch.commit().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let mut rows = local_constraint_records(table_root, index_root);
+        mutate(&mut rows, table_root, index_root);
+        let catalog = raw_tree(&mut batch, rows);
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+        (temp, pager)
+    }
+
+    fn raw_check_constraint_candidate_after_base(
+        mutate: impl FnOnce(&mut Records, PageRef),
+    ) -> (TempDatabase, Pager) {
+        let (temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let base_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let base_catalog = raw_tree(&mut batch, records(base_root));
+        publish(&mut batch, &base_catalog);
+        batch.commit().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut rows = local_check_constraint_records(table_root);
+        mutate(&mut rows, table_root);
+        let catalog = raw_tree(&mut batch, rows);
+        publish_with_features(
+            &mut batch,
+            &catalog,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+        (temp, pager)
     }
 
     fn raw_index_catalog_with_features(
