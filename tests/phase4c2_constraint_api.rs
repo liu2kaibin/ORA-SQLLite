@@ -216,6 +216,12 @@ fn prepared_constrained_create_rechecks_table_and_explicit_constraint_names() {
         &mut connection,
         "CREATE TABLE B (ID INT64 CONSTRAINT PK_SHARED PRIMARY KEY)",
     );
+    let unexpected = [Value::Int64(1).into()];
+    let error = connection
+        .execute(&prepared, Parameters::positional(&unexpected))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Bind);
+    assert_no_table(&mut connection, "A");
     let error = connection
         .execute(&prepared, Parameters::none())
         .unwrap_err();
@@ -262,7 +268,7 @@ fn prepared_constrained_create_rechecks_table_and_explicit_constraint_names() {
 fn declaration_forms_keep_null_empty_text_and_check_semantics_distinct() {
     // Breaks caught: losing quoted/composite identities, converting an empty
     // text to NULL, or accepting FALSE local CHECK results after persistence.
-    let (_files, database) = common::new_database("phase4c2-declaration-forms");
+    let (files, database) = common::new_database("phase4c2-declaration-forms");
     let mut connection = database.connect().unwrap();
     execute_sql(
         &mut connection,
@@ -316,8 +322,19 @@ fn declaration_forms_keep_null_empty_text_and_check_semantics_distinct() {
         "INSERT INTO COLUMN_FORMS VALUES (2, 'named', 'other', 'required', 'also', 1, 1)",
         "UQ_NAMED",
     );
+    let anonymous_unique = connection
+        .prepare("INSERT INTO COLUMN_FORMS VALUES (2, 'other', 'anon', 'required', 'also', 1, 1)")
+        .unwrap();
+    let anonymous_unique = connection
+        .execute(&anonymous_unique, Parameters::none())
+        .unwrap_err();
+    assert_eq!(anonymous_unique.code(), ErrorCode::Constraint);
+    let anonymous_unique_display = anonymous_unique.to_string();
+    assert!(
+        anonymous_unique_display.contains("SYS_C"),
+        "expected generated persisted constraint name in {anonymous_unique_display}"
+    );
     for sql in [
-        "INSERT INTO COLUMN_FORMS VALUES (2, 'other', 'anon', 'required', 'also', 1, 1)",
         "INSERT INTO COLUMN_FORMS VALUES (2, 'other', 'unique', NULL, 'also', 1, 1)",
         "INSERT INTO COLUMN_FORMS VALUES (2, 'other', 'unique', 'required', NULL, 1, 1)",
         "INSERT INTO COLUMN_FORMS VALUES (2, 'other', 'unique', 'required', 'also', 0, 1)",
@@ -405,6 +422,18 @@ fn declaration_forms_keep_null_empty_text_and_check_semantics_distinct() {
     ] {
         assert_constraint(&mut connection, sql, "CK_ALL");
     }
+    drop(connection);
+    drop(database);
+    let reopened = common::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    let anonymous_unique = connection
+        .prepare("INSERT INTO COLUMN_FORMS VALUES (2, 'other', 'anon', 'required', 'also', 1, 1)")
+        .unwrap();
+    let anonymous_unique = connection
+        .execute(&anonymous_unique, Parameters::none())
+        .unwrap_err();
+    assert_eq!(anonymous_unique.code(), ErrorCode::Constraint);
+    assert_eq!(anonymous_unique.to_string(), anonymous_unique_display);
 }
 
 #[test]
@@ -519,6 +548,8 @@ fn unsupported_constraint_and_phase5_forms_leave_catalog_unchanged() {
             assert_no_table(&mut connection, absent);
         }
     }
+    let missing_extra = connection.prepare("SELECT EXTRA FROM PARENT").unwrap_err();
+    assert_eq!(missing_extra.code(), ErrorCode::Bind);
     let missing_external = connection
         .prepare(
             "CREATE TABLE EXTERNAL_MISSING (ID INT64, PARENT_ID INT64 REFERENCES MISSING (ID))",
