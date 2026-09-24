@@ -1790,6 +1790,29 @@ pub(crate) struct Phase4c2aStorageState {
     pub(crate) wal_file_len: u64,
 }
 
+/// A raw, durable description of one local constraint.  This intentionally
+/// records the catalog-visible identity and definition separately from SQL's
+/// constraint evaluator so recovery tests can reject a torn bundle without
+/// treating a reconstructed name as equivalent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Phase4c2bConstraintState {
+    pub(crate) id: u64,
+    pub(crate) table_id: u64,
+    pub(crate) kind: String,
+    pub(crate) index_id: Option<u64>,
+    pub(crate) columns: Vec<String>,
+    pub(crate) check_program: Vec<u8>,
+}
+
+/// The Phase 4C2-B crash/model witness.  `base` holds accepted LSN, feature
+/// bits, roots, rows, logical index entries and the freelist; `constraints`
+/// makes the local-constraint graph explicit in old/new comparisons.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2bStorageState {
+    pub(crate) base: Phase4c2aStorageState,
+    pub(crate) constraints: BTreeMap<String, Phase4c2bConstraintState>,
+}
+
 pub(crate) fn phase_4c2a_create_pager(temp: &TempDatabase) -> Pager {
     Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create Phase 4C2-A pager")
 }
@@ -1808,6 +1831,53 @@ pub(crate) fn phase_4c2a_pager_state(pager: &Pager, path: &Path) -> Result<Phase
 
 pub(crate) fn phase_4c2a_model_state(pager: &Pager, path: &Path) -> Result<Phase4c2aStorageState> {
     phase4c2a_pager_state_inner(pager, path, false)
+}
+
+pub(crate) fn phase_4c2b_pager_state(pager: &Pager, path: &Path) -> Result<Phase4c2bStorageState> {
+    phase4c2b_state_inner(pager, path, true)
+}
+
+pub(crate) fn phase_4c2b_model_state(pager: &Pager, path: &Path) -> Result<Phase4c2bStorageState> {
+    phase4c2b_state_inner(pager, path, false)
+}
+
+fn phase4c2b_state_inner(pager: &Pager, path: &Path, deep: bool) -> Result<Phase4c2bStorageState> {
+    let base = if deep {
+        phase_4c2a_pager_state(pager, path)?
+    } else {
+        phase_4c2a_model_state(pager, path)?
+    };
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let mut constraints = BTreeMap::new();
+    for table_name in base.tables.keys() {
+        let table = catalog
+            .find_table_by_name(&CatalogName::new(table_name)?)
+            .ok_or_else(|| DbError::new(ErrorCode::Corruption, "captured table disappeared"))?;
+        for definition in catalog.constraints_for_table(table.id()) {
+            let state = Phase4c2bConstraintState {
+                id: definition.id().get(),
+                table_id: definition.table_id().get(),
+                kind: format!("{:?}", definition.kind()),
+                index_id: definition.index_id().map(|id| id.get()),
+                columns: catalog
+                    .columns_for_constraint(definition.id())
+                    .map(|column| column.name().as_str().to_owned())
+                    .collect(),
+                check_program: definition.check_program().to_vec(),
+            };
+            if constraints
+                .insert(definition.name().as_str().to_owned(), state)
+                .is_some()
+            {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "captured duplicate constraint name",
+                ));
+            }
+        }
+    }
+    Ok(Phase4c2bStorageState { base, constraints })
 }
 
 fn phase4c2a_pager_state_inner(
@@ -2031,6 +2101,15 @@ pub(crate) fn phase_4c2a_recover_and_capture(path: &Path) -> Result<(u64, Phase4
     let pager = phase_4c2a_open_pager(path)?;
     phase_4c2a_checkpoint(&pager)?;
     let state = phase_4c2a_pager_state(&pager, path)?;
+    drop(pager);
+    Ok((accepted_lsn, state))
+}
+
+pub(crate) fn phase_4c2b_recover_and_capture(path: &Path) -> Result<(u64, Phase4c2bStorageState)> {
+    let accepted_lsn = phase_4c2a_recovered_lsn(path)?;
+    let pager = phase_4c2a_open_pager(path)?;
+    phase_4c2a_checkpoint(&pager)?;
+    let state = phase_4c2b_pager_state(&pager, path)?;
     drop(pager);
     Ok((accepted_lsn, state))
 }

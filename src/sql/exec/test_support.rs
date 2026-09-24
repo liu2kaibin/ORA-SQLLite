@@ -15,16 +15,17 @@ use crate::{
         Pager,
         test_support::{
             Phase4c1CrashPathKind, Phase4c1SqlStorageState, Phase4c2aIndexEntry,
-            Phase4c2aStorageState, Phase4c2aWalRecord, TempDatabase, assert_commit_trace,
-            phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
-            phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
+            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState, TempDatabase,
+            assert_commit_trace, phase_4c1_abort_wal_initialization,
+            phase_4c1_aborting_crash_pager, phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
             phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
             phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
             phase_4c1_validate_crash_path, phase_4c1_wal_initialization_trace,
             phase_4c2a_checkpoint, phase_4c2a_commit_malformed_index, phase_4c2a_create_pager,
             phase_4c2a_model_state, phase_4c2a_open_pager, phase_4c2a_pager_state,
             phase_4c2a_recover_and_capture, phase_4c2a_remove_recovered_files,
-            phase_4c2a_wal_records,
+            phase_4c2a_wal_records, phase_4c2b_model_state, phase_4c2b_pager_state,
+            phase_4c2b_recover_and_capture,
         },
     },
 };
@@ -3310,4 +3311,1358 @@ fn collect_public_rows(rows: &mut crate::Rows<'_>) -> Vec<Vec<Value>> {
             None => return collected,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConstraintModelRow {
+    id: Option<i64>,
+    label: Option<String>,
+    group_id: Option<i64>,
+    score: Option<i64>,
+}
+
+impl ConstraintModelRow {
+    fn sql(&self) -> String {
+        format!(
+            "({}, {}, {}, {})",
+            phase4c2b_sql_int(self.id),
+            phase4c2b_sql_text(self.label.as_deref()),
+            phase4c2b_sql_int(self.group_id),
+            phase4c2b_sql_int(self.score),
+        )
+    }
+
+    fn values(&self) -> Vec<Value> {
+        vec![
+            self.id.map_or(Value::Null, Value::Int64),
+            self.label.clone().map_or(Value::Null, Value::Text),
+            self.group_id.map_or(Value::Null, Value::Int64),
+            self.score.map_or(Value::Null, Value::Int64),
+        ]
+    }
+}
+
+fn phase4c2b_sql_int(value: Option<i64>) -> String {
+    value.map_or_else(|| "NULL".to_owned(), |value| value.to_string())
+}
+
+fn phase4c2b_sql_text(value: Option<&str>) -> String {
+    value.map_or_else(|| "NULL".to_owned(), |value| format!("'{value}'"))
+}
+
+#[derive(Debug, Clone)]
+enum ConstraintOperation {
+    Create,
+    Insert(ConstraintModelRow),
+    Update {
+        target: i64,
+        replacement: ConstraintModelRow,
+    },
+    Delete {
+        target: i64,
+    },
+    Drop,
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl ConstraintOperation {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Insert(_) => "insert",
+            Self::Update { .. } => "update",
+            Self::Delete { .. } => "delete",
+            Self::Drop => "drop",
+            Self::Begin => "begin",
+            Self::Commit => "commit",
+            Self::Rollback => "rollback",
+        }
+    }
+
+    fn sql(&self) -> String {
+        match self {
+            Self::Create => phase4c2b_create_sql().to_owned(),
+            Self::Insert(row) => format!("INSERT INTO T VALUES {}", row.sql()),
+            Self::Update {
+                target,
+                replacement,
+            } => format!(
+                "UPDATE T SET ID = {}, LABEL = {}, G = {}, SCORE = {} WHERE ID = {target}",
+                phase4c2b_sql_int(replacement.id),
+                phase4c2b_sql_text(replacement.label.as_deref()),
+                phase4c2b_sql_int(replacement.group_id),
+                phase4c2b_sql_int(replacement.score),
+            ),
+            Self::Delete { target } => format!("DELETE FROM T WHERE ID = {target}"),
+            Self::Drop => "DROP TABLE T".to_owned(),
+            Self::Begin => "BEGIN".to_owned(),
+            Self::Commit => "COMMIT".to_owned(),
+            Self::Rollback => "ROLLBACK".to_owned(),
+        }
+    }
+}
+
+fn phase4c2b_create_sql() -> &'static str {
+    "CREATE TABLE T (
+        ID INT64 CONSTRAINT PK_T PRIMARY KEY,
+        LABEL TEXT CONSTRAINT NN_T NOT NULL,
+        G INT64,
+        SCORE INT64,
+        CONSTRAINT UQ_T UNIQUE (LABEL, G),
+        CONSTRAINT CK_T CHECK (SCORE BETWEEN 0 AND 100)
+    )"
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConstraintStepOutcome {
+    code: Option<ErrorCode>,
+    violation_name: Option<String>,
+    rows_affected: u64,
+    usable: bool,
+}
+
+impl ConstraintStepOutcome {
+    fn success(rows_affected: u64) -> Self {
+        Self {
+            code: None,
+            violation_name: None,
+            rows_affected,
+            usable: true,
+        }
+    }
+
+    fn violation(name: &'static str) -> Self {
+        Self {
+            code: Some(ErrorCode::Constraint),
+            violation_name: Some(name.to_owned()),
+            rows_affected: 0,
+            usable: true,
+        }
+    }
+}
+
+/// A deliberately ordinary Rust collection/predicate oracle.  It has no
+/// production index-key encoding, SQL CHECK evaluator, or catalog decoder in
+/// its decision path.
+struct ConstraintModel {
+    generator: Generator,
+    step: usize,
+    next_id: i64,
+    exists: bool,
+    rows: BTreeMap<i64, ConstraintModelRow>,
+    transaction_before: Option<BTreeMap<i64, ConstraintModelRow>>,
+    transaction_steps: usize,
+    transactions_started: usize,
+    rollback_current_transaction: bool,
+    coverage: BTreeMap<&'static str, usize>,
+}
+
+impl ConstraintModel {
+    fn new(seed: u64) -> Self {
+        Self {
+            generator: Generator::new(seed),
+            step: 0,
+            next_id: 1,
+            exists: false,
+            rows: BTreeMap::new(),
+            transaction_before: None,
+            transaction_steps: 0,
+            transactions_started: 0,
+            rollback_current_transaction: false,
+            coverage: BTreeMap::new(),
+        }
+    }
+
+    fn next_operation(&mut self) -> ConstraintOperation {
+        if !self.exists {
+            return ConstraintOperation::Create;
+        }
+        if self.transaction_before.is_some() {
+            return match self.transaction_steps {
+                // Every transaction proves that a CHECK failure only rolls back
+                // its statement; the following valid row is then committed or
+                // rolled back by the explicitly scheduled terminator.
+                0 => ConstraintOperation::Insert(self.invalid_check_row()),
+                1 => ConstraintOperation::Insert(self.fresh_row()),
+                _ if self.rollback_current_transaction => ConstraintOperation::Rollback,
+                _ => ConstraintOperation::Commit,
+            };
+        }
+        if self.step > 0 && self.step % 173 == 0 {
+            return ConstraintOperation::Drop;
+        }
+        if self.step > 0 && self.step % 41 == 0 {
+            return ConstraintOperation::Begin;
+        }
+        match self.generator.index(6) {
+            0 => ConstraintOperation::Insert(self.fresh_row()),
+            1 => ConstraintOperation::Insert(self.invalid_row()),
+            2 => self.update_operation(),
+            3 => self.delete_operation(),
+            4 => ConstraintOperation::Insert(self.fresh_row()),
+            _ => self.update_operation(),
+        }
+    }
+
+    fn fresh_row(&mut self) -> ConstraintModelRow {
+        let id = self.next_id;
+        self.next_id += 1;
+        ConstraintModelRow {
+            id: Some(id),
+            label: Some(format!("l{id}_{:x}", self.generator.next())),
+            group_id: Some(i64::try_from(self.generator.next() % 11).expect("small group")),
+            score: Some(i64::try_from(self.generator.next() % 101).expect("small score")),
+        }
+    }
+
+    fn invalid_check_row(&mut self) -> ConstraintModelRow {
+        let mut row = self.fresh_row();
+        row.score = Some(101);
+        row
+    }
+
+    fn invalid_row(&mut self) -> ConstraintModelRow {
+        match self.generator.index(5) {
+            0 if !self.rows.is_empty() => {
+                let mut row = self.fresh_row();
+                row.id = self.rows.keys().next().copied();
+                row
+            }
+            1 if !self.rows.is_empty() => {
+                let mut row = self.fresh_row();
+                let existing = self.rows.values().next().expect("nonempty rows");
+                row.label = existing.label.clone();
+                row.group_id = existing.group_id;
+                row
+            }
+            2 => {
+                let mut row = self.fresh_row();
+                row.label = None;
+                row
+            }
+            3 => self.invalid_check_row(),
+            _ => {
+                let mut row = self.fresh_row();
+                row.id = None;
+                row
+            }
+        }
+    }
+
+    fn update_operation(&mut self) -> ConstraintOperation {
+        let Some(target) = self.rows.keys().next().copied() else {
+            return ConstraintOperation::Insert(self.fresh_row());
+        };
+        let replacement = if self.generator.index(3) == 0 {
+            self.invalid_row()
+        } else {
+            self.fresh_row()
+        };
+        ConstraintOperation::Update {
+            target,
+            replacement,
+        }
+    }
+
+    fn delete_operation(&mut self) -> ConstraintOperation {
+        let target = self
+            .rows
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(-1 - i64::try_from(self.generator.next() % 17).expect("small id"));
+        ConstraintOperation::Delete { target }
+    }
+
+    fn apply(&mut self, operation: &ConstraintOperation) -> ConstraintStepOutcome {
+        *self.coverage.entry(operation.name()).or_default() += 1;
+        let outcome = match operation {
+            ConstraintOperation::Create => {
+                self.exists = true;
+                ConstraintStepOutcome::success(0)
+            }
+            ConstraintOperation::Insert(row) => match self.violation(row, None) {
+                Some(name) => ConstraintStepOutcome::violation(name),
+                None => {
+                    let id = row.id.expect("accepted primary key has an ID");
+                    self.rows.insert(id, row.clone());
+                    ConstraintStepOutcome::success(1)
+                }
+            },
+            ConstraintOperation::Update {
+                target,
+                replacement,
+            } => {
+                if !self.rows.contains_key(target) {
+                    ConstraintStepOutcome::success(0)
+                } else if let Some(name) = self.violation(replacement, Some(*target)) {
+                    ConstraintStepOutcome::violation(name)
+                } else {
+                    let id = replacement.id.expect("accepted primary key has an ID");
+                    self.rows.remove(target);
+                    self.rows.insert(id, replacement.clone());
+                    ConstraintStepOutcome::success(1)
+                }
+            }
+            ConstraintOperation::Delete { target } => {
+                ConstraintStepOutcome::success(u64::from(self.rows.remove(target).is_some()))
+            }
+            ConstraintOperation::Drop => {
+                self.exists = false;
+                self.rows.clear();
+                ConstraintStepOutcome::success(0)
+            }
+            ConstraintOperation::Begin => {
+                self.transaction_before = Some(self.rows.clone());
+                self.transaction_steps = 0;
+                self.transactions_started += 1;
+                self.rollback_current_transaction = self.transactions_started.is_multiple_of(2);
+                ConstraintStepOutcome::success(0)
+            }
+            ConstraintOperation::Commit => {
+                self.transaction_before = None;
+                self.transaction_steps = 0;
+                ConstraintStepOutcome::success(0)
+            }
+            ConstraintOperation::Rollback => {
+                self.rows = self
+                    .transaction_before
+                    .take()
+                    .expect("scheduled rollback has a transaction");
+                self.transaction_steps = 0;
+                ConstraintStepOutcome::success(0)
+            }
+        };
+        if self.transaction_before.is_some()
+            && matches!(
+                operation,
+                ConstraintOperation::Insert(_) | ConstraintOperation::Update { .. }
+            )
+        {
+            self.transaction_steps += 1;
+        }
+        self.step += 1;
+        outcome
+    }
+
+    fn violation(&self, row: &ConstraintModelRow, replaced: Option<i64>) -> Option<&'static str> {
+        let Some(id) = row.id else {
+            return Some("PK_T");
+        };
+        if self
+            .rows
+            .iter()
+            .any(|(&existing, _)| existing != replaced.unwrap_or(i64::MIN) && existing == id)
+        {
+            return Some("PK_T");
+        }
+        if row.label.is_none() {
+            return Some("NN_T");
+        }
+        if let (Some(label), Some(group_id)) = (&row.label, row.group_id)
+            && self.rows.iter().any(|(&existing_id, existing)| {
+                existing_id != replaced.unwrap_or(i64::MIN)
+                    && existing.label.as_deref() == Some(label)
+                    && existing.group_id == Some(group_id)
+            })
+        {
+            return Some("UQ_T");
+        }
+        if row.score.is_some_and(|score| !(0..=100).contains(&score)) {
+            return Some("CK_T");
+        }
+        None
+    }
+
+    fn rows(&self) -> BTreeMap<i64, ConstraintModelRow> {
+        self.rows.clone()
+    }
+
+    fn durable_rows(&self) -> &BTreeMap<i64, ConstraintModelRow> {
+        self.transaction_before.as_ref().unwrap_or(&self.rows)
+    }
+
+    fn assert_one_entry_per_visible_row_per_index(&self, state: &Phase4c2bStorageState) {
+        if !self.exists {
+            assert!(state.base.tables.is_empty());
+            assert!(state.base.indexes.is_empty());
+            return;
+        }
+        for (name, columns) in [("PK_T", vec![0_u16]), ("UQ_T", vec![1_u16, 2_u16])] {
+            let index = state
+                .base
+                .indexes
+                .get(name)
+                .unwrap_or_else(|| panic!("missing constraint-owned {name} index"));
+            assert_eq!(index.column_ordinals, columns, "{name} columns");
+            assert_eq!(
+                index.entries.len(),
+                self.durable_rows().len(),
+                "{name} row count"
+            );
+            let mut actual = index
+                .entries
+                .iter()
+                .map(|entry| entry.logical.clone())
+                .collect::<Vec<_>>();
+            let mut expected = self
+                .durable_rows()
+                .values()
+                .map(|row| match name {
+                    "PK_T" => vec![row.id.map_or(Value::Null, Value::Int64)],
+                    "UQ_T" => vec![
+                        row.label.clone().map_or(Value::Null, Value::Text),
+                        row.group_id.map_or(Value::Null, Value::Int64),
+                    ],
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            actual.sort_by_key(|values| format!("{values:?}"));
+            expected.sort_by_key(|values| format!("{values:?}"));
+            assert_eq!(actual, expected, "{name} logical entries");
+        }
+    }
+
+    fn assert_catalog_constraint_graph(&self, state: &Phase4c2bStorageState) {
+        if !self.exists {
+            assert!(state.constraints.is_empty());
+            return;
+        }
+        let expected = BTreeMap::from([
+            ("PK_T", ("PrimaryKey", vec!["ID"], true)),
+            ("UQ_T", ("Unique", vec!["LABEL", "G"], true)),
+            ("NN_T", ("NotNull", vec!["LABEL"], false)),
+            ("CK_T", ("Check", Vec::<&str>::new(), false)),
+        ]);
+        assert_eq!(state.constraints.len(), expected.len());
+        for (name, (kind, columns, has_index)) in expected {
+            let actual = state
+                .constraints
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name} constraint"));
+            assert_eq!(actual.kind, kind, "{name} kind");
+            assert_eq!(
+                actual
+                    .columns
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                columns
+            );
+            assert_eq!(
+                actual.index_id.is_some(),
+                has_index,
+                "{name} index ownership"
+            );
+            if name == "CK_T" {
+                assert!(!actual.check_program.is_empty(), "CHECK program retained");
+            } else {
+                assert!(actual.check_program.is_empty(), "non-CHECK program absent");
+            }
+        }
+    }
+
+    fn finish(&self) {
+        for required in [
+            "create", "insert", "update", "delete", "drop", "begin", "commit", "rollback",
+        ] {
+            assert!(
+                self.coverage.get(required).copied().unwrap_or(0) > 0,
+                "fixed seed missed {required}"
+            );
+        }
+    }
+}
+
+struct ModelDatabase {
+    _temp: TempDatabase,
+    pager: Pager,
+    connection: Connection,
+}
+
+impl ModelDatabase {
+    fn new(seed: u64) -> Self {
+        let temp = TempDatabase::new(&format!("phase4c2b-model-{seed:016x}"));
+        let pager = phase_4c2a_create_pager(&temp);
+        let connection = Connection::from_test_pager(pager.clone());
+        Self {
+            _temp: temp,
+            pager,
+            connection,
+        }
+    }
+
+    fn apply(&mut self, operation: &ConstraintOperation) -> ConstraintStepOutcome {
+        let sql = operation.sql();
+        let (code, name, rows_affected) = match self.connection.prepare(&sql) {
+            Ok(statement) => match self.connection.execute(&statement, Parameters::none()) {
+                Ok(result) => (None, None, result.rows_affected()),
+                Err(error) => (
+                    Some(error.code()),
+                    phase4c2b_violation_name(&error.to_string()),
+                    0,
+                ),
+            },
+            Err(error) => (
+                Some(error.code()),
+                phase4c2b_violation_name(&error.to_string()),
+                0,
+            ),
+        };
+        let usable = matches!(
+            actual_query(&mut self.connection, "SELECT 1", Parameters::none()),
+            Outcome::Rows(rows) if rows == vec![vec![Value::Int64(1)]]
+        );
+        ConstraintStepOutcome {
+            code,
+            violation_name: name,
+            rows_affected,
+            usable,
+        }
+    }
+
+    fn rows(&mut self) -> BTreeMap<i64, ConstraintModelRow> {
+        let state = self.capture();
+        if !state.base.tables.contains_key("T") {
+            return BTreeMap::new();
+        }
+        let Outcome::Rows(rows) = actual_query(
+            &mut self.connection,
+            "SELECT ID, LABEL, G, SCORE FROM T ORDER BY ID",
+            Parameters::none(),
+        ) else {
+            panic!("model row query failed");
+        };
+        rows.into_iter()
+            .map(|row| {
+                let [id, label, group_id, score] = row.try_into().expect("four selected columns");
+                let id = match id {
+                    Value::Int64(id) => id,
+                    value => panic!("primary key is not INT64: {value:?}"),
+                };
+                (
+                    id,
+                    ConstraintModelRow {
+                        id: Some(id),
+                        label: phase4c2b_optional_text(label),
+                        group_id: phase4c2b_optional_int(group_id),
+                        score: phase4c2b_optional_int(score),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn capture(&self) -> Phase4c2bStorageState {
+        phase_4c2b_model_state(&self.pager, self._temp.path())
+            .expect("capture constrained fixed-seed state")
+    }
+}
+
+fn phase4c2b_optional_int(value: Value) -> Option<i64> {
+    match value {
+        Value::Null => None,
+        Value::Int64(value) => Some(value),
+        value => panic!("unexpected INT64 value {value:?}"),
+    }
+}
+
+fn phase4c2b_optional_text(value: Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Text(value) => Some(value),
+        value => panic!("unexpected TEXT value {value:?}"),
+    }
+}
+
+fn phase4c2b_violation_name(message: &str) -> Option<String> {
+    ["PK_T", "UQ_T", "NN_T", "CK_T"]
+        .into_iter()
+        .find(|name| message.contains(name))
+        .map(str::to_owned)
+}
+
+fn assert_same_outcome(expected: ConstraintStepOutcome, actual: ConstraintStepOutcome) {
+    assert_eq!(actual, expected, "constraint model outcome diverged");
+}
+
+fn assert_one_entry_per_visible_row_per_index(
+    model: &ConstraintModel,
+    state: &Phase4c2bStorageState,
+) {
+    model.assert_one_entry_per_visible_row_per_index(state);
+}
+
+fn assert_catalog_constraint_graph(model: &ConstraintModel, state: &Phase4c2bStorageState) {
+    model.assert_catalog_constraint_graph(state);
+}
+
+fn assert_transaction_state_matches(_model: &ConstraintModel, database: &mut ModelDatabase) {
+    assert!(matches!(
+        actual_query(&mut database.connection, "SELECT 1", Parameters::none()),
+        Outcome::Rows(rows) if rows == vec![vec![Value::Int64(1)]]
+    ));
+}
+
+fn run_phase4c2b_fixed_seed_constraint_model() {
+    for seed in [0x4c2b_0001_u64, 0x4c2b_0002, 0x4c2b_0003] {
+        let mut model = ConstraintModel::new(seed);
+        let mut database = ModelDatabase::new(seed);
+        for _step in 0..2_000 {
+            let operation = model.next_operation();
+            assert_same_outcome(model.apply(&operation), database.apply(&operation));
+            assert_eq!(model.rows(), database.rows());
+            let state = database.capture();
+            assert_one_entry_per_visible_row_per_index(&model, &state);
+            assert_catalog_constraint_graph(&model, &state);
+            assert_transaction_state_matches(&model, &mut database);
+        }
+        model.finish();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase4c2bCrashScenario {
+    ConstrainedCreateEmpty,
+    ConstrainedCreateManyRecords,
+    InsertSplitsTableAndTwoSystemIndexes,
+    UpdateChangesPrimaryUniqueAndCheck,
+    DeleteCollapsesTableAndSystemIndex,
+    DropConstrainedTableReleasesAllRoots,
+    ExplicitTransactionMultipleRowsThenCommit,
+    FailingCheckRestoresStatementThenLaterCommit,
+}
+
+impl Phase4c2bCrashScenario {
+    const ALL: [Self; 8] = [
+        Self::InsertSplitsTableAndTwoSystemIndexes,
+        Self::UpdateChangesPrimaryUniqueAndCheck,
+        Self::DeleteCollapsesTableAndSystemIndex,
+        Self::DropConstrainedTableReleasesAllRoots,
+        Self::ExplicitTransactionMultipleRowsThenCommit,
+        Self::FailingCheckRestoresStatementThenLaterCommit,
+        Self::ConstrainedCreateEmpty,
+        Self::ConstrainedCreateManyRecords,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ConstrainedCreateEmpty => "constrained-create-empty",
+            Self::ConstrainedCreateManyRecords => "constrained-create-many-records",
+            Self::InsertSplitsTableAndTwoSystemIndexes => {
+                "insert-splits-table-and-two-system-indexes"
+            }
+            Self::UpdateChangesPrimaryUniqueAndCheck => "update-changes-primary-unique-and-check",
+            Self::DeleteCollapsesTableAndSystemIndex => "delete-collapses-table-and-system-index",
+            Self::DropConstrainedTableReleasesAllRoots => {
+                "drop-constrained-table-releases-all-roots"
+            }
+            Self::ExplicitTransactionMultipleRowsThenCommit => {
+                "explicit-transaction-multiple-rows-then-commit"
+            }
+            Self::FailingCheckRestoresStatementThenLaterCommit => {
+                "failing-check-restores-statement-then-later-commit"
+            }
+        }
+    }
+
+    fn statements(self) -> Vec<String> {
+        match self {
+            Self::ConstrainedCreateEmpty | Self::ConstrainedCreateManyRecords => {
+                vec![phase4c2b_create_sql().to_owned()]
+            }
+            Self::InsertSplitsTableAndTwoSystemIndexes => {
+                let mut statements = vec!["BEGIN".to_owned()];
+                for id in 1000..1012 {
+                    statements.push(format!(
+                        "INSERT INTO T VALUES ({id}, 'split-{id}', {id}, 50)"
+                    ));
+                }
+                statements.push("COMMIT".to_owned());
+                statements
+            }
+            Self::UpdateChangesPrimaryUniqueAndCheck => vec![
+                "UPDATE T SET ID = 1000, LABEL = 'updated-key', G = 99, SCORE = 100 WHERE ID = 0"
+                    .to_owned(),
+            ],
+            Self::DeleteCollapsesTableAndSystemIndex => {
+                vec!["DELETE FROM T WHERE ID < 95".to_owned()]
+            }
+            Self::DropConstrainedTableReleasesAllRoots => vec!["DROP TABLE T".to_owned()],
+            Self::ExplicitTransactionMultipleRowsThenCommit => vec![
+                "BEGIN".to_owned(),
+                "INSERT INTO T VALUES (1000, 'tx-1000', 1000, 10)".to_owned(),
+                "INSERT INTO T VALUES (1001, 'tx-1001', 1001, 11)".to_owned(),
+                "INSERT INTO T VALUES (1002, 'tx-1002', 1002, 12)".to_owned(),
+                "COMMIT".to_owned(),
+            ],
+            Self::FailingCheckRestoresStatementThenLaterCommit => vec![
+                "BEGIN".to_owned(),
+                "INSERT INTO T VALUES (1000, 'bad-check', 1000, 101)".to_owned(),
+                "INSERT INTO T VALUES (1001, 'after-check', 1001, 11)".to_owned(),
+                "COMMIT".to_owned(),
+            ],
+        }
+    }
+
+    const fn permits_constraint_error(self) -> bool {
+        matches!(self, Self::FailingCheckRestoresStatementThenLaterCommit)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase4c2bFaultFamily {
+    CatalogPageFrame,
+    TablePageFrame,
+    PrimarySystemIndexFrame,
+    UniqueSystemIndexFrame,
+    OtherPageFrame,
+    WalCommitRecord,
+    WalSync,
+    MemoryPublication,
+    MainFileWriteSync,
+    DirectorySync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Phase4c2bFaultTarget {
+    family: Phase4c2bFaultFamily,
+    point: FaultPoint,
+    occurrence: usize,
+}
+
+const PHASE4C2B_CRASH_CHILD: &str = "sql::exec::test_support::phase_4c2b_constraint_crash_child";
+const PHASE4C2B_PATH_ENV: &str = "ORA_SQLLITE_PHASE4C2B_PATH";
+const PHASE4C2B_SCENARIO_ENV: &str = "ORA_SQLLITE_PHASE4C2B_SCENARIO";
+const PHASE4C2B_POINT_ENV: &str = "ORA_SQLLITE_PHASE4C2B_POINT";
+const PHASE4C2B_OCCURRENCE_ENV: &str = "ORA_SQLLITE_PHASE4C2B_OCCURRENCE";
+const PHASE4C2B_TRACE_ENV: &str = "ORA_SQLLITE_PHASE4C2B_TRACE";
+
+fn phase4c2b_execute_statements(pager: Pager, scenario: Phase4c2bCrashScenario) {
+    let mut connection = Connection::from_test_pager(pager);
+    for sql in scenario.statements() {
+        let outcome = actual_execute(&mut connection, &sql, Parameters::none());
+        if scenario.permits_constraint_error() && sql.contains("bad-check") {
+            assert_eq!(outcome, Outcome::Error(ErrorCode::Constraint), "{sql}");
+        } else {
+            assert!(
+                matches!(outcome, Outcome::Affected(_)),
+                "{sql}: {outcome:?}"
+            );
+        }
+    }
+    drop(
+        connection
+            .begin_read()
+            .expect("constrained crash program left a transaction open"),
+    );
+}
+
+fn phase4c2b_fixture(scenario: Phase4c2bCrashScenario) -> TempDatabase {
+    let temp = TempDatabase::new("phase4c2b-crash-fixture");
+    let pager = phase_4c2a_create_pager(&temp);
+    if matches!(
+        scenario,
+        Phase4c2bCrashScenario::ConstrainedCreateEmpty
+            | Phase4c2bCrashScenario::ConstrainedCreateManyRecords
+    ) {
+        drop(pager);
+        return temp;
+    }
+    let mut connection = Connection::from_test_pager(pager.clone());
+    assert_eq!(
+        actual_execute(&mut connection, phase4c2b_create_sql(), Parameters::none()),
+        Outcome::Affected(0)
+    );
+    let row_count = match scenario {
+        Phase4c2bCrashScenario::InsertSplitsTableAndTwoSystemIndexes => 30,
+        Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex => 96,
+        _ => 12,
+    };
+    let label_bytes = match scenario {
+        Phase4c2bCrashScenario::InsertSplitsTableAndTwoSystemIndexes => 16,
+        Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex => 96,
+        _ => 16,
+    };
+    assert_eq!(
+        actual_execute(&mut connection, "BEGIN", Parameters::none()),
+        Outcome::Affected(0)
+    );
+    for id in 0..row_count {
+        let sql = format!(
+            "INSERT INTO T VALUES ({id}, 'r{id}-{}', {id}, {})",
+            "x".repeat(label_bytes),
+            id % 101
+        );
+        assert_eq!(
+            actual_execute(&mut connection, &sql, Parameters::none()),
+            Outcome::Affected(1)
+        );
+    }
+    assert_eq!(
+        actual_execute(&mut connection, "COMMIT", Parameters::none()),
+        Outcome::Affected(0)
+    );
+    drop(connection);
+    phase_4c2a_checkpoint(&pager).expect("checkpoint constrained crash fixture");
+    phase_4c2b_pager_state(&pager, temp.path()).expect("deep-validate constrained crash fixture");
+    drop(pager);
+    temp
+}
+
+fn phase4c2b_wal_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push("-wal");
+    PathBuf::from(value)
+}
+
+fn phase4c2b_trace(
+    fixture: &TempDatabase,
+    scenario: Phase4c2bCrashScenario,
+) -> (
+    Vec<FaultPoint>,
+    Vec<Phase4c2aWalRecord>,
+    Phase4c2bStorageState,
+    Phase4c2bStorageState,
+) {
+    let pre_pager =
+        phase_4c2a_open_pager(fixture.path()).expect("open constrained crash pre-state");
+    let pre = phase_4c2b_pager_state(&pre_pager, fixture.path())
+        .expect("capture constrained crash pre-state");
+    drop(pre_pager);
+    let trace_copy = phase_4c1_copy_crash_pair(fixture.path());
+    let wal_start = fs::metadata(phase4c2b_wal_path(trace_copy.path()))
+        .expect("read constrained trace WAL length")
+        .len();
+    let (pager, faults) = phase_4c1_recording_crash_pager(trace_copy.path());
+    phase4c2b_execute_statements(pager.clone(), scenario);
+    let records = phase_4c2a_wal_records(trace_copy.path(), wal_start)
+        .expect("decode successful constrained transaction records");
+    phase_4c2a_checkpoint(&pager).expect("checkpoint successful constrained trace");
+    let trace = faults.observed();
+    let publish_end = trace
+        .iter()
+        .position(|&point| point == FaultPoint::AfterWalPublish)
+        .expect("constrained trace publishes SQL commit");
+    assert_commit_trace(&trace[..=publish_end]);
+    assert_eq!(
+        records.len(),
+        trace[..=publish_end]
+            .iter()
+            .filter(|&&point| point == FaultPoint::AfterWalRecordWrite)
+            .count(),
+        "one hook quartet per constrained WAL record"
+    );
+    let post = phase_4c2b_pager_state(&pager, trace_copy.path())
+        .expect("capture constrained crash post-state");
+    assert_eq!(
+        post.base.lsn,
+        pre.base.lsn + 1,
+        "{} commits once",
+        scenario.name()
+    );
+    assert_ne!(post, pre, "{} changes captured state", scenario.name());
+    phase4c2b_assert_scenario_transition(scenario, &pre, &post);
+    drop(faults);
+    drop(pager);
+    (trace, records, pre, post)
+}
+
+fn phase4c2b_assert_scenario_transition(
+    scenario: Phase4c2bCrashScenario,
+    pre: &Phase4c2bStorageState,
+    post: &Phase4c2bStorageState,
+) {
+    match scenario {
+        Phase4c2bCrashScenario::InsertSplitsTableAndTwoSystemIndexes => {
+            assert!(
+                pre.base.tables["T"].root != post.base.tables["T"].root,
+                "table root must change under constrained split pressure: pre={:?} post={:?}",
+                pre.base.tables["T"],
+                post.base.tables["T"]
+            );
+            for name in ["PK_T", "UQ_T"] {
+                assert_eq!(
+                    post.base.indexes[name].entries.len(),
+                    pre.base.indexes[name].entries.len() + 12,
+                    "{name} must receive the split-triggering row"
+                );
+            }
+        }
+        Phase4c2bCrashScenario::UpdateChangesPrimaryUniqueAndCheck => {
+            assert_eq!(
+                post.base.tables["T"].rows.len(),
+                pre.base.tables["T"].rows.len()
+            );
+            assert!(
+                post.base.tables["T"]
+                    .rows
+                    .iter()
+                    .any(|(_, row)| row[0] == Value::Int64(1000))
+            );
+        }
+        Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex => {
+            assert!(post.base.tables["T"].rows.len() < pre.base.tables["T"].rows.len());
+            assert!(post.base.indexes["PK_T"].height <= pre.base.indexes["PK_T"].height);
+        }
+        Phase4c2bCrashScenario::DropConstrainedTableReleasesAllRoots => {
+            assert!(post.base.tables.is_empty());
+            assert!(post.base.indexes.is_empty());
+            assert!(post.constraints.is_empty());
+        }
+        Phase4c2bCrashScenario::FailingCheckRestoresStatementThenLaterCommit => {
+            assert_eq!(
+                post.base.tables["T"].rows.len(),
+                pre.base.tables["T"].rows.len() + 1
+            );
+            assert!(
+                post.base.tables["T"]
+                    .rows
+                    .iter()
+                    .all(|(_, row)| row[3] != Value::Int64(101))
+            );
+        }
+        _ => {}
+    }
+}
+
+fn phase4c2b_page_family(
+    page_id: u64,
+    pre: &Phase4c2bStorageState,
+    post: &Phase4c2bStorageState,
+) -> Phase4c2bFaultFamily {
+    if pre.base.catalog_pages.contains(&page_id) || post.base.catalog_pages.contains(&page_id) {
+        Phase4c2bFaultFamily::CatalogPageFrame
+    } else if pre.base.table_pages.contains(&page_id) || post.base.table_pages.contains(&page_id) {
+        Phase4c2bFaultFamily::TablePageFrame
+    } else if pre
+        .base
+        .indexes
+        .get("PK_T")
+        .is_some_and(|index| index.root.page_id == page_id)
+        || post
+            .base
+            .indexes
+            .get("PK_T")
+            .is_some_and(|index| index.root.page_id == page_id)
+    {
+        Phase4c2bFaultFamily::PrimarySystemIndexFrame
+    } else if pre
+        .base
+        .indexes
+        .get("UQ_T")
+        .is_some_and(|index| index.root.page_id == page_id)
+        || post
+            .base
+            .indexes
+            .get("UQ_T")
+            .is_some_and(|index| index.root.page_id == page_id)
+    {
+        Phase4c2bFaultFamily::UniqueSystemIndexFrame
+    } else {
+        Phase4c2bFaultFamily::OtherPageFrame
+    }
+}
+
+fn phase4c2b_fault_targets(
+    trace: &[FaultPoint],
+    records: &[Phase4c2aWalRecord],
+    pre: &Phase4c2bStorageState,
+    post: &Phase4c2bStorageState,
+) -> Vec<Phase4c2bFaultTarget> {
+    trace
+        .iter()
+        .enumerate()
+        .map(|(index, &point)| {
+            let occurrence = trace[..=index]
+                .iter()
+                .filter(|&&seen| seen == point)
+                .count();
+            let family = match point {
+                FaultPoint::BeforeWalRecordWrite
+                | FaultPoint::AfterWalRecordHeaderPrefixWrite
+                | FaultPoint::AfterWalRecordPayloadPrefixWrite
+                | FaultPoint::AfterWalRecordWrite => match records
+                    .get(occurrence - 1)
+                    .expect("constrained record hook names a WAL record")
+                {
+                    Phase4c2aWalRecord::PageFrame(page_id) => {
+                        phase4c2b_page_family(*page_id, pre, post)
+                    }
+                    Phase4c2aWalRecord::Commit => Phase4c2bFaultFamily::WalCommitRecord,
+                },
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish => {
+                    Phase4c2bFaultFamily::MemoryPublication
+                }
+                FaultPoint::BeforeMainDirectorySync
+                | FaultPoint::AfterMainDirectorySync
+                | FaultPoint::BeforeWalDirectorySync
+                | FaultPoint::AfterWalDirectorySync => Phase4c2bFaultFamily::DirectorySync,
+                FaultPoint::BeforeMainExtend
+                | FaultPoint::AfterMainExtend
+                | FaultPoint::BeforeMainPageWrite
+                | FaultPoint::AfterMainPageWrite
+                | FaultPoint::BeforeMainSync
+                | FaultPoint::AfterMainSync
+                | FaultPoint::BeforeSuperblockWrite
+                | FaultPoint::AfterSuperblockWrite => Phase4c2bFaultFamily::MainFileWriteSync,
+                FaultPoint::BeforeWalHeaderWrite
+                | FaultPoint::AfterWalHeaderWrite
+                | FaultPoint::BeforeWalSync
+                | FaultPoint::AfterWalSync
+                | FaultPoint::BeforeWalTruncate
+                | FaultPoint::AfterWalTruncate => Phase4c2bFaultFamily::WalSync,
+            };
+            Phase4c2bFaultTarget {
+                family,
+                point,
+                occurrence,
+            }
+        })
+        .collect()
+}
+
+fn phase4c2b_run_child(
+    fixture: &TempDatabase,
+    scenario: Phase4c2bCrashScenario,
+    trace: &[FaultPoint],
+    target: Phase4c2bFaultTarget,
+) -> TempDatabase {
+    let crash_copy = phase_4c1_copy_crash_pair(fixture.path());
+    let path = fs::canonicalize(crash_copy.path()).expect("canonical constrained crash path");
+    let marker = format!("PHASE4C2B_ABORT {}", scenario.name());
+    let mut command = phase_4c1_exact_crash_child_command(PHASE4C2B_CRASH_CHILD);
+    command
+        .env(PHASE4C2B_PATH_ENV, &path)
+        .env(PHASE4C2B_SCENARIO_ENV, scenario.name())
+        .env(PHASE4C2B_POINT_ENV, format!("{:?}", target.point))
+        .env(PHASE4C2B_OCCURRENCE_ENV, target.occurrence.to_string())
+        .env(
+            PHASE4C2B_TRACE_ENV,
+            trace
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    let output = command
+        .output()
+        .expect("synchronously reap constrained crash child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("running 1 test"),
+        "exact child did not run: {stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == format!("{marker} {:?} {}", target.point, target.occurrence)),
+        "wrong constrained child marker: {stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(6),
+            "child must die from SIGABRT"
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        output.status.code(),
+        Some(-1_073_740_791),
+        "child must die from Windows abort fast-fail 0xC0000409"
+    );
+    crash_copy
+}
+
+fn phase4c2b_assert_complete_constraint_graph(state: &Phase4c2bStorageState) {
+    if state.base.tables.is_empty() {
+        assert!(state.base.indexes.is_empty());
+        assert!(state.constraints.is_empty());
+        return;
+    }
+    assert_eq!(state.constraints.len(), 4);
+    for (name, has_index) in [
+        ("PK_T", true),
+        ("UQ_T", true),
+        ("NN_T", false),
+        ("CK_T", false),
+    ] {
+        let constraint = state
+            .constraints
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(constraint.index_id.is_some(), has_index, "{name} ownership");
+        if has_index {
+            let index = state
+                .base
+                .indexes
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name} index"));
+            assert_eq!(index.id, constraint.index_id.expect("index ID"));
+            assert_eq!(index.entries.len(), state.base.tables["T"].rows.len());
+        }
+    }
+}
+
+fn phase4c2b_recover_case(
+    crash_copy: TempDatabase,
+    scenario: Phase4c2bCrashScenario,
+    target: Phase4c2bFaultTarget,
+    pre: &Phase4c2bStorageState,
+    post: &Phase4c2bStorageState,
+) {
+    let path = fs::canonicalize(crash_copy.path()).expect("canonical constrained recovered path");
+    let (accepted_lsn, recovered) = phase_4c2b_recover_and_capture(&path).unwrap_or_else(|error| {
+        panic!("{} {:?}: recovery failed: {error}", scenario.name(), target)
+    });
+    let expected = if accepted_lsn == post.base.lsn {
+        post
+    } else {
+        assert_eq!(
+            accepted_lsn, pre.base.lsn,
+            "accepted neither complete old nor new commit"
+        );
+        pre
+    };
+    assert_eq!(
+        &recovered,
+        expected,
+        "{} {:?}/{}, family={:?} tore the constraint bundle",
+        scenario.name(),
+        target.point,
+        target.occurrence,
+        target.family
+    );
+    phase4c2b_assert_complete_constraint_graph(&recovered);
+    let (repeat_lsn, repeat) =
+        phase_4c2b_recover_and_capture(&path).expect("repeat constrained recovery succeeds");
+    assert_eq!(
+        repeat_lsn, accepted_lsn,
+        "repeat recovery changed accepted LSN"
+    );
+    assert_eq!(repeat, recovered, "repeat recovery changed state");
+    phase_4c2a_remove_recovered_files(&path);
+    drop(crash_copy);
+}
+
+fn phase4c2b_run_directory_sync_case(
+    family_counts: &mut BTreeMap<Phase4c2bFaultFamily, usize>,
+    hook_counts: &mut BTreeMap<String, usize>,
+) -> usize {
+    // A normal commit reuses its already-created WAL, so directory durability
+    // lives on the WAL-creation path.  Start from a checkpointed constrained
+    // main file, enumerate that real path, then crash after its directory sync
+    // and require recovery to preserve the complete old constraint graph.
+    let fixture = phase4c2b_fixture(Phase4c2bCrashScenario::DropConstrainedTableReleasesAllRoots);
+    let trace_copy = phase_4c1_copy_main_only(fixture.path());
+    let trace = phase_4c1_wal_initialization_trace(trace_copy.path());
+    assert_eq!(
+        trace,
+        vec![
+            FaultPoint::BeforeWalHeaderWrite,
+            FaultPoint::AfterWalHeaderWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalHeaderWrite,
+            FaultPoint::AfterWalHeaderWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalDirectorySync,
+            FaultPoint::AfterWalDirectorySync,
+        ],
+        "constrained WAL creation retains both header-slot and directory boundaries"
+    );
+    let expected = phase_4c2b_recover_and_capture(trace_copy.path())
+        .expect("capture initialized constrained WAL baseline")
+        .1;
+    let point = FaultPoint::AfterWalDirectorySync;
+    let occurrence = 1;
+    let crash_copy = phase_4c1_copy_main_only(fixture.path());
+    let path = fs::canonicalize(crash_copy.path()).expect("canonical constrained init crash path");
+    let marker = "PHASE4C1_ABORT initialize";
+    let mut command = phase_4c1_exact_crash_child_command(SQL_CRASH_CHILD);
+    command
+        .env(SQL_CRASH_PATH_ENV, &path)
+        .env(SQL_CRASH_PROGRAM_ENV, "initialize")
+        .env(SQL_CRASH_POINT_ENV, format!("{point:?}"))
+        .env(SQL_CRASH_OCCURRENCE_ENV, occurrence.to_string())
+        .env(
+            SQL_CRASH_TRACE_ENV,
+            trace
+                .iter()
+                .map(|point| format!("{point:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    let output = command
+        .output()
+        .expect("reap constrained WAL initialization child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("running 1 test"),
+        "exact init child did not run: {stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == format!("{marker} {point:?} {occurrence}")),
+        "wrong constrained WAL initialization marker: {stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(6),
+            "init child must die from SIGABRT"
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        output.status.code(),
+        Some(-1_073_740_791),
+        "init child must die from Windows abort fast-fail 0xC0000409"
+    );
+    let recovered = phase_4c2b_recover_and_capture(&path)
+        .expect("recover constrained WAL directory-sync crash")
+        .1;
+    assert_eq!(
+        recovered, expected,
+        "directory-sync crash changed constraint state"
+    );
+    phase4c2b_assert_complete_constraint_graph(&recovered);
+    phase_4c2a_remove_recovered_files(&path);
+    *family_counts
+        .entry(Phase4c2bFaultFamily::DirectorySync)
+        .or_default() += 1;
+    *hook_counts.entry(format!("{point:?}")).or_default() += 1;
+    1
+}
+
+fn phase4c2b_run_crash_matrix() {
+    let mut family_counts = BTreeMap::<Phase4c2bFaultFamily, usize>::new();
+    let mut hook_counts = BTreeMap::<String, usize>::new();
+    let mut scenarios = 0usize;
+    let mut crashes = phase4c2b_run_directory_sync_case(&mut family_counts, &mut hook_counts);
+    for scenario in Phase4c2bCrashScenario::ALL {
+        let fixture = phase4c2b_fixture(scenario);
+        let (trace, records, pre, post) = phase4c2b_trace(&fixture, scenario);
+        let targets = phase4c2b_fault_targets(&trace, &records, &pre, &post);
+        let expected_hooks = trace
+            .iter()
+            .enumerate()
+            .map(|(index, &point)| {
+                let occurrence = trace[..=index]
+                    .iter()
+                    .filter(|&&seen| seen == point)
+                    .count();
+                (point, occurrence)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.point, target.occurrence))
+                .collect::<Vec<_>>(),
+            expected_hooks,
+            "{} must target every observed hook occurrence exactly once",
+            scenario.name()
+        );
+        for target in targets {
+            let crash_copy = phase4c2b_run_child(&fixture, scenario, &trace, target);
+            phase4c2b_recover_case(crash_copy, scenario, target, &pre, &post);
+            *family_counts.entry(target.family).or_default() += 1;
+            *hook_counts
+                .entry(format!("{:?}", target.point))
+                .or_default() += 1;
+            crashes += 1;
+        }
+        scenarios += 1;
+        eprintln!(
+            "phase4c2b crash progress: scenario={} scenarios={} crashes={} family_counts={family_counts:?} hook_counts={hook_counts:?}",
+            scenario.name(),
+            scenarios,
+            crashes
+        );
+    }
+    for family in [
+        Phase4c2bFaultFamily::CatalogPageFrame,
+        Phase4c2bFaultFamily::TablePageFrame,
+        Phase4c2bFaultFamily::PrimarySystemIndexFrame,
+        Phase4c2bFaultFamily::UniqueSystemIndexFrame,
+        Phase4c2bFaultFamily::WalCommitRecord,
+        Phase4c2bFaultFamily::WalSync,
+        Phase4c2bFaultFamily::MemoryPublication,
+        Phase4c2bFaultFamily::MainFileWriteSync,
+        Phase4c2bFaultFamily::DirectorySync,
+    ] {
+        assert!(
+            family_counts.get(&family).copied().unwrap_or(0) > 0,
+            "unobserved required fault family {family:?}"
+        );
+    }
+    eprintln!(
+        "phase4c2b constraint crash matrix: scenarios={scenarios} crashes={crashes} family_counts={family_counts:?} hook_counts={hook_counts:?}; every observed occurrence targeted; all recovered exactly old or new"
+    );
+}
+
+#[test]
+#[ignore = "only launched with validated parameters by phase_4c2b_constraint_crash_recovery_matrix"]
+fn phase_4c2b_constraint_crash_child() {
+    let path = PathBuf::from(
+        std::env::var_os(PHASE4C2B_PATH_ENV)
+            .expect("invalid Phase 4C2-B crash configuration: missing path"),
+    );
+    let scenario_name =
+        std::env::var(PHASE4C2B_SCENARIO_ENV).expect("invalid Phase 4C2-B crash scenario");
+    let scenario = Phase4c2bCrashScenario::ALL
+        .into_iter()
+        .find(|scenario| scenario.name() == scenario_name)
+        .expect("invalid Phase 4C2-B crash scenario");
+    let point = parse_sql_fault_point(
+        &std::env::var(PHASE4C2B_POINT_ENV).expect("invalid Phase 4C2-B crash point"),
+    )
+    .expect("invalid Phase 4C2-B crash point");
+    let occurrence_text =
+        std::env::var(PHASE4C2B_OCCURRENCE_ENV).expect("invalid Phase 4C2-B crash occurrence");
+    let occurrence: usize = occurrence_text
+        .parse()
+        .expect("invalid Phase 4C2-B crash occurrence");
+    assert!(occurrence > 0 && occurrence_text == occurrence.to_string());
+    let trace = std::env::var(PHASE4C2B_TRACE_ENV)
+        .expect("invalid Phase 4C2-B crash trace")
+        .split(',')
+        .map(|name| parse_sql_fault_point(name).expect("invalid Phase 4C2-B trace point"))
+        .collect::<Vec<_>>();
+    assert!(trace.iter().filter(|&&seen| seen == point).count() >= occurrence);
+    let path = phase_4c1_validate_crash_path(path, Phase4c1CrashPathKind::Sql);
+    let pager = phase_4c1_aborting_crash_pager(
+        &path,
+        trace,
+        point,
+        occurrence,
+        format!("PHASE4C2B_ABORT {}", scenario.name()),
+    );
+    phase4c2b_execute_statements(pager.clone(), scenario);
+    phase_4c2a_checkpoint(&pager).expect("checkpoint Phase 4C2-B crash child");
+    panic!("configured Phase 4C2-B crash point was not reached");
+}
+
+#[test]
+#[ignore = "run by the dedicated Phase 4C2-B CI job"]
+fn phase_4c2b_fixed_seed_constraint_model() {
+    run_phase4c2b_fixed_seed_constraint_model();
+}
+
+#[test]
+#[ignore = "run by the dedicated Phase 4C2-B CI job"]
+fn phase_4c2b_constraint_crash_recovery_matrix() {
+    phase4c2b_run_crash_matrix();
 }
