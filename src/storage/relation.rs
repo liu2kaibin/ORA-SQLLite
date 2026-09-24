@@ -5,6 +5,9 @@ use std::cell::{Cell, RefCell};
 
 use crate::{DbError, ErrorCode, Result, Value};
 
+#[cfg(test)]
+use super::catalog::{ConstraintBundleFaultPoint, fail_constraint_bundle_at_for_test};
+
 use super::{
     PageRef, ReadSnapshot, WriteBatch,
     btree::{BTree, BTreeScanState, TreeKind},
@@ -136,7 +139,18 @@ pub(crate) fn take_value_validation_limits_for_test() -> Vec<usize> {
 
 #[cfg(test)]
 pub(crate) fn fail_constrained_create_at_for_test(point: ConstrainedCreateFaultPoint) {
-    CONSTRAINED_CREATE_FAILURE.set(Some(point));
+    match point {
+        ConstrainedCreateFaultPoint::ConstraintRecordFamilyInserted => {
+            fail_constraint_bundle_at_for_test(ConstraintBundleFaultPoint::RecordsInserted);
+        }
+        ConstrainedCreateFaultPoint::FeatureEnabled => {
+            fail_constraint_bundle_at_for_test(ConstraintBundleFaultPoint::FeatureEnabled);
+        }
+        ConstrainedCreateFaultPoint::SystemIndexRootAllocated
+        | ConstrainedCreateFaultPoint::CatalogFinished => {
+            CONSTRAINED_CREATE_FAILURE.set(Some(point));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -993,12 +1007,6 @@ pub(crate) fn create_constrained_relation(
         }
         for bundle in &bundles {
             catalog.insert_constraint_bundle(batch, bundle)?;
-            #[cfg(test)]
-            constrained_create_fault_for_test(
-                ConstrainedCreateFaultPoint::ConstraintRecordFamilyInserted,
-            )?;
-            #[cfg(test)]
-            constrained_create_fault_for_test(ConstrainedCreateFaultPoint::FeatureEnabled)?;
         }
         catalog.finish(batch)?;
         #[cfg(test)]
@@ -1291,7 +1299,8 @@ mod tests {
         Pager,
         btree::{BTree, TreeKind},
         catalog::{
-            CatalogReader, CatalogWriter,
+            CatalogReader, CatalogWriter, ConstraintBundleFaultPoint,
+            take_constraint_bundle_fault_observations_for_test,
             types::{
                 CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintKind, IndexOwnership,
                 RowId, SchemaVersion, TableDef, TableId,
@@ -1554,6 +1563,21 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(error.code(), ErrorCode::Io, "{point:?}");
+            let catalog_observations = take_constraint_bundle_fault_observations_for_test();
+            match point {
+                ConstrainedCreateFaultPoint::ConstraintRecordFamilyInserted => assert_eq!(
+                    catalog_observations,
+                    vec![(ConstraintBundleFaultPoint::RecordsInserted, false)]
+                ),
+                ConstrainedCreateFaultPoint::FeatureEnabled => assert_eq!(
+                    catalog_observations,
+                    vec![(ConstraintBundleFaultPoint::FeatureEnabled, true)]
+                ),
+                ConstrainedCreateFaultPoint::SystemIndexRootAllocated
+                | ConstrainedCreateFaultPoint::CatalogFinished => {
+                    assert!(catalog_observations.is_empty(), "{point:?}")
+                }
+            }
             before.assert_matches_batch_for_test(&batch);
             assert_eq!(batch.feature_bits(), before_features, "{point:?}");
             assert_eq!(batch.catalog_root(), before_catalog_root, "{point:?}");

@@ -7,6 +7,9 @@ use std::{
     ops::Bound,
 };
 
+#[cfg(test)]
+use std::cell::{Cell, RefCell};
+
 use super::{
     PageRef,
     btree::{BTree, TreeKind},
@@ -26,6 +29,55 @@ use types::{
     ConstraintKind, IndexDef, IndexId, IndexOwnership, ObjectId, ObjectKind, RowId, SchemaVersion,
     TableDef, TableId,
 };
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConstraintBundleFaultPoint {
+    RecordsInserted,
+    FeatureEnabled,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONSTRAINT_BUNDLE_FAILURE: Cell<Option<ConstraintBundleFaultPoint>> = const { Cell::new(None) };
+    static CONSTRAINT_BUNDLE_FAULT_OBSERVATIONS: RefCell<Vec<(ConstraintBundleFaultPoint, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_constraint_bundle_at_for_test(point: ConstraintBundleFaultPoint) {
+    CONSTRAINT_BUNDLE_FAULT_OBSERVATIONS.with(|observations| observations.borrow_mut().clear());
+    CONSTRAINT_BUNDLE_FAILURE.set(Some(point));
+}
+
+#[cfg(test)]
+pub(crate) fn take_constraint_bundle_fault_observations_for_test()
+-> Vec<(ConstraintBundleFaultPoint, bool)> {
+    CONSTRAINT_BUNDLE_FAULT_OBSERVATIONS
+        .with(|observations| std::mem::take(&mut *observations.borrow_mut()))
+}
+
+#[cfg(test)]
+fn constraint_bundle_fault_for_test(
+    batch: &WriteBatch,
+    point: ConstraintBundleFaultPoint,
+) -> Result<()> {
+    CONSTRAINT_BUNDLE_FAILURE.with(|failure| {
+        if failure.get() == Some(point) {
+            failure.set(None);
+            CONSTRAINT_BUNDLE_FAULT_OBSERVATIONS.with(|observations| {
+                observations
+                    .borrow_mut()
+                    .push((point, batch.feature_bits() & INDEX_CONSTRAINT_V1 != 0));
+            });
+            Err(DbError::new(
+                ErrorCode::Io,
+                "injected constraint bundle insertion failure",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
 
 /// A fully decoded and cross-checked image. No page source is retained.
 #[derive(Debug, PartialEq, Eq)]
@@ -1427,7 +1479,12 @@ impl CatalogWriter {
                 }
                 batch.track_tree(TreeKind::Index, index.root())?;
             }
-            batch.enable_feature_bits(INDEX_CONSTRAINT_V1)
+            #[cfg(test)]
+            constraint_bundle_fault_for_test(batch, ConstraintBundleFaultPoint::RecordsInserted)?;
+            batch.enable_feature_bits(INDEX_CONSTRAINT_V1)?;
+            #[cfg(test)]
+            constraint_bundle_fault_for_test(batch, ConstraintBundleFaultPoint::FeatureEnabled)?;
+            Ok(())
         })
     }
 
