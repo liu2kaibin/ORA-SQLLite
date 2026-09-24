@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     ffi::OsString,
     fs,
@@ -5,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+use ora_sqllite::{Connection, Database, ErrorCode, ExecutionResult, Options, Parameters, Value};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -87,6 +91,50 @@ impl Drop for TempPaths {
             }
         }
     }
+}
+
+pub fn new_database(label: &str) -> (TempPaths, Database) {
+    let files = TempPaths::new(label);
+    let database = Database::create(files.main(), Options::default()).unwrap();
+    (files, database)
+}
+
+pub fn reopen(files: &TempPaths) -> Database {
+    Database::open(files.main(), Options::default()).unwrap()
+}
+
+pub fn execute_sql(connection: &mut Connection, sql: &str) -> ExecutionResult {
+    let statement = connection.prepare(sql).unwrap();
+    connection.execute(&statement, Parameters::none()).unwrap()
+}
+
+pub fn collect(connection: &mut Connection, sql: &str) -> Vec<Vec<Value>> {
+    let statement = connection.prepare(sql).unwrap();
+    let mut rows = connection.query(&statement, Parameters::none()).unwrap();
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        values.push(row.values().to_vec());
+    }
+    values
+}
+
+pub fn assert_constraint(connection: &mut Connection, sql: &str, expected_name: &str) {
+    let statement = connection.prepare(sql).unwrap();
+    let error = connection
+        .execute(&statement, Parameters::none())
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Constraint, "{sql}: {error}");
+    assert!(
+        error.to_string().contains(expected_name),
+        "{sql}: expected constraint name {expected_name:?} in {error}"
+    );
+}
+
+pub fn assert_no_table(connection: &mut Connection, name: &str) {
+    let error = connection
+        .prepare(&format!("SELECT ID FROM {name}"))
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Bind, "unexpected table {name}");
 }
 
 #[cfg(test)]

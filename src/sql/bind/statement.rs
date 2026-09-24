@@ -282,6 +282,15 @@ fn bind_create_table(
     }];
     let mut constraints = Vec::new();
     for constraint in create_constraints(create) {
+        if let Constraint::ForeignKey(foreign_key) = constraint {
+            let referenced_name = checked_catalog_name(&foreign_key.referenced_table)?;
+            if referenced_name == name {
+                return Err(DbError::new(
+                    ErrorCode::Unsupported,
+                    "self-referential foreign keys require Phase 4C2-C",
+                ));
+            }
+        }
         let name = checked_constraint_name(constraint, &mut constraint_names)?;
         if let Some(constraint_name) = &name {
             if catalog.object_name_exists(ObjectKind::Constraint, constraint_name) {
