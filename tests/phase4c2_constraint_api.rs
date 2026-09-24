@@ -723,6 +723,116 @@ fn declaration_forms_keep_null_empty_text_and_check_semantics_distinct() {
 }
 
 #[test]
+fn composite_unique_and_check_nulls_keep_stable_constraint_outcomes() {
+    // Breaks caught: treating a NULL component as an ordinary composite UNIQUE
+    // key, treating UNKNOWN CHECK as FALSE, or losing the stable named
+    // constraint outcome after an ordinary statement failure.
+    let (files, database) = common::new_database("phase4c2-model-null-outcomes");
+    let mut connection = database.connect().expect("connect constrained database");
+    execute_sql(
+        &mut connection,
+        "CREATE TABLE T (
+            ID INT64 CONSTRAINT PK_T PRIMARY KEY,
+            LABEL TEXT CONSTRAINT NN_T NOT NULL,
+            G INT64,
+            SCORE INT64,
+            CONSTRAINT UQ_T UNIQUE (LABEL, G),
+            CONSTRAINT CK_T CHECK (SCORE BETWEEN 0 AND 100)
+        )",
+    );
+
+    // NULL in either the composite UNIQUE key or the CHECK expression does
+    // not reject the row.  These two rows would collide if NULL were encoded
+    // as an ordinary equal key component.
+    execute_sql(
+        &mut connection,
+        "INSERT INTO T VALUES (1, 'nullable', NULL, NULL)",
+    );
+    execute_sql(
+        &mut connection,
+        "INSERT INTO T VALUES (2, 'nullable', NULL, NULL)",
+    );
+    execute_sql(
+        &mut connection,
+        "INSERT INTO T VALUES (3, 'duplicate', 7, NULL)",
+    );
+    assert_constraint(
+        &mut connection,
+        "INSERT INTO T VALUES (4, 'duplicate', 7, 0)",
+        "UQ_T",
+    );
+    assert_constraint(
+        &mut connection,
+        "INSERT INTO T VALUES (4, NULL, 8, 0)",
+        "NN_T",
+    );
+    assert_constraint(
+        &mut connection,
+        "INSERT INTO T VALUES (4, 'check', 8, 101)",
+        "CK_T",
+    );
+    assert_constraint(
+        &mut connection,
+        "INSERT INTO T VALUES (1, 'primary', 8, 0)",
+        "PK_T",
+    );
+
+    // A later ordinary statement remains usable and only accepted rows are
+    // visible, which is the public contract exercised by the fixed-seed model.
+    execute_sql(
+        &mut connection,
+        "INSERT INTO T VALUES (4, 'after-error', 8, 0)",
+    );
+    let expected = vec![
+        vec![
+            Value::Int64(1),
+            Value::Text("nullable".into()),
+            Value::Null,
+            Value::Null,
+        ],
+        vec![
+            Value::Int64(2),
+            Value::Text("nullable".into()),
+            Value::Null,
+            Value::Null,
+        ],
+        vec![
+            Value::Int64(3),
+            Value::Text("duplicate".into()),
+            Value::Int64(7),
+            Value::Null,
+        ],
+        vec![
+            Value::Int64(4),
+            Value::Text("after-error".into()),
+            Value::Int64(8),
+            Value::Int64(0),
+        ],
+    ];
+    assert_eq!(
+        collect(
+            &mut connection,
+            "SELECT ID, LABEL, G, SCORE FROM T ORDER BY ID"
+        ),
+        expected
+    );
+    drop(connection);
+    drop(database);
+
+    let reopened = common::reopen(&files);
+    let mut connection = reopened
+        .connect()
+        .expect("connect reopened constrained database");
+    assert_eq!(
+        collect(
+            &mut connection,
+            "SELECT ID, LABEL, G, SCORE FROM T ORDER BY ID"
+        ),
+        expected
+    );
+}
+
+#[test]
 fn constrained_prepared_dml_stays_usable_after_root_splits() {
     // Breaks caught: ordinary table or system-index root changes invalidating a
     // schema-stable DML Statement, or forgetting a constraint index on later rows.

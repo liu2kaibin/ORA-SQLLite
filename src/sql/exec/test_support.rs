@@ -3447,31 +3447,37 @@ impl ConstraintStepOutcome {
 /// production index-key encoding, SQL CHECK evaluator, or catalog decoder in
 /// its decision path.
 struct ConstraintModel {
+    seed: u64,
     generator: Generator,
     step: usize,
     next_id: i64,
     exists: bool,
     rows: BTreeMap<i64, ConstraintModelRow>,
+    bootstrap_phase: usize,
     transaction_before: Option<BTreeMap<i64, ConstraintModelRow>>,
     transaction_steps: usize,
     transactions_started: usize,
     rollback_current_transaction: bool,
     coverage: BTreeMap<&'static str, usize>,
+    violation_coverage: BTreeMap<&'static str, usize>,
 }
 
 impl ConstraintModel {
     fn new(seed: u64) -> Self {
         Self {
+            seed,
             generator: Generator::new(seed),
             step: 0,
             next_id: 1,
             exists: false,
             rows: BTreeMap::new(),
+            bootstrap_phase: 0,
             transaction_before: None,
             transaction_steps: 0,
             transactions_started: 0,
             rollback_current_transaction: false,
             coverage: BTreeMap::new(),
+            violation_coverage: BTreeMap::new(),
         }
     }
 
@@ -3488,6 +3494,17 @@ impl ConstraintModel {
                 1 => ConstraintOperation::Insert(self.fresh_row()),
                 _ if self.rollback_current_transaction => ConstraintOperation::Rollback,
                 _ => ConstraintOperation::Commit,
+            };
+        }
+        if self.bootstrap_phase < 6 {
+            return match self.bootstrap_phase {
+                0 => ConstraintOperation::Insert(self.bootstrap_base_row()),
+                1 => ConstraintOperation::Insert(self.bootstrap_violation_row("PK_T")),
+                2 => ConstraintOperation::Insert(self.bootstrap_violation_row("UQ_T")),
+                3 => ConstraintOperation::Insert(self.bootstrap_violation_row("NN_T")),
+                4 => ConstraintOperation::Insert(self.bootstrap_violation_row("CK_T")),
+                5 => ConstraintOperation::Insert(self.nullable_unique_and_check_row()),
+                _ => unreachable!("bootstrap phase is bounded"),
             };
         }
         if self.step > 0 && self.step % 173 == 0 {
@@ -3512,9 +3529,48 @@ impl ConstraintModel {
         ConstraintModelRow {
             id: Some(id),
             label: Some(format!("l{id}_{:x}", self.generator.next())),
-            group_id: Some(i64::try_from(self.generator.next() % 11).expect("small group")),
-            score: Some(i64::try_from(self.generator.next() % 101).expect("small score")),
+            group_id: (self.generator.index(4) != 0)
+                .then(|| i64::try_from(self.generator.next() % 11).expect("small group")),
+            score: (self.generator.index(5) != 0)
+                .then(|| i64::try_from(self.generator.next() % 101).expect("small score")),
         }
+    }
+
+    fn bootstrap_base_row(&mut self) -> ConstraintModelRow {
+        let mut row = self.fresh_row();
+        row.group_id = Some(0);
+        row.score = Some(0);
+        row
+    }
+
+    fn bootstrap_violation_row(&mut self, name: &str) -> ConstraintModelRow {
+        let mut row = self.fresh_row();
+        match name {
+            "PK_T" => row.id = self.rows.keys().next().copied(),
+            "UQ_T" => {
+                let existing = self.rows.values().next().expect("bootstrap base row");
+                row.label = existing.label.clone();
+                row.group_id = existing.group_id;
+            }
+            "NN_T" => row.label = None,
+            "CK_T" => row.score = Some(101),
+            _ => unreachable!("known bootstrap constraint"),
+        }
+        row
+    }
+
+    fn nullable_unique_and_check_row(&mut self) -> ConstraintModelRow {
+        let mut row = self.fresh_row();
+        row.label = self
+            .rows
+            .values()
+            .next()
+            .expect("bootstrap base row")
+            .label
+            .clone();
+        row.group_id = None;
+        row.score = None;
+        row
     }
 
     fn invalid_check_row(&mut self) -> ConstraintModelRow {
@@ -3578,9 +3634,14 @@ impl ConstraintModel {
 
     fn apply(&mut self, operation: &ConstraintOperation) -> ConstraintStepOutcome {
         *self.coverage.entry(operation.name()).or_default() += 1;
+        let bootstrap_insert = self.exists
+            && self.transaction_before.is_none()
+            && self.bootstrap_phase < 6
+            && matches!(operation, ConstraintOperation::Insert(_));
         let outcome = match operation {
             ConstraintOperation::Create => {
                 self.exists = true;
+                self.bootstrap_phase = 0;
                 ConstraintStepOutcome::success(0)
             }
             ConstraintOperation::Insert(row) => match self.violation(row, None) {
@@ -3635,6 +3696,19 @@ impl ConstraintModel {
                 ConstraintStepOutcome::success(0)
             }
         };
+        if bootstrap_insert {
+            self.bootstrap_phase += 1;
+        }
+        if let Some(name) = outcome.violation_name.as_deref() {
+            let stable_name = match name {
+                "PK_T" => "PK_T",
+                "UQ_T" => "UQ_T",
+                "NN_T" => "NN_T",
+                "CK_T" => "CK_T",
+                _ => unreachable!("constraint model returns only stable local names"),
+            };
+            *self.violation_coverage.entry(stable_name).or_default() += 1;
+        }
         if self.transaction_before.is_some()
             && matches!(
                 operation,
@@ -3773,6 +3847,16 @@ impl ConstraintModel {
                 "fixed seed missed {required}"
             );
         }
+        for required in ["PK_T", "UQ_T", "NN_T", "CK_T"] {
+            assert!(
+                self.violation_coverage.get(required).copied().unwrap_or(0) > 0,
+                "fixed seed missed stable {required} outcome"
+            );
+        }
+        eprintln!(
+            "phase4c2b fixed model: seed={:#x} operation_counts={:?} violation_counts={:?}",
+            self.seed, self.coverage, self.violation_coverage
+        );
     }
 }
 
@@ -3935,6 +4019,9 @@ enum Phase4c2bCrashScenario {
     FailingCheckRestoresStatementThenLaterCommit,
 }
 
+const PHASE4C2B_CREATE_MANY_ROWS: i64 = 48;
+const PHASE4C2B_DELETE_SEED_ROWS: i64 = 256;
+
 impl Phase4c2bCrashScenario {
     const ALL: [Self; 8] = [
         Self::InsertSplitsTableAndTwoSystemIndexes,
@@ -3970,8 +4057,18 @@ impl Phase4c2bCrashScenario {
 
     fn statements(self) -> Vec<String> {
         match self {
-            Self::ConstrainedCreateEmpty | Self::ConstrainedCreateManyRecords => {
-                vec![phase4c2b_create_sql().to_owned()]
+            Self::ConstrainedCreateEmpty => vec![phase4c2b_create_sql().to_owned()],
+            Self::ConstrainedCreateManyRecords => {
+                let mut statements = vec!["BEGIN".to_owned(), phase4c2b_create_sql().to_owned()];
+                for id in 0..PHASE4C2B_CREATE_MANY_ROWS {
+                    statements.push(format!(
+                        "INSERT INTO T VALUES ({id}, 'create-{id}-{}', {id}, {})",
+                        "x".repeat(48),
+                        id % 101
+                    ));
+                }
+                statements.push("COMMIT".to_owned());
+                statements
             }
             Self::InsertSplitsTableAndTwoSystemIndexes => {
                 let mut statements = vec!["BEGIN".to_owned()];
@@ -3988,7 +4085,10 @@ impl Phase4c2bCrashScenario {
                     .to_owned(),
             ],
             Self::DeleteCollapsesTableAndSystemIndex => {
-                vec!["DELETE FROM T WHERE ID < 95".to_owned()]
+                vec![format!(
+                    "DELETE FROM T WHERE ID < {}",
+                    PHASE4C2B_DELETE_SEED_ROWS - 1
+                )]
             }
             Self::DropConstrainedTableReleasesAllRoots => vec!["DROP TABLE T".to_owned()],
             Self::ExplicitTransactionMultipleRowsThenCommit => vec![
@@ -4078,7 +4178,7 @@ fn phase4c2b_fixture(scenario: Phase4c2bCrashScenario) -> TempDatabase {
     );
     let row_count = match scenario {
         Phase4c2bCrashScenario::InsertSplitsTableAndTwoSystemIndexes => 30,
-        Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex => 96,
+        Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex => PHASE4C2B_DELETE_SEED_ROWS,
         _ => 12,
     };
     let label_bytes = match scenario {
@@ -4176,6 +4276,27 @@ fn phase4c2b_assert_scenario_transition(
     post: &Phase4c2bStorageState,
 ) {
     match scenario {
+        Phase4c2bCrashScenario::ConstrainedCreateEmpty => {
+            assert!(pre.base.tables.is_empty());
+            assert_eq!(post.base.tables["T"].rows.len(), 0);
+            for name in ["PK_T", "UQ_T"] {
+                assert_eq!(post.base.indexes[name].entries.len(), 0, "{name}");
+            }
+        }
+        Phase4c2bCrashScenario::ConstrainedCreateManyRecords => {
+            assert!(pre.base.tables.is_empty());
+            assert_eq!(
+                post.base.tables["T"].rows.len(),
+                usize::try_from(PHASE4C2B_CREATE_MANY_ROWS).expect("small create-many count")
+            );
+            for name in ["PK_T", "UQ_T"] {
+                assert_eq!(
+                    post.base.indexes[name].entries.len(),
+                    usize::try_from(PHASE4C2B_CREATE_MANY_ROWS).expect("small create-many count"),
+                    "{name}"
+                );
+            }
+        }
         Phase4c2bCrashScenario::InsertSplitsTableAndTwoSystemIndexes => {
             assert!(
                 pre.base.tables["T"].root != post.base.tables["T"].root,
@@ -4204,8 +4325,33 @@ fn phase4c2b_assert_scenario_transition(
             );
         }
         Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex => {
-            assert!(post.base.tables["T"].rows.len() < pre.base.tables["T"].rows.len());
-            assert!(post.base.indexes["PK_T"].height <= pre.base.indexes["PK_T"].height);
+            assert_eq!(
+                pre.base.tables["T"].rows.len(),
+                usize::try_from(PHASE4C2B_DELETE_SEED_ROWS).expect("small delete seed count")
+            );
+            assert_eq!(post.base.tables["T"].rows.len(), 1);
+            assert!(
+                post.base.tables["T"].height < pre.base.tables["T"].height,
+                "table must collapse: pre={:?} post={:?}",
+                pre.base.tables["T"],
+                post.base.tables["T"]
+            );
+            assert_ne!(
+                post.base.tables["T"].root, pre.base.tables["T"].root,
+                "table must publish a collapsed root"
+            );
+            for name in ["PK_T", "UQ_T"] {
+                assert!(
+                    post.base.indexes[name].height < pre.base.indexes[name].height,
+                    "{name} must collapse: pre={:?} post={:?}",
+                    pre.base.indexes[name],
+                    post.base.indexes[name]
+                );
+                assert_ne!(
+                    post.base.indexes[name].root, pre.base.indexes[name].root,
+                    "{name} must publish a collapsed root"
+                );
+            }
         }
         Phase4c2bCrashScenario::DropConstrainedTableReleasesAllRoots => {
             assert!(post.base.tables.is_empty());
@@ -4611,6 +4757,64 @@ fn phase4c2b_run_crash_matrix() {
     eprintln!(
         "phase4c2b constraint crash matrix: scenarios={scenarios} crashes={crashes} family_counts={family_counts:?} hook_counts={hook_counts:?}; every observed occurrence targeted; all recovered exactly old or new"
     );
+}
+
+#[test]
+fn phase_4c2b_named_crash_scenarios_have_distinct_structural_preconditions() {
+    // Breaks caught: collapsing both constrained-create programs into one
+    // empty CREATE, or calling the delete scenario a collapse without a real
+    // table and both system-index trees becoming structurally smaller.
+    let transition = |scenario| {
+        let fixture = phase4c2b_fixture(scenario);
+        let (_, _, pre, post) = phase4c2b_trace(&fixture, scenario);
+        (pre, post)
+    };
+
+    let (empty_pre, empty_post) = transition(Phase4c2bCrashScenario::ConstrainedCreateEmpty);
+    assert!(empty_pre.base.tables.is_empty());
+    assert_eq!(empty_post.base.tables["T"].rows.len(), 0);
+    for name in ["PK_T", "UQ_T"] {
+        assert_eq!(empty_post.base.indexes[name].entries.len(), 0, "{name}");
+    }
+
+    let (many_pre, many_post) = transition(Phase4c2bCrashScenario::ConstrainedCreateManyRecords);
+    assert!(many_pre.base.tables.is_empty());
+    assert_eq!(
+        many_post.base.tables["T"].rows.len(),
+        usize::try_from(PHASE4C2B_CREATE_MANY_ROWS).expect("small create-many count")
+    );
+    for name in ["PK_T", "UQ_T"] {
+        assert_eq!(
+            many_post.base.indexes[name].entries.len(),
+            usize::try_from(PHASE4C2B_CREATE_MANY_ROWS).expect("small create-many count"),
+            "{name}"
+        );
+    }
+
+    let (delete_pre, delete_post) =
+        transition(Phase4c2bCrashScenario::DeleteCollapsesTableAndSystemIndex);
+    assert_eq!(
+        delete_pre.base.tables["T"].rows.len(),
+        usize::try_from(PHASE4C2B_DELETE_SEED_ROWS).expect("small delete seed count")
+    );
+    assert_eq!(delete_post.base.tables["T"].rows.len(), 1);
+    assert!(delete_pre.base.tables["T"].height > delete_post.base.tables["T"].height);
+    assert_ne!(
+        delete_pre.base.tables["T"].root,
+        delete_post.base.tables["T"].root
+    );
+    for name in ["PK_T", "UQ_T"] {
+        assert!(
+            delete_pre.base.indexes[name].height > delete_post.base.indexes[name].height,
+            "{name} must collapse: pre={:?} post={:?}",
+            delete_pre.base.indexes[name],
+            delete_post.base.indexes[name]
+        );
+        assert_ne!(
+            delete_pre.base.indexes[name].root,
+            delete_post.base.indexes[name].root
+        );
+    }
 }
 
 #[test]
