@@ -5816,13 +5816,69 @@ mod tests {
     }
 
     #[test]
-    fn phase_4c2b_index_feature_without_catalog_rejects_durable_header_in_both_modes() {
+    fn phase_4c2b_index_feature_without_catalog_rejects_committed_candidate_without_fallback() {
         // `enable_feature_bits` correctly refuses this combination before it
-        // can commit.  A format-2 header can still be durably corrupted, so
-        // recovery must classify it without modifying or accepting the file.
-        let (temp, pager) = test_pager(4096).unwrap();
+        // can commit. A checksummed, complete WAL candidate can nevertheless
+        // be durably corrupted. Recovery must reject that candidate instead
+        // of selecting the earlier complete checkpointed catalog.
+        let (temp, pager, _) = committed_single_column_catalog();
+        let prior_lsn = pager.latest_lsn().unwrap();
+        let mut prior = pager.begin_read().unwrap();
+        assert!(
+            CatalogReader::open_empty_or_v1(&mut prior)
+                .unwrap()
+                .find_table_by_name(&CatalogName::new("T").unwrap())
+                .is_some(),
+            "the prior complete catalog must be valid before the candidate"
+        );
+        drop(prior);
+        assert_eq!(pager.checkpoint().unwrap().to_lsn, prior_lsn);
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let table_id = writer.allocate_object_id(&mut batch).unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let candidate_table = new_table(table_id.get(), table_root, 0, "LATER");
+        writer
+            .insert_table_definition(&mut batch, &candidate_table)
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+        assert_ne!(pager.latest_lsn().unwrap(), prior_lsn);
+        let mut latest = pager.begin_read().unwrap();
+        assert!(
+            CatalogReader::open_empty_or_v1(&mut latest)
+                .unwrap()
+                .find_table_by_name(&CatalogName::new("LATER").unwrap())
+                .is_some(),
+            "the later catalog candidate must be complete before patching"
+        );
+        drop(latest);
+
+        // This is the immediate catalog validation of the later committed
+        // candidate with precisely the feature declaration that is patched
+        // into its durable WAL commit below.
+        let mut current = pager.begin_write().unwrap();
+        let (candidate_tree, _) = current
+            .catalog_tree_with_report(TreeKind::Table)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            CatalogReader::open_candidate(
+                &mut current,
+                &candidate_tree,
+                super::super::features::INDEX_CONSTRAINT_V1,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Corruption,
+            "current committed candidate"
+        );
+        current.rollback().unwrap();
+        drop(current);
         drop(pager);
-        set_real_file_feature_bits(&temp, super::super::features::INDEX_CONSTRAINT_V1);
+
+        set_latest_wal_commit_feature_bits(&temp, super::super::features::INDEX_CONSTRAINT_V1);
         let main = std::fs::read(temp.path()).unwrap();
         let wal_path = crate::storage::wal::wal_path(temp.path());
         let wal = std::fs::read(&wal_path).unwrap();
@@ -6026,6 +6082,64 @@ mod tests {
                 .copy_from_slice(&checksum);
         }
         std::fs::write(temp.path(), bytes).unwrap();
+    }
+
+    fn set_latest_wal_commit_feature_bits(temp: &TempDatabase, bits: u64) {
+        const WAL_HEADER_AREA_LEN: usize = 4096 * 2;
+        const RECORD_HEADER_LEN: usize = 64;
+        const COMMIT_PAYLOAD_LEN: usize = 64;
+        const COMMIT_RECORD_TYPE: u8 = 2;
+        const RECORD_HEADER_CRC_OFFSET: usize = 52;
+        const RECORD_PAYLOAD_CRC_OFFSET: usize = 48;
+        const COMMIT_FEATURE_BITS_OFFSET: usize = 40;
+
+        let wal_path = crate::storage::wal::wal_path(temp.path());
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        let mut offset = WAL_HEADER_AREA_LEN;
+        let mut latest_commit = None;
+        while offset < bytes.len() {
+            assert!(
+                offset + RECORD_HEADER_LEN <= bytes.len(),
+                "fixture WAL record has a complete header"
+            );
+            assert_eq!(
+                &bytes[offset..offset + 8],
+                b"ORAWREC\0",
+                "fixture WAL record uses the expected magic"
+            );
+            let payload_len = usize::try_from(u32::from_le_bytes(
+                bytes[offset + 12..offset + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+            let payload_end = offset + RECORD_HEADER_LEN + payload_len;
+            let record_end = (payload_end + 7) & !7;
+            assert!(
+                record_end <= bytes.len(),
+                "fixture WAL record lies within the durable WAL"
+            );
+            if bytes[offset + 8] == COMMIT_RECORD_TYPE {
+                assert_eq!(payload_len, COMMIT_PAYLOAD_LEN);
+                latest_commit = Some(offset);
+            }
+            offset = record_end;
+        }
+        assert_eq!(offset, bytes.len(), "fixture WAL has no trailing bytes");
+
+        let commit = latest_commit.expect("fixture WAL has a committed candidate");
+        let payload = commit + RECORD_HEADER_LEN;
+        bytes[payload + COMMIT_FEATURE_BITS_OFFSET..payload + COMMIT_FEATURE_BITS_OFFSET + 8]
+            .copy_from_slice(&bits.to_le_bytes());
+        let payload_crc =
+            crate::storage::checksum::crc32c(&bytes[payload..payload + COMMIT_PAYLOAD_LEN]);
+        bytes[commit + RECORD_PAYLOAD_CRC_OFFSET..commit + RECORD_PAYLOAD_CRC_OFFSET + 4]
+            .copy_from_slice(&payload_crc.to_le_bytes());
+        let mut header = [0; RECORD_HEADER_LEN];
+        header.copy_from_slice(&bytes[commit..commit + RECORD_HEADER_LEN]);
+        header[RECORD_HEADER_CRC_OFFSET..RECORD_HEADER_CRC_OFFSET + 4].fill(0);
+        let header_crc = crate::storage::checksum::crc32c(&header);
+        bytes[commit + RECORD_HEADER_CRC_OFFSET..commit + RECORD_HEADER_CRC_OFFSET + 4]
+            .copy_from_slice(&header_crc.to_le_bytes());
+        std::fs::write(wal_path, bytes).unwrap();
     }
 
     fn assert_format2_read_only_open_preserves_bytes(
