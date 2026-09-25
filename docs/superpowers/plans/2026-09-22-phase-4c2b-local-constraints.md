@@ -1631,3 +1631,5 @@ incomplete until required local gates and remote CI have verified results.
   target at 3 passed and 1 ignored). `git diff --check` passed.
 - Remote CI remains PENDING; MSRV remains BLOCKED by the existing local Rust
   1.85 process-launch access denial. Neither is recorded as passing.
+- Fix Round 2 worktree evidence: `git status --short` was run before this
+  evidence-only update. Exact result: no output (clean worktree).
