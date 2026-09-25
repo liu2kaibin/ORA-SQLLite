@@ -23,6 +23,7 @@ const PAGE_HEADER_LEN: usize = 48;
 const LEAF_METADATA_END: usize = 56;
 const INTERNAL_METADATA_END: usize = 64;
 const PAGE_TYPE_FREELIST: u8 = 7;
+const PAGE_TYPE_OVERFLOW: u8 = 6;
 const FEATURE_CATALOG_V1: u64 = 1;
 const FEATURE_INDEX_V1: u64 = 2;
 
@@ -77,6 +78,28 @@ pub struct RawConstraint {
     pub columns: Vec<u64>,
     pub check_program_len: u32,
     pub check_program_version: Option<u8>,
+}
+
+/// A direct physical B+Tree capture made by the test-only format-2 witness.
+/// Page-kind bytes, height, and leaf keys come from the accepted main file;
+/// no production storage decoder participates in this observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawTreeCapture {
+    pub root: RawPageRef,
+    pub root_page_type: u8,
+    pub height: usize,
+    pub entry_keys: Vec<Vec<u8>>,
+    pub overflow_values: Vec<RawOverflowValue>,
+}
+
+/// A table-leaf overflow value whose chain was independently checked from the
+/// raw main-file bytes. Index leaves are never allowed to contribute one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawOverflowValue {
+    pub storage_code: u8,
+    pub inline_len: usize,
+    pub total_value_len: u64,
+    pub chain: Vec<RawPageRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,6 +169,7 @@ pub fn catalog_record_families(path: &std::path::Path) -> Result<Vec<u8>, String
         },
         TreeKind::Table,
         false,
+        false,
     )?;
     let mut families = BTreeSet::new();
     for (key, _) in catalog.entries {
@@ -175,6 +199,7 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         },
         TreeKind::Table,
         false,
+        false,
     )?;
     let mut parsed = parse_raw_catalog(&catalog.entries)?;
     for table in parsed.tables.values_mut() {
@@ -198,6 +223,53 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         indexes: parsed.indexes,
         constraints: parsed.constraints,
         table_constraints: parsed.table_constraints,
+    })
+}
+
+/// Walks one table tree from a raw catalog root and retains its physical keys.
+pub fn raw_table_tree_capture(
+    path: &std::path::Path,
+    root: RawPageRef,
+) -> Result<RawTreeCapture, String> {
+    raw_tree_capture(path, root, TreeKind::Table, false)
+}
+
+/// Walks one index tree from a raw catalog root and retains its physical keys.
+pub fn raw_index_tree_capture(
+    path: &std::path::Path,
+    root: RawPageRef,
+) -> Result<RawTreeCapture, String> {
+    raw_tree_capture(path, root, TreeKind::Index, true)
+}
+
+fn raw_tree_capture(
+    path: &std::path::Path,
+    root: RawPageRef,
+    kind: TreeKind,
+    require_empty_values: bool,
+) -> Result<RawTreeCapture, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read main file: {error}"))?;
+    let header = select_header(&bytes)?;
+    let disk = Disk {
+        bytes: &bytes,
+        header,
+    };
+    let root_page_type = disk.page(root.id, Some(root.generation))?.page_type;
+    let scan = disk.walk_tree(
+        PageRef {
+            id: root.id,
+            generation: root.generation,
+        },
+        kind,
+        require_empty_values,
+        matches!(kind, TreeKind::Table),
+    )?;
+    Ok(RawTreeCapture {
+        root,
+        root_page_type,
+        height: scan.height,
+        entry_keys: scan.entries.into_iter().map(|(key, _)| key).collect(),
+        overflow_values: scan.overflow_values,
     })
 }
 
@@ -254,6 +326,8 @@ struct Page<'a> {
 struct TreeScan {
     entries: Vec<(Vec<u8>, Vec<u8>)>,
     pages: Vec<u64>,
+    height: usize,
+    overflow_values: Vec<RawOverflowValue>,
 }
 
 #[derive(Debug)]
@@ -305,6 +379,7 @@ pub fn verify_index_model(
         },
         TreeKind::Table,
         false,
+        false,
     )?;
     let definitions = explicit_index_definitions(&catalog.entries)?;
     if definitions.len() != names.len() {
@@ -322,7 +397,7 @@ pub fn verify_index_model(
             .get(name)
             .ok_or_else(|| format!("catalog misses expected index {name}"))?;
         assert_expected_index_metadata(name, definition)?;
-        let scan = disk.walk_tree(definition.root, TreeKind::Index, true)?;
+        let scan = disk.walk_tree(definition.root, TreeKind::Index, true, false)?;
         if scan.entries.len() != expected_rows {
             return Err(format!(
                 "{name} has {} physical entries, expected {expected_rows}",
@@ -388,6 +463,7 @@ pub fn corrupt_first_index_separator_with_valid_checksum(
                 generation: disk.page_generation(disk.header.catalog_root)?,
             },
             TreeKind::Table,
+            false,
             false,
         )?;
         let root = explicit_index_definitions(&catalog.entries)?
@@ -546,6 +622,7 @@ impl Disk<'_> {
         root: PageRef,
         kind: TreeKind,
         require_empty_values: bool,
+        allow_overflow_values: bool,
     ) -> Result<TreeScan, String> {
         if root.id == 0 || root.id >= self.header.page_count || root.generation == 0 {
             return Err("tree root is outside accepted page range".into());
@@ -554,18 +631,21 @@ impl Disk<'_> {
         let mut pages = Vec::new();
         let mut leaves = Vec::new();
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut overflow_values = Vec::new();
         let page_limit =
             usize::try_from(self.header.page_count).map_err(|_| "page count exceeds platform")?;
-        self.walk_subtree(
+        let root_summary = self.walk_subtree(
             root,
             kind,
             require_empty_values,
+            allow_overflow_values,
             true,
             page_limit,
             &mut visited,
             &mut pages,
             &mut leaves,
             &mut entries,
+            &mut overflow_values,
         )?;
         for (position, (_, sibling)) in leaves.iter().enumerate() {
             let expected = leaves.get(position + 1).map(|(reference, _)| *reference);
@@ -573,7 +653,12 @@ impl Disk<'_> {
                 return Err("B+Tree leaf sibling chain disagrees with tree traversal".into());
             }
         }
-        Ok(TreeScan { entries, pages })
+        Ok(TreeScan {
+            entries,
+            pages,
+            height: root_summary.map_or(0, |summary| summary.depth),
+            overflow_values,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -582,12 +667,14 @@ impl Disk<'_> {
         reference: PageRef,
         kind: TreeKind,
         require_empty_values: bool,
+        allow_overflow_values: bool,
         is_root: bool,
         page_limit: usize,
         visited: &mut HashSet<u64>,
         pages: &mut Vec<u64>,
         leaves: &mut Vec<(PageRef, Option<PageRef>)>,
         entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        overflow_values: &mut Vec<RawOverflowValue>,
     ) -> Result<Option<SubtreeSummary>, String> {
         if !visited.insert(reference.id) || visited.len() >= page_limit {
             return Err("B+Tree contains a cycle or too many pages".into());
@@ -603,7 +690,25 @@ impl Disk<'_> {
                 let mut min_key = None;
                 let mut max_key = None;
                 for cell in page.cells {
-                    let (key, value) = decode_leaf_cell(cell)?;
+                    let (key, storage) = decode_leaf_cell(cell)?;
+                    let value = match storage {
+                        RawLeafStorage::Inline(value) => value,
+                        RawLeafStorage::Overflow {
+                            total_value_len,
+                            first,
+                        } if allow_overflow_values => {
+                            overflow_values.push(RawOverflowValue {
+                                storage_code: 1,
+                                inline_len: 0,
+                                total_value_len,
+                                chain: self.validate_overflow_chain(first, total_value_len)?,
+                            });
+                            Vec::new()
+                        }
+                        RawLeafStorage::Overflow { .. } => {
+                            return Err("leaf cell uses unsupported overflow storage".into());
+                        }
+                    };
                     if require_empty_values && !value.is_empty() {
                         return Err("physical index leaf stores a nonempty value".into());
                     }
@@ -651,12 +756,14 @@ impl Disk<'_> {
                             child,
                             kind,
                             require_empty_values,
+                            allow_overflow_values,
                             false,
                             page_limit,
                             visited,
                             pages,
                             leaves,
                             entries,
+                            overflow_values,
                         )?
                         .ok_or("non-root B+Tree child is empty")?,
                     );
@@ -688,6 +795,94 @@ impl Disk<'_> {
             }
             _ => Err("B+Tree page kind changes below its root".into()),
         }
+    }
+
+    fn validate_overflow_chain(
+        &self,
+        first: PageRef,
+        total_value_len: u64,
+    ) -> Result<Vec<RawPageRef>, String> {
+        let mut current = Some(first);
+        let mut seen = BTreeSet::new();
+        let mut chain = Vec::new();
+        let mut accumulated = 0_u64;
+        while let Some(reference) = current {
+            if reference.id == 0
+                || reference.id >= self.header.page_count
+                || reference.generation == 0
+                || !seen.insert(reference.id)
+            {
+                return Err(
+                    "overflow chain reference is outside the accepted range or cyclic".into(),
+                );
+            }
+            let (next, chunk_len) = self.overflow_chunk(reference)?;
+            accumulated = accumulated
+                .checked_add(u64::try_from(chunk_len).map_err(|_| "overflow chunk exceeds u64")?)
+                .ok_or("overflow chain length overflows")?;
+            if accumulated > total_value_len {
+                return Err("overflow chain exceeds its declared value length".into());
+            }
+            chain.push(RawPageRef {
+                id: reference.id,
+                generation: reference.generation,
+            });
+            current = next;
+        }
+        if accumulated != total_value_len {
+            return Err("overflow chain length disagrees with its leaf cell".into());
+        }
+        Ok(chain)
+    }
+
+    fn overflow_chunk(&self, reference: PageRef) -> Result<(Option<PageRef>, usize), String> {
+        let start = ordinary_page_offset(reference.id, self.header.page_size)?;
+        let end = start
+            .checked_add(self.header.page_size)
+            .ok_or("overflow page extent overflows")?;
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or("overflow page lies outside accepted file")?;
+        verify_page_checksum(bytes)?;
+        let page_type = byte(bytes, 0)?;
+        let cell_count = read_u16(bytes, 20)?;
+        let slot_end = read_u16(bytes, 22)?;
+        let payload_start = read_u16(bytes, 24)?;
+        let right_sibling = read_u64(bytes, 28)?;
+        let page_id = read_u64(bytes, 4)?;
+        let generation = read_u64(bytes, 12)?;
+        if bytes.len() != self.header.page_size
+            || page_type != PAGE_TYPE_OVERFLOW
+            || bytes[1] != 0
+            || read_u16(bytes, 2)? != 0
+            || cell_count != 0
+            || slot_end != PAGE_HEADER_LEN as u16
+            || payload_start
+                != u16::try_from(self.header.page_size)
+                    .map_err(|_| "overflow page size exceeds u16")?
+            || right_sibling != 0
+            || bytes[40..48].iter().any(|byte| *byte != 0)
+            || page_id != reference.id
+            || generation != reference.generation
+        {
+            return Err(format!(
+                "overflow page header is invalid: type={page_type}; cells={cell_count}; slot_end={slot_end}; payload_start={payload_start}; right_sibling={right_sibling}; page_id={page_id}; generation={generation}"
+            ));
+        }
+        let next = match (read_u64(bytes, 48)?, read_u64(bytes, 56)?) {
+            (0, 0) => None,
+            (id, generation) if id < self.header.page_count && generation != 0 => {
+                Some(PageRef { id, generation })
+            }
+            _ => return Err("overflow next reference is invalid".into()),
+        };
+        let chunk_len = usize::try_from(read_u32(bytes, 64)?)
+            .map_err(|_| "overflow chunk length exceeds this platform")?;
+        if read_u32(bytes, 68)? != 0 || chunk_len > bytes.len().saturating_sub(72) {
+            return Err("overflow page body is invalid".into());
+        }
+        Ok((next, chunk_len))
     }
 }
 
@@ -1434,7 +1629,15 @@ fn decode_leaf_sibling(page: &Page<'_>, page_count: u64) -> Result<Option<PageRe
     }
 }
 
-fn decode_leaf_cell(cell: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+enum RawLeafStorage {
+    Inline(Vec<u8>),
+    Overflow {
+        total_value_len: u64,
+        first: PageRef,
+    },
+}
+
+fn decode_leaf_cell(cell: &[u8]) -> Result<(Vec<u8>, RawLeafStorage), String> {
     if cell.len() < 12 {
         return Err("leaf cell is truncated".into());
     }
@@ -1442,24 +1645,59 @@ fn decode_leaf_cell(cell: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     if key_len > 1024 || cell[3] != 0 {
         return Err("leaf cell key length or reserved byte is invalid".into());
     }
-    let value_len =
-        usize::try_from(read_u64(cell, 4)?).map_err(|_| "leaf value length exceeds platform")?;
-    if cell[2] != 0 || value_len > 16 * 1024 * 1024 {
-        return Err("leaf cell uses unsupported storage or an excessive value".into());
-    }
+    let total_value_len = read_u64(cell, 4)?;
     let key_end = 12usize
         .checked_add(key_len)
         .ok_or("leaf key extent overflow")?;
-    let value_end = key_end
-        .checked_add(value_len)
-        .ok_or("leaf value extent overflow")?;
-    if value_end != cell.len() {
-        return Err("leaf cell length does not match key/value lengths".into());
+    let key = cell
+        .get(12..key_end)
+        .ok_or("leaf key lies outside its cell")?
+        .to_vec();
+    match cell[2] {
+        0 => {
+            let value_len = usize::try_from(total_value_len)
+                .map_err(|_| "leaf value length exceeds platform")?;
+            if value_len > 16 * 1024 * 1024 {
+                return Err("leaf inline value is excessive".into());
+            }
+            let value_end = key_end
+                .checked_add(value_len)
+                .ok_or("leaf value extent overflow")?;
+            if value_end != cell.len() {
+                return Err("leaf cell length does not match its inline value".into());
+            }
+            Ok((
+                key,
+                RawLeafStorage::Inline(cell[key_end..value_end].to_vec()),
+            ))
+        }
+        1 => {
+            if total_value_len == 0 {
+                return Err("leaf overflow value has zero length".into());
+            }
+            let reference_end = key_end
+                .checked_add(16)
+                .ok_or("leaf overflow reference extent overflow")?;
+            if reference_end != cell.len() {
+                return Err("leaf overflow cell length is invalid".into());
+            }
+            let first = PageRef {
+                id: read_u64(cell, key_end)?,
+                generation: read_u64(cell, key_end + 8)?,
+            };
+            if first.id == 0 || first.generation == 0 {
+                return Err("leaf overflow reference is invalid".into());
+            }
+            Ok((
+                key,
+                RawLeafStorage::Overflow {
+                    total_value_len,
+                    first,
+                },
+            ))
+        }
+        _ => Err("leaf cell has an unknown storage code".into()),
     }
-    Ok((
-        cell[12..key_end].to_vec(),
-        cell[key_end..value_end].to_vec(),
-    ))
 }
 
 fn decode_internal_children(

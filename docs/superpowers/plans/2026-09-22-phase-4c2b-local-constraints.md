@@ -1594,3 +1594,40 @@ incomplete until required local gates and remote CI have verified results.
   Task 11 adds none of those behaviors.
 - Remote CI — PENDING. No remote workflow was triggered, so there is no CI run
   URL to record. MSRV must be rerun once the local Rust 1.85 toolchain can start.
+
+### Task 11 Fix Round 1 local evidence — 2026-09-25
+
+- Added an independent raw physical witness for the explicit nonunique index,
+  `PK_T` system index, and `UQ_T` system index. It verifies full hand-derived
+  post-delete physical key sequences and counts, raw constraint/index
+  bidirectional ownership mappings, and checkpoint/reopen persistence.
+- Added deterministic collapse coverage: at 300 rows and at the ignored 100,000
+  row gate, table/PK/UQ roots are internal with positive height before delete;
+  after retaining three deterministic rows they are leaf roots of height zero,
+  and each root reference changes.
+- Added a table-overflow witness. It validates a legitimate overflow value
+  independently (checksum, header, references, chunk lengths, and full chain)
+  while index leaves still require empty inline values and reject overflow.
+  The observed deterministic witness was `storage_code=1`, `inline_len=0`,
+  `total_value_len=9121`, chain pages `6/1 -> 7/1 -> 8/1`.
+- RED evidence: the initial raw-index witness failed because it accepted only
+  explicit-index catalog records; the initial collapse assertion failed when a
+  half delete left table root type 2. The first exact 100,000-row run failed
+  after 1,177.48 seconds only because the test witness rejected a valid table
+  overflow value (`leaf cell uses unsupported storage or an excessive value`).
+- GREEN evidence: after fixing the witness, `rustup run stable cargo test
+  --profile exhaustive --test phase4c2_constraint_scale
+  phase_4c2b_hundred_thousand_row_constraint_smoke -- --exact --ignored
+  --nocapture` passed in 1,479.77 seconds. Its final output was
+  `phase 4C2-B 100k: final_rows=3; table pre=type2/height2 post=type3/height0;
+  PK pre=type4/height2 post=type5/height0; UQ pre=type4/height2
+  post=type5/height0; physical_entries explicit=3 pk=3 uq=3;
+  elapsed=1479.65s`.
+- Fresh local regression evidence after the fix: `cargo fmt --check` and strict
+  stable Clippy passed; `cargo test --test phase4c2_constraint_scale` passed
+  3 tests with the 100k gate explicitly ignored; index API passed 18/18;
+  constraint API passed 10/10; `cargo test --all-targets` passed (core: 869
+  passed, 16 ignored; all integration targets passed, including the scale
+  target at 3 passed and 1 ignored). `git diff --check` passed.
+- Remote CI remains PENDING; MSRV remains BLOCKED by the existing local Rust
+  1.85 process-launch access denial. Neither is recorded as passing.
