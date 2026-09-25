@@ -1567,9 +1567,11 @@ incomplete until required local gates and remote CI have verified results.
   16 ignored; public and integration targets also passed. The new
   `phase4c2_constraint_scale` target reported 1 passed and 1 ignored; the
   ignored 100,000-row target was run separately below.
-- `rustup run 1.85.0 cargo test --all-targets` — BLOCKED before compilation:
-  Windows returned `could not execute process rustc -vV` / `拒绝访问` (os error
-  5). This is not recorded as a passing MSRV result.
+- `rustup run 1.85.0 cargo test --all-targets` — the initial attempt was
+  BLOCKED before compilation when Windows returned `could not execute process
+  rustc -vV` / `拒绝访问` (os error 5). A fresh rerun on 2026-09-25 succeeded:
+  unit suite 869 passed, 16 ignored; every public and integration target also
+  passed.
 - `rustup run stable cargo test --test phase4c2_constraint_scale
   phase_4c2b_stale_format2_oracle_does_not_reject_persisted_freelist_after_constrained_update
   -- --exact --nocapture` — PASS. This normal 100-row regression proves the
@@ -1593,7 +1595,7 @@ incomplete until required local gates and remote CI have verified results.
   documentation for ForeignKey/ReferencedBy/IndexScan/ALTER/CASCADE/DEFERRABLE;
   Task 11 adds none of those behaviors.
 - Remote CI — PENDING. No remote workflow was triggered, so there is no CI run
-  URL to record. MSRV must be rerun once the local Rust 1.85 toolchain can start.
+  URL to record. The local Rust 1.85 MSRV rerun now passes.
 
 ### Task 11 Fix Round 1 local evidence — 2026-09-25
 
@@ -1629,7 +1631,21 @@ incomplete until required local gates and remote CI have verified results.
   constraint API passed 10/10; `cargo test --all-targets` passed (core: 869
   passed, 16 ignored; all integration targets passed, including the scale
   target at 3 passed and 1 ignored). `git diff --check` passed.
-- Remote CI remains PENDING; MSRV remains BLOCKED by the existing local Rust
-  1.85 process-launch access denial. Neither is recorded as passing.
+- Remote CI remains PENDING. Rust 1.85 MSRV is now PASS after the transient
+  process-launch access denial cleared: `rustc -vV` reported 1.85.0 and
+  `cargo test --all-targets` passed with 869 unit tests, 16 ignored, and every
+  integration target passing.
 - Fix Round 2 worktree evidence: `git status --short` was run before this
   evidence-only update. Exact result: no output (clean worktree).
+
+### Final local revalidation — 2026-09-25
+
+- `rustup run stable cargo test --all-targets` — PASS: 869 unit tests passed,
+  16 explicitly ignored, and every integration target passed; the constraint
+  scale target reported 3 passed and 1 ignored.
+- `rustup run 1.85.0 rustc -vV` — PASS: rustc 1.85.0
+  (`4d91de4e4`, x86_64-pc-windows-msvc).
+- `rustup run 1.85.0 cargo test --all-targets` — PASS: 869 unit tests passed,
+  16 explicitly ignored, and every integration target passed; the constraint
+  scale target reported 3 passed and 1 ignored.
+- Remote Linux Phase 4C2-B CI remains PENDING and has no run URL.
