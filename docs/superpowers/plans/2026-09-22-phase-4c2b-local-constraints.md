@@ -1466,7 +1466,7 @@ git commit -m "test: model and crash local constraints"
 - Consumes: all prior 4C2-B tasks and existing exhaustive profile.
 - Produces: dedicated Linux 4C2-B gate, updated project status, and recorded completion evidence.
 
-- [ ] **Step 1: Add the ignored 100,000-row constraint acceptance**
+- [x] **Step 1: Add the ignored 100,000-row constraint acceptance**
 
 ~~~rust
 #[test]
@@ -1486,13 +1486,13 @@ fn phase_4c2b_hundred_thousand_row_constraint_smoke() {
 
 The table has a PrimaryKey, a composite Unique with deterministic NULL rows, a NotNull column, a Check expression, and one explicit nonunique index. Exercise batched explicit transactions, updates that change all indexed columns, deletes that collapse trees, rollback, checkpoint, and reopen. Assert correctness only; do not add a shared-runner millisecond threshold.
 
-- [ ] **Step 2: Run the scale target**
+- [x] **Step 2: Run the scale target**
 
 Run: rustup run stable cargo test --profile exhaustive --test phase4c2_constraint_scale phase_4c2b_hundred_thousand_row_constraint_smoke -- --exact --ignored --nocapture
 
 Expected: pass with 100,000 inserted rows and a complete final table/explicit-index/system-index/constraint graph.
 
-- [ ] **Step 3: Add the dedicated Linux Phase 4C2-B CI job**
+- [x] **Step 3: Add the dedicated Linux Phase 4C2-B CI job**
 
 Add a 120-minute ubuntu-latest job named "Linux Phase 4C2-B local constraints" that installs stable Rust and runs:
 
@@ -1507,11 +1507,11 @@ Add a 120-minute ubuntu-latest job named "Linux Phase 4C2-B local constraints" t
 
 Keep the existing Linux stable, Rust 1.85 MSRV, Windows, Phase 4B, Phase 4C1, Phase 4C2-A, storage-model, WAL, and catalog jobs unchanged.
 
-- [ ] **Step 4: Update README with verified scope**
+- [x] **Step 4: Update README with verified scope**
 
 State that Phase 4C2-B supports persistent PrimaryKey, Unique, NotNull, and Check constraints; system-owned unique indexes; atomic constrained table lifecycle; named Constraint errors; rollback/reopen/recovery; and existing bounded WorkMemory. State explicitly that ForeignKey is Phase 4C2-C, IndexScan is Phase 4C2-D, SELECT and DML target discovery still use TableScan, and Phase 5 Oracle extensions remain deferred.
 
-- [ ] **Step 5: Run formatting, lint, stable, MSRV, and public tests**
+- [x] **Step 5: Run formatting, lint, stable, MSRV, and public tests**
 
 Run: rustup run stable cargo fmt --check
 
@@ -1523,7 +1523,7 @@ Run: rustup run 1.85.0 cargo test --all-targets
 
 Expected: all commands exit 0; only explicitly ignored model/crash/scale tests are skipped.
 
-- [ ] **Step 6: Run every 4C2-B specialized gate**
+- [x] **Step 6: Run every 4C2-B specialized gate**
 
 Run: rustup run stable cargo test sql::exec::test_support::phase_4c2b_fixed_seed_constraint_model -- --exact --ignored --nocapture
 
@@ -1533,7 +1533,7 @@ Run: rustup run stable cargo test --profile exhaustive --test phase4c2_constrain
 
 Expected: all pass with deterministic seeds, complete fault-family coverage, and no logical table/index mismatch.
 
-- [ ] **Step 7: Inspect exact scope**
+- [x] **Step 7: Inspect exact scope**
 
 Run: git diff --check
 
@@ -1543,7 +1543,7 @@ Run: rg -n "ForeignKey|ReferencedBy|IndexScan|ALTER TABLE|CASCADE|DEFERRABLE" sr
 
 Expected: no whitespace errors; changes are limited to 4C2-B; ForeignKey/ReferencedBy occur only in parse/bind/deferred/rejection tests; no IndexScan, ALTER, cascade, deferred-constraint, or Phase 5 behavior was implemented.
 
-- [ ] **Step 8: Record completion evidence and commit**
+- [x] **Step 8: Record completion evidence and commit**
 
 Append the verified command results, test counts, specialized-gate seeds/scenario counts, and CI run URL under the Completion Evidence heading below.
 
@@ -1595,8 +1595,8 @@ incomplete until required local gates and remote CI have verified results.
   documentation for ForeignKey/ReferencedBy/IndexScan/ALTER/CASCADE/DEFERRABLE;
   Task 11 adds none of those behaviors.
 - Remote CI — the first run exposed Rust 1.85-incompatible let-chain syntax;
-  the compatibility fix has clean local compile evidence and requires a remote
-  rerun before the MSRV gate can pass.
+  the compatibility fix was subsequently verified by the successful clean
+  Linux rerun recorded below.
 
 ### Task 11 Fix Round 1 local evidence — 2026-09-25
 
@@ -1634,8 +1634,8 @@ incomplete until required local gates and remote CI have verified results.
   target at 3 passed and 1 ignored). `git diff --check` passed.
 - Remote CI initially failed the Rust 1.85 and Phase 4B jobs on unsupported
   let-chain syntax. The compatibility fix also replaced the one later-stable
-  `usize::is_multiple_of` use found by a forced clean 1.85 compile; the remote
-  rerun remains required.
+  `usize::is_multiple_of` use found by a forced clean 1.85 compile; the final
+  clean Linux rerun passed as recorded below.
 - Fix Round 2 worktree evidence: `git status --short` was run before this
   evidence-only update. Exact result: no output (clean worktree).
 
@@ -1650,5 +1650,19 @@ incomplete until required local gates and remote CI have verified results.
   isolated target directory — RED on the two unsupported let-chains and then
   on `usize::is_multiple_of`; GREEN after the compatibility fix with
   `cargo check --all-targets`.
-- Remote CI rerun remains required; the first run URL is
+- The first remote run exposed the compatibility defects and is retained as
+  RED evidence:
   `https://github.com/liu2kaibin/ORA-SQLLite/actions/runs/36136039372`.
+
+### Final remote CI evidence — 2026-09-25
+
+- GitHub Actions run
+  `https://github.com/liu2kaibin/ORA-SQLLite/actions/runs/36138333820`
+  completed successfully at commit `fda6cc2971fd267d47a0cfcdca98d120fb081a26`.
+- All 10 jobs passed: Linux Rust 1.85 MSRV, Linux stable quality, Windows
+  stable, Phase 4B SQL frontend, Phase 4C1 SQL execution, Phase 4C2-A index
+  storage and DDL, Phase 4C2-B local constraints, exhaustive storage model,
+  WAL crash recovery, and catalog/row recovery.
+- The dedicated Phase 4C2-B job passed the fixed-seed model, crash-recovery
+  matrix, and exact 100,000-row smoke. The Rust 1.85 job passed its clean
+  minimum-supported-toolchain suite. Task 11 is complete.
