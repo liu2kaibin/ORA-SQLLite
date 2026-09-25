@@ -22,6 +22,7 @@ const SUPERBLOCK_AREA_LEN: usize = SUPERBLOCK_LEN * 2;
 const PAGE_HEADER_LEN: usize = 48;
 const LEAF_METADATA_END: usize = 56;
 const INTERNAL_METADATA_END: usize = 64;
+const PAGE_TYPE_FREELIST: u8 = 7;
 const FEATURE_CATALOG_V1: u64 = 1;
 const FEATURE_INDEX_V1: u64 = 2;
 
@@ -1263,7 +1264,7 @@ fn raw_freelist(disk: &Disk<'_>) -> Result<Vec<RawFreelistTrunk>, String> {
             .get(start..end)
             .ok_or("raw freelist page lies outside accepted file")?;
         verify_page_checksum(bytes)?;
-        if byte(bytes, 0)? != 6 || read_u64(bytes, 4)? != page_id {
+        if byte(bytes, 0)? != PAGE_TYPE_FREELIST || read_u64(bytes, 4)? != page_id {
             return Err("raw freelist page identity or kind is invalid".into());
         }
         let generation = read_u64(bytes, 12)?;

@@ -1554,4 +1554,43 @@ git commit -m "test: gate phase 4c2b local constraints"
 
 ## Phase 4C2-B Completion Evidence
 
-Record evidence here only after Task 11 commands and remote CI have completed. The implementation is not complete while this section has no verified results.
+Record local and remote evidence here as each gate completes. Task 11 remains
+incomplete until required local gates and remote CI have verified results.
+
+### Task 11 local evidence — 2026-09-25
+
+- `rustup run stable cargo fmt --check` — PASS after formatting the new scale
+  regression.
+- `rustup run stable cargo clippy --all-targets --all-features -- -D warnings`
+  — PASS.
+- `rustup run stable cargo test --all-targets` — PASS: unit suite 869 passed,
+  16 ignored; public and integration targets also passed. The new
+  `phase4c2_constraint_scale` target reported 1 passed and 1 ignored; the
+  ignored 100,000-row target was run separately below.
+- `rustup run 1.85.0 cargo test --all-targets` — BLOCKED before compilation:
+  Windows returned `could not execute process rustc -vV` / `拒绝访问` (os error
+  5). This is not recorded as a passing MSRV result.
+- `rustup run stable cargo test --test phase4c2_constraint_scale
+  phase_4c2b_stale_format2_oracle_does_not_reject_persisted_freelist_after_constrained_update
+  -- --exact --nocapture` — PASS. This normal 100-row regression proves the
+  independent format-2 witness accepts the nonempty persisted freelist created
+  by a constrained update, and validates the persisted constraint graph.
+- `rustup run stable cargo test --profile exhaustive --test
+  phase4c2_constraint_scale phase_4c2b_hundred_thousand_row_constraint_smoke
+  -- --exact --ignored --nocapture` — PASS: 100,000 inserted rows, constrained
+  updates/deletes/rollback/checkpoint/reopen, and raw final table/index/constraint
+  graph; 1,721.54 seconds.
+- `rustup run stable cargo test
+  sql::exec::test_support::phase_4c2b_fixed_seed_constraint_model -- --exact
+  --ignored --nocapture` — PASS: 6,000 total steps across seeds
+  `0x4c2b0001`, `0x4c2b0002`, and `0x4c2b0003`; 1,102.26 seconds.
+- `rustup run stable cargo test
+  sql::exec::test_support::phase_4c2b_constraint_crash_recovery_matrix --
+  --exact --ignored --nocapture` — PASS: all 8 named scenarios and 491 observed
+  crash targets recovered to exactly old or new state; 2,129.51 seconds.
+- Scope checks: `git diff --check` passed. The required keyword scan found only
+  pre-existing parser/binder/catalog rejection coverage and explicit deferred
+  documentation for ForeignKey/ReferencedBy/IndexScan/ALTER/CASCADE/DEFERRABLE;
+  Task 11 adds none of those behaviors.
+- Remote CI — PENDING. No remote workflow was triggered, so there is no CI run
+  URL to record. MSRV must be rerun once the local Rust 1.85 toolchain can start.
