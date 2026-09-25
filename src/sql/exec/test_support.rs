@@ -3679,7 +3679,7 @@ impl ConstraintModel {
                 self.transaction_before = Some(self.rows.clone());
                 self.transaction_steps = 0;
                 self.transactions_started += 1;
-                self.rollback_current_transaction = self.transactions_started.is_multiple_of(2);
+                self.rollback_current_transaction = self.transactions_started % 2 == 0;
                 ConstraintStepOutcome::success(0)
             }
             ConstraintOperation::Commit => {
@@ -3735,14 +3735,14 @@ impl ConstraintModel {
         if row.label.is_none() {
             return Some("NN_T");
         }
-        if let (Some(label), Some(group_id)) = (&row.label, row.group_id)
-            && self.rows.iter().any(|(&existing_id, existing)| {
+        if let (Some(label), Some(group_id)) = (&row.label, row.group_id) {
+            if self.rows.iter().any(|(&existing_id, existing)| {
                 existing_id != replaced.unwrap_or(i64::MIN)
                     && existing.label.as_deref() == Some(label)
                     && existing.group_id == Some(group_id)
-            })
-        {
-            return Some("UQ_T");
+            }) {
+                return Some("UQ_T");
+            }
         }
         if row.score.is_some_and(|score| !(0..=100).contains(&score)) {
             return Some("CK_T");

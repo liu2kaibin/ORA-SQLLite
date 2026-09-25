@@ -450,15 +450,16 @@ impl CatalogImage {
                     return Err(corruption("index contains a repeated column"));
                 }
             }
-            if let IndexOwnership::Constraint(constraint_id) = index.ownership()
-                && self
+            if let IndexOwnership::Constraint(constraint_id) = index.ownership() {
+                if self
                     .constraints
                     .get(&constraint_id)
                     .is_none_or(|constraint| constraint.index_id() != Some(index.id()))
-            {
-                return Err(corruption(
-                    "constraint-owned index has no matching owner constraint",
-                ));
+                {
+                    return Err(corruption(
+                        "constraint-owned index has no matching owner constraint",
+                    ));
+                }
             }
         }
         for (table_id, indexes) in &self.table_indexes {
