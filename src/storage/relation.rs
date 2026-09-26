@@ -1043,7 +1043,9 @@ pub(crate) fn create_constrained_relation(
                 ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
                     Some(IndexId::new(catalog.allocate_object_id(batch)?.get())?)
                 }
-                ConstraintKind::NotNull | ConstraintKind::Check => None,
+                ConstraintKind::NotNull | ConstraintKind::Check | ConstraintKind::ForeignKey => {
+                    None
+                }
             };
             let name = match constraint.explicit_name() {
                 Some(name) => name.clone(),
@@ -1293,6 +1295,7 @@ fn build_constraint_bundle(
             )
         })?,
         allocated.index_id,
+        None,
         program.unwrap_or_default(),
         allocated.name.clone(),
     )?;

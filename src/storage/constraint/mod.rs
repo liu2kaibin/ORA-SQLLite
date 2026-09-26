@@ -69,6 +69,12 @@ impl ConstraintCatalog {
                             definition.check_program().to_vec().into_boxed_slice(),
                         )?,
                     },
+                    ConstraintKind::ForeignKey => {
+                        return Err(DbError::new(
+                            ErrorCode::Unsupported,
+                            "foreign-key enforcement is not available",
+                        ));
+                    }
                 };
                 Ok((definition.id(), local, definition.index_id()))
             })

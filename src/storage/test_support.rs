@@ -194,6 +194,7 @@ pub(crate) fn phase_4c2b_constraint_fixture() -> Phase4c2bConstraintFixture {
         ConstraintKind::PrimaryKey,
         1,
         Some(index_id),
+        None,
         Box::new([]),
         constraint_name.clone(),
     )
@@ -336,6 +337,7 @@ pub(crate) fn phase_4b_catalog_fixture_with_constraint(
         fixture.users_id(),
         ConstraintKind::NotNull,
         1,
+        None,
         None,
         Box::new([]),
         CatalogName::new(name).expect("fixture constraint name"),

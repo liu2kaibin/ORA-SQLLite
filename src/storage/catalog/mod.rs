@@ -610,6 +610,7 @@ impl CatalogImage {
                     }
                 }
                 ConstraintKind::NotNull => {}
+                ConstraintKind::ForeignKey => {}
                 ConstraintKind::Check => {
                     let program = CheckProgram::from_bytes(
                         constraint.check_program().to_vec().into_boxed_slice(),
@@ -4765,6 +4766,7 @@ mod tests {
             ConstraintKind::PrimaryKey,
             1,
             Some(index_id),
+            None,
             Box::new([]),
             CatalogName::new("PK_T").unwrap(),
         )
@@ -4892,6 +4894,7 @@ mod tests {
             ConstraintKind::PrimaryKey,
             2,
             Some(index.id()),
+            None,
             Box::new([]),
             CatalogName::new("PK_T").unwrap(),
         )
@@ -4955,6 +4958,7 @@ mod tests {
             ConstraintKind::Check,
             0,
             None,
+            None,
             program.as_bytes().to_vec().into_boxed_slice(),
             CatalogName::new("CK_T").unwrap(),
         )
@@ -4983,6 +4987,7 @@ mod tests {
             TableId::new(10).unwrap(),
             ConstraintKind::NotNull,
             1,
+            None,
             None,
             Box::new([]),
             CatalogName::new("NN_T").unwrap(),
@@ -5055,6 +5060,7 @@ mod tests {
             ConstraintKind::PrimaryKey,
             2,
             Some(index.id()),
+            None,
             Box::new([]),
             CatalogName::new("PK_T_2").unwrap(),
         )
@@ -5195,6 +5201,7 @@ mod tests {
             ConstraintKind::PrimaryKey,
             2,
             Some(second_index.id()),
+            None,
             Box::new([]),
             CatalogName::new("PK_T_2").unwrap(),
         )
@@ -5258,12 +5265,7 @@ mod tests {
         bytes[24] = 5;
         let tree = raw_tree(&mut batch, foreign_key);
         let error = CatalogReader::open_candidate(&mut batch, &tree, features).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::Unsupported);
-        assert!(
-            error
-                .to_string()
-                .contains("foreign-key catalogs require Phase 4C2-C")
-        );
+        assert_eq!(error.code(), ErrorCode::Corruption);
     }
 
     fn remove_record(rows: &mut Records, key: &[u8]) -> Vec<u8> {
@@ -5574,7 +5576,7 @@ mod tests {
             ),
             (
                 "foreign-key constraint definition",
-                ErrorCode::Unsupported,
+                ErrorCode::Corruption,
                 complete_features,
                 Box::new(|_, rows, _, _| {
                     record_value_mut(

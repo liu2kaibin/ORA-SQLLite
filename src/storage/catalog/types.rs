@@ -248,11 +248,35 @@ pub(crate) struct IndexDef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForeignKeyTarget {
+    table_id: TableId,
+    constraint_id: ConstraintId,
+}
+
+impl ForeignKeyTarget {
+    pub(crate) const fn new(table_id: TableId, constraint_id: ConstraintId) -> Self {
+        Self {
+            table_id,
+            constraint_id,
+        }
+    }
+
+    pub(crate) const fn table_id(self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) const fn constraint_id(self) -> ConstraintId {
+        self.constraint_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConstraintKind {
     PrimaryKey,
     Unique,
     NotNull,
     Check,
+    ForeignKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +286,7 @@ pub(crate) struct ConstraintDef {
     kind: ConstraintKind,
     column_count: u16,
     index_id: Option<IndexId>,
+    foreign_key_target: Option<ForeignKeyTarget>,
     check_program: Box<[u8]>,
     name: CatalogName,
 }
@@ -289,6 +314,7 @@ pub(crate) enum CatalogRecord {
     ConstraintDefinition(ConstraintDef),
     TableConstraint(ConstraintId),
     ConstraintColumn(ColumnId),
+    ReferencedBy(ConstraintId),
 }
 
 impl ConstraintDef {
@@ -298,6 +324,7 @@ impl ConstraintDef {
         kind: ConstraintKind,
         column_count: u16,
         index_id: Option<IndexId>,
+        foreign_key_target: Option<ForeignKeyTarget>,
         check_program: Box<[u8]>,
         name: CatalogName,
     ) -> Result<Self> {
@@ -317,13 +344,26 @@ impl ConstraintDef {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
                 (1..=MAX_COLUMNS).contains(&column_count)
                     && index_id.is_some()
+                    && foreign_key_target.is_none()
                     && check_program.is_empty()
             }
             ConstraintKind::NotNull => {
-                column_count == 1 && index_id.is_none() && check_program.is_empty()
+                column_count == 1
+                    && index_id.is_none()
+                    && foreign_key_target.is_none()
+                    && check_program.is_empty()
             }
             ConstraintKind::Check => {
-                column_count == 0 && index_id.is_none() && !check_program.is_empty()
+                column_count == 0
+                    && index_id.is_none()
+                    && foreign_key_target.is_none()
+                    && !check_program.is_empty()
+            }
+            ConstraintKind::ForeignKey => {
+                (1..=MAX_COLUMNS).contains(&column_count)
+                    && index_id.is_none()
+                    && foreign_key_target.is_some()
+                    && check_program.is_empty()
             }
         };
         if !valid_shape {
@@ -338,6 +378,7 @@ impl ConstraintDef {
             kind,
             column_count,
             index_id,
+            foreign_key_target,
             check_program,
             name,
         })
@@ -357,6 +398,21 @@ impl ConstraintDef {
     }
     pub(crate) const fn index_id(&self) -> Option<IndexId> {
         self.index_id
+    }
+    pub(crate) const fn foreign_key_target(&self) -> Option<ForeignKeyTarget> {
+        self.foreign_key_target
+    }
+    pub(crate) const fn parent_table_id(&self) -> Option<TableId> {
+        match self.foreign_key_target {
+            Some(target) => Some(target.table_id()),
+            None => None,
+        }
+    }
+    pub(crate) const fn parent_constraint_id(&self) -> Option<ConstraintId> {
+        match self.foreign_key_target {
+            Some(target) => Some(target.constraint_id()),
+            None => None,
+        }
     }
     pub(crate) fn check_program(&self) -> &[u8] {
         &self.check_program
@@ -700,6 +756,7 @@ mod tests {
                 kind,
                 1,
                 Some(index_id),
+                None,
                 Box::new([]),
                 name.clone(),
             )
@@ -720,6 +777,7 @@ mod tests {
                         kind,
                         column_count,
                         Some(index_id),
+                        None,
                         Box::new([]),
                         name.clone(),
                     )
@@ -729,9 +787,18 @@ mod tests {
                 );
             }
             assert_eq!(
-                ConstraintDef::new(id, table_id, kind, 1, None, Box::new([]), name.clone(),)
-                    .unwrap_err()
-                    .code(),
+                ConstraintDef::new(
+                    id,
+                    table_id,
+                    kind,
+                    1,
+                    None,
+                    None,
+                    Box::new([]),
+                    name.clone(),
+                )
+                .unwrap_err()
+                .code(),
                 ErrorCode::Type
             );
             assert_eq!(
@@ -741,6 +808,7 @@ mod tests {
                     kind,
                     1,
                     Some(index_id),
+                    None,
                     vec![1].into_boxed_slice(),
                     name.clone(),
                 )
@@ -757,6 +825,7 @@ mod tests {
                 ConstraintKind::NotNull,
                 1,
                 None,
+                None,
                 Box::new([]),
                 name.clone(),
             )
@@ -768,6 +837,7 @@ mod tests {
                 table_id,
                 ConstraintKind::NotNull,
                 2,
+                None,
                 None,
                 Box::new([]),
                 name.clone(),
@@ -782,6 +852,7 @@ mod tests {
                 table_id,
                 ConstraintKind::NotNull,
                 1,
+                None,
                 None,
                 vec![1].into_boxed_slice(),
                 name.clone(),
@@ -797,6 +868,7 @@ mod tests {
                 ConstraintKind::NotNull,
                 1,
                 Some(index_id),
+                None,
                 Box::new([]),
                 name.clone(),
             )
@@ -810,6 +882,7 @@ mod tests {
             table_id,
             ConstraintKind::Check,
             0,
+            None,
             None,
             vec![0xaa].into_boxed_slice(),
             name.clone(),
@@ -828,6 +901,7 @@ mod tests {
                     ConstraintKind::Check,
                     column_count,
                     index_id,
+                    None,
                     program.into_boxed_slice(),
                     name.clone(),
                 )
@@ -843,6 +917,7 @@ mod tests {
                 ConstraintKind::Check,
                 0,
                 None,
+                None,
                 vec![0; MAX_CHECK_PROGRAM_BYTES + 1].into_boxed_slice(),
                 name.clone(),
             )
@@ -857,6 +932,7 @@ mod tests {
                 ConstraintKind::Check,
                 0,
                 None,
+                None,
                 vec![1].into_boxed_slice(),
                 CatalogName::new("a".repeat(129)).unwrap(),
             )
@@ -864,5 +940,87 @@ mod tests {
             .code(),
             ErrorCode::Type
         );
+    }
+
+    #[test]
+    fn foreign_key_constraint_requires_one_complete_target_and_no_index_or_program() {
+        let id = ConstraintId::new(7).unwrap();
+        let table_id = TableId::new(3).unwrap();
+        let target =
+            ForeignKeyTarget::new(TableId::new(5).unwrap(), ConstraintId::new(11).unwrap());
+        let name = CatalogName::new("FK_T_PARENT").unwrap();
+
+        let definition = ConstraintDef::new(
+            id,
+            table_id,
+            ConstraintKind::ForeignKey,
+            2,
+            None,
+            Some(target),
+            Box::new([]),
+            name.clone(),
+        )
+        .unwrap();
+        assert_eq!(definition.foreign_key_target(), Some(target));
+        assert_eq!(definition.parent_table_id(), Some(target.table_id()));
+        assert_eq!(
+            definition.parent_constraint_id(),
+            Some(target.constraint_id())
+        );
+
+        for (column_count, index_id, foreign_key_target, check_program) in [
+            (0, None, Some(target), Vec::new()),
+            (MAX_COLUMNS + 1, None, Some(target), Vec::new()),
+            (1, Some(IndexId::new(13).unwrap()), Some(target), Vec::new()),
+            (1, None, None, Vec::new()),
+            (1, None, Some(target), vec![1]),
+        ] {
+            assert_eq!(
+                ConstraintDef::new(
+                    id,
+                    table_id,
+                    ConstraintKind::ForeignKey,
+                    column_count,
+                    index_id,
+                    foreign_key_target,
+                    check_program.into_boxed_slice(),
+                    name.clone(),
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::Type
+            );
+        }
+
+        for kind in [
+            ConstraintKind::PrimaryKey,
+            ConstraintKind::Unique,
+            ConstraintKind::NotNull,
+            ConstraintKind::Check,
+        ] {
+            let (column_count, index_id, check_program) = match kind {
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
+                    (1, Some(IndexId::new(13).unwrap()), Vec::new())
+                }
+                ConstraintKind::NotNull => (1, None, Vec::new()),
+                ConstraintKind::Check => (0, None, vec![1]),
+                ConstraintKind::ForeignKey => unreachable!(),
+            };
+            assert_eq!(
+                ConstraintDef::new(
+                    id,
+                    table_id,
+                    kind,
+                    column_count,
+                    index_id,
+                    Some(target),
+                    check_program.into_boxed_slice(),
+                    name.clone(),
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::Type
+            );
+        }
     }
 }

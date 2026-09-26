@@ -10,8 +10,9 @@ use super::{
     key::RecordKind,
     types::{
         CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType, ConstraintDef,
-        ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, MAX_CHECK_PROGRAM_BYTES,
-        MAX_GLOBAL_CATALOG_NAME_BYTES, ObjectId, RowId, SchemaVersion, TableDef, TableId,
+        ConstraintId, ConstraintKind, ForeignKeyTarget, IndexDef, IndexId, IndexOwnership,
+        MAX_CHECK_PROGRAM_BYTES, MAX_GLOBAL_CATALOG_NAME_BYTES, ObjectId, RowId, SchemaVersion,
+        TableDef, TableId,
     },
 };
 
@@ -115,6 +116,16 @@ pub(super) fn encode_constraint_column_mapping(id: ColumnId) -> Vec<u8> {
     encode_mapping(RecordKind::ConstraintColumn, id.get())
 }
 
+pub(super) fn encode_referenced_by_mapping(id: ConstraintId) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ENVELOPE_LEN + MAPPING_PAYLOAD_LEN);
+    bytes.push(RecordKind::ReferencedBy.byte());
+    bytes.push(RECORD_VERSION_V1);
+    bytes.extend_from_slice(&0_u16.to_be_bytes());
+    bytes.extend_from_slice(&(MAPPING_PAYLOAD_LEN as u32).to_be_bytes());
+    bytes.extend_from_slice(&id.get().to_be_bytes());
+    bytes
+}
+
 pub(super) fn encode_constraint_definition(definition: &ConstraintDef) -> Vec<u8> {
     let mut payload = Encoder::new();
     payload.put_u64(definition.id().get());
@@ -123,8 +134,18 @@ pub(super) fn encode_constraint_definition(definition: &ConstraintDef) -> Vec<u8
     payload.put_u8(0);
     payload.put_u16(definition.column_count());
     payload.put_u64(definition.index_id().map_or(0, IndexId::get));
-    payload.put_u64(0);
-    payload.put_u64(0);
+    payload.put_bytes(
+        &definition
+            .parent_table_id()
+            .map_or(0, TableId::get)
+            .to_be_bytes(),
+    );
+    payload.put_bytes(
+        &definition
+            .parent_constraint_id()
+            .map_or(0, ConstraintId::get)
+            .to_be_bytes(),
+    );
     payload.put_u8(0);
     payload.put_u8(0);
     payload.put_u8(0);
@@ -142,7 +163,11 @@ pub(super) fn encode_constraint_definition(definition: &ConstraintDef) -> Vec<u8
 }
 
 pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<CatalogRecord> {
-    let payload = decode_envelope(expected, bytes)?;
+    let payload = if expected == RecordKind::ReferencedBy {
+        decode_referenced_by_envelope(bytes)?
+    } else {
+        decode_envelope(expected, bytes)?
+    };
     match expected {
         RecordKind::CatalogMeta => {
             decode_catalog_meta_payload(payload).map(CatalogRecord::CatalogMeta)
@@ -178,7 +203,9 @@ pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<Catalo
         RecordKind::ConstraintColumn => {
             decode_column_id_mapping(payload).map(CatalogRecord::ConstraintColumn)
         }
-        RecordKind::ReferencedBy => Err(foreign_key_unsupported()),
+        RecordKind::ReferencedBy => {
+            decode_referenced_by_payload(payload).map(CatalogRecord::ReferencedBy)
+        }
     }
 }
 
@@ -253,6 +280,15 @@ pub(super) fn decode_constraint_column_mapping(bytes: &[u8]) -> Result<ColumnId>
         CatalogRecord::ConstraintColumn(id) => Ok(id),
         _ => Err(corruption(
             "constraint column decoder received a different record kind",
+        )),
+    }
+}
+
+pub(super) fn decode_referenced_by_mapping(bytes: &[u8]) -> Result<ConstraintId> {
+    match decode_record(RecordKind::ReferencedBy, bytes)? {
+        CatalogRecord::ReferencedBy(id) => Ok(id),
+        _ => Err(corruption(
+            "referenced-by decoder received a different record kind",
         )),
     }
 }
@@ -404,6 +440,54 @@ fn strict_payload(bytes: &[u8]) -> Result<&[u8]> {
         .ok_or_else(truncated_record)
 }
 
+fn decode_referenced_by_envelope(bytes: &[u8]) -> Result<&[u8]> {
+    let kind = RecordKind::from_byte(*bytes.first().ok_or_else(truncated_record)?)?;
+    let version = *bytes.get(1).ok_or_else(truncated_record)?;
+    if version > RECORD_VERSION_V1 {
+        return Err(DbError::new(
+            ErrorCode::Unsupported,
+            "catalog record version is newer than V1",
+        ));
+    }
+    if version != RECORD_VERSION_V1 {
+        return Err(corruption("catalog record version zero is invalid"));
+    }
+    if kind != RecordKind::ReferencedBy {
+        return Err(corruption("catalog key and record kind disagree"));
+    }
+    if u16::from_be_bytes(
+        bytes
+            .get(2..4)
+            .ok_or_else(truncated_record)?
+            .try_into()
+            .map_err(|_| truncated_record())?,
+    ) != 0
+    {
+        return Err(corruption(
+            "catalog record envelope reserved bytes are nonzero",
+        ));
+    }
+    let payload_len = usize::try_from(u32::from_be_bytes(
+        bytes
+            .get(4..ENVELOPE_LEN)
+            .ok_or_else(truncated_record)?
+            .try_into()
+            .map_err(|_| truncated_record())?,
+    ))
+    .map_err(|_| corruption("catalog record payload length exceeds this platform"))?;
+    let total_len = ENVELOPE_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| corruption("catalog record payload length overflow"))?;
+    if bytes.len() != total_len {
+        return Err(corruption(
+            "catalog record length does not match its payload length",
+        ));
+    }
+    bytes
+        .get(ENVELOPE_LEN..total_len)
+        .ok_or_else(truncated_record)
+}
+
 fn decode_catalog_meta_payload(payload: &[u8]) -> Result<CatalogMeta> {
     let mut decoder = Decoder::new(payload);
     if decoder.get_u16()? != CATALOG_FORMAT_VERSION_V1 {
@@ -439,6 +523,16 @@ fn decode_constraint_id_mapping(payload: &[u8]) -> Result<ConstraintId> {
     require_mapping_length(payload)?;
     let mut decoder = Decoder::new(payload);
     decode_constraint_id(decoder.get_u64()?)
+}
+
+fn decode_referenced_by_payload(payload: &[u8]) -> Result<ConstraintId> {
+    require_mapping_length(payload)?;
+    let value = u64::from_be_bytes(
+        payload
+            .try_into()
+            .map_err(|_| corruption("referenced-by mapping id has an invalid length"))?,
+    );
+    decode_constraint_id(value)
 }
 
 fn require_mapping_length(payload: &[u8]) -> Result<()> {
@@ -528,11 +622,7 @@ fn decode_constraint_definition_payload(payload: &[u8]) -> Result<ConstraintDef>
     let mut decoder = Decoder::new(payload);
     let id = decode_constraint_id(decoder.get_u64()?)?;
     let table_id = decode_table_id(decoder.get_u64()?)?;
-    let kind_code = decoder.get_u8()?;
-    if kind_code == 5 {
-        return Err(foreign_key_unsupported());
-    }
-    let kind = decode_constraint_kind(kind_code)?;
+    let kind = decode_constraint_kind(decoder.get_u8()?)?;
     if decoder.get_u8()? != 0 {
         return Err(corruption("catalog constraint flags are nonzero"));
     }
@@ -541,19 +631,38 @@ fn decode_constraint_definition_payload(payload: &[u8]) -> Result<ConstraintDef>
         0 => None,
         value => Some(decode_index_id(value)?),
     };
-    let parent_table_id = decoder.get_u64()?;
-    let parent_constraint_id = decoder.get_u64()?;
-    if parent_table_id != 0 || parent_constraint_id != 0 {
-        return Err(foreign_key_unsupported());
-    }
+    let parent_table_id = u64::from_be_bytes(
+        decoder
+            .get_bytes(8)?
+            .try_into()
+            .map_err(|_| corruption("catalog parent table id is truncated"))?,
+    );
+    let parent_constraint_id = u64::from_be_bytes(
+        decoder
+            .get_bytes(8)?
+            .try_into()
+            .map_err(|_| corruption("catalog parent constraint id is truncated"))?,
+    );
+    let foreign_key_target = match (parent_table_id, parent_constraint_id) {
+        (0, 0) => None,
+        (0, _) | (_, 0) => {
+            return Err(corruption(
+                "catalog foreign-key parent ids must both be zero or both be nonzero",
+            ));
+        }
+        (table_id, constraint_id) => Some(ForeignKeyTarget::new(
+            decode_table_id(table_id)?,
+            decode_constraint_id(constraint_id)?,
+        )),
+    };
     if decoder.get_u8()? != 0 {
         return Err(corruption("catalog constraint deferred mode is nonzero"));
     }
     if decoder.get_u8()? != 0 {
-        return Err(foreign_key_unsupported());
+        return Err(corruption("catalog constraint update action is nonzero"));
     }
     if decoder.get_u8()? != 0 {
-        return Err(foreign_key_unsupported());
+        return Err(corruption("catalog constraint delete action is nonzero"));
     }
     if decoder.get_u8()? != 0 {
         return Err(corruption("catalog constraint reserved byte is nonzero"));
@@ -584,6 +693,7 @@ fn decode_constraint_definition_payload(payload: &[u8]) -> Result<ConstraintDef>
         kind,
         column_count,
         index_id,
+        foreign_key_target,
         check_program,
         name,
     )
@@ -596,6 +706,7 @@ const fn constraint_kind_code(kind: ConstraintKind) -> u8 {
         ConstraintKind::Unique => 2,
         ConstraintKind::NotNull => 3,
         ConstraintKind::Check => 4,
+        ConstraintKind::ForeignKey => 5,
     }
 }
 
@@ -605,6 +716,7 @@ fn decode_constraint_kind(code: u8) -> Result<ConstraintKind> {
         2 => Ok(ConstraintKind::Unique),
         3 => Ok(ConstraintKind::NotNull),
         4 => Ok(ConstraintKind::Check),
+        5 => Ok(ConstraintKind::ForeignKey),
         _ => Err(corruption("catalog constraint kind is invalid")),
     }
 }
@@ -660,15 +772,9 @@ fn corruption(message: &'static str) -> DbError {
     DbError::new(ErrorCode::Corruption, message)
 }
 
-fn foreign_key_unsupported() -> DbError {
-    DbError::new(
-        ErrorCode::Unsupported,
-        "foreign-key catalogs require Phase 4C2-C",
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::types::ForeignKeyTarget;
     use super::*;
     use crate::{
         ErrorCode,
@@ -679,7 +785,7 @@ mod tests {
                 types::{
                     CatalogMeta, CatalogName, CatalogRecord, ColumnDef, ColumnId, ColumnType,
                     ConstraintDef, ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership,
-                    ObjectId, RowId, SchemaVersion, TableDef, TableId,
+                    MAX_COLUMNS, ObjectId, RowId, SchemaVersion, TableDef, TableId,
                 },
             },
         },
@@ -1240,6 +1346,7 @@ mod tests {
             ConstraintKind::PrimaryKey,
             2,
             Some(IndexId::new(0x2122_2324_2526_2728).unwrap()),
+            None,
             Box::new([]),
             CatalogName::new("PK_T").unwrap(),
         )
@@ -1256,6 +1363,61 @@ mod tests {
         assert_eq!(
             decode_constraint_definition(definition.id(), &encoded).unwrap(),
             definition
+        );
+    }
+
+    #[test]
+    fn foreign_key_constraint_v1_uses_reserved_parent_fields_and_round_trips() {
+        let target = ForeignKeyTarget::new(
+            TableId::new(0x3132_3334_3536_3738).unwrap(),
+            ConstraintId::new(0x4142_4344_4546_4748).unwrap(),
+        );
+        let definition = ConstraintDef::new(
+            ConstraintId::new(0x0102_0304_0506_0708).unwrap(),
+            TableId::new(0x1112_1314_1516_1718).unwrap(),
+            ConstraintKind::ForeignKey,
+            2,
+            None,
+            Some(target),
+            Box::new([]),
+            CatalogName::new("FK_CHILD_PARENT").unwrap(),
+        )
+        .unwrap();
+        let encoded = encode_constraint_definition(&definition);
+        assert_eq!(encoded[0], RecordKind::ConstraintDefinition.byte());
+        assert_eq!(encoded[1], 1);
+        assert_eq!(&encoded[36..44], &target.table_id().get().to_be_bytes());
+        assert_eq!(
+            &encoded[44..52],
+            &target.constraint_id().get().to_be_bytes()
+        );
+        assert_eq!(
+            decode_constraint_definition(definition.id(), &encoded).unwrap(),
+            definition
+        );
+    }
+
+    #[test]
+    fn referenced_by_mapping_is_exact_and_rejects_wrong_kind_or_trailing_bytes() {
+        let child = ConstraintId::new(9).unwrap();
+        let bytes = encode_referenced_by_mapping(child);
+        assert_eq!(bytes, [0x34, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(decode_referenced_by_mapping(&bytes).unwrap(), child);
+
+        let mut wrong_kind = bytes.clone();
+        wrong_kind[0] = RecordKind::ConstraintColumn.byte();
+        assert_eq!(
+            decode_referenced_by_mapping(&wrong_kind)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(
+            decode_referenced_by_mapping(&trailing).unwrap_err().code(),
+            ErrorCode::Corruption
         );
     }
 
@@ -1313,6 +1475,7 @@ mod tests {
                 kind,
                 column_count,
                 index_id,
+                None,
                 check_program.into_boxed_slice(),
                 CatalogName::new("C_T").unwrap(),
             )
@@ -1371,11 +1534,100 @@ mod tests {
                 ConstraintKind::Check,
                 0,
                 None,
+                None,
                 vec![0xaa, 0xbb].into_boxed_slice(),
                 CatalogName::new("CK_T").unwrap(),
             )
             .unwrap(),
         )
+    }
+
+    fn encoded_foreign_key_constraint() -> Vec<u8> {
+        encode_constraint_definition(
+            &ConstraintDef::new(
+                ConstraintId::new(7).unwrap(),
+                TableId::new(3).unwrap(),
+                ConstraintKind::ForeignKey,
+                2,
+                None,
+                Some(ForeignKeyTarget::new(
+                    TableId::new(5).unwrap(),
+                    ConstraintId::new(11).unwrap(),
+                )),
+                Box::new([]),
+                CatalogName::new("FK_T_PARENT").unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn foreign_key_shape_conflicts(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut conflicts = Vec::new();
+
+        let mut wrong_key_id = bytes.to_vec();
+        wrong_key_id[8..16].copy_from_slice(&8_u64.to_le_bytes());
+        conflicts.push(wrong_key_id);
+
+        for range in [36..44, 44..52] {
+            let mut missing_parent_id = bytes.to_vec();
+            missing_parent_id[range].fill(0);
+            conflicts.push(missing_parent_id);
+        }
+        let mut missing_target = bytes.to_vec();
+        missing_target[36..52].fill(0);
+        conflicts.push(missing_target);
+
+        let mut system_index = bytes.to_vec();
+        system_index[28..36].copy_from_slice(&13_u64.to_le_bytes());
+        conflicts.push(system_index);
+
+        let mut check_program = bytes.to_vec();
+        check_program[56..60].copy_from_slice(&1_u32.to_le_bytes());
+        check_program.insert(64, 0xaa);
+        let payload_len = u32::from_le_bytes(check_program[4..8].try_into().unwrap()) + 1;
+        check_program[4..8].copy_from_slice(&payload_len.to_le_bytes());
+        conflicts.push(check_program);
+
+        for offset in [52, 53, 54, 55, 62] {
+            let mut nonzero_mode_action_or_reserved = bytes.to_vec();
+            nonzero_mode_action_or_reserved[offset] = 1;
+            conflicts.push(nonzero_mode_action_or_reserved);
+        }
+
+        for column_count in [0, MAX_COLUMNS + 1] {
+            let mut invalid_column_count = bytes.to_vec();
+            invalid_column_count[26..28].copy_from_slice(&column_count.to_le_bytes());
+            conflicts.push(invalid_column_count);
+        }
+
+        conflicts
+    }
+
+    #[test]
+    fn foreign_key_definition_rejects_every_truncation_and_invalid_shape() {
+        let bytes = encoded_foreign_key_constraint();
+        for end in 0..bytes.len() {
+            assert_eq!(
+                decode_constraint_definition(ConstraintId::new(7).unwrap(), &bytes[..end])
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption,
+                "truncation at {end}"
+            );
+        }
+        for (case, mutation) in foreign_key_shape_conflicts(&bytes).into_iter().enumerate() {
+            assert_eq!(
+                decode_constraint_definition(ConstraintId::new(7).unwrap(), &mutation)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption,
+                "shape conflict {case}"
+            );
+        }
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_constraint_corruption(trailing);
     }
 
     fn assert_constraint_corruption(bytes: Vec<u8>) {
@@ -1463,51 +1715,49 @@ mod tests {
     }
 
     #[test]
-    fn constraint_definition_recognizes_foreign_key_bytes_as_phase_4c2c_unsupported() {
+    fn local_constraints_reject_foreign_key_fields_and_actions_as_corruption() {
         let mut bytes = encoded_check_constraint();
         bytes[24] = 5;
-        let error =
-            decode_constraint_definition(ConstraintId::new(7).unwrap(), &bytes).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::Unsupported);
-        assert!(
-            error
-                .to_string()
-                .contains("foreign-key catalogs require Phase 4C2-C")
-        );
+        assert_constraint_corruption(bytes);
 
         for range in [36..44, 44..52] {
             let mut mutated = encoded_check_constraint();
-            mutated[range].copy_from_slice(&1_u64.to_le_bytes());
-            let error =
-                decode_constraint_definition(ConstraintId::new(7).unwrap(), &mutated).unwrap_err();
-            assert_eq!(error.code(), ErrorCode::Unsupported);
-            assert!(
-                error
-                    .to_string()
-                    .contains("foreign-key catalogs require Phase 4C2-C")
-            );
+            mutated[range].copy_from_slice(&1_u64.to_be_bytes());
+            assert_constraint_corruption(mutated);
         }
 
         for offset in [53, 54] {
             let mut mutated = encoded_check_constraint();
             mutated[offset] = 1;
-            let error =
-                decode_constraint_definition(ConstraintId::new(7).unwrap(), &mutated).unwrap_err();
-            assert_eq!(error.code(), ErrorCode::Unsupported);
-            assert!(
-                error
-                    .to_string()
-                    .contains("foreign-key catalogs require Phase 4C2-C")
+            assert_constraint_corruption(mutated);
+        }
+    }
+
+    #[test]
+    fn referenced_by_mapping_rejects_every_truncation_zero_id_and_future_version() {
+        let bytes = encode_referenced_by_mapping(ConstraintId::new(7).unwrap());
+        for end in 0..bytes.len() {
+            assert_eq!(
+                decode_referenced_by_mapping(&bytes[..end])
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption,
+                "truncation at {end}"
             );
         }
 
-        let referenced_by = encode_mapping(RecordKind::ReferencedBy, 7);
-        let error = decode_record(RecordKind::ReferencedBy, &referenced_by).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::Unsupported);
-        assert!(
-            error
-                .to_string()
-                .contains("foreign-key catalogs require Phase 4C2-C")
+        let mut zero_id = bytes.clone();
+        zero_id[8..16].fill(0);
+        assert_eq!(
+            decode_referenced_by_mapping(&zero_id).unwrap_err().code(),
+            ErrorCode::Corruption
+        );
+
+        let mut future = bytes;
+        future[1] = 2;
+        assert_eq!(
+            decode_referenced_by_mapping(&future).unwrap_err().code(),
+            ErrorCode::Unsupported
         );
     }
 }
