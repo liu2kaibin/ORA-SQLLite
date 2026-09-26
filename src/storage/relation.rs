@@ -63,6 +63,12 @@ pub(crate) enum TableConstraintSpec<'a> {
         name: Option<CatalogName>,
         template: &'a CheckProgramTemplate,
     },
+    ForeignKey {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+        parent_table_id: TableId,
+        parent_constraint_id: ConstraintId,
+    },
 }
 
 struct AllocatedConstraint {
@@ -327,6 +333,9 @@ impl<'a> ConstrainedTableSpec<'a> {
                 // below, after stable ColumnIds have been allocated under the
                 // writer and before any catalog definition is published.
                 TableConstraintSpec::Check { .. } => {}
+                TableConstraintSpec::ForeignKey { columns, .. } => {
+                    validate_key_columns(columns, table.columns().len())?;
+                }
             }
         }
         for (column, required_non_nullable) in table.columns().iter().zip(required_non_nullable) {
@@ -358,14 +367,15 @@ impl TableConstraintSpec<'_> {
             Self::PrimaryKey { name, .. }
             | Self::Unique { name, .. }
             | Self::NotNull { name, .. }
-            | Self::Check { name, .. } => name.as_ref(),
+            | Self::Check { name, .. }
+            | Self::ForeignKey { name, .. } => name.as_ref(),
         }
     }
 
     fn key_columns(&self) -> Option<&[u16]> {
         match self {
             Self::PrimaryKey { columns, .. } | Self::Unique { columns, .. } => Some(columns),
-            Self::NotNull { .. } | Self::Check { .. } => None,
+            Self::NotNull { .. } | Self::Check { .. } | Self::ForeignKey { .. } => None,
         }
     }
 
@@ -375,6 +385,7 @@ impl TableConstraintSpec<'_> {
             Self::Unique { .. } => ConstraintKind::Unique,
             Self::NotNull { .. } => ConstraintKind::NotNull,
             Self::Check { .. } => ConstraintKind::Check,
+            Self::ForeignKey { .. } => ConstraintKind::ForeignKey,
         }
     }
 }
@@ -1273,6 +1284,10 @@ fn build_constraint_bundle(
                 )
             }),
         TableConstraintSpec::Check { .. } => Ok(Vec::new()),
+        TableConstraintSpec::ForeignKey { .. } => Err(DbError::new(
+            ErrorCode::Unsupported,
+            "foreign key catalog publication requires Phase 4C2-C Task 4",
+        )),
     }?;
     let program = match constraint {
         TableConstraintSpec::Check { template, .. } => Some(

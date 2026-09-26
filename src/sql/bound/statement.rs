@@ -3,7 +3,10 @@ use crate::{
     api::{ColumnMetadata, ParameterMetadata},
     storage::catalog::{
         CatalogReader,
-        types::{CatalogName, ColumnId, ColumnType, IndexId, ObjectKind, SchemaVersion, TableId},
+        types::{
+            CatalogName, ColumnId, ColumnType, ConstraintId, IndexId, ObjectKind, SchemaVersion,
+            TableId,
+        },
     },
 };
 
@@ -368,6 +371,7 @@ pub(crate) enum BoundConstraint {
         columns: Vec<u16>,
         referenced_table: BoundTable,
         referenced_columns: Vec<BoundColumn>,
+        parent_constraint_id: ConstraintId,
         span: SqlSpan,
     },
 }

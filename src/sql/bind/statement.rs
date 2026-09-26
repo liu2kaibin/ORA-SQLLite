@@ -18,7 +18,8 @@ use crate::{
     storage::catalog::{
         CatalogReader,
         types::{
-            CatalogName, ColumnId, ColumnType, MAX_COLUMNS, ObjectKind, SchemaVersion, TableId,
+            CatalogName, ColumnId, ColumnType, ConstraintId, MAX_COLUMNS, ObjectKind,
+            SchemaVersion, TableId,
         },
     },
 };
@@ -526,6 +527,7 @@ fn bind_foreign_key(
     };
     let mut seen = HashSet::new();
     let mut referenced_columns = Vec::with_capacity(foreign_key.referenced_columns.len());
+    let mut referenced_column_ids = Vec::with_capacity(foreign_key.referenced_columns.len());
     for (ordinal, referenced_column_name) in local_columns
         .iter()
         .copied()
@@ -543,9 +545,15 @@ fn bind_foreign_key(
                 "FOREIGN KEY contains a duplicate referenced column",
             ));
         }
-        let local_type = column_type_to_sql_type(columns[usize::from(ordinal)].column_type);
+        let local_type = columns[usize::from(ordinal)].column_type;
+        if !foreign_key_types_compatible(local_type, referenced_column.column_type()) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "FOREIGN KEY child and parent column types are incompatible",
+            ));
+        }
         let referenced_type = column_type_to_sql_type(referenced_column.column_type());
-        let _ = local_type.unify(referenced_type)?;
+        referenced_column_ids.push(referenced_column.id());
         referenced_columns.push(BoundColumn {
             table_id: referenced_column.table_id(),
             column_id: referenced_column.id(),
@@ -555,6 +563,14 @@ fn bind_foreign_key(
             span,
         });
     }
+    let parent_constraint_id = catalog
+        .find_parent_key_constraint(referenced.id(), &referenced_column_ids)
+        .map(|constraint| constraint.id())
+        .ok_or_else(|| {
+            bind_error(
+                "FOREIGN KEY parent columns must exactly match a declared PRIMARY KEY or UNIQUE constraint",
+            )
+        })?;
     push_dependency(
         dependencies,
         table_dependency(referenced_table, database_uuid),
@@ -564,8 +580,13 @@ fn bind_foreign_key(
         columns: local_columns,
         referenced_table,
         referenced_columns,
+        parent_constraint_id,
         span: foreign_key.span,
     })
+}
+
+fn foreign_key_types_compatible(child: ColumnType, parent: ColumnType) -> bool {
+    child == parent || matches!((child, parent), (ColumnType::Int64, ColumnType::Decimal))
 }
 
 fn bind_create_index(
@@ -954,10 +975,15 @@ mod tests {
             parser::parse_statement,
         },
         storage::{
-            catalog::types::ObjectKind,
+            catalog::types::{CatalogName, ObjectKind},
             catalog::{
                 CatalogReader, add_unrelated_table, bump_users_schema_version,
                 drop_and_recreate_users, replace_users_id_column_id,
+            },
+            index::{IndexSpec, create_index},
+            relation::{
+                ColumnSpec, ConstrainedTableSpec, TableConstraintSpec, TableSpec,
+                create_constrained_relation,
             },
             test_support::{
                 Phase4bCatalogFixture, phase_4b_catalog_fixture_with_constraint,
@@ -967,6 +993,191 @@ mod tests {
     };
 
     use super::super::test_support::prepare_fixture;
+
+    fn foreign_key_catalog_fixture() -> Phase4bCatalogFixture {
+        use crate::storage::catalog::types::ColumnType;
+
+        fn column(name: &str, column_type: ColumnType) -> ColumnSpec {
+            ColumnSpec::new(CatalogName::new(name).unwrap(), column_type, false)
+        }
+
+        fn table(name: &str, columns: Vec<ColumnSpec>) -> TableSpec {
+            TableSpec::new(CatalogName::new(name).unwrap(), columns).unwrap()
+        }
+
+        let fixture = crate::storage::test_support::phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let mut batch = pager.begin_write().unwrap();
+        for (name, column_type) in [
+            ("PARENT", ColumnType::Int64),
+            ("DEC_PARENT", ColumnType::Decimal),
+        ] {
+            let spec = ConstrainedTableSpec::new(
+                table(name, vec![column("ID", column_type)]),
+                vec![TableConstraintSpec::PrimaryKey {
+                    name: Some(CatalogName::new(format!("PK_{name}")).unwrap()),
+                    columns: vec![0].into_boxed_slice(),
+                }],
+            )
+            .unwrap();
+            create_constrained_relation(&mut batch, &spec).unwrap();
+        }
+        let composite = ConstrainedTableSpec::new(
+            table(
+                "COMPOSITE",
+                vec![
+                    column("A", ColumnType::Int64),
+                    column("B", ColumnType::Int64),
+                ],
+            ),
+            vec![TableConstraintSpec::Unique {
+                name: Some(CatalogName::new("UQ_COMPOSITE").unwrap()),
+                columns: vec![0, 1].into_boxed_slice(),
+            }],
+        )
+        .unwrap();
+        create_constrained_relation(&mut batch, &composite).unwrap();
+
+        let explicit = ConstrainedTableSpec::new(
+            table("EXPLICIT_UQ", vec![column("A", ColumnType::Int64)]),
+            Vec::new(),
+        )
+        .unwrap();
+        let explicit_table = create_constrained_relation(&mut batch, &explicit).unwrap();
+        let explicit_columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(explicit_table)
+            .cloned()
+            .collect();
+        create_index(
+            &mut batch,
+            &IndexSpec::new(
+                CatalogName::new("UX_EXPLICIT_UQ").unwrap(),
+                explicit_table,
+                explicit_columns,
+                true,
+            )
+            .unwrap(),
+            u64::MAX,
+        )
+        .unwrap();
+        batch.commit().unwrap();
+        fixture
+    }
+
+    #[test]
+    fn foreign_key_binding_requires_exact_declared_parent_key_and_supported_types() {
+        // Production break caught: broad type unification or index-shaped lookup
+        // can accept a parent that is not the exact declared PK/UNIQUE target.
+        let fixture = foreign_key_catalog_fixture();
+        let pager = fixture.pager();
+        let database_uuid = pager.database_uuid().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let bind = |sql: &str| {
+            let statement = parse_statement(sql, &SqlLimits::default())?;
+            bind_statement(&statement, &catalog, database_uuid)
+        };
+
+        let parent =
+            bind("CREATE TABLE C (P INT64, CONSTRAINT FK FOREIGN KEY (P) REFERENCES PARENT (ID))")
+                .unwrap();
+        let expected_parent_constraint_id = catalog
+            .find_constraint_by_name(&CatalogName::new("PK_PARENT").unwrap())
+            .unwrap()
+            .id();
+        let BoundStatementKind::CreateTable { constraints, .. } = parent.kind else {
+            panic!("expected CREATE TABLE")
+        };
+        assert!(matches!(
+            &constraints[0],
+            BoundConstraint::ForeignKey {
+                parent_constraint_id,
+                ..
+            } if *parent_constraint_id == expected_parent_constraint_id
+        ));
+        assert!(
+            bind(
+                "CREATE TABLE C (P INT64, CONSTRAINT FK FOREIGN KEY (P) REFERENCES DEC_PARENT (ID))"
+            )
+            .is_ok()
+        );
+        assert!(
+            bind(
+                "CREATE TABLE C (A INT64, B INT64, FOREIGN KEY (A, B) REFERENCES COMPOSITE (A, B))"
+            )
+            .is_ok()
+        );
+        for sql in [
+            "CREATE TABLE C (A INT64, FOREIGN KEY (A) REFERENCES EXPLICIT_UQ (A))",
+            "CREATE TABLE C (A INT64, FOREIGN KEY (A) REFERENCES COMPOSITE (A))",
+            "CREATE TABLE C (A INT64, B INT64, FOREIGN KEY (A, B) REFERENCES COMPOSITE (B, A))",
+        ] {
+            let error = bind(sql).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Bind, "{sql}");
+            assert_eq!(
+                error.to_string(),
+                "[1100] FOREIGN KEY parent columns must exactly match a declared PRIMARY KEY or UNIQUE constraint",
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            bind("CREATE TABLE C (A TEXT, FOREIGN KEY (A) REFERENCES PARENT (ID))")
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+    }
+
+    #[test]
+    fn foreign_key_schema_dependency_is_checked_before_retained_parent_identities() {
+        // Production break caught: execution must report the parent table's
+        // schema-version change before inspecting retained FK column/constraint IDs.
+        let fixture = foreign_key_catalog_fixture();
+        let pager = fixture.pager();
+        let database_uuid = pager.database_uuid().unwrap();
+        let (bound, parent_table_id) = {
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = snapshot.catalog_reader().unwrap();
+            let sql = "CREATE TABLE C (P INT64 REFERENCES PARENT (ID))";
+            let statement = parse_statement(sql, &SqlLimits::default()).unwrap();
+            let bound = bind_statement(&statement, &catalog, database_uuid).unwrap();
+            let parent_table_id = catalog
+                .find_table_by_name(&CatalogName::new("PARENT").unwrap())
+                .unwrap()
+                .id();
+            (bound, parent_table_id)
+        };
+        let mut batch = pager.begin_write().unwrap();
+        let parent_columns = batch
+            .catalog_reader()
+            .unwrap()
+            .columns_for_table(parent_table_id)
+            .cloned()
+            .collect();
+        create_index(
+            &mut batch,
+            &IndexSpec::new(
+                CatalogName::new("IX_PARENT_ID").unwrap(),
+                parent_table_id,
+                parent_columns,
+                false,
+            )
+            .unwrap(),
+            u64::MAX,
+        )
+        .unwrap();
+        batch.commit().unwrap();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let error = bound.validate_schema(database_uuid, &catalog).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SchemaChanged);
+        assert_eq!(
+            error.to_string(),
+            "[1150] prepared table schema version has changed"
+        );
+    }
 
     #[test]
     fn create_table_rejects_check_parameters_before_planning() {
@@ -1241,15 +1452,18 @@ mod tests {
     fn create_table_maps_only_core_declarations_and_binds_own_constraints() {
         // Production break caught: collapsing declarations with attributes or
         // resolving CHECK columns through the ambient catalog loses DDL meaning.
-        let create = prepare_fixture(
-            "CREATE TABLE NEW_TYPES (\
+        let fixture = foreign_key_catalog_fixture();
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let sql = "CREATE TABLE NEW_TYPES (\
                  I INT64 NOT NULL, D DECIMAL, F FLOAT64, T TEXT, B BLOB,\
                  DA DATE, TS TIMESTAMP, OK BOOL,\
                  CONSTRAINT NEW_TYPES_CK CHECK (OK),\
-                 CONSTRAINT NEW_TYPES_FK FOREIGN KEY (I) REFERENCES USERS (ID),\
-                 CONSTRAINT NEW_TYPES_U UNIQUE (I, D))",
-        )
-        .unwrap();
+                 CONSTRAINT NEW_TYPES_FK FOREIGN KEY (I) REFERENCES PARENT (ID),\
+                 CONSTRAINT NEW_TYPES_U UNIQUE (I, D))";
+        let statement = parse_statement(sql, &SqlLimits::default()).unwrap();
+        let create = bind_statement(&statement, &catalog, pager.database_uuid().unwrap()).unwrap();
         let BoundStatementKind::CreateTable {
             name,
             columns,
@@ -1347,13 +1561,19 @@ mod tests {
                 .iter()
                 .any(|constraint| matches!(constraint, BoundConstraint::Unique { .. }))
         );
+        let parent_id = catalog
+            .find_table_by_name(
+                &crate::storage::catalog::types::CatalogName::new("PARENT").unwrap(),
+            )
+            .unwrap()
+            .id();
         assert_eq!(
             create
                 .dependencies()
                 .iter()
                 .map(|dependency| dependency.table_id.get())
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![parent_id.get()]
         );
 
         for sql in [
@@ -1642,7 +1862,6 @@ mod tests {
             "UPDATE USERS SET NAME = NAME WHERE ID = 1",
             "DELETE FROM USERS WHERE ID = 1",
             "CREATE INDEX USERS_ID_IDX ON USERS (ID)",
-            "CREATE TABLE FK_CHILD (USER_ID INT64 REFERENCES USERS (ID))",
         ];
         let statements = sqls
             .iter()
