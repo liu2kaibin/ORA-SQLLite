@@ -83,4 +83,17 @@ See:
 
 - [Architecture design](docs/superpowers/specs/2026-09-01-rust-oracle-compatible-embedded-db-design.md)
 - [Phase 3 WAL and transactions design](docs/superpowers/specs/2026-09-05-phase-3-wal-transactions-design.md)
+
+## Continuous integration
+
+Pull requests run the fast `PR CI` workflow: Linux formatting, Clippy, and the
+normal test suite, plus Rust 1.85 and Windows compilation checks. The expensive
+deterministic models, crash-recovery matrices, 100,000-row acceptance tests,
+full MSRV suite, and full Windows suite run in `Deep CI` after changes reach
+`main`, or when started manually from GitHub Actions.
+
+Documentation-only pull requests and `main` pushes are excluded from hosted
+workflows. For a documentation-only follow-up commit on a pull request that
+already contains code, `[skip ci]` may be added to that commit message. Never
+use `[skip ci]` for source, Cargo, workflow, build, or test changes.
 - [Bootstrap plan](docs/superpowers/plans/2026-09-01-project-bootstrap.md)

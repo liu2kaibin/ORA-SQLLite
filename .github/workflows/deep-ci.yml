@@ -1,0 +1,176 @@
+name: Deep CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Linux stable quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust with quality tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: rustup run stable cargo fmt --check
+      - name: Run Clippy
+        run: rustup run stable cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: rustup run stable cargo test --all-targets
+
+  msrv:
+    name: Linux Rust 1.85 MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Run tests on the minimum supported Rust version
+        run: rustup run 1.85.0 cargo test --all-targets
+
+  phase4b-sql-frontend:
+    name: Linux Phase 4B SQL frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Run deterministic SQL corpus
+        run: >-
+          rustup run 1.85.0 cargo test
+          sql::bind::test_support::phase_4b_sql_corpus
+          -- --exact --nocapture
+      - name: Run deterministic SQL no-panic model
+        run: >-
+          rustup run 1.85.0 cargo test
+          sql::bind::test_support::phase_4b_random_sql_never_panics
+          -- --exact
+
+  phase4c-sql-execution:
+    name: Linux Phase 4C1 SQL execution
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run deterministic execution model
+        run: >-
+          rustup run stable cargo test
+          sql::exec::test_support::phase_4c1_fixed_seed_execution_model
+          -- --exact --nocapture
+      - name: Run SQL crash recovery matrix
+        run: >-
+          rustup run stable cargo test
+          sql::exec::test_support::phase_4c1_sql_crash_recovery_matrix
+          -- --exact --ignored --nocapture
+      - name: Run 100,000-row smoke
+        run: >-
+          rustup run stable cargo test --profile exhaustive --test phase4c_scale
+          phase_4c1_hundred_thousand_row_smoke -- --exact --ignored --nocapture
+
+  phase4c2a-index-storage-ddl:
+    name: Linux Phase 4C2-A index storage and DDL
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run deterministic index model
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2a_fixed_seed_index_model -- --exact --ignored --nocapture
+      - name: Run index crash recovery matrix
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2a_index_crash_recovery_matrix -- --exact --ignored --nocapture
+      - name: Run 100,000-row index smoke
+        run: rustup run stable cargo test --profile exhaustive --test phase4c2_index_scale phase_4c2a_hundred_thousand_row_index_smoke -- --exact --ignored --nocapture
+
+  phase4c2b-local-constraints:
+    name: Linux Phase 4C2-B local constraints
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run deterministic local-constraint model
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2b_fixed_seed_constraint_model -- --exact --ignored --nocapture
+      - name: Run local-constraint crash recovery matrix
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2b_constraint_crash_recovery_matrix -- --exact --ignored --nocapture
+      - name: Run 100,000-row local-constraint smoke
+        run: rustup run stable cargo test --profile exhaustive --test phase4c2_constraint_scale phase_4c2b_hundred_thousand_row_constraint_smoke -- --exact --ignored --nocapture
+
+  windows:
+    name: Windows stable
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run tests on Windows
+        run: rustup run stable cargo test --all-targets
+
+  exhaustive-model:
+    name: Linux exhaustive storage model
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run the six-configuration storage model
+        run: >-
+          rustup run stable cargo test --profile exhaustive
+          fixed_seed_reference_model_covers_every_page_size_and_tree_kind
+          -- --ignored --nocapture
+
+  phase3-crash-recovery:
+    name: Linux WAL crash recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run the WAL crash recovery matrix
+        run: >-
+          rustup run stable cargo test
+          storage::test_support::phase_3_crash_recovery_matrix
+          -- --exact --ignored --nocapture
+      - name: Run every-byte WAL truncation matrix
+        run: >-
+          rustup run stable cargo test
+          phase_3_every_record_byte_truncation_matrix
+          -- --ignored --nocapture
+
+  phase4a-catalog-recovery:
+    name: Linux catalog and row recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run catalog crash recovery matrix
+        run: >-
+          rustup run stable cargo test
+          storage::test_support::phase_4a_catalog_crash_recovery_matrix
+          -- --exact --ignored --nocapture
