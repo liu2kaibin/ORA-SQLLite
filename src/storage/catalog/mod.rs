@@ -5872,7 +5872,7 @@ mod tests {
         let mut batch = pager.begin_write().unwrap();
         let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
         let before_insert = current_records(&writer, &mut batch);
-        for fail_after in 0..5 {
+        for fail_after in 0..6 {
             let checkpoint = batch.checkpoint_mutation().unwrap();
             let writer_root = writer.root();
             let error = writer
