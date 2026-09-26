@@ -1314,27 +1314,28 @@ mod tests {
     }
 
     #[test]
-    fn constrained_ddl_is_unsupported_before_mutation() {
-        // Production break caught: treating a deferred constraint as a partial
-        // CREATE would publish catalog/page changes despite returning Unsupported.
+    fn constrained_ddl_rolls_back_and_commits_with_explicit_transaction() {
+        // Production break caught: the Task 4 temporary boundary rejected a
+        // valid constrained CREATE, while a partial Task 5 write could escape
+        // rollback or fail to make the committed schema visible.
         let temp = TempDatabase::new("transaction-constrained-create");
         let db = Database::create(temp.path(), Options::default()).unwrap();
         drop(db);
         let before = std::fs::read(temp.path()).unwrap();
         let db = Database::open(temp.path(), Options::default()).unwrap();
         let mut connection = db.connect().unwrap();
-        let mut transaction = connection.begin_write().unwrap();
-        let constrained = transaction
+        let mut rollback = connection.begin_write().unwrap();
+        let constrained = rollback
             .prepare("CREATE TABLE T (ID INT64 PRIMARY KEY)")
             .unwrap();
         assert_eq!(
-            transaction
+            rollback
                 .execute(&constrained, Parameters::none())
-                .unwrap_err()
-                .code(),
-            ErrorCode::Unsupported
+                .unwrap()
+                .rows_affected(),
+            0
         );
-        transaction.commit().unwrap();
+        rollback.rollback().unwrap();
         assert_eq!(
             connection.prepare("SELECT ID FROM T").unwrap_err().code(),
             ErrorCode::Bind
@@ -1342,6 +1343,22 @@ mod tests {
         drop(connection);
         drop(db);
         assert_eq!(std::fs::read(temp.path()).unwrap(), before);
+
+        let db = Database::open(temp.path(), Options::default()).unwrap();
+        let mut connection = db.connect().unwrap();
+        let mut commit = connection.begin_write().unwrap();
+        let constrained = commit
+            .prepare("CREATE TABLE T (ID INT64 PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(
+            commit
+                .execute(&constrained, Parameters::none())
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        commit.commit().unwrap();
+        assert!(connection.prepare("SELECT ID FROM T").is_ok());
     }
 
     #[test]

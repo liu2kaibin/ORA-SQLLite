@@ -1,4 +1,5 @@
 //! Immutable, storage-independent compilation of the project's bound SQL IR.
+mod check;
 mod expr;
 mod mutation;
 mod query;
@@ -17,7 +18,8 @@ use crate::{
 };
 pub(crate) use expr::{AggregateDefinition, ExecExpr, ExecExprKind};
 pub(crate) use mutation::{
-    CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan, UpdatePlan,
+    CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan,
+    TableConstraintDefinition, UpdatePlan,
 };
 pub(crate) use query::{OrderExpression, QueryPlan};
 
@@ -103,12 +105,22 @@ impl Plan {
                 columns,
                 constraints,
             } => {
-                if constraints.is_empty() && columns.iter().all(|column| column.nullable) {
-                    PlanKind::CreateTable(CreateTablePlan::from_bound(name, columns, &locations)?)
-                } else {
+                if constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint,
+                        crate::sql::bound::BoundConstraint::ForeignKey { .. }
+                    )
+                }) {
                     PlanKind::DeferredUnsupported {
-                        required_phase: "4C2",
+                        required_phase: "4C2-C",
                     }
+                } else {
+                    PlanKind::CreateTable(CreateTablePlan::from_bound(
+                        name,
+                        columns,
+                        constraints,
+                        &locations,
+                    )?)
                 }
             }
             BoundStatementKind::DropTable { table_id } => PlanKind::DropTable {
@@ -201,7 +213,7 @@ fn invalid_plan(message: &'static str) -> DbError {
 mod tests {
     use std::ops::Deref;
 
-    use super::{ExecExprKind, Plan, PlanKind};
+    use super::{ExecExprKind, Plan, PlanKind, TableConstraintDefinition};
     use crate::{
         ErrorCode, ParameterIdentifier, Result, SqlLimits, Value,
         error::SqlLocation,
@@ -301,6 +313,97 @@ mod tests {
         Plan::from_bound(&bind_fixture(sql), sql)
     }
 
+    #[test]
+    fn local_constraint_plans_are_executable_but_foreign_keys_stay_deferred() {
+        let local = plan_sql(
+            "CREATE TABLE T (ID INT64 PRIMARY KEY, U INT64 UNIQUE, N INT64 NOT NULL, CHECK (N > 0))",
+        )
+        .unwrap();
+        let PlanKind::CreateTable(create) = local.kind() else {
+            panic!("local constraints must have an executable CREATE TABLE plan")
+        };
+        assert_eq!(create.constraints().len(), 4);
+        assert!(matches!(
+            &create.constraints()[0],
+            TableConstraintDefinition::PrimaryKey { columns, .. } if columns.as_ref() == [0]
+        ));
+        assert!(matches!(
+            &create.constraints()[1],
+            TableConstraintDefinition::Unique { columns, .. } if columns.as_ref() == [1]
+        ));
+        assert!(matches!(
+            &create.constraints()[2],
+            TableConstraintDefinition::NotNull { column: 2, .. }
+        ));
+        assert!(matches!(
+            &create.constraints()[3],
+            TableConstraintDefinition::Check { .. }
+        ));
+
+        let foreign = plan_sql(
+            "CREATE TABLE C (ID INT64, CONSTRAINT FK_C FOREIGN KEY (ID) REFERENCES USERS (ID))",
+        )
+        .unwrap();
+        assert!(matches!(
+            foreign.kind(),
+            PlanKind::DeferredUnsupported {
+                required_phase: "4C2-C"
+            }
+        ));
+    }
+
+    #[test]
+    fn local_constraints_retain_mixed_source_and_composite_ordinal_order() {
+        let plan = plan_sql(
+            "CREATE TABLE MIX (A INT64 UNIQUE, B INT64, CONSTRAINT MIX_CK CHECK (B > 0), C INT64 NOT NULL, CONSTRAINT MIX_PK PRIMARY KEY (C, A))",
+        )
+        .unwrap();
+        let PlanKind::CreateTable(create) = plan.kind() else {
+            panic!("CREATE TABLE must retain local constraints")
+        };
+        assert!(matches!(
+            &create.constraints()[0],
+            TableConstraintDefinition::Unique { columns, .. } if columns.as_ref() == [0]
+        ));
+        assert!(matches!(
+            &create.constraints()[1],
+            TableConstraintDefinition::Check { .. }
+        ));
+        assert!(matches!(
+            &create.constraints()[2],
+            TableConstraintDefinition::NotNull { column: 2, .. }
+        ));
+        assert!(matches!(
+            &create.constraints()[3],
+            TableConstraintDefinition::PrimaryKey { columns, .. } if columns.as_ref() == [2, 0]
+        ));
+    }
+
+    #[test]
+    fn null_check_literals_have_a_persistent_template_type() {
+        let plan = plan_sql("CREATE TABLE NULL_CHECK (B BOOL, CHECK (NULL IS NULL))").unwrap();
+        assert!(matches!(plan.kind(), PlanKind::CreateTable(_)));
+    }
+
+    #[test]
+    fn check_template_is_postorder_and_plan_debug_is_redacted() {
+        let plan = plan_sql(
+            "CREATE TABLE SECRET_TABLE (A INT64, CONSTRAINT SECRET_CHECK CHECK (A > 987654321))",
+        )
+        .unwrap();
+        let PlanKind::CreateTable(create) = plan.kind() else {
+            panic!("CREATE TABLE must retain CHECK")
+        };
+        let TableConstraintDefinition::Check { template, .. } = &create.constraints()[0] else {
+            panic!("expected CHECK template")
+        };
+        assert_eq!(
+            format!("{template:?}"),
+            "CheckProgramTemplate { instructions: [Column { ordinal: 0, result: Int64 }, Literal { value: Int64(987654321), result: Int64 }, Binary { op: GreaterThan, result: Bool }] }"
+        );
+        assert_eq!(format!("{plan:?}"), "Plan { .. }");
+    }
+
     impl PlanKind {
         fn matches_bound_kind(&self, bound: &BoundStatementKind) -> bool {
             match bound {
@@ -308,15 +411,24 @@ mod tests {
                 BoundStatementKind::Insert { .. } => matches!(self, Self::Insert(_)),
                 BoundStatementKind::Update { .. } => matches!(self, Self::Update(_)),
                 BoundStatementKind::Delete { .. } => matches!(self, Self::Delete(_)),
-                BoundStatementKind::CreateTable { constraints, .. } if !constraints.is_empty() => {
-                    matches!(
-                        self,
-                        Self::DeferredUnsupported {
-                            required_phase: "4C2"
-                        }
-                    )
+                BoundStatementKind::CreateTable { constraints, .. } => {
+                    let has_foreign_key = constraints.iter().any(|constraint| {
+                        matches!(
+                            constraint,
+                            crate::sql::bound::BoundConstraint::ForeignKey { .. }
+                        )
+                    });
+                    if has_foreign_key {
+                        matches!(
+                            self,
+                            Self::DeferredUnsupported {
+                                required_phase: "4C2-C"
+                            }
+                        )
+                    } else {
+                        matches!(self, Self::CreateTable(_))
+                    }
                 }
-                BoundStatementKind::CreateTable { .. } => matches!(self, Self::CreateTable(_)),
                 BoundStatementKind::DropTable { table_id } => {
                     matches!(self, Self::DropTable { table_id: actual } if actual == table_id)
                 }
@@ -355,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn index_ddl_is_executable_while_constrained_table_stays_deferred() {
+    fn index_ddl_and_local_constraints_are_executable() {
         let create = bound_create_index();
         assert!(matches!(
             Plan::from_bound(&create, create.source()).unwrap().kind(),
@@ -366,9 +478,7 @@ mod tests {
             Plan::from_bound(&constrained, constrained.source())
                 .unwrap()
                 .kind(),
-            PlanKind::DeferredUnsupported {
-                required_phase: "4C2"
-            }
+            PlanKind::CreateTable(_)
         ));
     }
 
@@ -786,27 +896,33 @@ mod tests {
                         | BoundStatementKind::CreateIndex { .. }
                         | BoundStatementKind::DropIndex { .. }
                         | BoundStatementKind::DropTable { .. }
-                ) || matches!(case.kind(), BoundStatementKind::CreateTable { constraints, .. } if constraints.is_empty())
+                ) || matches!(case.kind(), BoundStatementKind::CreateTable { constraints, .. }
+                    if !constraints.iter().any(|constraint| matches!(constraint, crate::sql::bound::BoundConstraint::ForeignKey { .. })) )
             );
         }
     }
 
     #[test]
-    fn every_constraint_family_stays_deferred() {
+    fn only_foreign_keys_stay_deferred() {
         for sql in [
             "CREATE TABLE N (ID INT64 NOT NULL)",
             "CREATE TABLE N (ID INT64 PRIMARY KEY)",
             "CREATE TABLE N (ID INT64 UNIQUE)",
             "CREATE TABLE N (ID INT64 CHECK (ID > 0))",
-            "CREATE TABLE N (ID INT64 REFERENCES USERS(ID))",
         ] {
             assert!(matches!(
                 plan_sql(sql).unwrap().kind(),
-                PlanKind::DeferredUnsupported {
-                    required_phase: "4C2"
-                }
+                PlanKind::CreateTable(_)
             ));
         }
+        assert!(matches!(
+            plan_sql("CREATE TABLE N (ID INT64 REFERENCES USERS(ID))")
+                .unwrap()
+                .kind(),
+            PlanKind::DeferredUnsupported {
+                required_phase: "4C2-C"
+            }
+        ));
     }
 
     #[test]

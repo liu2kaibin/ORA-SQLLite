@@ -8,10 +8,12 @@ use crate::{
     storage::{
         WriteBatch,
         catalog::types::ObjectKind,
+        constraint::ConstraintCatalog,
         index::{IndexSpec, create_index, drop_index},
         relation::{
-            ColumnSpec, ConstrainedTableWrite, Relation, RelationValueValidation, TableSpec,
-            create_relation, drop_relation,
+            ColumnSpec, ConstrainedTableSpec, ConstrainedTableWrite, Relation,
+            RelationValueValidation, TableSpec, create_constrained_relation, create_relation,
+            drop_relation,
         },
     },
 };
@@ -66,7 +68,7 @@ pub(crate) fn execute_validated_write_plan(
         mut memory,
     } = validated;
     match statement.plan().kind() {
-        PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &memory),
+        PlanKind::Insert(plan) => execute_insert(batch, plan, &params, &mut memory),
         PlanKind::Update(plan) => execute_update(batch, plan, &params, &mut memory),
         PlanKind::Delete(plan) => execute_delete(batch, plan, &params, &mut memory),
         PlanKind::CreateTable(plan) => execute_create_table(batch, plan),
@@ -156,73 +158,86 @@ fn execute_update(
         let old_values = stored.into_values();
         let old_bytes = owned_values_bytes(old_values.iter())?;
         memory.reserve(old_bytes)?;
-        let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
-        if !predicate_matches(plan.selection(), &old, params)? {
-            memory.release(old_bytes)?;
-            continue;
-        }
-        let (values, assignment_bytes) = evaluate_update_assignments(plan, &old, params, memory)?;
-        memory.reserve(old_bytes)?;
-        let mut replacement = Vec::with_capacity(relation.column_count());
-        for ordinal in 0..relation.column_count() {
-            let ordinal = u16::try_from(ordinal).map_err(|_| {
-                DbError::new(
-                    ErrorCode::Internal,
-                    "UPDATE relation column ordinal exceeds its bound",
-                )
-            })?;
-            replacement.push(
-                old.source_value(SourceId(0), ordinal)
-                    .cloned()
-                    .ok_or_else(|| {
-                        DbError::new(
-                            ErrorCode::Internal,
-                            "UPDATE old row is missing a relation column",
-                        )
-                    })?,
-            );
-        }
-        for (assignment, value) in plan.assignments().iter().zip(values) {
-            let target = replacement
-                .get_mut(usize::from(assignment.target().ordinal()))
-                .ok_or_else(|| {
-                    DbError::new(
-                        ErrorCode::Internal,
-                        "UPDATE target ordinal is outside the replacement row",
-                    )
-                })?;
-            *target = value;
-        }
-        validate_update_replacement(&relation, plan, &replacement, old_bytes, memory)?;
-        // Validation must happen before allocating the third owned row so an
-        // invalid assignment keeps its Type diagnostic. On the valid path,
-        // retain the original row for index deletion and account for it before
-        // cloning, while no B+Tree mutation has happened yet.
-        memory.reserve(old_bytes)?;
-        let old_for_index = (0..relation.column_count())
-            .map(|ordinal| {
+        let mut row_reserved = old_bytes;
+        let result = (|| {
+            let old = EvalRow::with_source(SourceId(0), old_values, old_bytes)?;
+            if !predicate_matches(plan.selection(), &old, params)? {
+                return Ok(false);
+            }
+            let (values, assignment_bytes) =
+                evaluate_update_assignments(plan, &old, params, memory)?;
+            row_reserved = checked_add_bytes(row_reserved, assignment_bytes)?;
+            memory.reserve(old_bytes)?;
+            row_reserved = checked_add_bytes(row_reserved, old_bytes)?;
+            let mut replacement = Vec::with_capacity(relation.column_count());
+            for ordinal in 0..relation.column_count() {
                 let ordinal = u16::try_from(ordinal).map_err(|_| {
                     DbError::new(
                         ErrorCode::Internal,
                         "UPDATE relation column ordinal exceeds its bound",
                     )
                 })?;
-                old.source_value(SourceId(0), ordinal)
-                    .cloned()
-                    .ok_or_else(|| {
+                replacement.push(old.source_value(SourceId(0), ordinal).cloned().ok_or_else(
+                    || {
                         DbError::new(
                             ErrorCode::Internal,
                             "UPDATE old row is missing a relation column",
                         )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        writer.replace(batch, rowid, &old_for_index, &replacement)?;
-        affected = checked_affected_count(affected)?;
-        memory.release(checked_add_bytes(
-            checked_add_bytes(checked_add_bytes(old_bytes, assignment_bytes)?, old_bytes)?,
-            old_bytes,
-        )?)?;
+                    },
+                )?);
+            }
+            for (assignment, value) in plan.assignments().iter().zip(values) {
+                let target = replacement
+                    .get_mut(usize::from(assignment.target().ordinal()))
+                    .ok_or_else(|| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE target ordinal is outside the replacement row",
+                        )
+                    })?;
+                *target = value;
+            }
+            writer.validate_row(&replacement, memory)?;
+            let max_row_bytes =
+                validate_update_replacement(&relation, plan, &replacement, old_bytes, memory)?;
+            // Validation must happen before allocating the third owned row so an
+            // invalid assignment keeps its Type diagnostic. On the valid path,
+            // retain the original row for index deletion and account for it before
+            // cloning, while no B+Tree mutation has happened yet.
+            memory.reserve(old_bytes)?;
+            row_reserved = checked_add_bytes(row_reserved, old_bytes)?;
+            let old_for_index = (0..relation.column_count())
+                .map(|ordinal| {
+                    let ordinal = u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(
+                            ErrorCode::Internal,
+                            "UPDATE relation column ordinal exceeds its bound",
+                        )
+                    })?;
+                    old.source_value(SourceId(0), ordinal)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::new(
+                                ErrorCode::Internal,
+                                "UPDATE old row is missing a relation column",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            writer.replace(
+                batch,
+                rowid,
+                &old_for_index,
+                &replacement,
+                max_row_bytes,
+                memory,
+            )?;
+            Ok(true)
+        })();
+        memory.release(row_reserved)?;
+        if result? {
+            affected = checked_affected_count(affected)?;
+        }
     }
     writer.finish(batch)?;
     Ok(ExecutionResult::new(affected))
@@ -240,18 +255,25 @@ fn evaluate_update_assignments(
         checked_array_bytes(count, std::mem::size_of::<crate::Value>() as u64)?,
     )?;
     memory.reserve(bytes)?;
-    let mut values = Vec::with_capacity(plan.assignments().len());
-    for assignment in plan.assignments() {
-        let value = coerce_assignment(
-            eval(assignment.value(), old, params)?,
-            assignment.target().data_type(),
-        )?;
-        let payload = owned_value_payload_bytes(&value)?;
-        memory.reserve(payload)?;
-        bytes = checked_add_bytes(bytes, payload)?;
-        values.push(value);
+    let result = (|| {
+        let mut values = Vec::with_capacity(plan.assignments().len());
+        for assignment in plan.assignments() {
+            let value = coerce_assignment(
+                eval(assignment.value(), old, params)?,
+                assignment.target().data_type(),
+            )?;
+            let payload = owned_value_payload_bytes(&value)?;
+            let next = checked_add_bytes(bytes, payload)?;
+            memory.reserve(payload)?;
+            bytes = next;
+            values.push(value);
+        }
+        Ok((values, bytes))
+    })();
+    if result.is_err() {
+        memory.release(bytes)?;
     }
-    Ok((values, bytes))
+    result
 }
 
 fn execute_delete(
@@ -324,7 +346,7 @@ fn validate_update_replacement(
     replacement: &[crate::Value],
     planned_old_clone_bytes: u64,
     memory: &mut WorkMemory,
-) -> Result<()> {
+) -> Result<usize> {
     // Keep the old row clone in the statement budget before allocating it.
     // RowCodec checks value shapes before it classifies the bounded length, so
     // an invalid assignment preserves its Type diagnostic even when the valid
@@ -333,7 +355,7 @@ fn validate_update_replacement(
     let max_row_bytes = usize::try_from(row_budget).unwrap_or(usize::MAX);
     let validation = relation.validate_update_values(replacement, max_row_bytes);
     match validation {
-        Ok(RelationValueValidation::Valid) => Ok(()),
+        Ok(RelationValueValidation::Valid) => Ok(max_row_bytes),
         Ok(RelationValueValidation::ExceedsLimit) => Err(resource_limit()),
         Ok(RelationValueValidation::InvalidValue { ordinal, error }) => {
             let assignment = plan
@@ -397,7 +419,7 @@ fn execute_insert(
     batch: &mut WriteBatch,
     plan: &InsertPlan,
     params: &ParameterFrame,
-    memory: &WorkMemory,
+    memory: &mut WorkMemory,
 ) -> Result<ExecutionResult> {
     if plan.targets().len() != plan.values().len() {
         return Err(DbError::new(
@@ -422,25 +444,41 @@ fn execute_insert(
         *slot = value;
     }
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
+    let constraints = {
+        let catalog = batch.catalog_reader()?;
+        ConstraintCatalog::open(&catalog, table_id)?
+    };
+    constraints.validate_row(relation.columns(), &values, memory)?;
     relation.validate_values(&values, max_row_bytes)?;
     let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
-    writer.insert(batch, &values)?;
+    writer.insert(batch, &values, max_row_bytes, memory)?;
     writer.finish(batch)?;
     Ok(ExecutionResult::new(1))
 }
 
 fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Result<ExecutionResult> {
-    // Keep this check adjacent to the mutation facade. Validation already made
-    // the same assertion before the outer statement checkpoint, but execution
-    // must never turn a retained CREATE into a different catalog operation.
-    if batch
-        .catalog_reader()?
-        .object_name_exists(ObjectKind::Table, plan.name())
+    // Keep table and explicit constraint names adjacent to mutation. The
+    // binder checks the same identities earlier, but an already-validated
+    // CREATE must not claim a stale name after another DDL statement wins it.
     {
-        return Err(DbError::new(
-            ErrorCode::SchemaChanged,
-            "prepared CREATE name is no longer available",
-        ));
+        let catalog = batch.catalog_reader()?;
+        if catalog.object_name_exists(ObjectKind::Table, plan.name()) {
+            return Err(DbError::new(
+                ErrorCode::SchemaChanged,
+                "prepared CREATE name is no longer available",
+            ));
+        }
+        for constraint in plan.constraints() {
+            if let Some(name) = constraint.explicit_name() {
+                if catalog.object_name_exists(ObjectKind::Constraint, name) {
+                    return Err(DbError::new(
+                        ErrorCode::SchemaChanged,
+                        "prepared constraint name is no longer available",
+                    )
+                    .with_sql_location(constraint.location()));
+                }
+            }
+        }
     }
     let columns = plan
         .columns()
@@ -454,8 +492,38 @@ fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Resul
         })
         .collect();
     let spec = TableSpec::new(plan.name().clone(), columns)?;
-    create_relation(batch, &spec)?;
+    if plan.constraints().is_empty() {
+        create_relation(batch, &spec)?;
+    } else {
+        let constraints = plan
+            .constraints()
+            .iter()
+            .map(|constraint| constraint.storage_spec())
+            .collect();
+        let constrained = ConstrainedTableSpec::new(spec, constraints)
+            .map_err(|error| map_constraint_error(plan, error, false))?;
+        create_constrained_relation(batch, &constrained)
+            .map_err(|error| map_constraint_error(plan, error, true))?;
+    }
     Ok(ExecutionResult::new(0))
+}
+
+fn map_constraint_error(plan: &CreateTablePlan, error: DbError, check_only: bool) -> DbError {
+    if error.sql_location().is_some() {
+        return error;
+    }
+    if check_only && !matches!(error.code(), ErrorCode::Type | ErrorCode::ResourceLimit) {
+        return error;
+    }
+    if let Some(constraint) = plan
+        .constraints()
+        .iter()
+        .find(|constraint| !check_only || constraint.is_check())
+    {
+        error.with_sql_location(constraint.location())
+    } else {
+        error
+    }
 }
 
 fn reject_wrong_execute_api_kind(kind: &PlanKind) -> Result<()> {
@@ -494,9 +562,12 @@ mod tests {
     };
     use crate::error::SqlLocation;
     use crate::sql::bind_sql;
-    use crate::storage::relation::Relation;
-    use crate::storage::test_support::phase_4b_catalog_fixture;
-    use crate::{ErrorCode, Parameters, SqlLimits, Statement, Value};
+    use crate::storage::{
+        catalog::types::CatalogName,
+        relation::Relation,
+        test_support::{TempDatabase, phase_4b_catalog_fixture, phase_4c1_query_relation_fixture},
+    };
+    use crate::{Database, ErrorCode, Options, Parameters, SqlLimits, Statement, Value};
 
     fn prepare(pager: &crate::storage::Pager, sql: &str) -> Statement {
         let mut snapshot = pager.begin_read().unwrap();
@@ -509,6 +580,32 @@ mod tests {
         )
         .unwrap();
         Statement::from_bound(bound, sql).unwrap()
+    }
+
+    fn execute_committed(pager: &crate::storage::Pager, sql: &str) {
+        let statement = prepare(pager, sql);
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        execute_validated_write_plan(&mut batch, validated).unwrap();
+        batch.commit().unwrap();
+    }
+
+    fn table_values(batch: &mut crate::storage::WriteBatch, name: &str) -> Vec<Vec<Value>> {
+        let table_id = batch
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_name(&CatalogName::new(name).unwrap())
+            .unwrap()
+            .id();
+        let relation = Relation::open_from_batch(batch, table_id).unwrap();
+        let mut scan = relation.scan(usize::MAX);
+        let mut rows = Vec::new();
+        while let Some(row) = scan.next_batch(batch).unwrap() {
+            rows.push(row.into_values().into_vec());
+        }
+        rows
     }
 
     #[test]
@@ -565,6 +662,118 @@ mod tests {
                     &crate::storage::catalog::types::CatalogName::new("NEW_TABLE").unwrap()
                 )
                 .is_some()
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn constrained_create_persists_the_constraint_graph_without_a_plain_table_fallback() {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let statement = prepare(&pager, "CREATE TABLE GUARDED (ID INT64 PRIMARY KEY)");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        assert_eq!(
+            execute_validated_write_plan(&mut batch, validated)
+                .unwrap()
+                .rows_affected(),
+            0
+        );
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(
+                &crate::storage::catalog::types::CatalogName::new("GUARDED").unwrap(),
+            )
+            .unwrap();
+        let constraints = catalog
+            .constraints_for_table(table.id())
+            .collect::<Vec<_>>();
+        assert_eq!(constraints.len(), 1);
+        assert!(constraints[0].index_id().is_some());
+        assert!(
+            catalog
+                .find_index_by_id(constraints[0].index_id().unwrap())
+                .is_some()
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn constrained_create_resolves_check_to_persistent_column_ids() {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let statement = prepare(
+            &pager,
+            "CREATE TABLE CHECKED (ID INT64, CONSTRAINT CK_POSITIVE CHECK (ID > 0))",
+        );
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        execute_validated_write_plan(&mut batch, validated).unwrap();
+
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(
+                &crate::storage::catalog::types::CatalogName::new("CHECKED").unwrap(),
+            )
+            .unwrap();
+        let constraint = catalog
+            .find_constraint_by_name(
+                &crate::storage::catalog::types::CatalogName::new("CK_POSITIVE").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(constraint.table_id(), table.id());
+        assert_eq!(
+            constraint.kind(),
+            crate::storage::catalog::types::ConstraintKind::Check
+        );
+        let columns = catalog
+            .columns_for_table(table.id())
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::storage::constraint::program::CheckProgram::from_bytes(
+            constraint.check_program().to_vec().into_boxed_slice(),
+        )
+        .unwrap()
+        .validate(&columns)
+        .unwrap();
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn constrained_create_rechecks_an_explicit_constraint_name_at_mutation() {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let first = prepare(
+            &pager,
+            "CREATE TABLE FIRST_CONSTRAINT (ID INT64 CONSTRAINT CK_STALE NOT NULL)",
+        );
+        let stale = prepare(
+            &pager,
+            "CREATE TABLE STALE_CONSTRAINT (ID INT64 CONSTRAINT CK_STALE NOT NULL)",
+        );
+        let mut batch = pager.begin_write().unwrap();
+        let first =
+            validate_write_execution(&mut batch, &first, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let stale =
+            validate_write_execution(&mut batch, &stale, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        execute_validated_write_plan(&mut batch, first).unwrap();
+        let error = execute_validated_write_plan(&mut batch, stale).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SchemaChanged);
+        assert!(error.sql_location().is_some());
+        assert!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_name(
+                    &crate::storage::catalog::types::CatalogName::new("STALE_CONSTRAINT").unwrap(),
+                )
+                .is_none()
         );
         batch.rollback().unwrap();
     }
@@ -782,6 +991,60 @@ mod tests {
     }
 
     #[test]
+    fn drop_system_index_by_name_is_rejected_without_mutation() {
+        // Production break caught: an independently dropped system index must
+        // identify its persisted owner constraint without opening a mutation.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+        let statement = prepare(&pager, "DROP INDEX PK_KEYED");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+
+        crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+            let error = execute_validated_write_plan(batch, validated).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Constraint);
+            assert!(error.to_string().contains("PK_KEYED"), "{error}");
+        });
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn prepared_system_index_drop_cannot_rebind_to_a_recreated_constraint() {
+        // Production break caught: resolving DROP INDEX by its reused name at
+        // execution time could target a new constraint-owned object.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+        let stale = prepare(&pager, "DROP INDEX PK_KEYED");
+        execute_committed(&pager, "DROP TABLE KEYED");
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+
+        let mut batch = pager.begin_write().unwrap();
+        crate::storage::test_support::assert_batch_unchanged_after(&mut batch, |batch| {
+            let error =
+                match validate_write_execution(batch, &stale, Parameters::none(), 64 * 1024 * 1024)
+                {
+                    Ok(_) => panic!("stale system-index DROP unexpectedly rebound"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.code(), ErrorCode::SchemaChanged);
+        });
+        batch.rollback().unwrap();
+    }
+
+    #[test]
     fn insert_prevalidates_nullability_and_row_size_before_any_write() {
         // Production break caught: opening TableWrite before complete-row
         // validation can alter the catalog gate/root/ROWID on an ordinary error.
@@ -840,5 +1103,260 @@ mod tests {
             &[Value::Int64(1), Value::Null, Value::Null, Value::Null]
         );
         batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn update_accepts_the_exact_memory_budget_for_its_replacement_row() {
+        // Production break caught: deducting the saved old row a second time
+        // at the mutation boundary rejects a replacement that already passed
+        // generic validation and exactly fills the remaining statement budget.
+        let payload = "x";
+        let value_bytes = u64::try_from(std::mem::size_of::<Value>()).unwrap();
+        let old_row_bytes = 32 + 4 * value_bytes + u64::try_from(payload.len()).unwrap();
+        let assignment_bytes = 32 + value_bytes;
+        let encoded_replacement_bytes = 32 + 1 + 4 * 8 + 8 + payload.len() as u64;
+        let exact_limit = 32 + 3 * old_row_bytes + assignment_bytes + encoded_replacement_bytes;
+
+        let fixture = phase_4c1_query_relation_fixture(&[(1, payload)]);
+        let pager = fixture.pager();
+        let statement = prepare(&pager, "UPDATE USERS SET ID = 2");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), exact_limit)
+                .unwrap();
+
+        assert_eq!(
+            execute_validated_write_plan(&mut batch, validated)
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn update_rejects_a_replacement_row_one_byte_over_its_memory_budget() {
+        // Production break caught: weakening the caller row bound admits a
+        // replacement whose encoded representation cannot fit alongside the
+        // retained old-row copies.
+        let payload = "x";
+        let value_bytes = u64::try_from(std::mem::size_of::<Value>()).unwrap();
+        let old_row_bytes = 32 + 4 * value_bytes + u64::try_from(payload.len()).unwrap();
+        let assignment_bytes = 32 + value_bytes;
+        let encoded_replacement_bytes = 32 + 1 + 4 * 8 + 8 + payload.len() as u64;
+        let exact_limit = 32 + 3 * old_row_bytes + assignment_bytes + encoded_replacement_bytes;
+
+        let fixture = phase_4c1_query_relation_fixture(&[(1, payload)]);
+        let pager = fixture.pager();
+        let statement = prepare(&pager, "UPDATE USERS SET ID = 2");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), exact_limit - 1)
+                .unwrap();
+
+        assert_eq!(
+            execute_validated_write_plan(&mut batch, validated)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn named_check_diagnostics_flow_through_insert_and_update_execution() {
+        // Production break caught: bypassing local validation in either DML
+        // route loses the user-visible CHECK name and accepts invalid rows.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE CHECKED (ID INT64 CONSTRAINT PK_CHECKED PRIMARY KEY, SCORE INT64 CONSTRAINT CK_SCORE CHECK (SCORE > 0))",
+        );
+        execute_committed(&pager, "INSERT INTO CHECKED VALUES (1, 1)");
+
+        for sql in [
+            "INSERT INTO CHECKED VALUES (2, 0)",
+            "UPDATE CHECKED SET SCORE = 0 WHERE ID = 1",
+        ] {
+            let statement = prepare(&pager, sql);
+            let mut batch = pager.begin_write().unwrap();
+            let validated = validate_write_execution(
+                &mut batch,
+                &statement,
+                Parameters::none(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            let error = execute_validated_write_plan(&mut batch, validated).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Constraint, "{sql}");
+            assert!(error.to_string().contains("CK_SCORE"), "{sql}: {error}");
+            batch.rollback().unwrap();
+        }
+    }
+
+    #[test]
+    fn update_conflicts_with_an_unprocessed_named_primary_key_row() {
+        // Production break caught: removing an old system-index key before
+        // probing the replacement lets a row move onto a later, unprocessed
+        // key instead of reporting the persisted constraint name.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE KEYED (ID INT64 CONSTRAINT PK_KEYED PRIMARY KEY)",
+        );
+        execute_committed(&pager, "INSERT INTO KEYED VALUES (1)");
+        execute_committed(&pager, "INSERT INTO KEYED VALUES (2)");
+
+        let statement = prepare(&pager, "UPDATE KEYED SET ID = ID + 1");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let error = execute_validated_write_plan(&mut batch, validated).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("PK_KEYED"));
+        batch.restore_statement(checkpoint);
+        assert_eq!(
+            table_values(&mut batch, "KEYED"),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn later_named_check_failure_restores_rows_and_system_index_roots() {
+        // Production break caught: when an early replacement changes a system
+        // key and a later CHECK fails, statement rollback must restore both
+        // the table root and every constraint-owned index root.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE GUARDED (ID INT64, SCORE INT64, CONSTRAINT PK_GUARDED PRIMARY KEY (ID), CONSTRAINT CK_SCORE CHECK (SCORE > 0))",
+        );
+        execute_committed(&pager, "INSERT INTO GUARDED VALUES (1, 2)");
+        execute_committed(&pager, "INSERT INTO GUARDED VALUES (2, 1)");
+
+        let statement = prepare(&pager, "UPDATE GUARDED SET ID = ID + 2, SCORE = SCORE - 1");
+        let mut batch = pager.begin_write().unwrap();
+        let (table_id, before_roots) = {
+            let catalog = batch.catalog_reader().unwrap();
+            let table = catalog
+                .find_table_by_name(&CatalogName::new("GUARDED").unwrap())
+                .unwrap();
+            (
+                table.id(),
+                (
+                    table.root(),
+                    catalog
+                        .indexes_for_table(table.id())
+                        .map(|index| (index.id(), index.root()))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let error = execute_validated_write_plan(&mut batch, validated).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("CK_SCORE"));
+        batch.restore_statement(checkpoint);
+
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog.find_table_by_id(table_id).unwrap();
+        let after_roots = (
+            table.root(),
+            catalog
+                .indexes_for_table(table_id)
+                .map(|index| (index.id(), index.root()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(after_roots, before_roots);
+        assert_eq!(
+            table_values(&mut batch, "GUARDED"),
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(2), Value::Int64(1)],
+            ]
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn low_work_memory_releases_check_evaluation_between_updated_rows() {
+        // Production break caught: retaining CHECK-program or evaluator
+        // scratch after a successful row makes a streaming UPDATE exhaust a
+        // budget that is sufficient for one row at a time.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE STREAMED (ID INT64, SCORE INT64, CONSTRAINT CK_POSITIVE CHECK (SCORE > 0))",
+        );
+        let mut inserts = pager.begin_write().unwrap();
+        for id in 1..=20 {
+            let statement = prepare(&pager, &format!("INSERT INTO STREAMED VALUES ({id}, 1)"));
+            let validated = validate_write_execution(
+                &mut inserts,
+                &statement,
+                Parameters::none(),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            execute_validated_write_plan(&mut inserts, validated).unwrap();
+        }
+        inserts.commit().unwrap();
+
+        let statement = prepare(&pager, "UPDATE STREAMED SET SCORE = SCORE");
+        let mut batch = pager.begin_write().unwrap();
+        let validated =
+            validate_write_execution(&mut batch, &statement, Parameters::none(), 800).unwrap();
+        assert_eq!(
+            execute_validated_write_plan(&mut batch, validated)
+                .unwrap()
+                .rows_affected(),
+            20
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn explicit_transaction_commits_later_work_after_named_system_constraint_failure() {
+        // Production break caught: a named primary-key violation is an
+        // ordinary statement error, so it must not poison a caller-managed
+        // transaction or discard later valid work.
+        let temp = TempDatabase::new("named-system-constraint-transaction");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let create = transaction
+            .prepare("CREATE TABLE T (ID INT64 CONSTRAINT PK_T PRIMARY KEY)")
+            .unwrap();
+        transaction.execute(&create, Parameters::none()).unwrap();
+        let first = transaction.prepare("INSERT INTO T VALUES (1)").unwrap();
+        transaction.execute(&first, Parameters::none()).unwrap();
+        let duplicate = transaction.prepare("INSERT INTO T VALUES (1)").unwrap();
+        let error = transaction
+            .execute(&duplicate, Parameters::none())
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("PK_T"));
+        let later = transaction.prepare("INSERT INTO T VALUES (2)").unwrap();
+        transaction.execute(&later, Parameters::none()).unwrap();
+        transaction.commit().unwrap();
+
+        let duplicate_after_commit = connection.prepare("INSERT INTO T VALUES (2)").unwrap();
+        assert_eq!(
+            connection
+                .execute(&duplicate_after_commit, Parameters::none())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Constraint
+        );
     }
 }

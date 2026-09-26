@@ -2297,7 +2297,9 @@ mod tests {
         page::{PageFrame, PageType},
         relation::{ColumnSpec, Relation, TableSpec, TableWrite, create_relation, drop_relation},
         slotted::SlottedPage,
-        test_support::{TempDatabase, create_pager, durable_lengths, test_pager},
+        test_support::{
+            TempDatabase, create_pager, durable_lengths, phase_4c2b_constraint_fixture, test_pager,
+        },
         validate::validate_tree,
         wal::{Wal, format::CommitState, wal_path},
     };
@@ -2691,6 +2693,111 @@ mod tests {
                 .is_some()
         );
         recovered.validate_deep(&mut read).unwrap();
+    }
+
+    #[test]
+    fn phase_4c2b_checkpoint_keeps_constraint_snapshot_roots_paired_until_reader_release() {
+        // Production break caught: checkpointing a constrained catalog while an
+        // old reader is alive must not mix its table/system-index roots with the
+        // newer catalog, nor regenerate the persisted constraint identity.
+        let fixture = phase_4c2b_constraint_fixture();
+        let pager = fixture.pager().clone();
+        let table_id = fixture.table_id();
+        let index_id = fixture.index_id();
+        let constraint_id = fixture.constraint_id();
+        let constraint_name = fixture.constraint_name().clone();
+        let mut old = pager.begin_read().unwrap();
+        let old_catalog = CatalogReader::open_empty_or_v1(&mut old).unwrap();
+        let old_table_root = old_catalog.find_table_by_id(table_id).unwrap().root();
+        let old_index_root = old_catalog.find_index_by_id(index_id).unwrap().root();
+        assert_eq!(
+            old_catalog
+                .find_constraint_by_id(constraint_id)
+                .unwrap()
+                .name(),
+            &constraint_name
+        );
+        drop(old_catalog);
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let table_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        batch.track_tree(TreeKind::Table, table_root).unwrap();
+        batch.track_tree(TreeKind::Index, index_root).unwrap();
+        writer
+            .update_table_root(&mut batch, table_id, table_root)
+            .unwrap();
+        writer
+            .update_index_root(&mut batch, index_id, index_root)
+            .unwrap();
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut latest = pager.begin_read().unwrap();
+        let latest_catalog = CatalogReader::open_empty_or_v1(&mut latest).unwrap();
+        assert_ne!(
+            latest_catalog.find_table_by_id(table_id).unwrap().root(),
+            old_table_root
+        );
+        assert_ne!(
+            latest_catalog.find_index_by_id(index_id).unwrap().root(),
+            old_index_root
+        );
+        assert_eq!(
+            latest_catalog
+                .find_constraint_by_id(constraint_id)
+                .unwrap()
+                .name(),
+            &constraint_name
+        );
+        drop(latest_catalog);
+
+        assert_eq!(pager.checkpoint().unwrap().to_lsn, old.lsn());
+        let old_catalog = CatalogReader::open_empty_or_v1(&mut old).unwrap();
+        assert_eq!(
+            old_catalog.find_table_by_id(table_id).unwrap().root(),
+            old_table_root
+        );
+        assert_eq!(
+            old_catalog.find_index_by_id(index_id).unwrap().root(),
+            old_index_root
+        );
+        assert_eq!(
+            old_catalog
+                .find_constraint_by_id(constraint_id)
+                .unwrap()
+                .name(),
+            &constraint_name
+        );
+        drop(old_catalog);
+        drop(old);
+
+        let latest_lsn = latest.lsn();
+        assert_eq!(pager.checkpoint().unwrap().to_lsn, latest_lsn);
+        drop(latest);
+        drop(pager);
+        let temp = fixture.into_temp();
+        let reopened = Pager::open(
+            temp.path(),
+            OpenMode::ReadOnly,
+            PagerConfig::test_default(4096),
+        )
+        .unwrap();
+        let mut read = reopened.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut read).unwrap();
+        assert_eq!(
+            catalog.find_constraint_by_id(constraint_id).unwrap().name(),
+            &constraint_name
+        );
+        assert_eq!(
+            catalog.find_table_by_id(table_id).unwrap().root(),
+            table_root
+        );
+        assert_eq!(
+            catalog.find_index_by_id(index_id).unwrap().root(),
+            index_root
+        );
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub(crate) fn bind_statement_with_limits(
         drop(parts);
         parts = bind_parts(statement, catalog, database_uuid, &mut parameters)?;
     }
+    require_persistence_safe_checks(&parts.kind)?;
     Ok(BoundStatement {
         kind: parts.kind,
         database_uuid,
@@ -275,9 +276,33 @@ fn bind_create_table(
     let scope = NewTableScope::new(&columns)?;
     let mut dependencies = Vec::new();
     let mut constraint_names = HashSet::new();
+    let mut created_names = vec![CreatedNameDependency {
+        object_kind: ObjectKind::Table,
+        name: name.clone(),
+    }];
     let mut constraints = Vec::new();
     for constraint in create_constraints(create) {
+        if let Constraint::ForeignKey(foreign_key) = constraint {
+            let referenced_name = checked_catalog_name(&foreign_key.referenced_table)?;
+            if referenced_name == name {
+                return Err(DbError::new(
+                    ErrorCode::Unsupported,
+                    "self-referential foreign keys require Phase 4C2-C",
+                ));
+            }
+        }
         let name = checked_constraint_name(constraint, &mut constraint_names)?;
+        if let Some(constraint_name) = &name {
+            if catalog.object_name_exists(ObjectKind::Constraint, constraint_name) {
+                return Err(bind_error(
+                    "constraint name is already present in the catalog",
+                ));
+            }
+            created_names.push(CreatedNameDependency {
+                object_kind: ObjectKind::Constraint,
+                name: constraint_name.clone(),
+            });
+        }
         constraints.push(bind_constraint(
             constraint,
             name,
@@ -297,10 +322,7 @@ fn bind_create_table(
             constraints,
         },
         dependencies,
-        created_names: vec![CreatedNameDependency {
-            object_kind: ObjectKind::Table,
-            name,
-        }],
+        created_names,
         columns: Vec::new(),
     })
 }
@@ -358,12 +380,15 @@ fn bind_column_type(declaration: &TypeDeclaration) -> Result<ColumnType> {
     }
 }
 
-fn create_constraints(create: &CreateTable) -> impl Iterator<Item = &Constraint> {
-    create
+fn create_constraints(create: &CreateTable) -> Vec<&Constraint> {
+    let mut constraints = create
         .columns
         .iter()
         .flat_map(|column| column.constraints.iter())
         .chain(create.constraints.iter())
+        .collect::<Vec<_>>();
+    constraints.sort_by_key(|constraint| constraint.span().start());
+    constraints
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -414,6 +439,68 @@ fn bind_constraint(
             dependencies,
         ),
     }
+}
+
+/// Rejects expression nodes that cannot become a persistent, table-local CHECK
+/// program. This is deliberately iterative because statement limits permit
+/// deeply nested expressions.
+fn require_persistence_safe_checks(kind: &BoundStatementKind) -> Result<()> {
+    let BoundStatementKind::CreateTable { constraints, .. } = kind else {
+        return Ok(());
+    };
+    for constraint in constraints {
+        if let BoundConstraint::Check { expression, .. } = constraint {
+            require_persistence_safe_check(expression)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_persistence_safe_check(expression: &BoundExpr) -> Result<()> {
+    let mut work = vec![expression];
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            BoundExprKind::Parameter(_) => {
+                return Err(bind_error("CHECK cannot contain parameters"));
+            }
+            BoundExprKind::Aggregate { .. } => {
+                return Err(bind_error("CHECK cannot contain aggregates"));
+            }
+            BoundExprKind::Column { .. } => {
+                return Err(bind_error("CHECK cannot reference another table"));
+            }
+            BoundExprKind::Binary {
+                op: crate::sql::bound::BoundBinaryOp::Modulo,
+                ..
+            } => {
+                return Err(bind_error("CHECK cannot contain unsupported operators"));
+            }
+            BoundExprKind::Unary { expr, .. } | BoundExprKind::IsNull { expr, .. } => {
+                work.push(expr);
+            }
+            BoundExprKind::Binary { left, right, .. } => {
+                work.push(right);
+                work.push(left);
+            }
+            BoundExprKind::InList { expr, values, .. } => {
+                work.extend(values.iter());
+                work.push(expr);
+            }
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => {
+                work.push(high);
+                work.push(low);
+                work.push(expr);
+            }
+            BoundExprKind::Like { expr, pattern, .. } => {
+                work.push(pattern);
+                work.push(expr);
+            }
+            BoundExprKind::Literal(_) | BoundExprKind::NewTableColumn { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn bind_foreign_key(
@@ -867,15 +954,67 @@ mod tests {
             parser::parse_statement,
         },
         storage::{
+            catalog::types::ObjectKind,
             catalog::{
                 CatalogReader, add_unrelated_table, bump_users_schema_version,
                 drop_and_recreate_users, replace_users_id_column_id,
             },
-            test_support::{Phase4bCatalogFixture, phase_4b_catalog_fixture_with_explicit_index},
+            test_support::{
+                Phase4bCatalogFixture, phase_4b_catalog_fixture_with_constraint,
+                phase_4b_catalog_fixture_with_explicit_index,
+            },
         },
     };
 
     use super::super::test_support::prepare_fixture;
+
+    #[test]
+    fn create_table_rejects_check_parameters_before_planning() {
+        let error = prepare_fixture("CREATE TABLE T (N INT64, CHECK (N > :1))").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
+
+    #[test]
+    fn create_table_tracks_explicit_constraint_names_and_rejects_duplicates() {
+        let statement = prepare_fixture(
+            "CREATE TABLE NAME_DEPS (A INT64 CONSTRAINT NN_A NOT NULL, CONSTRAINT CK_A CHECK (A > 0))",
+        )
+        .unwrap();
+        assert_eq!(
+            statement
+                .created_names
+                .iter()
+                .map(|dependency| (dependency.object_kind, dependency.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ObjectKind::Table, "NAME_DEPS"),
+                (ObjectKind::Constraint, "NN_A"),
+                (ObjectKind::Constraint, "CK_A"),
+            ]
+        );
+        let error = prepare_fixture(
+            "CREATE TABLE DUP_DEPS (A INT64 CONSTRAINT DUP_NAME NOT NULL, CONSTRAINT DUP_NAME CHECK (A > 0))",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
+
+    #[test]
+    fn create_table_rejects_an_existing_global_constraint_name() {
+        let fixture = phase_4b_catalog_fixture_with_constraint(4096, "CK_SHARED");
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let statement = parse_statement(
+            "CREATE TABLE T (N INT64, CONSTRAINT CK_SHARED CHECK (N > 0))",
+            &SqlLimits::default(),
+        )
+        .unwrap();
+
+        let error =
+            bind_statement(&statement, &catalog, pager.database_uuid().unwrap()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
 
     fn prepared_users_select() -> (
         BoundStatement,

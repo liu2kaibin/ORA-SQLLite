@@ -4,6 +4,7 @@ pub(crate) mod catalog;
 mod checkpoint;
 mod checksum;
 mod codec;
+pub(crate) mod constraint;
 mod features;
 mod file;
 mod freelist;

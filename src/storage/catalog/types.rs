@@ -5,6 +5,7 @@ use crate::{DbError, ErrorCode, Result, storage::PageRef};
 const MAX_CATALOG_NAME_BYTES: usize = 1013;
 pub(super) const MAX_GLOBAL_CATALOG_NAME_BYTES: usize = 128;
 pub(crate) const MAX_COLUMNS: u16 = 1000;
+pub(crate) const MAX_CHECK_PROGRAM_BYTES: usize = 1024 * 1024;
 
 macro_rules! nonzero_id {
     ($name:ident, $message:literal) => {
@@ -246,6 +247,32 @@ pub(crate) struct IndexDef {
     name: CatalogName,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConstraintKind {
+    PrimaryKey,
+    Unique,
+    NotNull,
+    Check,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConstraintDef {
+    id: ConstraintId,
+    table_id: TableId,
+    kind: ConstraintKind,
+    column_count: u16,
+    index_id: Option<IndexId>,
+    check_program: Box<[u8]>,
+    name: CatalogName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConstraintBundle {
+    pub(crate) definition: ConstraintDef,
+    pub(crate) columns: Box<[ColumnId]>,
+    pub(crate) system_index: Option<(IndexDef, Box<[ColumnId]>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CatalogRecord {
     CatalogMeta(CatalogMeta),
@@ -258,6 +285,85 @@ pub(crate) enum CatalogRecord {
     IndexDefinition(IndexDef),
     TableIndex(IndexId),
     IndexColumn(ColumnId),
+    ConstraintName(ConstraintId),
+    ConstraintDefinition(ConstraintDef),
+    TableConstraint(ConstraintId),
+    ConstraintColumn(ColumnId),
+}
+
+impl ConstraintDef {
+    pub(crate) fn new(
+        id: ConstraintId,
+        table_id: TableId,
+        kind: ConstraintKind,
+        column_count: u16,
+        index_id: Option<IndexId>,
+        check_program: Box<[u8]>,
+        name: CatalogName,
+    ) -> Result<Self> {
+        if check_program.len() > MAX_CHECK_PROGRAM_BYTES {
+            return Err(DbError::new(
+                ErrorCode::ResourceLimit,
+                "check program must not exceed 1048576 bytes",
+            ));
+        }
+        if name.as_bytes().len() > MAX_GLOBAL_CATALOG_NAME_BYTES {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "constraint name must not exceed 128 UTF-8 bytes",
+            ));
+        }
+        let valid_shape = match kind {
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
+                (1..=MAX_COLUMNS).contains(&column_count)
+                    && index_id.is_some()
+                    && check_program.is_empty()
+            }
+            ConstraintKind::NotNull => {
+                column_count == 1 && index_id.is_none() && check_program.is_empty()
+            }
+            ConstraintKind::Check => {
+                column_count == 0 && index_id.is_none() && !check_program.is_empty()
+            }
+        };
+        if !valid_shape {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "constraint fields do not match the constraint kind",
+            ));
+        }
+        Ok(Self {
+            id,
+            table_id,
+            kind,
+            column_count,
+            index_id,
+            check_program,
+            name,
+        })
+    }
+
+    pub(crate) const fn id(&self) -> ConstraintId {
+        self.id
+    }
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+    pub(crate) const fn kind(&self) -> ConstraintKind {
+        self.kind
+    }
+    pub(crate) const fn column_count(&self) -> u16 {
+        self.column_count
+    }
+    pub(crate) const fn index_id(&self) -> Option<IndexId> {
+        self.index_id
+    }
+    pub(crate) fn check_program(&self) -> &[u8] {
+        &self.check_program
+    }
+    pub(crate) const fn name(&self) -> &CatalogName {
+        &self.name
+    }
 }
 
 impl IndexDef {
@@ -573,6 +679,186 @@ mod tests {
                 false,
                 IndexOwnership::Explicit,
                 index.name().clone(),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+    }
+
+    #[test]
+    fn constraint_def_enforces_kind_specific_shapes_and_program_limit() {
+        let id = ConstraintId::new(7).unwrap();
+        let table_id = TableId::new(3).unwrap();
+        let index_id = IndexId::new(11).unwrap();
+        let name = CatalogName::new("C_T").unwrap();
+
+        for kind in [ConstraintKind::PrimaryKey, ConstraintKind::Unique] {
+            let definition = ConstraintDef::new(
+                id,
+                table_id,
+                kind,
+                1,
+                Some(index_id),
+                Box::new([]),
+                name.clone(),
+            )
+            .unwrap();
+            assert_eq!(definition.id(), id);
+            assert_eq!(definition.table_id(), table_id);
+            assert_eq!(definition.kind(), kind);
+            assert_eq!(definition.column_count(), 1);
+            assert_eq!(definition.index_id(), Some(index_id));
+            assert_eq!(definition.check_program(), &[]);
+            assert_eq!(definition.name(), &name);
+
+            for column_count in [0, MAX_COLUMNS + 1] {
+                assert_eq!(
+                    ConstraintDef::new(
+                        id,
+                        table_id,
+                        kind,
+                        column_count,
+                        Some(index_id),
+                        Box::new([]),
+                        name.clone(),
+                    )
+                    .unwrap_err()
+                    .code(),
+                    ErrorCode::Type
+                );
+            }
+            assert_eq!(
+                ConstraintDef::new(id, table_id, kind, 1, None, Box::new([]), name.clone(),)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Type
+            );
+            assert_eq!(
+                ConstraintDef::new(
+                    id,
+                    table_id,
+                    kind,
+                    1,
+                    Some(index_id),
+                    vec![1].into_boxed_slice(),
+                    name.clone(),
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::Type
+            );
+        }
+
+        assert!(
+            ConstraintDef::new(
+                id,
+                table_id,
+                ConstraintKind::NotNull,
+                1,
+                None,
+                Box::new([]),
+                name.clone(),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            ConstraintDef::new(
+                id,
+                table_id,
+                ConstraintKind::NotNull,
+                2,
+                None,
+                Box::new([]),
+                name.clone(),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+        assert_eq!(
+            ConstraintDef::new(
+                id,
+                table_id,
+                ConstraintKind::NotNull,
+                1,
+                None,
+                vec![1].into_boxed_slice(),
+                name.clone(),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+        assert_eq!(
+            ConstraintDef::new(
+                id,
+                table_id,
+                ConstraintKind::NotNull,
+                1,
+                Some(index_id),
+                Box::new([]),
+                name.clone(),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+
+        let check = ConstraintDef::new(
+            id,
+            table_id,
+            ConstraintKind::Check,
+            0,
+            None,
+            vec![0xaa].into_boxed_slice(),
+            name.clone(),
+        )
+        .unwrap();
+        assert_eq!(check.check_program(), &[0xaa]);
+        for (column_count, index_id, program) in [
+            (1, None, vec![1]),
+            (0, Some(index_id), vec![1]),
+            (0, None, Vec::new()),
+        ] {
+            assert_eq!(
+                ConstraintDef::new(
+                    id,
+                    table_id,
+                    ConstraintKind::Check,
+                    column_count,
+                    index_id,
+                    program.into_boxed_slice(),
+                    name.clone(),
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::Type
+            );
+        }
+        assert_eq!(
+            ConstraintDef::new(
+                id,
+                table_id,
+                ConstraintKind::Check,
+                0,
+                None,
+                vec![0; MAX_CHECK_PROGRAM_BYTES + 1].into_boxed_slice(),
+                name.clone(),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(
+            ConstraintDef::new(
+                id,
+                table_id,
+                ConstraintKind::Check,
+                0,
+                None,
+                vec![1].into_boxed_slice(),
+                CatalogName::new("a".repeat(129)).unwrap(),
             )
             .unwrap_err()
             .code(),

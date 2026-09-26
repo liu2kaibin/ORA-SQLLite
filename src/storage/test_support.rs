@@ -22,8 +22,9 @@ use super::{
     catalog::{
         CatalogReader, CatalogWriter,
         types::{
-            CatalogName, ColumnDef, ColumnId, ColumnType, IndexDef, IndexId, IndexOwnership, RowId,
-            SchemaVersion, TableDef, TableId,
+            CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintBundle, ConstraintDef,
+            ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, RowId, SchemaVersion,
+            TableDef, TableId,
         },
     },
     checksum::stamp_page_checksum,
@@ -80,6 +81,155 @@ pub(super) fn test_pager(page_size: u32) -> Result<(TempDatabase, Pager)> {
     let temp = TempDatabase::new("pager");
     let pager = Pager::create(temp.path(), PagerConfig::test_default(page_size))?;
     Ok((temp, pager))
+}
+
+/// A minimal committed Phase 4C2-B primary-key graph for storage snapshot and
+/// checkpoint tests.  The returned identifiers deliberately remain stable so
+/// callers can compare old and new catalog roots without reconstructing names.
+pub(crate) struct Phase4c2bConstraintFixture {
+    temp: TempDatabase,
+    pager: Pager,
+    table_id: TableId,
+    index_id: IndexId,
+    constraint_id: ConstraintId,
+    constraint_name: CatalogName,
+}
+
+impl Phase4c2bConstraintFixture {
+    pub(crate) const fn temp(&self) -> &TempDatabase {
+        &self.temp
+    }
+
+    pub(crate) const fn pager(&self) -> &Pager {
+        &self.pager
+    }
+
+    pub(crate) fn into_temp(self) -> TempDatabase {
+        self.temp
+    }
+
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) const fn index_id(&self) -> IndexId {
+        self.index_id
+    }
+
+    pub(crate) const fn constraint_id(&self) -> ConstraintId {
+        self.constraint_id
+    }
+
+    pub(crate) fn constraint_name(&self) -> &CatalogName {
+        &self.constraint_name
+    }
+}
+
+pub(crate) fn phase_4c2b_constraint_fixture() -> Phase4c2bConstraintFixture {
+    let (temp, pager) = test_pager(4096).expect("create Phase 4C2-B constraint fixture");
+    let mut batch = pager.begin_write().expect("begin constraint fixture write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("bootstrap constraint catalog");
+    let table_id = TableId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture table ID")
+            .get(),
+    )
+    .expect("fixture table ID is nonzero");
+    let table_root = BTree::create(&mut batch, TreeKind::Table)
+        .expect("create constraint fixture table root")
+        .root();
+    let table = TableDef::new(
+        table_id,
+        SchemaVersion::new(1).expect("fixture schema version"),
+        table_root,
+        RowId::new(1).expect("fixture row ID"),
+        1,
+        CatalogName::new("T").expect("fixture table name"),
+    )
+    .expect("build constraint fixture table");
+    writer
+        .insert_table_definition(&mut batch, &table)
+        .expect("insert constraint fixture table");
+    let column_id = ColumnId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture column ID")
+            .get(),
+    )
+    .expect("fixture column ID is nonzero");
+    let column = ColumnDef::new(
+        column_id,
+        table_id,
+        0,
+        ColumnType::Int64,
+        false,
+        CatalogName::new("ID").expect("fixture column name"),
+    )
+    .expect("build constraint fixture column");
+    writer
+        .insert_column_definition(&mut batch, &column)
+        .expect("insert constraint fixture column");
+    let constraint_id = ConstraintId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture constraint ID")
+            .get(),
+    )
+    .expect("fixture constraint ID is nonzero");
+    let index_id = IndexId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate constraint fixture index ID")
+            .get(),
+    )
+    .expect("fixture index ID is nonzero");
+    let index_root = BTree::create(&mut batch, TreeKind::Index)
+        .expect("create constraint fixture index root")
+        .root();
+    let constraint_name = CatalogName::new("PK_T").expect("fixture constraint name");
+    let definition = ConstraintDef::new(
+        constraint_id,
+        table_id,
+        ConstraintKind::PrimaryKey,
+        1,
+        Some(index_id),
+        Box::new([]),
+        constraint_name.clone(),
+    )
+    .expect("build constraint fixture definition");
+    let index = IndexDef::new(
+        index_id,
+        table_id,
+        index_root,
+        1,
+        true,
+        IndexOwnership::Constraint(constraint_id),
+        CatalogName::new("SYS_PK_T").expect("fixture system-index name"),
+    )
+    .expect("build constraint fixture system index");
+    writer
+        .insert_constraint_bundle(
+            &mut batch,
+            &ConstraintBundle {
+                definition,
+                columns: vec![column_id].into_boxed_slice(),
+                system_index: Some((index, vec![column_id].into_boxed_slice())),
+            },
+        )
+        .expect("insert constraint fixture bundle");
+    writer
+        .finish(&mut batch)
+        .expect("finish constraint fixture");
+    batch.commit().expect("commit constraint fixture");
+    Phase4c2bConstraintFixture {
+        temp,
+        pager,
+        table_id,
+        index_id,
+        constraint_id,
+        constraint_name,
+    }
 }
 
 pub(super) fn create_pager(temp: &TempDatabase) -> Pager {
@@ -151,6 +301,59 @@ impl Phase4bCatalogFixture {
 
 pub(crate) fn phase_4b_catalog_fixture(page_size: u32) -> Phase4bCatalogFixture {
     phase_4b_catalog_fixture_with_uuid(page_size, [0x5a; 16])
+}
+
+/// A Phase 4B catalog with an existing global constraint name for binder tests.
+pub(crate) fn phase_4b_catalog_fixture_with_constraint(
+    page_size: u32,
+    name: &str,
+) -> Phase4bCatalogFixture {
+    let fixture = phase_4b_catalog_fixture(page_size);
+    let pager = fixture.pager();
+    let mut snapshot = pager.begin_read().expect("read constraint fixture catalog");
+    let catalog = snapshot
+        .catalog_reader()
+        .expect("open constraint fixture catalog");
+    let column_id = catalog
+        .find_column_by_name(fixture.users_id(), &CatalogName::new("ID").unwrap())
+        .expect("USERS(ID) in constraint fixture")
+        .id();
+    drop(catalog);
+    drop(snapshot);
+
+    let mut batch = pager.begin_write().expect("begin constraint fixture write");
+    let mut writer =
+        CatalogWriter::bootstrap(&mut batch).expect("bootstrap constraint fixture catalog");
+    let constraint_id = ConstraintId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate fixture constraint id")
+            .get(),
+    )
+    .expect("fixture constraint id is nonzero");
+    let definition = ConstraintDef::new(
+        constraint_id,
+        fixture.users_id(),
+        ConstraintKind::NotNull,
+        1,
+        None,
+        Box::new([]),
+        CatalogName::new(name).expect("fixture constraint name"),
+    )
+    .expect("build fixture constraint definition");
+    let bundle = ConstraintBundle {
+        definition,
+        columns: vec![column_id].into_boxed_slice(),
+        system_index: None,
+    };
+    writer
+        .insert_constraint_bundle(&mut batch, &bundle)
+        .expect("insert fixture constraint definition");
+    writer
+        .finish(&mut batch)
+        .expect("finish constraint fixture catalog");
+    batch.commit().expect("commit constraint fixture catalog");
+    fixture
 }
 
 #[derive(Clone, Copy)]
@@ -1587,6 +1790,29 @@ pub(crate) struct Phase4c2aStorageState {
     pub(crate) wal_file_len: u64,
 }
 
+/// A raw, durable description of one local constraint.  This intentionally
+/// records the catalog-visible identity and definition separately from SQL's
+/// constraint evaluator so recovery tests can reject a torn bundle without
+/// treating a reconstructed name as equivalent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Phase4c2bConstraintState {
+    pub(crate) id: u64,
+    pub(crate) table_id: u64,
+    pub(crate) kind: String,
+    pub(crate) index_id: Option<u64>,
+    pub(crate) columns: Vec<String>,
+    pub(crate) check_program: Vec<u8>,
+}
+
+/// The Phase 4C2-B crash/model witness.  `base` holds accepted LSN, feature
+/// bits, roots, rows, logical index entries and the freelist; `constraints`
+/// makes the local-constraint graph explicit in old/new comparisons.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Phase4c2bStorageState {
+    pub(crate) base: Phase4c2aStorageState,
+    pub(crate) constraints: BTreeMap<String, Phase4c2bConstraintState>,
+}
+
 pub(crate) fn phase_4c2a_create_pager(temp: &TempDatabase) -> Pager {
     Pager::create(temp.path(), PagerConfig::test_default(4096)).expect("create Phase 4C2-A pager")
 }
@@ -1605,6 +1831,53 @@ pub(crate) fn phase_4c2a_pager_state(pager: &Pager, path: &Path) -> Result<Phase
 
 pub(crate) fn phase_4c2a_model_state(pager: &Pager, path: &Path) -> Result<Phase4c2aStorageState> {
     phase4c2a_pager_state_inner(pager, path, false)
+}
+
+pub(crate) fn phase_4c2b_pager_state(pager: &Pager, path: &Path) -> Result<Phase4c2bStorageState> {
+    phase4c2b_state_inner(pager, path, true)
+}
+
+pub(crate) fn phase_4c2b_model_state(pager: &Pager, path: &Path) -> Result<Phase4c2bStorageState> {
+    phase4c2b_state_inner(pager, path, false)
+}
+
+fn phase4c2b_state_inner(pager: &Pager, path: &Path, deep: bool) -> Result<Phase4c2bStorageState> {
+    let base = if deep {
+        phase_4c2a_pager_state(pager, path)?
+    } else {
+        phase_4c2a_model_state(pager, path)?
+    };
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let mut constraints = BTreeMap::new();
+    for table_name in base.tables.keys() {
+        let table = catalog
+            .find_table_by_name(&CatalogName::new(table_name)?)
+            .ok_or_else(|| DbError::new(ErrorCode::Corruption, "captured table disappeared"))?;
+        for definition in catalog.constraints_for_table(table.id()) {
+            let state = Phase4c2bConstraintState {
+                id: definition.id().get(),
+                table_id: definition.table_id().get(),
+                kind: format!("{:?}", definition.kind()),
+                index_id: definition.index_id().map(|id| id.get()),
+                columns: catalog
+                    .columns_for_constraint(definition.id())
+                    .map(|column| column.name().as_str().to_owned())
+                    .collect(),
+                check_program: definition.check_program().to_vec(),
+            };
+            if constraints
+                .insert(definition.name().as_str().to_owned(), state)
+                .is_some()
+            {
+                return Err(DbError::new(
+                    ErrorCode::Corruption,
+                    "captured duplicate constraint name",
+                ));
+            }
+        }
+    }
+    Ok(Phase4c2bStorageState { base, constraints })
 }
 
 fn phase4c2a_pager_state_inner(
@@ -1828,6 +2101,15 @@ pub(crate) fn phase_4c2a_recover_and_capture(path: &Path) -> Result<(u64, Phase4
     let pager = phase_4c2a_open_pager(path)?;
     phase_4c2a_checkpoint(&pager)?;
     let state = phase_4c2a_pager_state(&pager, path)?;
+    drop(pager);
+    Ok((accepted_lsn, state))
+}
+
+pub(crate) fn phase_4c2b_recover_and_capture(path: &Path) -> Result<(u64, Phase4c2bStorageState)> {
+    let accepted_lsn = phase_4c2a_recovered_lsn(path)?;
+    let pager = phase_4c2a_open_pager(path)?;
+    phase_4c2a_checkpoint(&pager)?;
+    let state = phase_4c2b_pager_state(&pager, path)?;
     drop(pager);
     Ok((accepted_lsn, state))
 }

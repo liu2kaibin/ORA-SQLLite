@@ -277,12 +277,13 @@ fn wrong_connection_api_kinds_are_rejected_without_changing_state() {
 #[test]
 fn begin_and_autocommit_are_nonblocking_busy_but_validation_precedes_writer_acquisition() {
     // Breaks caught: blocking/acquiring the writer before deciding BEGIN/DDL,
-    // or returning Busy before parameter and deferred-plan validation.
+    // returning Busy before parameter validation, or retaining the Task 4
+    // temporary constrained-CREATE rejection after that boundary is removed.
     let (_files, database) = support::new_database("connection-writer-conflicts");
     let mut setup = database.connect().unwrap();
     execute_sql(&mut setup, "CREATE TABLE T (ID INT64)");
     let create_index = setup.prepare("CREATE INDEX IX_T ON T (ID)").unwrap();
-    let deferred = setup
+    let constrained = setup
         .prepare("CREATE TABLE PENDING (ID INT64 PRIMARY KEY)")
         .unwrap();
     let insert = setup.prepare("INSERT INTO T VALUES (:1)").unwrap();
@@ -308,10 +309,10 @@ fn begin_and_autocommit_are_nonblocking_busy_but_validation_precedes_writer_acqu
     );
     assert_eq!(
         contender
-            .execute(&deferred, Parameters::none())
+            .execute(&constrained, Parameters::none())
             .unwrap_err()
             .code(),
-        ErrorCode::Unsupported
+        ErrorCode::Busy
     );
     assert_eq!(
         contender

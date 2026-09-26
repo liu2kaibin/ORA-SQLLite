@@ -1,14 +1,19 @@
-use super::{ExecExpr, Locations, expr::ExprCompiler};
+use super::{ExecExpr, Locations, check, expr::ExprCompiler};
 use crate::{
     DbError, ErrorCode, Result,
     error::SqlLocation,
     sql::{
         SqlType,
-        bound::{BoundAssignment, BoundColumn, BoundColumnDefinition, BoundExpr, BoundTable},
+        bound::{
+            BoundAssignment, BoundColumn, BoundColumnDefinition, BoundConstraint, BoundExpr,
+            BoundTable,
+        },
     },
     storage::catalog::types::{
         CatalogName, ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId,
     },
+    storage::constraint::program::CheckProgramTemplate,
+    storage::relation::TableConstraintSpec,
 };
 
 /// Logical identities only: never a physical root or a retained catalog reader.
@@ -319,12 +324,40 @@ impl ColumnDefinition {
 pub(crate) struct CreateTablePlan {
     name: CatalogName,
     columns: Box<[ColumnDefinition]>,
+    constraints: Box<[TableConstraintDefinition]>,
+}
+
+/// A persistence-safe, identity-free constraint definition for a new table.
+/// Column references remain logical ordinals until the catalog writer assigns
+/// durable `ColumnId` values.
+pub(crate) enum TableConstraintDefinition {
+    PrimaryKey {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+        location: SqlLocation,
+    },
+    Unique {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+        location: SqlLocation,
+    },
+    NotNull {
+        name: Option<CatalogName>,
+        column: u16,
+        location: SqlLocation,
+    },
+    Check {
+        name: Option<CatalogName>,
+        template: CheckProgramTemplate,
+        location: SqlLocation,
+    },
 }
 
 impl CreateTablePlan {
     pub(super) fn from_bound(
         name: &CatalogName,
         columns: &[BoundColumnDefinition],
+        constraints: &[BoundConstraint],
         locations: &Locations<'_>,
     ) -> Result<Self> {
         Ok(Self {
@@ -341,6 +374,10 @@ impl CreateTablePlan {
                     })
                 })
                 .collect::<Result<_>>()?,
+            constraints: constraints
+                .iter()
+                .map(|constraint| TableConstraintDefinition::from_bound(constraint, locations))
+                .collect::<Result<_>>()?,
         })
     }
     pub(crate) fn name(&self) -> &CatalogName {
@@ -348,5 +385,99 @@ impl CreateTablePlan {
     }
     pub(crate) fn columns(&self) -> &[ColumnDefinition] {
         &self.columns
+    }
+    pub(crate) fn constraints(&self) -> &[TableConstraintDefinition] {
+        &self.constraints
+    }
+}
+
+impl TableConstraintDefinition {
+    pub(crate) fn storage_spec(&self) -> TableConstraintSpec<'_> {
+        match self {
+            Self::PrimaryKey { name, columns, .. } => TableConstraintSpec::PrimaryKey {
+                name: name.clone(),
+                columns: columns.clone(),
+            },
+            Self::Unique { name, columns, .. } => TableConstraintSpec::Unique {
+                name: name.clone(),
+                columns: columns.clone(),
+            },
+            Self::NotNull { name, column, .. } => TableConstraintSpec::NotNull {
+                name: name.clone(),
+                column: *column,
+            },
+            Self::Check { name, template, .. } => TableConstraintSpec::Check {
+                name: name.clone(),
+                template,
+            },
+        }
+    }
+
+    pub(crate) fn explicit_name(&self) -> Option<&CatalogName> {
+        match self {
+            Self::PrimaryKey { name, .. }
+            | Self::Unique { name, .. }
+            | Self::NotNull { name, .. }
+            | Self::Check { name, .. } => name.as_ref(),
+        }
+    }
+
+    pub(crate) const fn location(&self) -> SqlLocation {
+        match self {
+            Self::PrimaryKey { location, .. }
+            | Self::Unique { location, .. }
+            | Self::NotNull { location, .. }
+            | Self::Check { location, .. } => *location,
+        }
+    }
+
+    pub(crate) const fn is_check(&self) -> bool {
+        matches!(self, Self::Check { .. })
+    }
+
+    fn from_bound(constraint: &BoundConstraint, locations: &Locations<'_>) -> Result<Self> {
+        match constraint {
+            BoundConstraint::PrimaryKey {
+                name,
+                columns,
+                span,
+                ..
+            } => Ok(Self::PrimaryKey {
+                name: name.clone(),
+                columns: columns.clone().into_boxed_slice(),
+                location: locations.resolve(*span)?,
+            }),
+            BoundConstraint::Unique {
+                name,
+                columns,
+                span,
+                ..
+            } => Ok(Self::Unique {
+                name: name.clone(),
+                columns: columns.clone().into_boxed_slice(),
+                location: locations.resolve(*span)?,
+            }),
+            BoundConstraint::NotNull {
+                name, column, span, ..
+            } => Ok(Self::NotNull {
+                name: name.clone(),
+                column: *column,
+                location: locations.resolve(*span)?,
+            }),
+            BoundConstraint::Check {
+                name, expression, ..
+            } => {
+                let (template, location) = check::compile_check(expression, locations)?;
+                Ok(Self::Check {
+                    name: name.clone(),
+                    template,
+                    location,
+                })
+            }
+            BoundConstraint::ForeignKey { .. } => Err(DbError::new(
+                ErrorCode::Internal,
+                "foreign keys must be deferred before local constraint planning",
+            )),
+        }
     }
 }

@@ -10,6 +10,7 @@ pub mod error;
     reason = "fault boundaries are consumed by later storage tasks"
 )]
 mod fault;
+mod scalar;
 mod sql;
 #[allow(
     dead_code,

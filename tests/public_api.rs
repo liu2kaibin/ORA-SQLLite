@@ -1,13 +1,26 @@
 mod common;
 
 #[test]
-fn prepared_check_parameters_are_solved_and_owned_without_execution() {
+fn persistent_check_parameters_are_rejected_without_prepare_mutation() {
     use ora_sqllite::{DataType, ParameterIdentifier};
     let paths = TempPaths::new("public-final-constraints");
     let db = Database::create(paths.main(), Options::default()).unwrap();
+    drop(db);
+    let before_main = std::fs::read(paths.main()).unwrap();
+    let before_wal = std::fs::read(paths.wal()).unwrap();
+    let db = Database::open(paths.main(), Options::default()).unwrap();
     let mut conn = db.connect().unwrap();
-    let statement = conn
+    let error = conn
         .prepare("CREATE TABLE FLAGS (B BOOL CHECK (:first = :second AND :second = TRUE))")
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Bind);
+    assert_eq!(error.to_string(), "[1100] CHECK cannot contain parameters");
+    assert_eq!(error.sql_location(), None);
+
+    // The same parameter expression remains valid outside a persisted CHECK,
+    // and its public metadata contract is unchanged.
+    let statement = conn
+        .prepare("SELECT :first = :second AND :second = TRUE")
         .unwrap();
     assert_eq!(
         statement
@@ -26,16 +39,13 @@ fn prepared_check_parameters_are_solved_and_owned_without_execution() {
             .iter()
             .all(|p| p.data_type() == Some(DataType::Bool))
     );
-    assert_eq!(
-        conn.prepare("CREATE TABLE FLAGS (B BOOL CHECK (:a = :b AND :a = TRUE AND :b = 1))")
-            .unwrap_err()
-            .code(),
-        ErrorCode::Type
-    );
-    // CREATE was only prepared, so the same name is still available.
+    // Rejected and successful prepare calls are read-only, and the rejected
+    // CREATE did not reserve its table name.
     conn.prepare("CREATE TABLE FLAGS (B BOOL)").unwrap();
     drop(conn);
     drop(db);
+    assert_eq!(std::fs::read(paths.main()).unwrap(), before_main);
+    assert_eq!(std::fs::read(paths.wal()).unwrap(), before_wal);
     let cloned = statement.clone();
     drop(statement);
     assert_eq!(cloned.parameters().len(), 2);

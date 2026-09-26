@@ -10,7 +10,7 @@ use std::{
 
 use ora_sqllite::{Connection, Database, ExecutionResult, Options, Parameters, Statement, Value};
 
-mod format2;
+pub(crate) mod format2;
 
 #[allow(unused_imports)]
 pub use format2::{

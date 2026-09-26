@@ -67,16 +67,12 @@ pub(crate) fn validate_write_before_writer(
         database_uuid,
         max_query_memory_bytes,
     )?;
-    if matches!(
-        statement.plan().kind(),
-        PlanKind::DeferredUnsupported { .. }
-    ) {
-        Err(DbError::new(
+    match statement.plan().kind() {
+        PlanKind::DeferredUnsupported { .. } => Err(DbError::new(
             ErrorCode::Unsupported,
             "statement execution requires Phase 4C2",
-        ))
-    } else {
-        Ok(())
+        )),
+        _ => Ok(()),
     }
 }
 
