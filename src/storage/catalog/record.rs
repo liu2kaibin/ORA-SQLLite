@@ -441,7 +441,10 @@ fn strict_payload(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn decode_referenced_by_envelope(bytes: &[u8]) -> Result<&[u8]> {
-    let kind = RecordKind::from_byte(*bytes.first().ok_or_else(truncated_record)?)?;
+    let kind = *bytes.first().ok_or_else(truncated_record)?;
+    if kind != RecordKind::ReferencedBy.byte() {
+        return Err(corruption("catalog key and record kind disagree"));
+    }
     let version = *bytes.get(1).ok_or_else(truncated_record)?;
     if version > RECORD_VERSION_V1 {
         return Err(DbError::new(
@@ -451,9 +454,6 @@ fn decode_referenced_by_envelope(bytes: &[u8]) -> Result<&[u8]> {
     }
     if version != RECORD_VERSION_V1 {
         return Err(corruption("catalog record version zero is invalid"));
-    }
-    if kind != RecordKind::ReferencedBy {
-        return Err(corruption("catalog key and record kind disagree"));
     }
     if u16::from_be_bytes(
         bytes
@@ -1408,6 +1408,15 @@ mod tests {
         wrong_kind[0] = RecordKind::ConstraintColumn.byte();
         assert_eq!(
             decode_referenced_by_mapping(&wrong_kind)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let mut unknown_kind = bytes.clone();
+        unknown_kind[0] = 0xff;
+        assert_eq!(
+            decode_referenced_by_mapping(&unknown_kind)
                 .unwrap_err()
                 .code(),
             ErrorCode::Corruption
