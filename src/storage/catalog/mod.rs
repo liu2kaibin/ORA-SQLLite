@@ -26,8 +26,8 @@ use crate::{DbError, ErrorCode, Result};
 use key::DecodedCatalogKey;
 use types::{
     CatalogMeta, CatalogName, ColumnDef, ColumnId, ConstraintBundle, ConstraintDef, ConstraintId,
-    ConstraintKind, IndexDef, IndexId, IndexOwnership, ObjectId, ObjectKind, RowId, SchemaVersion,
-    TableDef, TableId,
+    ConstraintKind, ForeignKeyTarget, IndexDef, IndexId, IndexOwnership, ObjectId, ObjectKind,
+    RowId, SchemaVersion, TableDef, TableId,
 };
 
 #[cfg(test)]
@@ -40,6 +40,7 @@ pub(crate) enum ConstraintBundleFaultPoint {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConstraintRemovalFaultPoint {
+    ReferencedBy,
     Columns,
     TableMapping,
     NameMapping,
@@ -139,6 +140,7 @@ pub(crate) struct CatalogImage {
     constraint_names: BTreeMap<String, ConstraintId>,
     table_constraints: BTreeMap<TableId, BTreeSet<ConstraintId>>,
     constraint_columns: BTreeMap<ConstraintId, BTreeMap<u16, ColumnId>>,
+    referenced_by: BTreeMap<ConstraintId, BTreeSet<ConstraintId>>,
 }
 
 impl CatalogImage {
@@ -158,6 +160,7 @@ impl CatalogImage {
             constraint_names: BTreeMap::new(),
             table_constraints: BTreeMap::new(),
             constraint_columns: BTreeMap::new(),
+            referenced_by: BTreeMap::new(),
         }
     }
 
@@ -298,12 +301,18 @@ impl CatalogImage {
                         record::decode_constraint_column_mapping(&value)?,
                     )?;
                 }
-                DecodedCatalogKey::ReferencedBy { .. } => {
+                DecodedCatalogKey::ReferencedBy {
+                    parent_id: parent,
+                    child_id: child,
+                } => {
                     require_index_feature(feature_bits)?;
-                    return Err(DbError::new(
-                        ErrorCode::Unsupported,
-                        "foreign-key catalogs require Phase 4C2-C",
-                    ));
+                    if record::decode_referenced_by_mapping(&value)? != child
+                        || !image.referenced_by.entry(parent).or_default().insert(child)
+                    {
+                        return Err(corruption(
+                            "catalog contains an invalid referenced-by mapping",
+                        ));
+                    }
                 }
             }
         }
@@ -610,7 +619,14 @@ impl CatalogImage {
                     }
                 }
                 ConstraintKind::NotNull => {}
-                ConstraintKind::ForeignKey => {}
+                ConstraintKind::ForeignKey => self.validate_foreign_key(
+                    constraint,
+                    constraint
+                        .foreign_key_target()
+                        .ok_or_else(|| corruption("foreign-key constraint has no parent target"))?,
+                    columns
+                        .ok_or_else(|| corruption("foreign-key constraint has no local columns"))?,
+                )?,
                 ConstraintKind::Check => {
                     let program = CheckProgram::from_bytes(
                         constraint.check_program().to_vec().into_boxed_slice(),
@@ -662,6 +678,126 @@ impl CatalogImage {
                     ));
                 }
             }
+        }
+        for (parent_id, children) in &self.referenced_by {
+            let parent = self.constraints.get(parent_id).ok_or_else(|| {
+                corruption("referenced-by mapping references a missing parent constraint")
+            })?;
+            for child_id in children {
+                let child = self.constraints.get(child_id).ok_or_else(|| {
+                    corruption("referenced-by mapping references a missing child constraint")
+                })?;
+                if child.kind() != ConstraintKind::ForeignKey
+                    || child.foreign_key_target()
+                        != Some(ForeignKeyTarget::new(parent.table_id(), *parent_id))
+                {
+                    return Err(corruption(
+                        "referenced-by mapping does not match the child foreign key",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_foreign_key(
+        &self,
+        child: &ConstraintDef,
+        target: ForeignKeyTarget,
+        local_columns: &BTreeMap<u16, ColumnId>,
+    ) -> Result<()> {
+        if child.table_id() == target.table_id() {
+            return Err(corruption("foreign key cannot reference its own table"));
+        }
+        let parent = self
+            .constraints
+            .get(&target.constraint_id())
+            .ok_or_else(|| corruption("foreign key references a missing parent constraint"))?;
+        if parent.table_id() != target.table_id() {
+            return Err(corruption(
+                "foreign-key parent constraint belongs to the wrong table",
+            ));
+        }
+        if !matches!(
+            parent.kind(),
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique
+        ) {
+            return Err(corruption(
+                "foreign-key parent is not a primary-key or unique constraint",
+            ));
+        }
+        let index = parent
+            .index_id()
+            .and_then(|id| self.indexes.get(&id))
+            .ok_or_else(|| corruption("foreign-key parent has no system index"))?;
+        if index.table_id() != parent.table_id()
+            || index.ownership() != IndexOwnership::Constraint(parent.id())
+            || !index.unique()
+        {
+            return Err(corruption(
+                "foreign-key parent has no constraint-owned unique system index",
+            ));
+        }
+        let parent_columns = self
+            .constraint_columns
+            .get(&parent.id())
+            .ok_or_else(|| corruption("foreign-key parent has no constraint columns"))?;
+        if local_columns.len() != parent_columns.len()
+            || local_columns.len() != usize::from(child.column_count())
+            || parent_columns.len() != usize::from(parent.column_count())
+        {
+            return Err(corruption(
+                "foreign-key child and parent column counts differ",
+            ));
+        }
+        for (expected, (ordinal, _)) in local_columns.iter().enumerate() {
+            if *ordinal
+                != u16::try_from(expected)
+                    .map_err(|_| corruption("foreign-key child ordinal exceeds u16"))?
+            {
+                return Err(corruption(
+                    "foreign-key child columns are not contiguous from zero",
+                ));
+            }
+        }
+        for (expected, (ordinal, _)) in parent_columns.iter().enumerate() {
+            if *ordinal
+                != u16::try_from(expected)
+                    .map_err(|_| corruption("foreign-key parent ordinal exceeds u16"))?
+            {
+                return Err(corruption(
+                    "foreign-key parent columns are not contiguous from zero",
+                ));
+            }
+        }
+        for (child_column_id, parent_column_id) in
+            local_columns.values().zip(parent_columns.values())
+        {
+            let child_column = self.columns.get(child_column_id).ok_or_else(|| {
+                corruption("foreign-key child column mapping references a missing column")
+            })?;
+            let parent_column = self.columns.get(parent_column_id).ok_or_else(|| {
+                corruption("foreign-key parent column mapping references a missing column")
+            })?;
+            let child_type = child_column.column_type();
+            let parent_type = parent_column.column_type();
+            if child_type != parent_type
+                && !(child_type == types::ColumnType::Int64
+                    && parent_type == types::ColumnType::Decimal)
+            {
+                return Err(corruption(
+                    "foreign-key child and parent column types are incompatible",
+                ));
+            }
+        }
+        if !self
+            .referenced_by
+            .get(&parent.id())
+            .is_some_and(|children| children.contains(&child.id()))
+        {
+            return Err(corruption(
+                "foreign-key constraint has no matching referenced-by mapping",
+            ));
         }
         Ok(())
     }
@@ -967,6 +1103,152 @@ impl CatalogReader {
                     .get(id)
                     .expect("validated constraint column references an existing column")
             })
+    }
+
+    pub(crate) fn find_parent_key_constraint(
+        &self,
+        table_id: TableId,
+        ordered_columns: &[ColumnId],
+    ) -> Option<&ConstraintDef> {
+        self.constraints_for_table(table_id).find(|constraint| {
+            matches!(
+                constraint.kind(),
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique
+            ) && self
+                .image
+                .constraint_columns
+                .get(&constraint.id())
+                .is_some_and(|columns| {
+                    columns
+                        .values()
+                        .copied()
+                        .eq(ordered_columns.iter().copied())
+                })
+        })
+    }
+
+    pub(crate) fn foreign_keys_referencing(
+        &self,
+        parent_constraint: ConstraintId,
+    ) -> impl Iterator<Item = &ConstraintDef> {
+        self.image
+            .referenced_by
+            .get(&parent_constraint)
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .map(|child| {
+                self.image
+                    .constraints
+                    .get(child)
+                    .expect("validated referenced-by mapping references a foreign key")
+            })
+    }
+
+    pub(crate) fn referenced_by_exists(&self, parent_constraint: ConstraintId) -> bool {
+        self.image.referenced_by.contains_key(&parent_constraint)
+    }
+
+    fn validate_foreign_key_candidate(
+        &self,
+        child: &ConstraintDef,
+        local_columns: &[ColumnId],
+    ) -> Result<ForeignKeyTarget> {
+        let target = child.foreign_key_target().ok_or_else(|| {
+            DbError::new(ErrorCode::Constraint, "foreign key has no parent target")
+        })?;
+        if child.table_id() == target.table_id() {
+            return Err(DbError::new(
+                ErrorCode::Constraint,
+                "foreign key cannot reference its own table",
+            ));
+        }
+        let parent = self
+            .image
+            .constraints
+            .get(&target.constraint_id())
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Constraint,
+                    "foreign key references a missing parent constraint",
+                )
+            })?;
+        if parent.table_id() != target.table_id()
+            || !matches!(
+                parent.kind(),
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique
+            )
+        {
+            return Err(DbError::new(
+                ErrorCode::Constraint,
+                "foreign-key parent is not an eligible key constraint",
+            ));
+        }
+        let index = parent
+            .index_id()
+            .and_then(|id| self.image.indexes.get(&id))
+            .filter(|index| {
+                index.table_id() == parent.table_id()
+                    && index.ownership() == IndexOwnership::Constraint(parent.id())
+                    && index.unique()
+            })
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Constraint,
+                    "foreign-key parent has no constraint-owned unique system index",
+                )
+            })?;
+        let parent_columns = self
+            .image
+            .constraint_columns
+            .get(&parent.id())
+            .ok_or_else(|| corruption("validated parent constraint columns are missing"))?;
+        let index_columns = self
+            .image
+            .index_columns
+            .get(&index.id())
+            .ok_or_else(|| corruption("validated parent index columns are missing"))?;
+        if parent_columns.values().ne(index_columns.values()) {
+            return Err(corruption(
+                "validated parent constraint and index column order differs",
+            ));
+        }
+        if local_columns.len() != parent_columns.len() {
+            return Err(DbError::new(
+                ErrorCode::Constraint,
+                "foreign-key child and parent column counts differ",
+            ));
+        }
+        for (child_column_id, parent_column_id) in local_columns.iter().zip(parent_columns.values())
+        {
+            let child_column = self.image.columns.get(child_column_id).ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Constraint,
+                    "foreign-key child column does not exist",
+                )
+            })?;
+            let parent_column =
+                self.image.columns.get(parent_column_id).ok_or_else(|| {
+                    corruption("validated foreign-key parent column does not exist")
+                })?;
+            if child_column.table_id() != child.table_id() {
+                return Err(DbError::new(
+                    ErrorCode::Constraint,
+                    "foreign-key child column belongs to another table",
+                ));
+            }
+            let child_type = child_column.column_type();
+            let parent_type = parent_column.column_type();
+            if child_type != parent_type
+                && !(child_type == types::ColumnType::Int64
+                    && parent_type == types::ColumnType::Decimal)
+            {
+                return Err(DbError::new(
+                    ErrorCode::Constraint,
+                    "foreign-key child and parent column types are incompatible",
+                ));
+            }
+        }
+        Ok(target)
     }
 
     /// Returns whether a persisted V1 object has this exact typed identity.
@@ -1304,11 +1586,24 @@ impl CatalogWriter {
         let has_primary_key = current
             .constraints_for_table(bundle.definition.table_id())
             .any(|constraint| constraint.kind() == ConstraintKind::PrimaryKey);
+        let foreign_key_target = if bundle.definition.kind() == ConstraintKind::ForeignKey {
+            Some(
+                current
+                    .validate_foreign_key_candidate(&bundle.definition, bundle.columns.as_ref())?,
+            )
+        } else {
+            None
+        };
         self.mutate(batch, |tree, batch| {
-            let mut record_number = 0;
+            let mut record_number = 0_usize;
             let mut record_written = || {
                 let completed = record_number;
-                record_number += 1;
+                record_number = record_number.checked_add(1).ok_or_else(|| {
+                    DbError::new(
+                        ErrorCode::ResourceLimit,
+                        "constraint bundle record count is exhausted",
+                    )
+                })?;
                 record_hook(completed)
             };
             let definition = &bundle.definition;
@@ -1492,6 +1787,10 @@ impl CatalogWriter {
                 )?;
                 record_written()?;
             }
+            if let Some(target) = foreign_key_target {
+                insert_referenced_by(tree, batch, target.constraint_id(), definition.id())?;
+                record_written()?;
+            }
             if let Some((index, index_columns, index_name_key, table_index_key)) = prepared_index {
                 tree.insert(
                     batch,
@@ -1589,6 +1888,14 @@ impl CatalogWriter {
         reader.validate_deep_from(batch, &self.tree, report, features)?;
         self.mutate(batch, |tree, batch| {
             require_matching_constraint_record(tree, batch, constraint, columns)?;
+            if constraint.foreign_key_target().is_none()
+                && reader.referenced_by_exists(constraint.id())
+            {
+                return Err(DbError::new(
+                    ErrorCode::Constraint,
+                    "referenced parent constraint cannot be removed",
+                ));
+            }
             let system_index = if let Some(index_id) = constraint.index_id() {
                 let index = read_index_definition(tree, batch, index_id)?;
                 if index.ownership() != IndexOwnership::Constraint(constraint.id()) {
@@ -1601,6 +1908,11 @@ impl CatalogWriter {
             } else {
                 None
             };
+            if let Some(target) = constraint.foreign_key_target() {
+                remove_referenced_by(tree, batch, target.constraint_id(), constraint.id())?;
+                #[cfg(test)]
+                constraint_removal_fault_for_test(ConstraintRemovalFaultPoint::ReferencedBy)?;
+            }
             for (ordinal, _) in columns.iter().enumerate() {
                 let ordinal = u16::try_from(ordinal).map_err(|_| {
                     DbError::new(ErrorCode::Type, "constraint column ordinal exceeds u16")
@@ -1903,6 +2215,35 @@ fn replace_record(
         return Err(corruption("catalog replacement record is missing"));
     }
     tree.insert(batch, key, value)
+}
+
+fn insert_referenced_by(
+    tree: &mut BTree,
+    batch: &mut WriteBatch,
+    parent: ConstraintId,
+    child: ConstraintId,
+) -> Result<()> {
+    let key = key::referenced_by_key(parent, child);
+    require_available_key(tree, batch, &key, "duplicate referenced-by mapping")?;
+    tree.insert(batch, &key, &record::encode_referenced_by_mapping(child))
+}
+
+fn remove_referenced_by(
+    tree: &mut BTree,
+    batch: &mut WriteBatch,
+    parent: ConstraintId,
+    child: ConstraintId,
+) -> Result<()> {
+    let key = key::referenced_by_key(parent, child);
+    let value = tree
+        .get(batch, &key)?
+        .ok_or_else(|| corruption("bound referenced-by mapping is missing before mutation"))?;
+    if record::decode_referenced_by_mapping(&value)? != child {
+        return Err(corruption(
+            "bound referenced-by mapping changed before mutation",
+        ));
+    }
+    delete_required_record(tree, batch, &key)
 }
 
 fn require_matching_table_record(
@@ -2367,6 +2708,20 @@ mod tests {
     type ConstraintCandidateCase = (&'static str, ErrorCode, u64, ConstraintCandidateMutation);
     type CheckProgramMutation = Box<dyn Fn(&mut Records)>;
     type CheckProgramCase = (&'static str, ErrorCode, CheckProgramMutation);
+
+    #[derive(Clone, Copy)]
+    enum ForeignKeyCandidate {
+        MissingReferencedBy,
+        OrphanReferencedBy,
+        WrongParentKey,
+        WrongChildValue,
+        ExplicitUniqueParentIndex,
+        ParentColumnOrderMismatch,
+        ChildInt64ParentDecimal,
+        ChildDecimalParentInt64,
+        SelfReference,
+        Valid,
+    }
 
     #[test]
     fn check_program_error_normalization_preserves_non_corruption_codes() {
@@ -4944,6 +5299,660 @@ mod tests {
         rows
     }
 
+    fn parent_constraint_id() -> ConstraintId {
+        ConstraintId::new(50).unwrap()
+    }
+
+    fn child_constraint_id(child: u64) -> ConstraintId {
+        match child {
+            1 => ConstraintId::new(60).unwrap(),
+            2 => ConstraintId::new(80).unwrap(),
+            _ => panic!("foreign-key fixture has only two children"),
+        }
+    }
+
+    fn candidate_without_referenced_by() -> ForeignKeyCandidate {
+        ForeignKeyCandidate::MissingReferencedBy
+    }
+
+    fn candidate_with_orphan_referenced_by() -> ForeignKeyCandidate {
+        ForeignKeyCandidate::OrphanReferencedBy
+    }
+
+    fn candidate_with_wrong_parent_key() -> ForeignKeyCandidate {
+        ForeignKeyCandidate::WrongParentKey
+    }
+
+    fn candidate_with_wrong_child_value() -> ForeignKeyCandidate {
+        ForeignKeyCandidate::WrongChildValue
+    }
+
+    fn candidate_with_explicit_unique_parent_index() -> ForeignKeyCandidate {
+        ForeignKeyCandidate::ExplicitUniqueParentIndex
+    }
+
+    fn candidate_with_parent_column_order_mismatch() -> ForeignKeyCandidate {
+        ForeignKeyCandidate::ParentColumnOrderMismatch
+    }
+
+    fn graph_column(
+        id: u64,
+        table_id: TableId,
+        ordinal: u16,
+        column_type: ColumnType,
+        nullable: bool,
+        name: &str,
+    ) -> ColumnDef {
+        ColumnDef::new(
+            ColumnId::new(id).unwrap(),
+            table_id,
+            ordinal,
+            column_type,
+            nullable,
+            CatalogName::new(name).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn append_graph_table(rows: &mut Records, table: &TableDef, columns: &[ColumnDef]) {
+        rows.extend([
+            (
+                table_name_key(table.name()).unwrap(),
+                encode_table_name_mapping(table.id()),
+            ),
+            (
+                table_definition_key(table.id()),
+                encode_table_definition(table),
+            ),
+        ]);
+        for column in columns {
+            rows.extend([
+                (
+                    column_name_key(column.table_id(), column.name()).unwrap(),
+                    encode_column_name_mapping(column.id()),
+                ),
+                (
+                    column_ordinal_key(column.table_id(), column.ordinal()),
+                    encode_column_ordinal_mapping(column.id()),
+                ),
+                (
+                    column_definition_key(column.id()),
+                    encode_column_definition(column),
+                ),
+            ]);
+        }
+    }
+
+    fn append_graph_constraint(
+        rows: &mut Records,
+        constraint: &ConstraintDef,
+        columns: &[ColumnId],
+    ) {
+        rows.extend([
+            (
+                constraint_name_key(constraint.name()).unwrap(),
+                encode_constraint_name_mapping(constraint.id()),
+            ),
+            (
+                constraint_definition_key(constraint.id()),
+                encode_constraint_definition(constraint),
+            ),
+            (
+                table_constraint_key(constraint.table_id(), constraint.id()),
+                encode_table_constraint_mapping(constraint.id()),
+            ),
+        ]);
+        for (ordinal, column) in columns.iter().copied().enumerate() {
+            rows.push((
+                constraint_column_key(constraint.id(), u16::try_from(ordinal).unwrap()),
+                encode_constraint_column_mapping(column),
+            ));
+        }
+    }
+
+    fn foreign_key_graph_records(
+        parent_root: PageRef,
+        parent_index_root: PageRef,
+        first_child_root: PageRef,
+        second_child_root: PageRef,
+    ) -> Records {
+        let parent_table = new_table(10, parent_root, 2, "PARENT");
+        let parent_columns = [
+            graph_column(20, parent_table.id(), 0, ColumnType::Int64, false, "A"),
+            graph_column(21, parent_table.id(), 1, ColumnType::Text, false, "B"),
+        ];
+        let parent_constraint = ConstraintDef::new(
+            parent_constraint_id(),
+            parent_table.id(),
+            ConstraintKind::PrimaryKey,
+            2,
+            Some(IndexId::new(30).unwrap()),
+            None,
+            Box::new([]),
+            CatalogName::new("PK_PARENT").unwrap(),
+        )
+        .unwrap();
+        let parent_index = IndexDef::new(
+            IndexId::new(30).unwrap(),
+            parent_table.id(),
+            parent_index_root,
+            2,
+            true,
+            IndexOwnership::Constraint(parent_constraint.id()),
+            CatalogName::new("SYS_PK_PARENT").unwrap(),
+        )
+        .unwrap();
+
+        let mut rows = vec![(
+            catalog_meta_key(),
+            encode_catalog_meta(&CatalogMeta::new(ObjectId::new(100).unwrap())),
+        )];
+        append_graph_table(&mut rows, &parent_table, &parent_columns);
+        rows.extend([
+            (
+                index_name_key(parent_index.name()).unwrap(),
+                encode_index_name_mapping(parent_index.id()),
+            ),
+            (
+                index_definition_key(parent_index.id()),
+                encode_index_definition(&parent_index),
+            ),
+            (
+                table_index_key(parent_index.table_id(), parent_index.id()),
+                encode_table_index_mapping(parent_index.id()),
+            ),
+            (
+                index_column_key(parent_index.id(), 0),
+                encode_index_column_mapping(parent_columns[0].id()),
+            ),
+            (
+                index_column_key(parent_index.id(), 1),
+                encode_index_column_mapping(parent_columns[1].id()),
+            ),
+        ]);
+        append_graph_constraint(
+            &mut rows,
+            &parent_constraint,
+            &[parent_columns[0].id(), parent_columns[1].id()],
+        );
+
+        for (table, columns, constraint) in [
+            (
+                new_table(40, first_child_root, 2, "CHILD_1"),
+                [
+                    graph_column(
+                        41,
+                        TableId::new(40).unwrap(),
+                        0,
+                        ColumnType::Int64,
+                        true,
+                        "A",
+                    ),
+                    graph_column(
+                        42,
+                        TableId::new(40).unwrap(),
+                        1,
+                        ColumnType::Text,
+                        true,
+                        "B",
+                    ),
+                ],
+                ConstraintDef::new(
+                    child_constraint_id(1),
+                    TableId::new(40).unwrap(),
+                    ConstraintKind::ForeignKey,
+                    2,
+                    None,
+                    Some(ForeignKeyTarget::new(
+                        parent_table.id(),
+                        parent_constraint.id(),
+                    )),
+                    Box::new([]),
+                    CatalogName::new("FK_CHILD_1_PARENT").unwrap(),
+                )
+                .unwrap(),
+            ),
+            (
+                new_table(70, second_child_root, 2, "CHILD_2"),
+                [
+                    graph_column(
+                        71,
+                        TableId::new(70).unwrap(),
+                        0,
+                        ColumnType::Int64,
+                        true,
+                        "A",
+                    ),
+                    graph_column(
+                        72,
+                        TableId::new(70).unwrap(),
+                        1,
+                        ColumnType::Text,
+                        true,
+                        "B",
+                    ),
+                ],
+                ConstraintDef::new(
+                    child_constraint_id(2),
+                    TableId::new(70).unwrap(),
+                    ConstraintKind::ForeignKey,
+                    2,
+                    None,
+                    Some(ForeignKeyTarget::new(
+                        parent_table.id(),
+                        parent_constraint.id(),
+                    )),
+                    Box::new([]),
+                    CatalogName::new("FK_CHILD_2_PARENT").unwrap(),
+                )
+                .unwrap(),
+            ),
+        ] {
+            append_graph_table(&mut rows, &table, &columns);
+            append_graph_constraint(&mut rows, &constraint, &[columns[0].id(), columns[1].id()]);
+            rows.push((
+                referenced_by_key(parent_constraint.id(), constraint.id()),
+                encode_referenced_by_mapping(constraint.id()),
+            ));
+        }
+        rows
+    }
+
+    fn open_candidate(candidate: ForeignKeyCandidate) -> Result<CatalogReader> {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let parent_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let parent_index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let first_child_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let second_child_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut rows = foreign_key_graph_records(
+            parent_root,
+            parent_index_root,
+            first_child_root,
+            second_child_root,
+        );
+        match candidate {
+            ForeignKeyCandidate::MissingReferencedBy => {
+                remove_record(
+                    &mut rows,
+                    &referenced_by_key(parent_constraint_id(), child_constraint_id(1)),
+                );
+            }
+            ForeignKeyCandidate::OrphanReferencedBy => {
+                let orphan = ConstraintId::new(90).unwrap();
+                rows.push((
+                    referenced_by_key(parent_constraint_id(), orphan),
+                    encode_referenced_by_mapping(orphan),
+                ));
+            }
+            ForeignKeyCandidate::WrongParentKey => {
+                let child = ConstraintDef::new(
+                    child_constraint_id(1),
+                    TableId::new(40).unwrap(),
+                    ConstraintKind::ForeignKey,
+                    2,
+                    None,
+                    Some(ForeignKeyTarget::new(
+                        TableId::new(70).unwrap(),
+                        child_constraint_id(2),
+                    )),
+                    Box::new([]),
+                    CatalogName::new("FK_CHILD_1_PARENT").unwrap(),
+                )
+                .unwrap();
+                *record_value_mut(
+                    &mut rows,
+                    &constraint_definition_key(child_constraint_id(1)),
+                ) = encode_constraint_definition(&child);
+                remove_record(
+                    &mut rows,
+                    &referenced_by_key(parent_constraint_id(), child_constraint_id(1)),
+                );
+                rows.push((
+                    referenced_by_key(child_constraint_id(2), child_constraint_id(1)),
+                    encode_referenced_by_mapping(child_constraint_id(1)),
+                ));
+            }
+            ForeignKeyCandidate::WrongChildValue => {
+                *record_value_mut(
+                    &mut rows,
+                    &referenced_by_key(parent_constraint_id(), child_constraint_id(1)),
+                ) = encode_referenced_by_mapping(child_constraint_id(2));
+            }
+            ForeignKeyCandidate::ExplicitUniqueParentIndex => {
+                remove_record(
+                    &mut rows,
+                    &constraint_name_key(&CatalogName::new("PK_PARENT").unwrap()).unwrap(),
+                );
+                remove_record(
+                    &mut rows,
+                    &constraint_definition_key(parent_constraint_id()),
+                );
+                remove_record(
+                    &mut rows,
+                    &table_constraint_key(TableId::new(10).unwrap(), parent_constraint_id()),
+                );
+                remove_record(&mut rows, &constraint_column_key(parent_constraint_id(), 0));
+                remove_record(&mut rows, &constraint_column_key(parent_constraint_id(), 1));
+                let explicit = IndexDef::new(
+                    IndexId::new(30).unwrap(),
+                    TableId::new(10).unwrap(),
+                    parent_index_root,
+                    2,
+                    true,
+                    IndexOwnership::Explicit,
+                    CatalogName::new("SYS_PK_PARENT").unwrap(),
+                )
+                .unwrap();
+                *record_value_mut(&mut rows, &index_definition_key(explicit.id())) =
+                    encode_index_definition(&explicit);
+            }
+            ForeignKeyCandidate::ParentColumnOrderMismatch => {
+                *record_value_mut(&mut rows, &constraint_column_key(parent_constraint_id(), 0)) =
+                    encode_constraint_column_mapping(ColumnId::new(21).unwrap());
+                *record_value_mut(&mut rows, &constraint_column_key(parent_constraint_id(), 1)) =
+                    encode_constraint_column_mapping(ColumnId::new(20).unwrap());
+                *record_value_mut(&mut rows, &index_column_key(IndexId::new(30).unwrap(), 0)) =
+                    encode_index_column_mapping(ColumnId::new(21).unwrap());
+                *record_value_mut(&mut rows, &index_column_key(IndexId::new(30).unwrap(), 1)) =
+                    encode_index_column_mapping(ColumnId::new(20).unwrap());
+            }
+            ForeignKeyCandidate::ChildInt64ParentDecimal => {
+                let parent_column = graph_column(
+                    20,
+                    TableId::new(10).unwrap(),
+                    0,
+                    ColumnType::Decimal,
+                    false,
+                    "A",
+                );
+                *record_value_mut(&mut rows, &column_definition_key(parent_column.id())) =
+                    encode_column_definition(&parent_column);
+            }
+            ForeignKeyCandidate::ChildDecimalParentInt64 => {
+                let child_column = graph_column(
+                    41,
+                    TableId::new(40).unwrap(),
+                    0,
+                    ColumnType::Decimal,
+                    true,
+                    "A",
+                );
+                *record_value_mut(&mut rows, &column_definition_key(child_column.id())) =
+                    encode_column_definition(&child_column);
+            }
+            ForeignKeyCandidate::SelfReference => {
+                let child = ConstraintDef::new(
+                    child_constraint_id(1),
+                    TableId::new(40).unwrap(),
+                    ConstraintKind::ForeignKey,
+                    2,
+                    None,
+                    Some(ForeignKeyTarget::new(
+                        TableId::new(40).unwrap(),
+                        child_constraint_id(1),
+                    )),
+                    Box::new([]),
+                    CatalogName::new("FK_CHILD_1_PARENT").unwrap(),
+                )
+                .unwrap();
+                *record_value_mut(
+                    &mut rows,
+                    &constraint_definition_key(child_constraint_id(1)),
+                ) = encode_constraint_definition(&child);
+                remove_record(
+                    &mut rows,
+                    &referenced_by_key(parent_constraint_id(), child_constraint_id(1)),
+                );
+                rows.push((
+                    referenced_by_key(child.id(), child.id()),
+                    encode_referenced_by_mapping(child.id()),
+                ));
+            }
+            ForeignKeyCandidate::Valid => {}
+        }
+        let tree = raw_tree(&mut batch, rows);
+        CatalogReader::open_candidate(
+            &mut batch,
+            &tree,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        )
+    }
+
+    fn open_valid_parent_and_two_children() -> CatalogReader {
+        open_candidate(ForeignKeyCandidate::Valid).unwrap()
+    }
+
+    fn remove_graph_constraint(rows: &mut Records, constraint: &ConstraintDef) {
+        remove_record(rows, &constraint_name_key(constraint.name()).unwrap());
+        remove_record(rows, &constraint_definition_key(constraint.id()));
+        remove_record(
+            rows,
+            &table_constraint_key(constraint.table_id(), constraint.id()),
+        );
+        for ordinal in 0..constraint.column_count() {
+            remove_record(rows, &constraint_column_key(constraint.id(), ordinal));
+        }
+        if let Some(parent) = constraint.parent_constraint_id() {
+            remove_record(rows, &referenced_by_key(parent, constraint.id()));
+        }
+    }
+
+    #[test]
+    fn foreign_key_graph_rejects_every_one_sided_or_misdirected_reference() {
+        for candidate in [
+            candidate_without_referenced_by(),
+            candidate_with_orphan_referenced_by(),
+            candidate_with_wrong_parent_key(),
+            candidate_with_wrong_child_value(),
+            candidate_with_explicit_unique_parent_index(),
+            candidate_with_parent_column_order_mismatch(),
+        ] {
+            assert_eq!(
+                open_candidate(candidate).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+        }
+    }
+
+    #[test]
+    fn valid_foreign_key_graph_exposes_both_directions_in_constraint_id_order() {
+        let catalog = open_valid_parent_and_two_children();
+        assert_eq!(
+            catalog
+                .foreign_keys_referencing(parent_constraint_id())
+                .map(ConstraintDef::id)
+                .collect::<Vec<_>>(),
+            vec![child_constraint_id(1), child_constraint_id(2)]
+        );
+    }
+
+    #[test]
+    fn parent_key_lookup_requires_an_exact_declared_key_and_reports_reverse_edges() {
+        let catalog = open_valid_parent_and_two_children();
+        let parent_columns = [ColumnId::new(20).unwrap(), ColumnId::new(21).unwrap()];
+        assert_eq!(
+            catalog
+                .find_parent_key_constraint(TableId::new(10).unwrap(), &parent_columns)
+                .map(ConstraintDef::id),
+            Some(parent_constraint_id())
+        );
+        assert!(
+            catalog
+                .find_parent_key_constraint(
+                    TableId::new(10).unwrap(),
+                    &[ColumnId::new(20).unwrap()],
+                )
+                .is_none()
+        );
+        assert!(
+            catalog
+                .find_parent_key_constraint(
+                    TableId::new(10).unwrap(),
+                    &[parent_columns[1], parent_columns[0]],
+                )
+                .is_none()
+        );
+        assert!(catalog.referenced_by_exists(parent_constraint_id()));
+        assert!(!catalog.referenced_by_exists(child_constraint_id(1)));
+    }
+
+    #[test]
+    fn foreign_key_types_are_directional_and_self_references_are_corruption() {
+        assert!(open_candidate(ForeignKeyCandidate::ChildInt64ParentDecimal).is_ok());
+        for candidate in [
+            ForeignKeyCandidate::ChildDecimalParentInt64,
+            ForeignKeyCandidate::SelfReference,
+        ] {
+            assert_eq!(
+                open_candidate(candidate).unwrap_err().code(),
+                ErrorCode::Corruption
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_key_writer_inserts_and_removes_the_exact_reverse_record() {
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let mut batch = pager.begin_write().unwrap();
+        let parent_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let parent_index_root = BTree::create(&mut batch, TreeKind::Index).unwrap().root();
+        let first_child_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let second_child_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
+        let mut rows = foreign_key_graph_records(
+            parent_root,
+            parent_index_root,
+            first_child_root,
+            second_child_root,
+        );
+        let child = ConstraintDef::new(
+            child_constraint_id(1),
+            TableId::new(40).unwrap(),
+            ConstraintKind::ForeignKey,
+            2,
+            None,
+            Some(ForeignKeyTarget::new(
+                TableId::new(10).unwrap(),
+                parent_constraint_id(),
+            )),
+            Box::new([]),
+            CatalogName::new("FK_CHILD_1_PARENT").unwrap(),
+        )
+        .unwrap();
+        let second_child = ConstraintDef::new(
+            child_constraint_id(2),
+            TableId::new(70).unwrap(),
+            ConstraintKind::ForeignKey,
+            2,
+            None,
+            Some(ForeignKeyTarget::new(
+                TableId::new(10).unwrap(),
+                parent_constraint_id(),
+            )),
+            Box::new([]),
+            CatalogName::new("FK_CHILD_2_PARENT").unwrap(),
+        )
+        .unwrap();
+        remove_graph_constraint(&mut rows, &child);
+        remove_graph_constraint(&mut rows, &second_child);
+        let tree = raw_tree(&mut batch, rows);
+        publish_with_features(
+            &mut batch,
+            &tree,
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+        );
+        batch.commit().unwrap();
+
+        let child_columns = [ColumnId::new(41).unwrap(), ColumnId::new(42).unwrap()];
+        let bundle = ConstraintBundle {
+            definition: child.clone(),
+            columns: child_columns.into(),
+            system_index: None,
+        };
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let before_insert = current_records(&writer, &mut batch);
+        for fail_after in 0..5 {
+            let checkpoint = batch.checkpoint_mutation().unwrap();
+            let writer_root = writer.root();
+            let error = writer
+                .insert_constraint_bundle_with_record_hook(&mut batch, &bundle, |record_number| {
+                    if record_number == fail_after {
+                        Err(DbError::new(
+                            ErrorCode::Io,
+                            "injected after foreign-key bundle record",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Io, "record {fail_after}");
+            checkpoint.assert_matches_batch_for_test(&batch);
+            assert_eq!(writer.root(), writer_root);
+            assert_eq!(current_records(&writer, &mut batch), before_insert);
+        }
+        writer
+            .insert_constraint_bundle(&mut batch, &bundle)
+            .unwrap();
+        let reverse_key = referenced_by_key(parent_constraint_id(), child.id());
+        assert_eq!(
+            current_records(&writer, &mut batch)
+                .into_iter()
+                .find(|(key, _)| key == &reverse_key)
+                .map(|(_, value)| decode_referenced_by_mapping(&value).unwrap()),
+            Some(child.id())
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert_eq!(
+            catalog
+                .foreign_keys_referencing(parent_constraint_id())
+                .map(ConstraintDef::id)
+                .collect::<Vec<_>>(),
+            vec![child.id()]
+        );
+        drop(read);
+
+        let mut batch = pager.begin_write().unwrap();
+        let mut writer = CatalogWriter::bootstrap(&mut batch).unwrap();
+        let before_remove = current_records(&writer, &mut batch);
+        let checkpoint = batch.checkpoint_mutation().unwrap();
+        let writer_root = writer.root();
+        {
+            let _fault =
+                fail_constraint_removal_at_for_test(ConstraintRemovalFaultPoint::ReferencedBy);
+            assert_eq!(
+                writer
+                    .remove_constraint(&mut batch, &child, &child_columns)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Io
+            );
+        }
+        checkpoint.assert_matches_batch_for_test(&batch);
+        assert_eq!(writer.root(), writer_root);
+        assert_eq!(current_records(&writer, &mut batch), before_remove);
+        writer
+            .remove_constraint(&mut batch, &child, &child_columns)
+            .unwrap();
+        assert!(
+            current_records(&writer, &mut batch)
+                .into_iter()
+                .all(|(key, _)| key != reverse_key)
+        );
+        writer.finish(&mut batch).unwrap();
+        batch.commit().unwrap();
+
+        let mut read = pager.begin_read().unwrap();
+        let catalog = read.catalog_reader().unwrap();
+        assert!(!catalog.referenced_by_exists(parent_constraint_id()));
+        assert!(catalog.find_constraint_by_id(child.id()).is_none());
+    }
+
     fn local_check_constraint_records(table_root: PageRef) -> Records {
         let program = CheckProgramTemplate::new(vec![CheckTemplateInstruction::Literal {
             value: crate::Value::Bool(true),
@@ -5587,7 +6596,7 @@ mod tests {
             ),
             (
                 "foreign-key reverse edge",
-                ErrorCode::Unsupported,
+                ErrorCode::Corruption,
                 complete_features,
                 Box::new(|_, rows, _, _| {
                     rows.push((
@@ -6546,7 +7555,7 @@ mod tests {
         }
         assert_bad_records_with_features(
             "foreign-key reverse edge",
-            ErrorCode::Unsupported,
+            ErrorCode::Corruption,
             CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
             |rows, _| rows.push((referenced_by, vec![])),
         );
