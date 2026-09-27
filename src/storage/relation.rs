@@ -870,6 +870,8 @@ impl ConstrainedTableWrite {
         }
     }
 
+    // Keep old/new rows and the distinct row/check/FK budgets explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace(
         &mut self,
         batch: &mut WriteBatch,

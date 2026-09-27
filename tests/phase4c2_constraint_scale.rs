@@ -12,6 +12,325 @@ const FAST_COLLAPSE_ROWS: i64 = 300;
 const FINAL_SURVIVOR_ROWS: i64 = 3;
 
 #[test]
+#[ignore = "run by the dedicated Phase 4C2-C Deep CI job"]
+fn phase_4c2c_hundred_thousand_row_foreign_key_smoke() {
+    // Breaks caught: missed child-key updates, a stale child prefix index,
+    // either restrict path accepting an orphan, or leaked rows/edges/pages
+    // after deleting the data and dropping the complete dependency graph.
+    const ROWS: i64 = 100_000;
+    let started = Instant::now();
+    let (files, database) = support::new_database("phase4c2c-foreign-key-scale");
+    let mut connection = database.connect().expect("connect FK scale database");
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE P (ID INT64 CONSTRAINT PK_P PRIMARY KEY)",
+    );
+    for (table, constraint) in [("CI", "FK_CI_P"), ("CS", "FK_CS_P")] {
+        support::execute_sql(
+            &mut connection,
+            &format!(
+                "CREATE TABLE {table} (ID INT64, PID INT64,
+                 CONSTRAINT {constraint} FOREIGN KEY (PID) REFERENCES P (ID))"
+            ),
+        );
+    }
+    support::execute_sql(&mut connection, "CREATE INDEX IX_CI_PID_ID ON CI (PID, ID)");
+    insert_foreign_key_scale_rows(&mut connection, ROWS);
+    for table in ["P", "CI", "CS"] {
+        assert_foreign_key_scale_count(&mut connection, table, ROWS);
+    }
+    eprintln!(
+        "phase 4C2-C scale: inserted parents={ROWS} indexed_children={ROWS} unindexed_children={ROWS}"
+    );
+    update_foreign_key_scale_children(&mut connection, ROWS);
+    assert_foreign_key_scale_child_values(&mut connection, ROWS);
+    // Even parent keys are referenced only by CI, odd keys only by CS. Thus
+    // neither restrict check can accidentally be satisfied by the other path.
+    for (id, constraint) in [(0, "FK_CI_P"), (1, "FK_CS_P")] {
+        assert_named_constraint(
+            &mut connection,
+            &format!("UPDATE P SET ID = ID + {ROWS} WHERE ID = {id}"),
+            constraint,
+        );
+        assert_named_constraint(
+            &mut connection,
+            &format!("DELETE FROM P WHERE ID = {id}"),
+            constraint,
+        );
+        assert_eq!(
+            support::collect(
+                &mut connection,
+                &format!("SELECT ID FROM P WHERE ID = {id}")
+            ),
+            vec![vec![Value::Int64(id)]],
+        );
+    }
+    assert_foreign_key_scale_count(&mut connection, "P", ROWS);
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    assert_foreign_key_scale_graph(&files, ROWS, ROWS);
+    eprintln!("phase 4C2-C scale: populated rows, physical indexes and reverse edges verified");
+
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().expect("reopen populated FK scale graph");
+    assert_foreign_key_scale_child_values(&mut connection, ROWS);
+    // Set-based mutations deliberately retain the ROWID TableScan target
+    // discovery path; this witness makes no query-optimizer IndexScan claim.
+    for table in ["CI", "CS", "P"] {
+        support::execute_sql(&mut connection, "BEGIN");
+        assert_eq!(
+            support::execute_sql(&mut connection, &format!("DELETE FROM {table}")).rows_affected(),
+            ROWS as u64,
+            "delete all {table} rows",
+        );
+        support::execute_sql(&mut connection, "COMMIT");
+        assert_foreign_key_scale_count(&mut connection, table, 0);
+        eprintln!("phase 4C2-C scale: deleted {ROWS} rows from {table}");
+    }
+    drop(connection);
+    drop(reopened);
+    support::checkpoint_accepted_state(&files);
+    assert_foreign_key_scale_graph(&files, ROWS, 0);
+
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().expect("reopen empty FK scale tables");
+    for table in ["CI", "CS", "P"] {
+        assert_foreign_key_scale_count(&mut connection, table, 0);
+        support::execute_sql(&mut connection, &format!("DROP TABLE {table}"));
+    }
+    drop(connection);
+    drop(reopened);
+    support::checkpoint_accepted_state(&files);
+    let empty = assert_foreign_key_scale_dropped_graph(&files);
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().expect("reopen dropped FK scale graph");
+    for table in ["CI", "CS", "P"] {
+        let error = connection
+            .prepare(&format!("SELECT * FROM {table}"))
+            .expect_err("dropped table must remain absent after reopen");
+        assert_eq!(error.code(), ErrorCode::Bind);
+    }
+    drop(connection);
+    drop(reopened);
+    support::checkpoint_accepted_state(&files);
+    assert_eq!(assert_foreign_key_scale_dropped_graph(&files), empty);
+    eprintln!(
+        "phase 4C2-C 100k: parents={ROWS} indexed_children={ROWS} unindexed_children={ROWS}; child_updates=200000 restrict_checks=4; final_rows=0 indexes=0 reverse_records=0; all {} allocated pages accounted for (catalog=1, freelist_trunks={}, free_leaves={}); elapsed={:.2}s",
+        empty.page_count - 1,
+        empty.freelist.len(),
+        empty
+            .freelist
+            .iter()
+            .map(|trunk| trunk.leaves.len())
+            .sum::<usize>(),
+        started.elapsed().as_secs_f64(),
+    );
+}
+
+fn insert_foreign_key_scale_rows(connection: &mut Connection, rows: i64) {
+    for table in ["P", "CI", "CS"] {
+        let sql = if table == "P" {
+            "INSERT INTO P VALUES (:1)".to_owned()
+        } else {
+            format!("INSERT INTO {table} VALUES (:1, :2)")
+        };
+        let insert = connection.prepare(&sql).expect("prepare FK scale insert");
+        for start in (0..rows).step_by(BATCH_ROWS as usize) {
+            support::execute_sql(connection, "BEGIN");
+            for id in start..(start + BATCH_ROWS).min(rows) {
+                let parent_id = 2 * (id % (rows / 2)) + i64::from(table == "CS");
+                let values: [ParameterValue; 2] =
+                    [Value::Int64(id).into(), Value::Int64(parent_id).into()];
+                let width = if table == "P" { 1 } else { 2 };
+                assert_eq!(
+                    connection
+                        .execute(&insert, Parameters::positional(&values[..width]))
+                        .expect("insert FK scale row")
+                        .rows_affected(),
+                    1,
+                );
+            }
+            support::execute_sql(connection, "COMMIT");
+        }
+        eprintln!("phase 4C2-C scale: inserted {rows} rows into {table}");
+    }
+}
+
+fn update_foreign_key_scale_children(connection: &mut Connection, rows: i64) {
+    for (table, pivot) in [("CI", rows - 2), ("CS", rows)] {
+        support::execute_sql(connection, "BEGIN");
+        assert_eq!(
+            support::execute_sql(
+                connection,
+                &format!("UPDATE {table} SET PID = {pivot} - PID")
+            )
+            .rows_affected(),
+            rows as u64,
+            "update every {table} child to an existing parent",
+        );
+        support::execute_sql(connection, "COMMIT");
+        eprintln!("phase 4C2-C scale: updated {rows} child keys in {table}");
+    }
+}
+
+fn assert_foreign_key_scale_child_values(connection: &mut Connection, rows: i64) {
+    for table in ["CI", "CS"] {
+        let statement = connection
+            .prepare(&format!("SELECT ID, PID FROM {table}"))
+            .expect("prepare child value witness");
+        let mut result = connection
+            .query(&statement, Parameters::none())
+            .expect("query child value witness");
+        let mut ids = BTreeSet::new();
+        while let Some(row) = result.next().expect("read child value witness") {
+            let [Value::Int64(id), Value::Int64(parent_id)] = row.values() else {
+                panic!("unexpected FK child row: {:?}", row.values());
+            };
+            assert!(ids.insert(*id), "duplicate child ID in {table}");
+            let expected = rows - 2 - 2 * (id % (rows / 2)) + i64::from(table == "CS");
+            assert_eq!(
+                *parent_id, expected,
+                "{table} child {id} must use its updated parent"
+            );
+        }
+        assert_eq!(ids, (0..rows).collect());
+    }
+}
+
+fn assert_foreign_key_scale_count(connection: &mut Connection, table: &str, rows: i64) {
+    assert_eq!(
+        support::collect(connection, &format!("SELECT COUNT(*) FROM {table}")),
+        vec![vec![Value::Int64(rows)]],
+        "{table} row count",
+    );
+}
+
+fn assert_foreign_key_scale_graph(files: &support::TestFiles, allocated: i64, rows: i64) {
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture persisted FK scale graph");
+    assert_eq!(capture.tables.len(), 3);
+    assert_eq!(capture.constraints.len(), 3);
+    assert_eq!(capture.indexes.len(), 2);
+    let parent = &capture.tables["P"];
+    let primary = &capture.constraints["PK_P"];
+    assert_eq!(primary.kind, 1);
+    assert_eq!(primary.table_id, parent.id);
+    assert_eq!(primary.columns, vec![parent.columns[0].id]);
+    let mut foreign_keys = Vec::new();
+    for (name, table_name) in [("FK_CI_P", "CI"), ("FK_CS_P", "CS")] {
+        let foreign_key = &capture.constraints[name];
+        let child = &capture.tables[table_name];
+        assert_eq!(foreign_key.kind, 5);
+        assert_eq!(foreign_key.table_id, child.id);
+        assert_eq!(foreign_key.columns, vec![child.columns[1].id]);
+        assert_eq!(foreign_key.parent_table_id, Some(parent.id));
+        assert_eq!(foreign_key.parent_constraint_id, Some(primary.id));
+        assert_eq!(foreign_key.index_id, None);
+        assert_eq!(capture.table_constraints[&child.id], vec![foreign_key.id]);
+        foreign_keys.push(foreign_key.id);
+    }
+    foreign_keys.sort_unstable();
+    assert_eq!(
+        capture.referenced_by,
+        std::collections::BTreeMap::from([(primary.id, foreign_keys)])
+    );
+    assert_eq!(capture.table_constraints.len(), 3);
+    assert_eq!(capture.table_constraints[&parent.id], vec![primary.id]);
+    for (name, table) in &capture.tables {
+        assert_eq!(table.next_rowid, allocated as u64 + 1);
+        let tree = support::format2::raw_table_tree_capture(files.main(), table.root)
+            .expect("capture FK scale table tree");
+        let expected = (1..=rows as u64)
+            .map(|id| id.to_be_bytes().to_vec())
+            .collect::<Vec<_>>();
+        assert_exact_physical_entries(name, &tree, &expected);
+        if rows == 0 {
+            assert_eq!((tree.root_page_type, tree.height), (3, 0));
+        } else {
+            assert!(tree.height > 0, "scale table must span internal pages");
+        }
+    }
+    for (name, index) in &capture.indexes {
+        let mut expected = Vec::new();
+        if index.owner_constraint_id == Some(primary.id) {
+            assert_constraint_index_mapping(primary, index, "PK_P");
+            assert!(index.unique);
+            assert_eq!(index.table_id, parent.id);
+            assert_eq!(index.columns, primary.columns);
+            for id in 0..rows {
+                expected.push(hand_derived_int_index_key(&[Some(id)], id as u64 + 1));
+            }
+        } else {
+            assert_eq!(name, "IX_CI_PID_ID");
+            assert_eq!(index.owner_constraint_id, None);
+            assert!(!index.unique);
+            let child = &capture.tables["CI"];
+            assert_eq!(index.table_id, child.id);
+            assert_eq!(
+                index.columns,
+                vec![child.columns[1].id, child.columns[0].id]
+            );
+            for id in 0..rows {
+                let parent_id = allocated - 2 - 2 * (id % (allocated / 2));
+                expected.push(hand_derived_int_index_key(
+                    &[Some(parent_id), Some(id)],
+                    id as u64 + 1,
+                ));
+            }
+        }
+        expected.sort_unstable();
+        let tree = support::format2::raw_index_tree_capture(files.main(), index.root)
+            .expect("capture FK scale index tree");
+        assert_exact_physical_entries(name, &tree, &expected);
+        if rows == 0 {
+            assert_eq!((tree.root_page_type, tree.height), (5, 0));
+        } else {
+            assert!(tree.height > 0, "scale index must span internal pages");
+        }
+    }
+}
+
+fn assert_foreign_key_scale_dropped_graph(
+    files: &support::TestFiles,
+) -> support::format2::RawCatalogCapture {
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture dropped FK scale graph");
+    assert!(capture.tables.is_empty());
+    assert!(capture.indexes.is_empty());
+    assert!(capture.constraints.is_empty());
+    assert!(capture.table_constraints.is_empty());
+    assert!(capture.referenced_by.is_empty());
+    assert_eq!(
+        support::format2::catalog_record_families(files.main()).unwrap(),
+        vec![0]
+    );
+    let catalog = support::format2::raw_table_tree_capture(files.main(), capture.catalog_root)
+        .expect("capture final catalog leaf");
+    assert_eq!((catalog.root_page_type, catalog.height), (3, 0));
+    assert_eq!(catalog.entry_keys, vec![vec![0]]);
+    let mut accounted = BTreeSet::from([capture.catalog_root.id]);
+    for trunk in &capture.freelist {
+        assert!(
+            accounted.insert(trunk.reference.id),
+            "freelist trunk overlaps a live/free page"
+        );
+        for page in &trunk.leaves {
+            assert!(
+                accounted.insert(*page),
+                "free page duplicated or still reachable"
+            );
+        }
+    }
+    assert_eq!(
+        accounted,
+        (1..capture.page_count).collect(),
+        "every allocated page must be catalog-owned or free"
+    );
+    capture
+}
+
+#[test]
 #[ignore = "run by the dedicated Phase 4C2-B CI job"]
 fn phase_4c2b_hundred_thousand_row_constraint_smoke() {
     // Breaks caught: losing rows or any table/system/explicit-index state

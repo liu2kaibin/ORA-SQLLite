@@ -161,6 +161,8 @@ impl IndexKeyCodec {
         (lower, Bound::Unbounded)
     }
 
+    // Preserve the standard lower/upper Bound pair shared with prefix_bounds.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn checked_prefix_bounds(
         logical: &[u8],
     ) -> Result<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {

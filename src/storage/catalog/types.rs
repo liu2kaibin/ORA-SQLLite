@@ -318,6 +318,8 @@ pub(crate) enum CatalogRecord {
 }
 
 impl ConstraintDef {
+    // Keep the validated catalog fields explicit at this on-disk boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: ConstraintId,
         table_id: TableId,
