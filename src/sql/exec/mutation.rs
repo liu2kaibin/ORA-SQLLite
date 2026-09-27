@@ -325,7 +325,8 @@ fn execute_delete(
                         })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let deleted = writer.delete(batch, rowid, &old_for_index);
+            let foreign_key_work_bytes = memory.remaining();
+            let deleted = writer.delete(batch, rowid, &old_for_index, foreign_key_work_bytes);
             memory.release(old_bytes)?;
             if deleted? {
                 affected = checked_affected_count(affected)?;
@@ -596,7 +597,8 @@ mod tests {
     use crate::sql::bind_sql;
     use crate::storage::{
         catalog::types::CatalogName,
-        relation::Relation,
+        index::corrupt_index_entry_for_test,
+        relation::{ConstrainedTableWrite, Relation, corrupt_relation_row_for_test},
         test_support::{TempDatabase, phase_4b_catalog_fixture, phase_4c1_query_relation_fixture},
     };
     use crate::{Database, ErrorCode, Options, Parameters, SqlLimits, Statement, Value};
@@ -635,6 +637,24 @@ mod tests {
         execute_validated_write_plan(batch, validated)
     }
 
+    fn execute_statement_in_batch(
+        pager: &crate::storage::Pager,
+        batch: &mut crate::storage::WriteBatch,
+        sql: &str,
+    ) -> crate::Result<crate::ExecutionResult> {
+        let checkpoint = batch.statement_checkpoint()?;
+        match execute_in_batch(pager, batch, sql) {
+            Ok(result) => {
+                batch.finish_statement(checkpoint)?;
+                Ok(result)
+            }
+            Err(error) => {
+                batch.restore_statement(checkpoint);
+                Err(error)
+            }
+        }
+    }
+
     fn table_values(batch: &mut crate::storage::WriteBatch, name: &str) -> Vec<Vec<Value>> {
         let table_id = batch
             .catalog_reader()
@@ -666,6 +686,483 @@ mod tests {
                 .map(|index| index.root())
                 .collect(),
         )
+    }
+
+    fn assert_named_constraint(result: crate::Result<crate::ExecutionResult>, name: &str) {
+        let error = result.expect_err("referenced parent mutation must be rejected");
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains(name), "{error}");
+    }
+
+    #[test]
+    fn parent_restrict_uses_valid_child_prefix_index_or_rowid_scan_with_identical_results() {
+        // Production breaks caught: ignoring incoming references, accepting a
+        // wrong-order/short probe index, or rejecting a usable trailing-column
+        // prefix makes indexed and streaming parent restrict disagree.
+        for child_index in [
+            None,
+            Some("CREATE INDEX IX_CHILD_PARENT ON FK_RESTRICT_CHILD (PARENT_ID)"),
+            Some("CREATE INDEX IX_CHILD_PARENT_TRAILING ON FK_RESTRICT_CHILD (PARENT_ID, EXTRA)"),
+            Some("CREATE INDEX IX_CHILD_WRONG_ORDER ON FK_RESTRICT_CHILD (EXTRA, PARENT_ID)"),
+        ] {
+            let fixture = phase_4b_catalog_fixture(4096);
+            let pager = fixture.pager();
+            execute_committed(
+                &pager,
+                "CREATE TABLE FK_RESTRICT_PARENT (ID INT64 CONSTRAINT PK_FK_RESTRICT_PARENT PRIMARY KEY, NOTE TEXT)",
+            );
+            execute_committed(
+                &pager,
+                "CREATE TABLE FK_RESTRICT_CHILD (ID INT64 CONSTRAINT PK_FK_RESTRICT_CHILD PRIMARY KEY, PARENT_ID INT64, EXTRA INT64, CONSTRAINT FK_CHILD_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_RESTRICT_PARENT (ID))",
+            );
+            if let Some(sql) = child_index {
+                execute_committed(&pager, sql);
+            }
+            execute_committed(
+                &pager,
+                "INSERT INTO FK_RESTRICT_PARENT VALUES (7, 'before')",
+            );
+            execute_committed(&pager, "INSERT INTO FK_RESTRICT_CHILD VALUES (1, 7, 99)");
+
+            let mut batch = pager.begin_write().unwrap();
+            assert_named_constraint(
+                execute_statement_in_batch(
+                    &pager,
+                    &mut batch,
+                    "UPDATE FK_RESTRICT_PARENT SET ID = 8 WHERE ID = 7",
+                ),
+                "FK_CHILD_PARENT",
+            );
+            assert_named_constraint(
+                execute_statement_in_batch(
+                    &pager,
+                    &mut batch,
+                    "DELETE FROM FK_RESTRICT_PARENT WHERE ID = 7",
+                ),
+                "FK_CHILD_PARENT",
+            );
+            execute_statement_in_batch(
+                &pager,
+                &mut batch,
+                "DELETE FROM FK_RESTRICT_CHILD WHERE PARENT_ID = 7",
+            )
+            .unwrap();
+            assert_eq!(
+                execute_statement_in_batch(
+                    &pager,
+                    &mut batch,
+                    "DELETE FROM FK_RESTRICT_PARENT WHERE ID = 7",
+                )
+                .unwrap()
+                .rows_affected(),
+                1
+            );
+            batch.rollback().unwrap();
+        }
+    }
+
+    #[test]
+    fn parent_restrict_reads_current_batch_and_skips_unchanged_keys() {
+        // Production breaks caught: probing a committed child root misses an
+        // earlier batch-local delete, while probing unchanged parent keys
+        // incorrectly rejects updates to unrelated columns.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_BATCH_RESTRICT_PARENT (ID INT64 CONSTRAINT PK_FK_BATCH_RESTRICT_PARENT PRIMARY KEY, NOTE TEXT)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_BATCH_RESTRICT_CHILD (PARENT_ID INT64, CONSTRAINT FK_BATCH_RESTRICT FOREIGN KEY (PARENT_ID) REFERENCES FK_BATCH_RESTRICT_PARENT (ID))",
+        );
+        execute_committed(
+            &pager,
+            "INSERT INTO FK_BATCH_RESTRICT_PARENT VALUES (7, 'before')",
+        );
+        execute_committed(&pager, "INSERT INTO FK_BATCH_RESTRICT_CHILD VALUES (7)");
+
+        let mut batch = pager.begin_write().unwrap();
+        assert_named_constraint(
+            execute_in_batch(
+                &pager,
+                &mut batch,
+                "DELETE FROM FK_BATCH_RESTRICT_PARENT WHERE ID = 7",
+            ),
+            "FK_BATCH_RESTRICT",
+        );
+        batch.rollback().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        execute_in_batch(
+            &pager,
+            &mut batch,
+            "DELETE FROM FK_BATCH_RESTRICT_CHILD WHERE PARENT_ID = 7",
+        )
+        .unwrap();
+        assert_eq!(
+            execute_in_batch(
+                &pager,
+                &mut batch,
+                "DELETE FROM FK_BATCH_RESTRICT_PARENT WHERE ID = 7",
+            )
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        batch.rollback().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        assert_eq!(
+            execute_in_batch(
+                &pager,
+                &mut batch,
+                "UPDATE FK_BATCH_RESTRICT_PARENT SET ID = ID, NOTE = 'after' WHERE ID = 7",
+            )
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        assert_eq!(
+            table_values(&mut batch, "FK_BATCH_RESTRICT_PARENT"),
+            vec![vec![Value::Int64(7), Value::Text("after".into())]]
+        );
+        assert_eq!(
+            table_values(&mut batch, "FK_BATCH_RESTRICT_CHILD"),
+            vec![vec![Value::Int64(7)]]
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn parent_restrict_decimal_to_int64_is_exact_for_index_and_fallback() {
+        // Production breaks caught: indexed probes that truncate fractions or
+        // overflow i64 diverge from fallback scans, and i64::MIN negation can
+        // panic or miss a real reference.
+        for child_index in [
+            None,
+            Some("CREATE INDEX IX_NUMERIC_CHILD_PARENT ON FK_NUMERIC_CHILD (PARENT_D)"),
+        ] {
+            let fixture = phase_4b_catalog_fixture(4096);
+            let pager = fixture.pager();
+            execute_committed(
+                &pager,
+                "CREATE TABLE FK_NUMERIC_PARENT (D DECIMAL CONSTRAINT PK_FK_NUMERIC_PARENT PRIMARY KEY)",
+            );
+            execute_committed(
+                &pager,
+                "CREATE TABLE FK_NUMERIC_CHILD (PARENT_D INT64, CONSTRAINT FK_NUMERIC_PARENT FOREIGN KEY (PARENT_D) REFERENCES FK_NUMERIC_PARENT (D))",
+            );
+            if let Some(sql) = child_index {
+                execute_committed(&pager, sql);
+            }
+            for sql in [
+                "INSERT INTO FK_NUMERIC_PARENT VALUES (7.0)",
+                "INSERT INTO FK_NUMERIC_PARENT VALUES (7.5)",
+                "INSERT INTO FK_NUMERIC_PARENT VALUES (9223372036854775808)",
+                "INSERT INTO FK_NUMERIC_PARENT VALUES (9223372036854775807)",
+                "INSERT INTO FK_NUMERIC_CHILD VALUES (7)",
+                "INSERT INTO FK_NUMERIC_CHILD VALUES (9223372036854775807)",
+            ] {
+                execute_committed(&pager, sql);
+            }
+
+            let mut batch = pager.begin_write().unwrap();
+            assert_named_constraint(
+                execute_statement_in_batch(
+                    &pager,
+                    &mut batch,
+                    "UPDATE FK_NUMERIC_PARENT SET D = 8 WHERE D = 7.0",
+                ),
+                "FK_NUMERIC_PARENT",
+            );
+            assert_named_constraint(
+                execute_statement_in_batch(
+                    &pager,
+                    &mut batch,
+                    "DELETE FROM FK_NUMERIC_PARENT WHERE D = 9223372036854775807",
+                ),
+                "FK_NUMERIC_PARENT",
+            );
+            for sql in [
+                "DELETE FROM FK_NUMERIC_PARENT WHERE D = 7.5",
+                "DELETE FROM FK_NUMERIC_PARENT WHERE D = 9223372036854775808",
+            ] {
+                assert_eq!(
+                    execute_statement_in_batch(&pager, &mut batch, sql)
+                        .unwrap()
+                        .rows_affected(),
+                    1
+                );
+            }
+            batch.rollback().unwrap();
+        }
+    }
+
+    #[test]
+    fn parent_restrict_ignores_null_children_and_reports_lowest_constraint_id() {
+        // Production breaks caught: NULL child components must not restrict a
+        // parent, and catalog traversal order must not change the first named
+        // violation when multiple child constraints reference the same key.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_ORDER_PARENT (ID INT64 CONSTRAINT PK_FK_ORDER_PARENT PRIMARY KEY)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_ORDER_CHILD_FIRST (PARENT_ID INT64, CONSTRAINT FK_ORDER_FIRST FOREIGN KEY (PARENT_ID) REFERENCES FK_ORDER_PARENT (ID))",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_ORDER_CHILD_SECOND (PARENT_ID INT64, CONSTRAINT FK_ORDER_SECOND FOREIGN KEY (PARENT_ID) REFERENCES FK_ORDER_PARENT (ID))",
+        );
+        for sql in [
+            "INSERT INTO FK_ORDER_PARENT VALUES (7)",
+            "INSERT INTO FK_ORDER_PARENT VALUES (8)",
+            "INSERT INTO FK_ORDER_CHILD_FIRST VALUES (7)",
+            "INSERT INTO FK_ORDER_CHILD_SECOND VALUES (7)",
+            "INSERT INTO FK_ORDER_CHILD_FIRST VALUES (NULL)",
+            "INSERT INTO FK_ORDER_CHILD_SECOND VALUES (NULL)",
+        ] {
+            execute_committed(&pager, sql);
+        }
+
+        let mut batch = pager.begin_write().unwrap();
+        assert_named_constraint(
+            execute_statement_in_batch(
+                &pager,
+                &mut batch,
+                "DELETE FROM FK_ORDER_PARENT WHERE ID = 7",
+            ),
+            "FK_ORDER_FIRST",
+        );
+        assert_eq!(
+            execute_statement_in_batch(
+                &pager,
+                &mut batch,
+                "DELETE FROM FK_ORDER_PARENT WHERE ID = 8",
+            )
+            .unwrap()
+            .rows_affected(),
+            1
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn parent_restrict_foreign_key_work_memory_selects_index_or_fails_before_mutation() {
+        // Production breaks caught: selecting a wrong-order index bypasses the
+        // fallback budget, rejecting a valid leading index wastes bounded scan
+        // memory, and a zero fallback budget must not mutate the parent first.
+        for (child_index, expected) in [
+            (None, ErrorCode::ResourceLimit),
+            (
+                Some("CREATE INDEX IX_MEMORY_EXACT ON FK_MEMORY_CHILD (PARENT_ID)"),
+                ErrorCode::Constraint,
+            ),
+            (
+                Some("CREATE INDEX IX_MEMORY_TRAILING ON FK_MEMORY_CHILD (PARENT_ID, EXTRA)"),
+                ErrorCode::Constraint,
+            ),
+            (
+                Some("CREATE INDEX IX_MEMORY_WRONG ON FK_MEMORY_CHILD (EXTRA, PARENT_ID)"),
+                ErrorCode::ResourceLimit,
+            ),
+        ] {
+            let fixture = phase_4b_catalog_fixture(4096);
+            let pager = fixture.pager();
+            execute_committed(
+                &pager,
+                "CREATE TABLE FK_MEMORY_PARENT (ID INT64 CONSTRAINT PK_FK_MEMORY_PARENT PRIMARY KEY)",
+            );
+            execute_committed(
+                &pager,
+                "CREATE TABLE FK_MEMORY_CHILD (PARENT_ID INT64, EXTRA INT64, CONSTRAINT FK_MEMORY_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_MEMORY_PARENT (ID))",
+            );
+            if let Some(sql) = child_index {
+                execute_committed(&pager, sql);
+            }
+            execute_committed(&pager, "INSERT INTO FK_MEMORY_PARENT VALUES (7)");
+            execute_committed(&pager, "INSERT INTO FK_MEMORY_CHILD VALUES (7, 1)");
+
+            let mut batch = pager.begin_write().unwrap();
+            let table_id = batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_name(&CatalogName::new("FK_MEMORY_PARENT").unwrap())
+                .unwrap()
+                .id();
+            let relation = Relation::open_from_batch(&mut batch, table_id).unwrap();
+            let mut scan = relation.scan(usize::MAX);
+            let row = scan.next_batch(&mut batch).unwrap().unwrap();
+            let before = table_and_index_roots(&mut batch, "FK_MEMORY_PARENT");
+            let checkpoint = batch.statement_checkpoint().unwrap();
+            let mut writer = ConstrainedTableWrite::open(&mut batch, table_id).unwrap();
+            let error = writer
+                .delete(&mut batch, row.rowid(), row.values(), 0)
+                .unwrap_err();
+            assert_eq!(error.code(), expected);
+            drop(writer);
+            batch.restore_statement(checkpoint);
+            assert_eq!(
+                table_and_index_roots(&mut batch, "FK_MEMORY_PARENT"),
+                before
+            );
+            assert_eq!(
+                table_values(&mut batch, "FK_MEMORY_PARENT"),
+                vec![vec![Value::Int64(7)]]
+            );
+            batch.rollback().unwrap();
+        }
+    }
+
+    #[test]
+    fn parent_restrict_fallback_surfaces_corrupt_matching_child_row() {
+        // Production break caught: treating an undecodable child row as absent
+        // would permit deleting its referenced parent and mask durable damage.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_CORRUPT_PARENT (ID INT64 CONSTRAINT PK_FK_CORRUPT_PARENT PRIMARY KEY)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_CORRUPT_CHILD (PARENT_ID INT64, CONSTRAINT FK_CORRUPT_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_CORRUPT_PARENT (ID))",
+        );
+        execute_committed(&pager, "INSERT INTO FK_CORRUPT_PARENT VALUES (7)");
+        execute_committed(&pager, "INSERT INTO FK_CORRUPT_CHILD VALUES (7)");
+
+        let mut batch = pager.begin_write().unwrap();
+        let child_id = batch
+            .catalog_reader()
+            .unwrap()
+            .find_table_by_name(&CatalogName::new("FK_CORRUPT_CHILD").unwrap())
+            .unwrap()
+            .id();
+        let child = Relation::open_from_batch(&mut batch, child_id).unwrap();
+        let rowid = child
+            .scan(usize::MAX)
+            .next_batch(&mut batch)
+            .unwrap()
+            .unwrap()
+            .rowid();
+        corrupt_relation_row_for_test(&mut batch, child_id, rowid, b"bad-row").unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        let before = table_and_index_roots(&mut batch, "FK_CORRUPT_PARENT");
+        let error = execute_statement_in_batch(
+            &pager,
+            &mut batch,
+            "DELETE FROM FK_CORRUPT_PARENT WHERE ID = 7",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_eq!(
+            table_and_index_roots(&mut batch, "FK_CORRUPT_PARENT"),
+            before
+        );
+        assert_eq!(
+            table_values(&mut batch, "FK_CORRUPT_PARENT"),
+            vec![vec![Value::Int64(7)]]
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn parent_restrict_uses_lowest_eligible_index_and_preserves_corruption() {
+        // Production breaks caught: selecting the first catalog traversal hit
+        // instead of the lowest IndexId, or returning on a prefix hit without
+        // validating its leaf payload, masks corruption in the chosen index.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_INDEX_CORRUPT_PARENT (ID INT64 CONSTRAINT PK_FK_INDEX_CORRUPT_PARENT PRIMARY KEY)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_INDEX_CORRUPT_CHILD (PARENT_ID INT64, EXTRA INT64, CONSTRAINT FK_INDEX_CORRUPT_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_INDEX_CORRUPT_PARENT (ID))",
+        );
+        execute_committed(
+            &pager,
+            "CREATE INDEX IX_FK_INDEX_LOW ON FK_INDEX_CORRUPT_CHILD (PARENT_ID)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE INDEX IX_FK_INDEX_HIGH ON FK_INDEX_CORRUPT_CHILD (PARENT_ID, EXTRA)",
+        );
+        execute_committed(&pager, "INSERT INTO FK_INDEX_CORRUPT_PARENT VALUES (7)");
+        execute_committed(&pager, "INSERT INTO FK_INDEX_CORRUPT_CHILD VALUES (7, 1)");
+
+        let mut batch = pager.begin_write().unwrap();
+        let low = batch
+            .catalog_reader()
+            .unwrap()
+            .find_index_by_name(&CatalogName::new("IX_FK_INDEX_LOW").unwrap())
+            .unwrap()
+            .id();
+        corrupt_index_entry_for_test(
+            &mut batch,
+            low,
+            &[Value::Int64(7), Value::Int64(1)],
+            crate::storage::catalog::types::RowId::new(1).unwrap(),
+            b"bad-leaf",
+        )
+        .unwrap();
+        batch.commit().unwrap();
+
+        let mut batch = pager.begin_write().unwrap();
+        let before = table_and_index_roots(&mut batch, "FK_INDEX_CORRUPT_PARENT");
+        let error = execute_statement_in_batch(
+            &pager,
+            &mut batch,
+            "DELETE FROM FK_INDEX_CORRUPT_PARENT WHERE ID = 7",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_eq!(
+            table_and_index_roots(&mut batch, "FK_INDEX_CORRUPT_PARENT"),
+            before
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn parent_restrict_later_row_failure_restores_earlier_parent_mutation() {
+        // Production break caught: a late referenced row must rely on the
+        // outer statement checkpoint to restore an earlier successful row.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_LATE_PARENT (ID INT64 CONSTRAINT PK_FK_LATE_PARENT PRIMARY KEY)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_LATE_CHILD (PARENT_ID INT64, CONSTRAINT FK_LATE_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_LATE_PARENT (ID))",
+        );
+        execute_committed(&pager, "INSERT INTO FK_LATE_PARENT VALUES (1)");
+        execute_committed(&pager, "INSERT INTO FK_LATE_PARENT VALUES (2)");
+        execute_committed(&pager, "INSERT INTO FK_LATE_CHILD VALUES (2)");
+
+        let mut batch = pager.begin_write().unwrap();
+        assert_named_constraint(
+            execute_statement_in_batch(
+                &pager,
+                &mut batch,
+                "UPDATE FK_LATE_PARENT SET ID = ID + 10",
+            ),
+            "FK_LATE_PARENT",
+        );
+        assert_eq!(
+            table_values(&mut batch, "FK_LATE_PARENT"),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+        batch.rollback().unwrap();
     }
 
     #[test]

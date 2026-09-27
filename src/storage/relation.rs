@@ -175,6 +175,32 @@ pub(crate) fn fail_table_write_next_after_for_test(successful_calls: usize, code
 }
 
 #[cfg(test)]
+pub(crate) fn corrupt_relation_row_for_test(
+    batch: &mut WriteBatch,
+    table_id: TableId,
+    rowid: RowId,
+    bytes: &[u8],
+) -> Result<()> {
+    let table = batch
+        .catalog_reader()?
+        .find_table_by_id(table_id)
+        .cloned()
+        .ok_or_else(|| DbError::new(ErrorCode::SchemaChanged, "test table disappeared"))?;
+    let mut catalog = CatalogWriter::bootstrap(batch)?;
+    let mut rows = BTree::from_root(TreeKind::Table, table.root());
+    let key = encode_rowid_key(rowid);
+    if rows.delete(batch, &key)?.is_none() {
+        return Err(DbError::new(
+            ErrorCode::SchemaChanged,
+            "test row disappeared",
+        ));
+    }
+    rows.insert(batch, &key, bytes)?;
+    catalog.update_table_root(batch, table_id, rows.root())?;
+    catalog.finish(batch)
+}
+
+#[cfg(test)]
 pub(crate) fn take_value_validation_limits_for_test() -> Vec<usize> {
     VALUE_VALIDATION_LIMITS.with(|limits| std::mem::take(&mut *limits.borrow_mut()))
 }
@@ -829,9 +855,6 @@ impl ConstrainedTableWrite {
         memory: &mut impl CheckMemory,
         foreign_key_work_bytes: u64,
     ) -> Result<()> {
-        // Task 6 consumes this available caller budget for parent-side
-        // restrict scans. Child probes are index-bounded and allocate no row.
-        let _ = foreign_key_work_bytes;
         self.validate_row(new, memory)?;
         self.foreign_keys.validate_child_row(batch, new)?;
         let encoded =
@@ -839,6 +862,8 @@ impl ConstrainedTableWrite {
         let old_entries = self.prepare_entries(old, rowid)?;
         let new_entries = self.prepare_entries(new, rowid)?;
         self.check_unique(batch, &new_entries, Some(rowid))?;
+        self.foreign_keys
+            .validate_parent_update(batch, old, new, foreign_key_work_bytes)?;
         let scope = batch.begin_mutation_scope()?;
         let catalog_checkpoint = self.catalog.checkpoint();
         let table_root = self.rows.root();
@@ -875,12 +900,15 @@ impl ConstrainedTableWrite {
         batch: &mut WriteBatch,
         rowid: RowId,
         old: &[Value],
+        foreign_key_work_bytes: u64,
     ) -> Result<bool> {
         let entries = self.prepare_entries(old, rowid)?;
         let key = encode_rowid_key(rowid);
         if self.rows.get(batch, &key)?.is_none() {
             return Ok(false);
         }
+        self.foreign_keys
+            .validate_parent_delete(batch, old, foreign_key_work_bytes)?;
         let scope = batch.begin_mutation_scope()?;
         let catalog_checkpoint = self.catalog.checkpoint();
         let table_root = self.rows.root();
@@ -2378,7 +2406,7 @@ mod tests {
             .unwrap();
         assert!(
             writer
-                .delete(&mut batch, row.rowid(), row.values())
+                .delete(&mut batch, row.rowid(), row.values(), u64::MAX)
                 .unwrap()
         );
         writer

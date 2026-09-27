@@ -54,6 +54,18 @@ impl DecodedIndexKey {
 pub(crate) struct IndexKeyCodec;
 
 impl IndexKeyCodec {
+    pub(crate) fn encode_prefix(columns: &[ColumnDef], values: &[Value]) -> Result<Vec<u8>> {
+        if columns.is_empty() {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index key prefix requires at least one column",
+            ));
+        }
+        let rowid = RowId::new(1).map_err(|_| corruption("index probe ROWID is invalid"))?;
+        let encoded = Self::encode(columns, values, rowid)?;
+        Ok(encoded.logical().to_vec())
+    }
+
     pub(crate) fn encode(
         columns: &[ColumnDef],
         values: &[Value],
@@ -457,6 +469,37 @@ mod tests {
 
     fn decimal(negative: bool, scale: i8, magnitude: u128) -> Value {
         Value::Decimal(Decimal::new(negative, scale, magnitude).unwrap())
+    }
+
+    #[test]
+    fn logical_prefix_encoding_checks_arity_nonempty_and_eventual_rowid_bound() {
+        // Production breaks caught: an empty prefix makes an unbounded probe,
+        // mismatched arity changes component meaning, and omitting the eventual
+        // ROWID allowance admits physical keys beyond the 1024-byte contract.
+        let cols = columns(&[ColumnType::Int64, ColumnType::Text]);
+        let prefix = IndexKeyCodec::encode_prefix(&cols[..1], &[Value::Int64(7)]).unwrap();
+        let complete =
+            IndexKeyCodec::encode(&cols[..1], &[Value::Int64(7)], RowId::new(1).unwrap()).unwrap();
+        assert_eq!(prefix, complete.logical());
+        assert_eq!(
+            IndexKeyCodec::encode_prefix(&[], &[]).unwrap_err().code(),
+            ErrorCode::Type
+        );
+        assert_eq!(
+            IndexKeyCodec::encode_prefix(&cols, &[Value::Int64(7)])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+        assert_eq!(
+            IndexKeyCodec::encode_prefix(
+                &columns(&[ColumnType::Text]),
+                &[Value::Text("x".repeat(MAX_INDEX_KEY_BYTES))],
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::ResourceLimit
+        );
     }
 
     fn date(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> OracleDate {
