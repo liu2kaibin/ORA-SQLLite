@@ -1730,12 +1730,11 @@ impl StatementTokenIndex {
     }
 
     fn drop_table_cascade_constraints_span(&self, source_map: &SourceMap<'_>) -> Option<SqlSpan> {
-        let body_len = self.tokens.len()
-            - usize::from(
-                self.tokens
-                    .last()
-                    .is_some_and(|token| token.kind == IndexedTokenKind::Semicolon),
-            );
+        let body_len = self.tokens.len().checked_sub(usize::from(
+            self.tokens
+                .last()
+                .is_some_and(|token| token.kind == IndexedTokenKind::Semicolon),
+        ))?;
         let [drop, table, name, cascade, constraints] = self.tokens.get(..body_len)? else {
             return None;
         };

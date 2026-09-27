@@ -1180,7 +1180,9 @@ fn prepared_foreign_key_create_and_parent_dml_recheck_stable_identities() {
     execute_sql(
         &mut schema_connection,
         "CREATE TABLE C_ACTIVE (
+            ID INT64,
             P_ID INT64,
+            PAYLOAD TEXT,
             CONSTRAINT FK_C_ACTIVE_P FOREIGN KEY (P_ID) REFERENCES P (ID)
         )",
     );
@@ -1200,6 +1202,19 @@ fn prepared_foreign_key_create_and_parent_dml_recheck_stable_identities() {
         ];
         prepared_connection
             .execute(&insert, Parameters::positional(&values))
+            .unwrap();
+    }
+    let child_insert = prepared_connection
+        .prepare("INSERT INTO C_ACTIVE VALUES (:1, :2, :3)")
+        .unwrap();
+    for id in 1..=160 {
+        let values = [
+            Value::Int64(id).into(),
+            Value::Null.into(),
+            Value::Text(format!("child-root-split-{id:03}-{}", "y".repeat(96))).into(),
+        ];
+        prepared_connection
+            .execute(&child_insert, Parameters::positional(&values))
             .unwrap();
     }
     let update_values = [
