@@ -84,6 +84,232 @@ fn legacy_format2_without_feature_opens_and_plain_crud_remains_byte_compatible()
     );
 }
 
+#[test]
+fn raw_foreign_key_catalog_capture_exposes_parent_and_reverse_edge() {
+    // Breaks caught: the independent byte witness silently skipping family
+    // 0x34, or decoding the child without its persisted parent identities.
+    let (files, database) = common::new_database("phase4c2c-raw-foreign-key");
+    let mut connection = database.connect().expect("connect raw FK fixture");
+    create_foreign_key_parent_and_child(&mut connection);
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture checkpointed FK catalog bytes");
+    let parent = &capture.tables["P"];
+    let child = &capture.tables["C"];
+    let parent_key = &capture.constraints["PK_P"];
+    let foreign_key = &capture.constraints["FK_C_P"];
+    assert_eq!(capture.feature_bits & 2, 2);
+    assert_eq!(foreign_key.table_id, child.id);
+    assert_eq!(foreign_key.kind, 5);
+    assert_eq!(foreign_key.parent_table_id, Some(parent.id));
+    assert_eq!(foreign_key.parent_constraint_id, Some(parent_key.id));
+    assert_eq!(
+        capture.referenced_by,
+        std::collections::BTreeMap::from([(parent_key.id, vec![foreign_key.id])])
+    );
+
+    let local = &capture.constraints["PK_C"];
+    assert_eq!(local.parent_table_id, None);
+    assert_eq!(local.parent_constraint_id, None);
+}
+
+#[test]
+fn raw_foreign_key_parser_keeps_local_constraint_graph_parentless() {
+    // Breaks caught: interpreting the reserved zero parent fields on a
+    // pre-FK local-constraint catalog as identities or synthesizing 0x34 edges.
+    let (files, database) = common::new_database("phase4c2b-raw-local-graph");
+    let mut connection = database.connect().expect("connect local graph fixture");
+    execute_sql(
+        &mut connection,
+        "CREATE TABLE T (
+            ID INT64 CONSTRAINT PK_T PRIMARY KEY,
+            EMAIL TEXT CONSTRAINT UQ_T UNIQUE,
+            SCORE INT64 CONSTRAINT NN_T NOT NULL,
+            CONSTRAINT CK_T CHECK (SCORE BETWEEN 0 AND 100)
+        )",
+    );
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture local-only constraint graph");
+    assert!(capture.referenced_by.is_empty());
+    assert!(capture.constraints.values().all(|constraint| {
+        constraint.parent_table_id.is_none() && constraint.parent_constraint_id.is_none()
+    }));
+}
+
+#[test]
+fn pre_constraint_format2_file_remains_writable_and_first_fk_uses_existing_feature_bit() {
+    // Breaks caught: requiring a migration before the first constrained DDL,
+    // allocating a second feature bit for FKs, or omitting the reverse edge.
+    let files = support::format2::legacy_catalog_fixture();
+    let before = support::format2::raw_catalog_capture(files.main())
+        .expect("capture pre-constraint format-2 file");
+    assert_eq!(before.feature_bits, 1);
+    assert!(before.constraints.is_empty());
+    assert!(before.referenced_by.is_empty());
+
+    let database = ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default())
+        .expect("open pre-constraint format-2 file for FK DDL");
+    let mut connection = database.connect().expect("connect legacy FK writer");
+    create_foreign_key_parent_and_child(&mut connection);
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture first FK in legacy file");
+    assert_eq!(capture.feature_bits, 3);
+    assert_eq!(capture.referenced_by.len(), 1);
+    assert_eq!(capture.constraints["FK_C_P"].kind, 5);
+}
+
+#[test]
+fn old_snapshot_keeps_old_cross_table_graph_and_roots() {
+    // Breaks caught: refreshing a held reader to the child CREATE's catalog
+    // root, or mixing the old parent relation root with the new FK graph.
+    let (files, database) = common::new_database("phase4c2c-snapshot-graph");
+    let mut seed = database.connect().expect("connect snapshot seed");
+    execute_sql(
+        &mut seed,
+        "CREATE TABLE P (ID INT64 CONSTRAINT PK_P PRIMARY KEY, NOTE TEXT)",
+    );
+    execute_sql(&mut seed, "INSERT INTO P VALUES (1, 'old')");
+    drop(seed);
+    drop(database);
+    checkpoint_file(files.main());
+    let old_capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture parent-only catalog root");
+    assert!(!old_capture.tables.contains_key("C"));
+    assert!(old_capture.referenced_by.is_empty());
+
+    let database = ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default())
+        .expect("open snapshot graph database");
+    let mut old_connection = database.connect().expect("connect old graph reader");
+    let mut old = old_connection
+        .begin_read()
+        .expect("begin old graph snapshot");
+    assert_eq!(
+        collect_read_transaction(&mut old, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("old".into())]]
+    );
+
+    let mut writer = database.connect().expect("connect graph writer");
+    execute_sql(
+        &mut writer,
+        "CREATE TABLE C (
+            ID INT64 CONSTRAINT PK_C PRIMARY KEY,
+            P_ID INT64,
+            CONSTRAINT FK_C_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+        )",
+    );
+    execute_sql(&mut writer, "INSERT INTO P VALUES (2, 'new')");
+    execute_sql(&mut writer, "INSERT INTO C VALUES (20, 2)");
+
+    assert_eq!(
+        collect_read_transaction(&mut old, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("old".into())]],
+        "held snapshot must retain the old parent relation root"
+    );
+    let error = old
+        .prepare("SELECT ID, P_ID FROM C")
+        .expect_err("held snapshot must not see the child catalog entry");
+    assert_eq!(error.code(), ErrorCode::Bind);
+
+    let mut fresh = database.connect().expect("connect fresh graph reader");
+    assert_eq!(
+        collect(&mut fresh, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![
+            vec![Value::Int64(1), Value::Text("old".into())],
+            vec![Value::Int64(2), Value::Text("new".into())],
+        ]
+    );
+    assert_eq!(
+        collect(&mut fresh, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(20), Value::Int64(2)]]
+    );
+    drop(fresh);
+    drop(writer);
+    drop(old);
+    drop(old_connection);
+    drop(database);
+
+    checkpoint_file(files.main());
+    let new_capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture complete cross-table graph");
+    assert_ne!(old_capture.accepted_lsn, new_capture.accepted_lsn);
+    assert_eq!(old_capture.tables["P"].root, new_capture.tables["P"].root);
+    assert_eq!(
+        new_capture.tables["P"].schema_version,
+        old_capture.tables["P"].schema_version + 1,
+        "publishing the incoming FK edge must bump the parent schema version"
+    );
+    let parent_key = &new_capture.constraints["PK_P"];
+    let foreign_key = &new_capture.constraints["FK_C_P"];
+    assert_eq!(
+        new_capture.referenced_by[&parent_key.id],
+        vec![foreign_key.id]
+    );
+    assert_eq!(
+        foreign_key.parent_table_id,
+        Some(new_capture.tables["P"].id)
+    );
+    assert_eq!(foreign_key.parent_constraint_id, Some(parent_key.id));
+}
+
+#[test]
+fn foreign_key_graph_survives_checkpoint_reopen_and_read_only_open_without_writes() {
+    // Breaks caught: losing either graph direction at checkpoint/recovery, or
+    // allowing a read-only open to rewrite/truncate the main/WAL pair.
+    let (files, database) = common::new_database("phase4c2c-reopen-graph");
+    let mut connection = database.connect().expect("connect reopen fixture");
+    create_foreign_key_parent_and_child(&mut connection);
+    execute_sql(&mut connection, "INSERT INTO P VALUES (1, 'parent')");
+    execute_sql(&mut connection, "INSERT INTO C VALUES (10, 1)");
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let before_capture =
+        support::format2::raw_catalog_capture(files.main()).expect("capture checkpointed FK graph");
+    let database = common::reopen(&files);
+    let mut connection = database.connect().expect("connect reopened FK graph");
+    assert_constraint(&mut connection, "INSERT INTO C VALUES (11, 99)", "FK_C_P");
+    assert_constraint(&mut connection, "DELETE FROM P WHERE ID = 1", "FK_C_P");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(1)]]
+    );
+    drop(connection);
+    drop(database);
+
+    let before_read_only = database_file_bytes(&files);
+    let read_only =
+        ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default().read_only())
+            .expect("open FK graph read-only");
+    let mut connection = read_only.connect().expect("connect read-only FK graph");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("parent".into())]]
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(1)]]
+    );
+    drop(connection);
+    drop(read_only);
+    assert_eq!(database_file_bytes(&files), before_read_only);
+
+    let after_capture =
+        support::format2::raw_catalog_capture(files.main()).expect("re-capture read-only FK graph");
+    assert_eq!(after_capture, before_capture);
+}
+
 fn collect_read_transaction(
     transaction: &mut ora_sqllite::ReadTransaction<'_>,
     sql: &str,
