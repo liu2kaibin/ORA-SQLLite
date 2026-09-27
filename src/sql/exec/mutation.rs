@@ -3,7 +3,10 @@ use crate::{
     sql::{
         SqlType,
         bound::SourceId,
-        plan::{CreateTablePlan, DeletePlan, InsertPlan, PlanKind, UpdatePlan},
+        plan::{
+            CreateTablePlan, DeletePlan, InsertPlan, PlanKind, TableConstraintDefinition,
+            UpdatePlan, validate_foreign_key_plan,
+        },
     },
     storage::{
         WriteBatch,
@@ -480,6 +483,10 @@ fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Resul
             }
         }
     }
+    {
+        let catalog = batch.catalog_reader()?;
+        validate_foreign_key_plans(plan, &catalog)?;
+    }
     let columns = plan
         .columns()
         .iter()
@@ -506,6 +513,29 @@ fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Resul
             .map_err(|error| map_constraint_error(plan, error, true))?;
     }
     Ok(ExecutionResult::new(0))
+}
+
+fn validate_foreign_key_plans(
+    plan: &CreateTablePlan,
+    catalog: &crate::storage::catalog::CatalogReader,
+) -> Result<()> {
+    for constraint in plan.constraints() {
+        validate_foreign_key_plan(constraint, catalog)
+            .map_err(|error| error.with_sql_location(constraint.location()))?;
+        if let TableConstraintDefinition::ForeignKey { parent_table, .. } = constraint {
+            catalog
+                .find_table_by_id(parent_table.table_id)
+                .expect("validated foreign key parent table must remain present")
+                .schema_version()
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    DbError::new(ErrorCode::Type, "table schema version counter is exhausted")
+                        .with_sql_location(constraint.location())
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn map_constraint_error(plan: &CreateTablePlan, error: DbError, check_only: bool) -> DbError {
@@ -696,6 +726,80 @@ mod tests {
             catalog
                 .find_index_by_id(constraints[0].index_id().unwrap())
                 .is_some()
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn foreign_key_create_invalidates_prepared_parent_dml() {
+        // Production break caught: CREATE FOREIGN KEY must version the parent,
+        // so retained UPDATE and DELETE plans cannot ignore the new dependency.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE PARENT_KEYED (ID INT64 CONSTRAINT PK_PARENT_KEYED PRIMARY KEY)",
+        );
+        let update = prepare(&pager, "UPDATE PARENT_KEYED SET ID = ID + 1 WHERE ID = 1");
+        let delete = prepare(&pager, "DELETE FROM PARENT_KEYED WHERE ID = 1");
+
+        execute_committed(
+            &pager,
+            "CREATE TABLE CHILD_KEYED (PARENT_ID INT64, CONSTRAINT FK_CHILD_KEYED FOREIGN KEY (PARENT_ID) REFERENCES PARENT_KEYED (ID))",
+        );
+
+        for statement in [&update, &delete] {
+            let mut batch = pager.begin_write().unwrap();
+            let error = match validate_write_execution(
+                &mut batch,
+                statement,
+                Parameters::none(),
+                64 * 1024 * 1024,
+            ) {
+                Ok(_) => panic!("prepared parent DML unexpectedly remained valid"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::SchemaChanged);
+            batch.rollback().unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_foreign_key_create_is_rejected_at_the_authored_constraint_location() {
+        // Production break caught: a validated CREATE held across another FK
+        // publication must not skip retained-parent validation or lose its span.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE LOCATION_PARENT (ID INT64 CONSTRAINT PK_LOCATION_PARENT PRIMARY KEY)",
+        );
+        let stale = prepare(
+            &pager,
+            "CREATE TABLE LOCATION_STALE (PARENT_ID INT64, CONSTRAINT FK_LOCATION_STALE FOREIGN KEY (PARENT_ID) REFERENCES LOCATION_PARENT (ID))",
+        );
+        let winner = prepare(
+            &pager,
+            "CREATE TABLE LOCATION_WINNER (PARENT_ID INT64, CONSTRAINT FK_LOCATION_WINNER FOREIGN KEY (PARENT_ID) REFERENCES LOCATION_PARENT (ID))",
+        );
+        let mut batch = pager.begin_write().unwrap();
+        let stale =
+            validate_write_execution(&mut batch, &stale, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        let winner =
+            validate_write_execution(&mut batch, &winner, Parameters::none(), 64 * 1024 * 1024)
+                .unwrap();
+        execute_validated_write_plan(&mut batch, winner).unwrap();
+
+        let error = execute_validated_write_plan(&mut batch, stale).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::SchemaChanged);
+        assert!(error.sql_location().is_some());
+        assert!(
+            batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_name(&CatalogName::new("LOCATION_STALE").unwrap())
+                .is_none()
         );
         batch.rollback().unwrap();
     }

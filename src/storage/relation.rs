@@ -15,8 +15,8 @@ use super::{
         CatalogReader, CatalogWriter,
         types::{
             CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintBundle, ConstraintDef,
-            ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, MAX_COLUMNS,
-            ObjectKind, RowId, SchemaVersion, TableDef, TableId,
+            ConstraintId, ConstraintKind, ForeignKeyTarget, IndexDef, IndexId, IndexOwnership,
+            MAX_COLUMNS, ObjectKind, RowId, SchemaVersion, TableDef, TableId,
         },
     },
     constraint::{
@@ -127,6 +127,7 @@ pub(crate) enum ConstrainedCreateFaultPoint {
     SystemIndexRootAllocated,
     ConstraintRecordFamilyInserted,
     FeatureEnabled,
+    ParentVersionBumped,
     CatalogFinished,
 }
 
@@ -187,6 +188,7 @@ pub(crate) fn fail_constrained_create_at_for_test(point: ConstrainedCreateFaultP
             fail_constraint_bundle_at_for_test(ConstraintBundleFaultPoint::FeatureEnabled);
         }
         ConstrainedCreateFaultPoint::SystemIndexRootAllocated
+        | ConstrainedCreateFaultPoint::ParentVersionBumped
         | ConstrainedCreateFaultPoint::CatalogFinished => {
             CONSTRAINED_CREATE_FAILURE.set(Some(point));
         }
@@ -1102,6 +1104,15 @@ pub(crate) fn create_constrained_relation(
         for bundle in &bundles {
             catalog.insert_constraint_bundle(batch, bundle)?;
         }
+        let parent_tables = bundles
+            .iter()
+            .filter_map(|bundle| bundle.definition.parent_table_id())
+            .collect::<BTreeSet<_>>();
+        for parent_table in parent_tables {
+            catalog.bump_table_schema_version(batch, parent_table)?;
+            #[cfg(test)]
+            constrained_create_fault_for_test(ConstrainedCreateFaultPoint::ParentVersionBumped)?;
+        }
         catalog.finish(batch)?;
         #[cfg(test)]
         constrained_create_fault_for_test(ConstrainedCreateFaultPoint::CatalogFinished)?;
@@ -1139,6 +1150,21 @@ fn prevalidate_constrained_create(
                 ));
             }
         }
+        if let TableConstraintSpec::ForeignKey {
+            columns,
+            parent_table_id,
+            parent_constraint_id,
+            ..
+        } = constraint
+        {
+            prevalidate_foreign_key_target(
+                &catalog,
+                spec.table(),
+                columns,
+                *parent_table_id,
+                *parent_constraint_id,
+            )?;
+        }
     }
     let allocated = required_object_count(spec)?;
     catalog
@@ -1146,6 +1172,74 @@ fn prevalidate_constrained_create(
         .get()
         .checked_add(allocated)
         .ok_or_else(|| DbError::new(ErrorCode::Type, "catalog object ID counter is exhausted"))?;
+    Ok(())
+}
+
+fn prevalidate_foreign_key_target(
+    catalog: &CatalogReader,
+    child_table: &TableSpec,
+    local_ordinals: &[u16],
+    parent_table_id: TableId,
+    parent_constraint_id: ConstraintId,
+) -> Result<()> {
+    let parent_table = catalog.find_table_by_id(parent_table_id).ok_or_else(|| {
+        DbError::new(
+            ErrorCode::SchemaChanged,
+            "prepared foreign key parent table is no longer present",
+        )
+    })?;
+    parent_table
+        .schema_version()
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| {
+            DbError::new(ErrorCode::Type, "table schema version counter is exhausted")
+        })?;
+    let parent_constraint = catalog
+        .find_constraint_by_id(parent_constraint_id)
+        .filter(|constraint| {
+            constraint.table_id() == parent_table_id
+                && matches!(
+                    constraint.kind(),
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                )
+        })
+        .ok_or_else(|| {
+            DbError::new(
+                ErrorCode::SchemaChanged,
+                "prepared foreign key parent constraint identity has changed",
+            )
+        })?;
+    let parent_columns = catalog
+        .columns_for_constraint(parent_constraint.id())
+        .collect::<Vec<_>>();
+    if local_ordinals.len() != parent_columns.len() {
+        return Err(DbError::new(
+            ErrorCode::SchemaChanged,
+            "prepared foreign key parent constraint column count has changed",
+        ));
+    }
+    for (local_ordinal, parent_column) in local_ordinals.iter().zip(parent_columns) {
+        let child_type = child_table
+            .columns()
+            .get(usize::from(*local_ordinal))
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Type,
+                    "foreign-key child column ordinal is absent",
+                )
+            })?
+            .column_type();
+        let parent_type = parent_column.column_type();
+        if child_type != parent_type
+            && !(child_type == ColumnType::Int64 && parent_type == ColumnType::Decimal)
+        {
+            return Err(DbError::new(
+                ErrorCode::SchemaChanged,
+                "prepared foreign key child and parent column types are incompatible",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1262,7 +1356,8 @@ fn build_constraint_bundle(
 ) -> Result<ConstraintBundle> {
     let columns = match constraint {
         TableConstraintSpec::PrimaryKey { columns, .. }
-        | TableConstraintSpec::Unique { columns, .. } => columns
+        | TableConstraintSpec::Unique { columns, .. }
+        | TableConstraintSpec::ForeignKey { columns, .. } => columns
             .iter()
             .map(|ordinal| {
                 column_ids
@@ -1284,10 +1379,6 @@ fn build_constraint_bundle(
                 )
             }),
         TableConstraintSpec::Check { .. } => Ok(Vec::new()),
-        TableConstraintSpec::ForeignKey { .. } => Err(DbError::new(
-            ErrorCode::Unsupported,
-            "foreign key catalog publication requires Phase 4C2-C Task 4",
-        )),
     }?;
     let program = match constraint {
         TableConstraintSpec::Check { template, .. } => Some(
@@ -1297,6 +1388,17 @@ fn build_constraint_bundle(
                 .to_vec()
                 .into_boxed_slice(),
         ),
+        _ => None,
+    };
+    let foreign_key_target = match constraint {
+        TableConstraintSpec::ForeignKey {
+            parent_table_id,
+            parent_constraint_id,
+            ..
+        } => Some(ForeignKeyTarget::new(
+            *parent_table_id,
+            *parent_constraint_id,
+        )),
         _ => None,
     };
     let definition = ConstraintDef::new(
@@ -1310,7 +1412,7 @@ fn build_constraint_bundle(
             )
         })?,
         allocated.index_id,
-        None,
+        foreign_key_target,
         program.unwrap_or_default(),
         allocated.name.clone(),
     )?;
@@ -1478,8 +1580,8 @@ mod tests {
             fail_constraint_removal_at_for_test,
             take_constraint_bundle_fault_observations_for_test,
             types::{
-                CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintKind, IndexOwnership,
-                RowId, SchemaVersion, TableDef, TableId,
+                CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintId, ConstraintKind,
+                ForeignKeyTarget, IndexOwnership, RowId, SchemaVersion, TableDef, TableId,
             },
         },
         constraint::program::{
@@ -1536,6 +1638,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn constrained_create_publishes_foreign_key_and_reverse_edge_atomically() {
+        // Production breaks caught: publishing only one side of the FK graph,
+        // leaking any allocator/page/catalog/version state after a late error,
+        // or giving a foreign key an unnecessary system index.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let (parent_table_id, parent_constraint_id, parent_version) = {
+            let mut batch = pager.try_begin_write().unwrap();
+            let parent = create_constrained_relation(
+                &mut batch,
+                &ConstrainedTableSpec::new(
+                    table_spec("PARENT", &[("ID", ColumnType::Int64, false)]),
+                    vec![TableConstraintSpec::PrimaryKey {
+                        name: Some(CatalogName::new("PK_PARENT").unwrap()),
+                        columns: vec![0].into_boxed_slice(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let catalog = batch.catalog_reader().unwrap();
+            let parent_constraint = catalog
+                .find_constraint_by_name(&CatalogName::new("PK_PARENT").unwrap())
+                .unwrap()
+                .id();
+            let version = catalog.find_table_by_id(parent).unwrap().schema_version();
+            batch.commit().unwrap();
+            (parent, parent_constraint, version)
+        };
+        let child_spec = ConstrainedTableSpec::new(
+            table_spec("CHILD", &[("PARENT_ID", ColumnType::Int64, true)]),
+            vec![TableConstraintSpec::ForeignKey {
+                name: Some(CatalogName::new("FK_CHILD_PARENT").unwrap()),
+                columns: vec![0].into_boxed_slice(),
+                parent_table_id,
+                parent_constraint_id,
+            }],
+        )
+        .unwrap();
+        let mut batch = pager.try_begin_write().unwrap();
+
+        for point in [
+            ConstrainedCreateFaultPoint::ConstraintRecordFamilyInserted,
+            ConstrainedCreateFaultPoint::FeatureEnabled,
+            ConstrainedCreateFaultPoint::ParentVersionBumped,
+            ConstrainedCreateFaultPoint::CatalogFinished,
+        ] {
+            let before = batch.checkpoint_mutation().unwrap();
+            fail_constrained_create_at_for_test(point);
+            let error = create_constrained_relation(&mut batch, &child_spec).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Io, "{point:?}");
+            before.assert_matches_batch_for_test(&batch);
+            let catalog = batch.catalog_reader().unwrap();
+            assert_eq!(
+                catalog
+                    .find_table_by_id(parent_table_id)
+                    .unwrap()
+                    .schema_version(),
+                parent_version,
+                "{point:?}"
+            );
+            assert!(
+                catalog
+                    .find_table_by_name(&CatalogName::new("CHILD").unwrap())
+                    .is_none(),
+                "{point:?}"
+            );
+            assert_eq!(
+                catalog
+                    .foreign_keys_referencing(parent_constraint_id)
+                    .count(),
+                0,
+                "{point:?}"
+            );
+        }
+
+        let child_table_id = create_constrained_relation(&mut batch, &child_spec).unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        let child = catalog
+            .find_constraint_by_name(&CatalogName::new("FK_CHILD_PARENT").unwrap())
+            .unwrap();
+        assert_eq!(child.table_id(), child_table_id);
+        assert_eq!(child.kind(), ConstraintKind::ForeignKey);
+        assert_eq!(child.index_id(), None);
+        assert_eq!(
+            child.foreign_key_target(),
+            Some(ForeignKeyTarget::new(parent_table_id, parent_constraint_id))
+        );
+        assert_eq!(
+            catalog
+                .columns_for_constraint(child.id())
+                .map(ColumnDef::table_id)
+                .collect::<Vec<_>>(),
+            vec![child_table_id]
+        );
+        assert_eq!(
+            catalog
+                .foreign_keys_referencing(parent_constraint_id)
+                .map(|constraint| constraint.id())
+                .collect::<Vec<ConstraintId>>(),
+            vec![child.id()]
+        );
+        assert_eq!(
+            catalog
+                .find_table_by_id(parent_table_id)
+                .unwrap()
+                .schema_version()
+                .get(),
+            parent_version.get() + 1
+        );
+    }
+
+    #[test]
+    fn constrained_create_bumps_each_distinct_parent_once() {
+        // Production break caught: deriving bumps directly from FK bundles can
+        // invalidate one parent twice while missing a different parent.
+        let (_temp, pager) = test_pager(4096).unwrap();
+        let (first_parent, first_key, second_parent, second_key) = {
+            let mut batch = pager.try_begin_write().unwrap();
+            let first_parent = create_constrained_relation(
+                &mut batch,
+                &ConstrainedTableSpec::new(
+                    table_spec("FIRST_PARENT", &[("ID", ColumnType::Int64, false)]),
+                    vec![TableConstraintSpec::PrimaryKey {
+                        name: Some(CatalogName::new("PK_FIRST_PARENT").unwrap()),
+                        columns: vec![0].into_boxed_slice(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let second_parent = create_constrained_relation(
+                &mut batch,
+                &ConstrainedTableSpec::new(
+                    table_spec("SECOND_PARENT", &[("ID", ColumnType::Int64, false)]),
+                    vec![TableConstraintSpec::PrimaryKey {
+                        name: Some(CatalogName::new("PK_SECOND_PARENT").unwrap()),
+                        columns: vec![0].into_boxed_slice(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let catalog = batch.catalog_reader().unwrap();
+            let first_key = catalog
+                .find_constraint_by_name(&CatalogName::new("PK_FIRST_PARENT").unwrap())
+                .unwrap()
+                .id();
+            let second_key = catalog
+                .find_constraint_by_name(&CatalogName::new("PK_SECOND_PARENT").unwrap())
+                .unwrap()
+                .id();
+            batch.commit().unwrap();
+            (first_parent, first_key, second_parent, second_key)
+        };
+        let mut batch = pager.try_begin_write().unwrap();
+        create_constrained_relation(
+            &mut batch,
+            &ConstrainedTableSpec::new(
+                table_spec(
+                    "MULTI_CHILD",
+                    &[
+                        ("FIRST_A", ColumnType::Int64, true),
+                        ("FIRST_B", ColumnType::Int64, true),
+                        ("SECOND", ColumnType::Int64, true),
+                    ],
+                ),
+                vec![
+                    TableConstraintSpec::ForeignKey {
+                        name: Some(CatalogName::new("FK_FIRST_A").unwrap()),
+                        columns: vec![0].into_boxed_slice(),
+                        parent_table_id: first_parent,
+                        parent_constraint_id: first_key,
+                    },
+                    TableConstraintSpec::ForeignKey {
+                        name: Some(CatalogName::new("FK_FIRST_B").unwrap()),
+                        columns: vec![1].into_boxed_slice(),
+                        parent_table_id: first_parent,
+                        parent_constraint_id: first_key,
+                    },
+                    TableConstraintSpec::ForeignKey {
+                        name: Some(CatalogName::new("FK_SECOND").unwrap()),
+                        columns: vec![2].into_boxed_slice(),
+                        parent_table_id: second_parent,
+                        parent_constraint_id: second_key,
+                    },
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog = batch.catalog_reader().unwrap();
+        assert_eq!(
+            catalog
+                .find_table_by_id(first_parent)
+                .unwrap()
+                .schema_version()
+                .get(),
+            2
+        );
+        assert_eq!(
+            catalog
+                .find_table_by_id(second_parent)
+                .unwrap()
+                .schema_version()
+                .get(),
+            2
+        );
     }
 
     #[test]
@@ -1907,6 +2219,7 @@ mod tests {
                     vec![(ConstraintBundleFaultPoint::FeatureEnabled, true)]
                 ),
                 ConstrainedCreateFaultPoint::SystemIndexRootAllocated
+                | ConstrainedCreateFaultPoint::ParentVersionBumped
                 | ConstrainedCreateFaultPoint::CatalogFinished => {
                     assert!(catalog_observations.is_empty(), "{point:?}")
                 }

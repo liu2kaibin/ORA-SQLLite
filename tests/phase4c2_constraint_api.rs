@@ -912,10 +912,6 @@ fn unsupported_constraint_and_phase5_forms_leave_catalog_unchanged() {
     );
     for (sql, absent) in [
         (
-            "CREATE TABLE FOREIGN_KEY (ID INT64, PARENT_ID INT64, CONSTRAINT FK FOREIGN KEY (PARENT_ID) REFERENCES PARENT (ID))",
-            "FOREIGN_KEY",
-        ),
-        (
             "CREATE TABLE SELF_REF (ID INT64 PRIMARY KEY, PARENT_ID INT64 REFERENCES SELF_REF (ID))",
             "SELF_REF",
         ),
