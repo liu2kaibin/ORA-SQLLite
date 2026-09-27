@@ -54,10 +54,17 @@ still uses a ROWID `TableScan`. Table constraints, foreign keys, and optimizer
 Phase 4C2-B supports persistent `PrimaryKey`, `Unique`, `NotNull`, and `Check`
 constraints; system-owned unique indexes; atomic constrained-table lifecycle;
 named `Constraint` errors; rollback, reopen, and recovery. Constraint evaluation
-uses the existing bounded `WorkMemory` budget. Foreign keys are Phase 4C2-C and
-optimizer `IndexScan` is Phase 4C2-D: `SELECT` and `UPDATE`/`DELETE` target
+uses the existing bounded `WorkMemory` budget. Optimizer `IndexScan` is Phase
+4C2-D: `SELECT` and `UPDATE`/`DELETE` target
 discovery still use `TableScan` (a ROWID `TableScan` for DML). Phase 5 Oracle
 extensions remain deferred.
+
+Phase 4C2-C supports immediate, named foreign keys that reference declared
+PRIMARY KEY or UNIQUE constraints; child INSERT/UPDATE and parent UPDATE/DELETE
+checks; optional child-index prefix probes with ROWID-scan fallback; atomic
+reverse dependencies; and safe DROP TABLE rejection/cleanup. Self-reference,
+cycles, ALTER TABLE, deferred/referential actions, and optimizer IndexScan remain
+unsupported; IndexScan is Phase 4C2-D.
 
 Creation synchronizes the main/WAL files and their parent directory entries before
 publishing the format-2 initialization marker. Unix uses a directory file sync;

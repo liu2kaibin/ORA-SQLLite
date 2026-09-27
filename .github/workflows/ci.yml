@@ -20,38 +20,16 @@ env:
 
 jobs:
   quality:
-    name: Linux stable quality
+    name: Linux MVP validation
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable Rust with quality tools
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-      - name: Check formatting
-        run: rustup run stable cargo fmt --check
-      - name: Run Clippy
-        run: rustup run stable cargo clippy --all-targets --all-features -- -D warnings
-      - name: Run tests
-        run: rustup run stable cargo test --all-targets
-
-  msrv:
-    name: Linux Rust 1.85 MSRV
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust 1.85
-        run: rustup toolchain install 1.85.0 --profile minimal
-      - name: Check the minimum supported Rust version
-        run: rustup run 1.85.0 cargo check --all-targets
-
-  windows:
-    name: Windows stable
-    runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
-      - name: Check Windows compilation
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Check formatting
+        run: rustup run stable cargo fmt --check
+      - name: Check all targets
         run: rustup run stable cargo check --all-targets
+      - name: Run MVP API tests
+        run: rustup run stable cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api

@@ -23,8 +23,8 @@ use super::{
         CatalogReader, CatalogWriter,
         types::{
             CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintBundle, ConstraintDef,
-            ConstraintId, ConstraintKind, IndexDef, IndexId, IndexOwnership, RowId, SchemaVersion,
-            TableDef, TableId,
+            ConstraintId, ConstraintKind, ForeignKeyTarget, IndexDef, IndexId, IndexOwnership,
+            RowId, SchemaVersion, TableDef, TableId,
         },
     },
     checksum::stamp_page_checksum,
@@ -42,6 +42,384 @@ use super::{
 
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_QUERY_DATABASE_UUID: AtomicU8 = AtomicU8::new(1);
+
+// Phase 4C2-C's deliberately narrow INT64 fixture witness. The B+Tree page
+// reader is shared with storage, but catalog envelopes, FK edges, row layouts
+// and physical index keys are decoded here, NOT by CatalogReader/RowCodec/
+// IndexKeyCodec. Offsets follow tests/support/format2.rs (Task 9). This also
+// works on a private WriteBatch, which the checkpointed-file witness cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawCatalogCapture {
+    pub(crate) lsn: Option<u64>,
+    pub(crate) feature_bits: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) page_count: u64,
+    pub(crate) freelist: Vec<Phase4c2aFreelistTrunk>,
+    pub(crate) records: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) tables: BTreeMap<String, Phase4c2cRawTable>,
+    pub(crate) indexes: BTreeMap<String, Phase4c2cRawIndex>,
+    pub(crate) constraints: BTreeMap<String, Phase4c2cRawConstraint>,
+    pub(crate) referenced_by: BTreeSet<(u64, u64)>,
+    pub(crate) table_constraints: BTreeSet<(u64, u64)>,
+    pub(crate) pages: BTreeMap<u64, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Phase4c2cRawTable {
+    pub(crate) id: u64,
+    pub(crate) version: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) next_rowid: u64,
+    pub(crate) columns: Vec<u64>,
+    pub(crate) rows: BTreeMap<u64, Vec<Option<i64>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Phase4c2cRawIndex {
+    pub(crate) id: u64,
+    pub(crate) table: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) owner: u64,
+    pub(crate) unique: bool,
+    pub(crate) columns: Vec<u64>,
+    pub(crate) entries: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Phase4c2cRawConstraint {
+    pub(crate) id: u64,
+    pub(crate) table: u64,
+    pub(crate) kind: u8,
+    pub(crate) index: u64,
+    pub(crate) parent_table: u64,
+    pub(crate) parent_constraint: u64,
+    pub(crate) columns: Vec<u64>,
+}
+
+fn phase4c2c_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("raw u64"))
+}
+
+fn phase4c2c_be(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().expect("raw BE u64"))
+}
+
+fn phase4c2c_u16(bytes: &[u8], offset: usize) -> usize {
+    usize::from(u16::from_le_bytes(
+        bytes[offset..offset + 2].try_into().unwrap(),
+    ))
+}
+
+fn phase4c2c_u32(bytes: &[u8], offset: usize) -> usize {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+}
+
+fn phase4c2c_payload(value: &[u8], family: u8) -> &[u8] {
+    assert!(value.len() >= 8, "raw envelope is truncated");
+    assert_eq!(&value[..4], &[family, 1, 0, 0]);
+    let length = phase4c2c_u32(value, 4);
+    assert_eq!(value.len(), 8 + length, "raw envelope length");
+    &value[8..]
+}
+
+fn phase4c2c_name(payload: &[u8], length_offset: usize, start: usize) -> String {
+    let len = phase4c2c_u16(payload, length_offset);
+    assert_eq!(start + len, payload.len());
+    String::from_utf8(payload[start..].to_vec()).expect("raw catalog name UTF-8")
+}
+
+pub(crate) fn phase4c2c_raw_capture(pager: &Pager) -> RawCatalogCapture {
+    let mut snapshot = pager.begin_read().expect("raw snapshot");
+    let tree = snapshot.catalog_tree(TreeKind::Table).unwrap().unwrap();
+    let features = snapshot.feature_bits();
+    let lsn = snapshot.lsn().0;
+    phase4c2c_raw_source(&mut snapshot, tree, features, Some(lsn))
+}
+
+pub(crate) fn phase4c2c_raw_batch_capture(batch: &mut WriteBatch) -> RawCatalogCapture {
+    let (tree, _) = batch
+        .catalog_tree_with_report(TreeKind::Table)
+        .unwrap()
+        .unwrap();
+    phase4c2c_raw_source(batch, tree, batch.feature_bits(), None)
+}
+
+fn phase4c2c_raw_source(
+    source: &mut impl PageSource,
+    catalog: BTree,
+    feature_bits: u64,
+    lsn: Option<u64>,
+) -> RawCatalogCapture {
+    let records: BTreeMap<_, _> = collect_all(&catalog, source).unwrap().into_iter().collect();
+    let mut state = RawCatalogCapture {
+        lsn,
+        feature_bits,
+        root: catalog.root().into(),
+        page_count: source.page_count().unwrap(),
+        freelist: Vec::new(),
+        records,
+        tables: BTreeMap::new(),
+        indexes: BTreeMap::new(),
+        constraints: BTreeMap::new(),
+        referenced_by: BTreeSet::new(),
+        table_constraints: BTreeSet::new(),
+        pages: BTreeMap::new(),
+    };
+    for page in validate_tree(source, &catalog).unwrap().all_live_pages() {
+        assert!(state.pages.insert(page.0, "catalog".into()).is_none());
+    }
+    let ordered_ids = |family, id| -> Vec<u64> {
+        let mappings: Vec<_> = state
+            .records
+            .iter()
+            .filter(|(k, _)| k.len() == 11 && k[0] == family && phase4c2c_be(k, 1) == id)
+            .collect();
+        mappings
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (key, value))| {
+                assert_eq!(
+                    u16::from_be_bytes(key[9..11].try_into().unwrap()) as usize,
+                    ordinal
+                );
+                phase4c2c_u64(phase4c2c_payload(value, family), 0)
+            })
+            .collect()
+    };
+    for (key, value) in &state.records {
+        let family = key[0];
+        let payload = phase4c2c_payload(value, family);
+        match family {
+            0x11 => {
+                assert_eq!(key.len(), 9);
+                let id = phase4c2c_u64(payload, 0);
+                assert_eq!(id, phase4c2c_be(key, 1));
+                state.tables.insert(
+                    phase4c2c_name(payload, 42, 44),
+                    Phase4c2cRawTable {
+                        id,
+                        version: phase4c2c_u64(payload, 8),
+                        root: Phase4c2aPageRef {
+                            page_id: phase4c2c_u64(payload, 16),
+                            generation: phase4c2c_u64(payload, 24),
+                        },
+                        next_rowid: phase4c2c_u64(payload, 32),
+                        columns: ordered_ids(0x13, id),
+                        rows: BTreeMap::new(),
+                    },
+                );
+            }
+            0x21 => {
+                assert_eq!(key.len(), 9);
+                let id = phase4c2c_u64(payload, 0);
+                assert_eq!(id, phase4c2c_be(key, 1));
+                state.indexes.insert(
+                    phase4c2c_name(payload, 46, 48),
+                    Phase4c2cRawIndex {
+                        id,
+                        table: phase4c2c_u64(payload, 8),
+                        root: Phase4c2aPageRef {
+                            page_id: phase4c2c_u64(payload, 16),
+                            generation: phase4c2c_u64(payload, 24),
+                        },
+                        unique: payload[34] == 1,
+                        owner: phase4c2c_u64(payload, 38),
+                        columns: ordered_ids(0x23, id),
+                        entries: Vec::new(),
+                    },
+                );
+                assert!(payload[34] <= 1);
+                assert_eq!(payload[35] == 1, phase4c2c_u64(payload, 38) != 0);
+            }
+            0x31 => {
+                assert_eq!(key.len(), 9);
+                let id = phase4c2c_u64(payload, 0);
+                assert_eq!(id, phase4c2c_be(key, 1));
+                assert_eq!(
+                    phase4c2c_u32(payload, 48),
+                    0,
+                    "fixture has no CHECK programs"
+                );
+                state.constraints.insert(
+                    phase4c2c_name(payload, 52, 56),
+                    Phase4c2cRawConstraint {
+                        id,
+                        table: phase4c2c_u64(payload, 8),
+                        kind: payload[16],
+                        index: phase4c2c_u64(payload, 20),
+                        parent_table: phase4c2c_be(payload, 28),
+                        parent_constraint: phase4c2c_be(payload, 36),
+                        columns: ordered_ids(0x33, id),
+                    },
+                );
+            }
+            0x32 | 0x34 => {
+                assert_eq!(key.len(), 17);
+                let pair = (phase4c2c_be(key, 1), phase4c2c_be(key, 9));
+                assert_eq!(payload.len(), 8);
+                assert_eq!(
+                    pair.1,
+                    if family == 0x34 {
+                        phase4c2c_be(payload, 0)
+                    } else {
+                        phase4c2c_u64(payload, 0)
+                    }
+                );
+                if family == 0x34 {
+                    state.referenced_by.insert(pair);
+                } else {
+                    state.table_constraints.insert(pair);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, table) in &mut state.tables {
+        let root = PageRef::new(PageId(table.root.page_id), table.root.generation).unwrap();
+        let tree = BTree::from_root(TreeKind::Table, root);
+        for page in validate_tree(source, &tree).unwrap().all_live_pages() {
+            assert!(
+                state
+                    .pages
+                    .insert(page.0, format!("table:{name}"))
+                    .is_none()
+            );
+        }
+        for (key, bytes) in collect_all(&tree, source).unwrap() {
+            assert_eq!(key.len(), 8);
+            assert_eq!(&bytes[..8], b"OROW\x01\0\0\0");
+            assert!((1..=table.version).contains(&phase4c2c_u64(&bytes, 8)));
+            let count = phase4c2c_u16(&bytes, 16);
+            let bitmap = phase4c2c_u16(&bytes, 18);
+            assert_eq!(count, table.columns.len());
+            assert_eq!(bitmap, count.div_ceil(8));
+            assert_eq!(phase4c2c_u32(&bytes, 20), count * 8);
+            let data = 32 + bitmap + count * 8;
+            assert_eq!(bytes.len(), data + phase4c2c_u32(&bytes, 24));
+            let values = (0..count)
+                .map(|column| {
+                    let directory = 32 + bitmap + column * 8;
+                    let offset = phase4c2c_u32(&bytes, directory);
+                    let len = phase4c2c_u32(&bytes, directory + 4);
+                    if bytes[32 + column / 8] & (1 << (column % 8)) != 0 {
+                        assert_eq!((offset, len), (0, 0));
+                        None
+                    } else {
+                        assert_eq!(len, 8, "this witness accepts only fixture INT64 rows");
+                        Some(phase4c2c_u64(&bytes, data + offset) as i64)
+                    }
+                })
+                .collect();
+            assert!(table.rows.insert(phase4c2c_be(&key, 0), values).is_none());
+        }
+    }
+    for (name, index) in &mut state.indexes {
+        let root = PageRef::new(PageId(index.root.page_id), index.root.generation).unwrap();
+        let tree = BTree::from_root(TreeKind::Index, root);
+        for page in validate_tree(source, &tree).unwrap().all_live_pages() {
+            assert!(
+                state
+                    .pages
+                    .insert(page.0, format!("index:{name}"))
+                    .is_none()
+            );
+        }
+        index.entries = collect_all(&tree, source)
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| {
+                assert!(value.is_empty());
+                key
+            })
+            .collect();
+    }
+    let mut next = source.freelist_root().unwrap().0;
+    while next != 0 {
+        assert!(state.pages.insert(next, "freelist".into()).is_none());
+        let frame = source.read_page_by_id(PageId(next)).unwrap();
+        let trunk = Freelist::decode(&frame).unwrap();
+        state.freelist.push(Phase4c2aFreelistTrunk {
+            reference: Phase4c2aPageRef {
+                page_id: next,
+                generation: frame.header().generation(),
+            },
+            leaves: trunk.leaves().iter().map(|page| page.0).collect(),
+        });
+        next = trunk.next().map_or(0, |reference| reference.page_id().0);
+    }
+    let mut free_leaves = BTreeSet::new();
+    for trunk in &state.freelist {
+        for &page in &trunk.leaves {
+            assert!(
+                page > 0 && page < state.page_count,
+                "free leaf outside accepted extent"
+            );
+            assert!(
+                !state.pages.contains_key(&page),
+                "freelist overlaps a live tree or trunk"
+            );
+            assert!(free_leaves.insert(page), "duplicate free leaf");
+        }
+    }
+    state
+}
+
+#[derive(Default)]
+struct Phase4c2cCatalogTrace {
+    observed: Vec<String>,
+    abort_at: Option<(usize, Vec<String>)>,
+}
+
+thread_local! {
+    static PHASE4C2C_CATALOG_TRACE: std::cell::RefCell<Option<Phase4c2cCatalogTrace>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct Phase4c2cCatalogTraceGuard;
+
+impl Drop for Phase4c2cCatalogTraceGuard {
+    fn drop(&mut self) {
+        PHASE4C2C_CATALOG_TRACE.with(|trace| *trace.borrow_mut() = None);
+    }
+}
+
+pub(crate) fn phase4c2c_trace_catalog(
+    abort_at: Option<(usize, Vec<String>)>,
+) -> Phase4c2cCatalogTraceGuard {
+    PHASE4C2C_CATALOG_TRACE.with(|trace| {
+        assert!(trace.borrow().is_none(), "catalog traces must not nest");
+        *trace.borrow_mut() = Some(Phase4c2cCatalogTrace {
+            observed: Vec::new(),
+            abort_at,
+        });
+    });
+    Phase4c2cCatalogTraceGuard
+}
+
+pub(crate) fn phase4c2c_catalog_observed() -> Vec<String> {
+    PHASE4C2C_CATALOG_TRACE.with(|trace| trace.borrow().as_ref().unwrap().observed.clone())
+}
+
+pub(crate) fn phase4c2c_catalog_record(family: u8, action: &str) {
+    PHASE4C2C_CATALOG_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(trace) = trace.as_mut() else {
+            return;
+        };
+        trace.observed.push(format!("{action}:{family:02x}"));
+        if let Some((target, expected)) = &trace.abort_at {
+            let count = trace.observed.len();
+            assert_eq!(
+                trace.observed,
+                expected[..count],
+                "catalog trace diverged before abort"
+            );
+            if count == *target {
+                eprintln!("PHASE4C2C_CATALOG_ABORT {count}");
+                std::process::abort();
+            }
+        }
+    });
+}
 
 pub(crate) struct TempDatabase {
     path: PathBuf,
@@ -194,6 +572,7 @@ pub(crate) fn phase_4c2b_constraint_fixture() -> Phase4c2bConstraintFixture {
         ConstraintKind::PrimaryKey,
         1,
         Some(index_id),
+        None,
         Box::new([]),
         constraint_name.clone(),
     )
@@ -230,6 +609,439 @@ pub(crate) fn phase_4c2b_constraint_fixture() -> Phase4c2bConstraintFixture {
         constraint_id,
         constraint_name,
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Phase4c2cForeignKeyCatalogMutation {
+    RemoveReferencedBy,
+    AddOrphanReferencedBy,
+    ChangeReferencedByChildValue,
+    ChangeParentTableId,
+    ChangeParentConstraintId,
+    ChangeParentKind,
+    ReorderParentConstraintColumn,
+    RemoveParentSystemIndex,
+}
+
+#[test]
+fn phase_4c2c_foreign_key_catalog_corruption_matrix() {
+    for mutation in [
+        Phase4c2cForeignKeyCatalogMutation::RemoveReferencedBy,
+        Phase4c2cForeignKeyCatalogMutation::AddOrphanReferencedBy,
+        Phase4c2cForeignKeyCatalogMutation::ChangeReferencedByChildValue,
+        Phase4c2cForeignKeyCatalogMutation::ChangeParentTableId,
+        Phase4c2cForeignKeyCatalogMutation::ChangeParentConstraintId,
+        Phase4c2cForeignKeyCatalogMutation::ChangeParentKind,
+        Phase4c2cForeignKeyCatalogMutation::ReorderParentConstraintColumn,
+        Phase4c2cForeignKeyCatalogMutation::RemoveParentSystemIndex,
+    ] {
+        assert_fatal_foreign_key_catalog_corruption(mutation);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Phase4c2cForeignKeyCatalogIds {
+    parent_table: u64,
+    child_table: u64,
+    parent_constraint: u64,
+    child_constraint: u64,
+    parent_index: u64,
+}
+
+fn assert_fatal_foreign_key_catalog_corruption(mutation: Phase4c2cForeignKeyCatalogMutation) {
+    let (temp, pager, ids) = phase_4c2c_foreign_key_catalog_fixture();
+    let old_lsn = pager.latest_lsn().expect("read valid graph LSN");
+    phase_4c2c_commit_foreign_key_catalog_corruption(&pager, ids, mutation)
+        .expect("commit complete corrupt graph candidate");
+    let corrupt_lsn = pager.latest_lsn().expect("read corrupt graph LSN");
+    assert!(
+        corrupt_lsn > old_lsn,
+        "corrupt candidate must be newer than the complete valid graph"
+    );
+    drop(pager);
+
+    let before = crash_pair_bytes(temp.path());
+    for mode in [OpenMode::ReadOnly, OpenMode::ReadWrite] {
+        let error = match Pager::open(temp.path(), mode, PagerConfig::test_default(4096)) {
+            Ok(_) => panic!(
+                "{mutation:?} silently opened or fell back from LSN {} to {}",
+                corrupt_lsn.0, old_lsn.0
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Corruption, "{mutation:?}: {error}");
+        assert_eq!(
+            crash_pair_bytes(temp.path()),
+            before,
+            "{mutation:?} {mode:?} open must preserve the full main/WAL pair"
+        );
+    }
+    eprintln!(
+        "phase4c2c {mutation:?}: corrupt LSN {} rejected without fallback to valid LSN {}",
+        corrupt_lsn.0, old_lsn.0
+    );
+}
+
+fn phase_4c2c_foreign_key_catalog_fixture() -> (TempDatabase, Pager, Phase4c2cForeignKeyCatalogIds)
+{
+    let (temp, pager) = test_pager(4096).expect("create FK corruption fixture");
+    let mut batch = pager.begin_write().expect("begin FK fixture write");
+    let mut writer = CatalogWriter::bootstrap(&mut batch).expect("bootstrap FK corruption catalog");
+
+    let parent_table = TableId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate parent table")
+            .get(),
+    )
+    .expect("parent table ID");
+    let parent_root = BTree::create(&mut batch, TreeKind::Table)
+        .expect("create parent root")
+        .root();
+    let parent = TableDef::new(
+        parent_table,
+        SchemaVersion::new(1).expect("parent schema version"),
+        parent_root,
+        RowId::new(1).expect("parent next rowid"),
+        2,
+        CatalogName::new("P").expect("parent name"),
+    )
+    .expect("build parent table");
+    writer
+        .insert_table_definition(&mut batch, &parent)
+        .expect("insert parent table");
+    let parent_a = ColumnId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate parent A")
+            .get(),
+    )
+    .expect("parent A ID");
+    let parent_b = ColumnId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate parent B")
+            .get(),
+    )
+    .expect("parent B ID");
+    for column in [
+        ColumnDef::new(
+            parent_a,
+            parent_table,
+            0,
+            ColumnType::Int64,
+            false,
+            CatalogName::new("A").unwrap(),
+        )
+        .unwrap(),
+        ColumnDef::new(
+            parent_b,
+            parent_table,
+            1,
+            ColumnType::Text,
+            false,
+            CatalogName::new("B").unwrap(),
+        )
+        .unwrap(),
+    ] {
+        writer
+            .insert_column_definition(&mut batch, &column)
+            .expect("insert parent column");
+    }
+    let parent_constraint = ConstraintId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate parent constraint")
+            .get(),
+    )
+    .expect("parent constraint ID");
+    let parent_index = IndexId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate parent index")
+            .get(),
+    )
+    .expect("parent index ID");
+    let parent_index_root = BTree::create(&mut batch, TreeKind::Index)
+        .expect("create parent index root")
+        .root();
+    let parent_definition = ConstraintDef::new(
+        parent_constraint,
+        parent_table,
+        ConstraintKind::PrimaryKey,
+        2,
+        Some(parent_index),
+        None,
+        Box::new([]),
+        CatalogName::new("PK_P").unwrap(),
+    )
+    .unwrap();
+    let parent_index_definition = IndexDef::new(
+        parent_index,
+        parent_table,
+        parent_index_root,
+        2,
+        true,
+        IndexOwnership::Constraint(parent_constraint),
+        CatalogName::new("SYS_PK_P").unwrap(),
+    )
+    .unwrap();
+    writer
+        .insert_constraint_bundle(
+            &mut batch,
+            &ConstraintBundle {
+                definition: parent_definition,
+                columns: vec![parent_a, parent_b].into_boxed_slice(),
+                system_index: Some((
+                    parent_index_definition,
+                    vec![parent_a, parent_b].into_boxed_slice(),
+                )),
+            },
+        )
+        .expect("insert parent key bundle");
+
+    let child_table = TableId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate child table")
+            .get(),
+    )
+    .expect("child table ID");
+    let child_root = BTree::create(&mut batch, TreeKind::Table)
+        .expect("create child root")
+        .root();
+    let child = TableDef::new(
+        child_table,
+        SchemaVersion::new(1).expect("child schema version"),
+        child_root,
+        RowId::new(1).expect("child next rowid"),
+        2,
+        CatalogName::new("C").expect("child name"),
+    )
+    .expect("build child table");
+    writer
+        .insert_table_definition(&mut batch, &child)
+        .expect("insert child table");
+    let child_a = ColumnId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate child A")
+            .get(),
+    )
+    .expect("child A ID");
+    let child_b = ColumnId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate child B")
+            .get(),
+    )
+    .expect("child B ID");
+    for column in [
+        ColumnDef::new(
+            child_a,
+            child_table,
+            0,
+            ColumnType::Int64,
+            true,
+            CatalogName::new("A").unwrap(),
+        )
+        .unwrap(),
+        ColumnDef::new(
+            child_b,
+            child_table,
+            1,
+            ColumnType::Text,
+            true,
+            CatalogName::new("B").unwrap(),
+        )
+        .unwrap(),
+    ] {
+        writer
+            .insert_column_definition(&mut batch, &column)
+            .expect("insert child column");
+    }
+    let child_constraint = ConstraintId::new(
+        writer
+            .allocate_object_id(&mut batch)
+            .expect("allocate child constraint")
+            .get(),
+    )
+    .expect("child constraint ID");
+    let child_definition = ConstraintDef::new(
+        child_constraint,
+        child_table,
+        ConstraintKind::ForeignKey,
+        2,
+        None,
+        Some(ForeignKeyTarget::new(parent_table, parent_constraint)),
+        Box::new([]),
+        CatalogName::new("FK_C_P").unwrap(),
+    )
+    .unwrap();
+    writer
+        .insert_constraint_bundle(
+            &mut batch,
+            &ConstraintBundle {
+                definition: child_definition,
+                columns: vec![child_a, child_b].into_boxed_slice(),
+                system_index: None,
+            },
+        )
+        .expect("insert child FK bundle");
+    writer.finish(&mut batch).expect("finish valid FK catalog");
+    batch.commit().expect("commit valid FK graph");
+
+    let mut snapshot = pager.begin_read().expect("open valid graph snapshot");
+    let catalog = snapshot.catalog_reader().expect("open valid FK graph");
+    catalog
+        .validate_deep(&mut snapshot)
+        .expect("deep-validate valid FK graph and relation/index roots");
+    drop(snapshot);
+
+    (
+        temp,
+        pager,
+        Phase4c2cForeignKeyCatalogIds {
+            parent_table: parent_table.get(),
+            child_table: child_table.get(),
+            parent_constraint: parent_constraint.get(),
+            child_constraint: child_constraint.get(),
+            parent_index: parent_index.get(),
+        },
+    )
+}
+
+fn phase_4c2c_commit_foreign_key_catalog_corruption(
+    pager: &Pager,
+    ids: Phase4c2cForeignKeyCatalogIds,
+    mutation: Phase4c2cForeignKeyCatalogMutation,
+) -> Result<()> {
+    let mut snapshot = pager.begin_read()?;
+    let catalog_tree = snapshot
+        .catalog_tree(TreeKind::Table)?
+        .ok_or_else(|| DbError::new(ErrorCode::Internal, "FK fixture catalog is missing"))?;
+    let records = collect_all(&catalog_tree, &mut snapshot)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    drop(snapshot);
+
+    let reverse_key = phase_4c2c_two_id_key(0x34, ids.parent_constraint, ids.child_constraint);
+    let parent_definition_key = phase_4c2c_id_key(0x31, ids.parent_constraint);
+    let child_definition_key = phase_4c2c_id_key(0x31, ids.child_constraint);
+    let parent_column_0 = phase_4c2c_id_ordinal_key(0x33, ids.parent_constraint, 0);
+    let parent_column_1 = phase_4c2c_id_ordinal_key(0x33, ids.parent_constraint, 1);
+    let parent_index_definition = phase_4c2c_id_key(0x21, ids.parent_index);
+    let mut batch = pager.begin_write()?;
+    let mut tree = BTree::from_root(TreeKind::Table, catalog_tree.root());
+    match mutation {
+        Phase4c2cForeignKeyCatalogMutation::RemoveReferencedBy => {
+            phase_4c2c_remove_catalog_record(&mut tree, &mut batch, &reverse_key)?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::AddOrphanReferencedBy => {
+            let orphan = u64::MAX - 1;
+            tree.insert(
+                &mut batch,
+                &phase_4c2c_two_id_key(0x34, ids.parent_constraint, orphan),
+                &phase_4c2c_referenced_by_value(orphan),
+            )?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::ChangeReferencedByChildValue => {
+            phase_4c2c_replace_catalog_record(
+                &mut tree,
+                &mut batch,
+                &reverse_key,
+                phase_4c2c_referenced_by_value(ids.parent_constraint),
+            )?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::ChangeParentTableId => {
+            let mut value = records[&child_definition_key].clone();
+            value[36..44].copy_from_slice(&ids.child_table.to_be_bytes());
+            phase_4c2c_replace_catalog_record(&mut tree, &mut batch, &child_definition_key, value)?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::ChangeParentConstraintId => {
+            let mut value = records[&child_definition_key].clone();
+            value[44..52].copy_from_slice(&ids.child_constraint.to_be_bytes());
+            phase_4c2c_replace_catalog_record(&mut tree, &mut batch, &child_definition_key, value)?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::ChangeParentKind => {
+            let mut value = records[&parent_definition_key].clone();
+            value[24] = 3;
+            phase_4c2c_replace_catalog_record(
+                &mut tree,
+                &mut batch,
+                &parent_definition_key,
+                value,
+            )?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::ReorderParentConstraintColumn => {
+            phase_4c2c_replace_catalog_record(
+                &mut tree,
+                &mut batch,
+                &parent_column_0,
+                records[&parent_column_1].clone(),
+            )?;
+            phase_4c2c_replace_catalog_record(
+                &mut tree,
+                &mut batch,
+                &parent_column_1,
+                records[&parent_column_0].clone(),
+            )?;
+        }
+        Phase4c2cForeignKeyCatalogMutation::RemoveParentSystemIndex => {
+            phase_4c2c_remove_catalog_record(&mut tree, &mut batch, &parent_index_definition)?;
+        }
+    }
+    batch.track_tree(TreeKind::Table, tree.root())?;
+    batch.set_catalog_root(tree.root())?;
+    batch.commit()
+}
+
+fn phase_4c2c_id_key(family: u8, id: u64) -> Vec<u8> {
+    let mut key = vec![family];
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+fn phase_4c2c_two_id_key(family: u8, first: u64, second: u64) -> Vec<u8> {
+    let mut key = phase_4c2c_id_key(family, first);
+    key.extend_from_slice(&second.to_be_bytes());
+    key
+}
+
+fn phase_4c2c_id_ordinal_key(family: u8, id: u64, ordinal: u16) -> Vec<u8> {
+    let mut key = phase_4c2c_id_key(family, id);
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+
+fn phase_4c2c_referenced_by_value(child: u64) -> Vec<u8> {
+    let mut value = vec![0x34, 1, 0, 0, 8, 0, 0, 0];
+    value.extend_from_slice(&child.to_be_bytes());
+    value
+}
+
+fn phase_4c2c_remove_catalog_record(
+    tree: &mut BTree,
+    batch: &mut WriteBatch,
+    key: &[u8],
+) -> Result<()> {
+    if tree.delete(batch, key)?.is_none() {
+        return Err(DbError::new(
+            ErrorCode::Internal,
+            "FK corruption target record is missing",
+        ));
+    }
+    Ok(())
+}
+
+fn phase_4c2c_replace_catalog_record(
+    tree: &mut BTree,
+    batch: &mut WriteBatch,
+    key: &[u8],
+    value: Vec<u8>,
+) -> Result<()> {
+    phase_4c2c_remove_catalog_record(tree, batch, key)?;
+    tree.insert(batch, key, &value)
 }
 
 pub(super) fn create_pager(temp: &TempDatabase) -> Pager {
@@ -336,6 +1148,7 @@ pub(crate) fn phase_4b_catalog_fixture_with_constraint(
         fixture.users_id(),
         ConstraintKind::NotNull,
         1,
+        None,
         None,
         Box::new([]),
         CatalogName::new(name).expect("fixture constraint name"),

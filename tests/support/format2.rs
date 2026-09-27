@@ -50,6 +50,7 @@ pub struct RawColumn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawTable {
     pub id: u64,
+    pub schema_version: u64,
     pub root: RawPageRef,
     /// Physical type of the root page in this checkpointed snapshot.
     pub root_page_type: u8,
@@ -75,6 +76,8 @@ pub struct RawConstraint {
     pub table_id: u64,
     pub kind: u8,
     pub index_id: Option<u64>,
+    pub parent_table_id: Option<u64>,
+    pub parent_constraint_id: Option<u64>,
     pub columns: Vec<u64>,
     pub check_program_len: u32,
     pub check_program_version: Option<u8>,
@@ -124,6 +127,7 @@ pub struct RawCatalogCapture {
     pub indexes: BTreeMap<String, RawIndex>,
     pub constraints: BTreeMap<String, RawConstraint>,
     pub table_constraints: BTreeMap<u64, Vec<u64>>,
+    pub referenced_by: BTreeMap<u64, Vec<u64>>,
 }
 
 /// Creates a committed format-2 catalog that predates the local-constraint
@@ -223,6 +227,7 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         indexes: parsed.indexes,
         constraints: parsed.constraints,
         table_constraints: parsed.table_constraints,
+        referenced_by: parsed.referenced_by,
     })
 }
 
@@ -1042,11 +1047,13 @@ struct RawCatalogParts {
     indexes: BTreeMap<String, RawIndex>,
     constraints: BTreeMap<String, RawConstraint>,
     table_constraints: BTreeMap<u64, Vec<u64>>,
+    referenced_by: BTreeMap<u64, Vec<u64>>,
 }
 
 #[derive(Clone)]
 struct RawTableDefinition {
     id: u64,
+    schema_version: u64,
     root: RawPageRef,
     next_rowid: u64,
     name: String,
@@ -1068,6 +1075,8 @@ struct RawConstraintDefinition {
     table_id: u64,
     kind: u8,
     index_id: Option<u64>,
+    parent_table_id: Option<u64>,
+    parent_constraint_id: Option<u64>,
     check_program_len: u32,
     check_program_version: Option<u8>,
     name: String,
@@ -1084,6 +1093,8 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
     let mut constraint_names = BTreeMap::new();
     let mut constraint_columns = BTreeMap::<u64, BTreeMap<u16, u64>>::new();
     let mut table_constraints = BTreeMap::<u64, Vec<u64>>::new();
+    let mut referenced_by = BTreeMap::<u64, Vec<u64>>::new();
+    let mut referenced_children = BTreeSet::new();
 
     for (key, value) in entries {
         let family = *key.first().ok_or("catalog contains an empty key")?;
@@ -1108,6 +1119,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
                 }
                 let definition = RawTableDefinition {
                     id,
+                    schema_version: read_u64(payload, 8)?,
                     root: RawPageRef {
                         id: read_u64(payload, 16)?,
                         generation: read_u64(payload, 24)?,
@@ -1212,9 +1224,28 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             0x31 => {
                 let id = raw_id_key(key, family, "constraint definition")?;
                 let payload = catalog_payload(value, family, "constraint definition")?;
-                if payload.len() < 56 || read_u64(payload, 0)? != id || payload[17] != 0 {
+                if payload.len() < 56
+                    || read_u64(payload, 0)? != id
+                    || payload[17] != 0
+                    || payload.get(44..48) != Some(&[0, 0, 0, 0])
+                    || read_u16(payload, 54)? != 0
+                {
                     return Err("raw constraint definition is malformed".into());
                 }
+                let parent_table_id = read_be_u64(payload, 28)?;
+                let parent_constraint_id = read_be_u64(payload, 36)?;
+                let (parent_table_id, parent_constraint_id) =
+                    match (parent_table_id, parent_constraint_id) {
+                        (0, 0) => (None, None),
+                        (table, constraint) if table != 0 && constraint != 0 => {
+                            (Some(table), Some(constraint))
+                        }
+                        _ => {
+                            return Err(
+                                "raw constraint parent identities are inconsistently zero".into()
+                            );
+                        }
+                    };
                 let check_program_len = read_u32(payload, 48)?;
                 let program_start = 56_usize;
                 let program_end = program_start
@@ -1234,6 +1265,8 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
                         0 => None,
                         id => Some(id),
                     },
+                    parent_table_id,
+                    parent_constraint_id,
                     check_program_len,
                     check_program_version: check_program.first().copied(),
                     name: catalog_name(payload, 52, program_end, "constraint")?,
@@ -1272,6 +1305,23 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
                     return Err("raw catalog has duplicate constraint columns".into());
                 }
             }
+            0x34 => {
+                if key.len() != 17 {
+                    return Err("raw referenced-by key is malformed".into());
+                }
+                let parent_id = read_be_u64(key, 1)?;
+                let child_id = read_be_u64(key, 9)?;
+                if parent_id == 0 || child_id == 0 {
+                    return Err("raw referenced-by identity is zero".into());
+                }
+                if raw_referenced_by_child(value)? != child_id {
+                    return Err("raw referenced-by mapping disagrees with its key".into());
+                }
+                if !referenced_children.insert(child_id) {
+                    return Err("raw catalog has duplicate referenced-by child edges".into());
+                }
+                referenced_by.entry(parent_id).or_default().push(child_id);
+            }
             _ => {}
         }
     }
@@ -1289,6 +1339,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             definition.name,
             RawTable {
                 id: definition.id,
+                schema_version: definition.schema_version,
                 root: definition.root,
                 root_page_type: 0,
                 next_rowid: definition.next_rowid,
@@ -1331,6 +1382,8 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
                 table_id: definition.table_id,
                 kind: definition.kind,
                 index_id: definition.index_id,
+                parent_table_id: definition.parent_table_id,
+                parent_constraint_id: definition.parent_constraint_id,
                 columns: raw_ordered_ids(
                     constraint_columns
                         .remove(&definition.id)
@@ -1345,12 +1398,16 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
     for ids in table_constraints.values_mut() {
         ids.sort_unstable();
     }
+    for ids in referenced_by.values_mut() {
+        ids.sort_unstable();
+    }
     Ok(RawCatalogParts {
         next_object_id,
         tables,
         indexes,
         constraints,
         table_constraints,
+        referenced_by,
     })
 }
 
@@ -1418,6 +1475,13 @@ fn raw_mapping_id(value: &[u8], family: u8, label: &str) -> Result<u64, String> 
         return Err(format!("raw {label} payload is malformed"));
     }
     read_u64(payload, 0)
+}
+
+fn raw_referenced_by_child(value: &[u8]) -> Result<u64, String> {
+    if value.len() != 16 || value.get(0..4) != Some(&[0x34, 1, 0, 0]) || read_u32(value, 4)? != 8 {
+        return Err("raw referenced-by payload is malformed".into());
+    }
+    read_be_u64(value, 8)
 }
 
 fn read_be_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {

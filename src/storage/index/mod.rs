@@ -263,6 +263,33 @@ pub(crate) fn fail_index_release_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn corrupt_index_entry_for_test(
+    batch: &mut WriteBatch,
+    index_id: IndexId,
+    table_values: &[Value],
+    rowid: RowId,
+    leaf_value: &[u8],
+) -> Result<()> {
+    let mut storage = IndexStorage::open(&batch.catalog_reader()?, index_id)?;
+    let original_root = storage.root();
+    let entry = storage.prepare(table_values, rowid)?;
+    if storage.tree.delete(batch, &entry.physical)?.is_none() {
+        return Err(DbError::new(
+            ErrorCode::SchemaChanged,
+            "test index entry disappeared",
+        ));
+    }
+    storage.tree.insert(batch, &entry.physical, leaf_value)?;
+    if storage.root() != original_root {
+        return Err(DbError::new(
+            ErrorCode::Internal,
+            "test index corruption unexpectedly changed its root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn after_index_release_for_test() -> Result<()> {
     INDEX_RELEASE_FAILURE.with(|failure| match failure.get() {
         Some((0, code)) => {
@@ -402,6 +429,46 @@ impl IndexStorage {
             }
         }
         Ok(())
+    }
+
+    pub(in crate::storage) fn contains_key(
+        &self,
+        source: &mut impl super::pager::PageSource,
+        key_values: &[Value],
+    ) -> Result<bool> {
+        self.contains_prefix(source, self.schema.columns.len(), key_values)
+    }
+
+    pub(in crate::storage) fn contains_prefix(
+        &self,
+        source: &mut impl super::pager::PageSource,
+        prefix_columns: usize,
+        values: &[Value],
+    ) -> Result<bool> {
+        if prefix_columns == 0
+            || prefix_columns > self.schema.columns.len()
+            || values.len() != prefix_columns
+        {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index prefix requires one value per leading column",
+            ));
+        }
+        let logical = IndexKeyCodec::encode_prefix(&self.schema.columns[..prefix_columns], values)?;
+        let (start, end) = IndexKeyCodec::checked_prefix_bounds(&logical)?;
+        let mut scan = self.tree.scan_state(
+            start.as_ref().map(Vec::as_slice),
+            end.as_ref().map(Vec::as_slice),
+        )?;
+        let mut found = false;
+        while let Some((physical, value)) = scan.next(source)? {
+            if !value.is_empty() {
+                return Err(corruption("index leaf value must be empty"));
+            }
+            IndexKeyCodec::decode(&self.schema.columns, &physical)?;
+            found = true;
+        }
+        Ok(found)
     }
 
     /// Logical uniqueness is a separate probe; every row, including NULLs,
@@ -1425,6 +1492,166 @@ mod tests {
         );
         assert!(fixture.probe(&[Value::Int64(6)], None).is_ok());
         assert!(fixture.probe(&[Value::Int64(8)], None).is_ok());
+    }
+
+    #[test]
+    fn exact_parent_key_probe_decodes_every_entry_and_rejects_corruption() {
+        // Production breaks caught: treating a bounded prefix hit as existence
+        // without decoding it, returning after the first valid duplicate, or
+        // accepting nonempty index leaf payloads.
+        let mut fixture = writable_index_fixture(true, &[ColumnType::Int64]);
+        fixture.insert(&[Value::Int64(7)], 1).unwrap();
+        assert!(
+            fixture
+                .storage
+                .contains_key(&mut fixture.batch, &[Value::Int64(7)])
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .storage
+                .contains_key(&mut fixture.batch, &[Value::Int64(8)])
+                .unwrap()
+        );
+
+        let corrupt = fixture
+            .storage
+            .prepare(&[Value::Int64(7)], RowId::new(2).unwrap())
+            .unwrap();
+        fixture
+            .storage
+            .tree
+            .insert(&mut fixture.batch, &corrupt.physical, b"bad")
+            .unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .contains_key(&mut fixture.batch, &[Value::Int64(7)])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        fixture
+            .storage
+            .tree
+            .delete(&mut fixture.batch, &corrupt.physical)
+            .unwrap();
+        let mut malformed = corrupt.physical;
+        malformed[corrupt.logical_len..].fill(0);
+        fixture
+            .storage
+            .tree
+            .insert(&mut fixture.batch, &malformed, &[])
+            .unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .contains_key(&mut fixture.batch, &[Value::Int64(7)])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn prefix_probe_accepts_trailing_columns_and_decodes_every_matching_entry() {
+        // Production breaks caught: requiring a complete index key rejects a
+        // usable FK-leading index, while returning at the first matching entry
+        // masks corruption later in the same logical prefix.
+        let mut fixture = writable_index_fixture(false, &[ColumnType::Int64, ColumnType::Text]);
+        fixture
+            .insert(&[Value::Int64(7), Value::Text("A".into())], 1)
+            .unwrap();
+        fixture
+            .insert(&[Value::Int64(7), Value::Text("B".into())], 2)
+            .unwrap();
+        fixture
+            .insert(&[Value::Int64(8), Value::Text("C".into())], 3)
+            .unwrap();
+        assert!(
+            fixture
+                .storage
+                .contains_prefix(&mut fixture.batch, 1, &[Value::Int64(7)])
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .storage
+                .contains_prefix(&mut fixture.batch, 1, &[Value::Int64(9)])
+                .unwrap()
+        );
+        for (count, values) in [(0, vec![]), (3, vec![Value::Int64(7)])] {
+            assert_eq!(
+                fixture
+                    .storage
+                    .contains_prefix(&mut fixture.batch, count, &values)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Type
+            );
+        }
+        assert_eq!(
+            fixture
+                .storage
+                .contains_prefix(
+                    &mut fixture.batch,
+                    1,
+                    &[Value::Int64(7), Value::Text("A".into())],
+                )
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+
+        let corrupt = fixture
+            .storage
+            .prepare(
+                &[Value::Int64(7), Value::Text("Z".into())],
+                RowId::new(4).unwrap(),
+            )
+            .unwrap();
+        fixture
+            .storage
+            .tree
+            .insert(&mut fixture.batch, &corrupt.physical, b"bad")
+            .unwrap();
+        assert_eq!(
+            fixture
+                .storage
+                .contains_prefix(&mut fixture.batch, 1, &[Value::Int64(7)])
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn exact_parent_key_probe_reads_the_current_split_root() {
+        // Production break caught: retaining the index's original leaf root
+        // makes a probe miss keys after the parent system index splits.
+        let mut fixture = writable_index_fixture(true, &[ColumnType::Int64]);
+        let original_root = fixture.storage.root();
+        for rowid in 1..=200 {
+            fixture
+                .insert(&[Value::Int64(rowid as i64)], rowid)
+                .unwrap();
+        }
+        assert_ne!(fixture.storage.root(), original_root);
+        for value in [1, 100, 200] {
+            assert!(
+                fixture
+                    .storage
+                    .contains_key(&mut fixture.batch, &[Value::Int64(value)])
+                    .unwrap()
+            );
+        }
+        assert!(
+            !fixture
+                .storage
+                .contains_key(&mut fixture.batch, &[Value::Int64(201)])
+                .unwrap()
+        );
     }
 
     #[test]

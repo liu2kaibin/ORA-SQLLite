@@ -9,8 +9,12 @@ use crate::{
             BoundTable,
         },
     },
-    storage::catalog::types::{
-        CatalogName, ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId,
+    storage::catalog::{
+        CatalogReader,
+        types::{
+            CatalogName, ColumnDef, ColumnId, ColumnType, ConstraintId, ConstraintKind, IndexId,
+            SchemaVersion, TableId,
+        },
     },
     storage::constraint::program::CheckProgramTemplate,
     storage::relation::TableConstraintSpec,
@@ -327,9 +331,9 @@ pub(crate) struct CreateTablePlan {
     constraints: Box<[TableConstraintDefinition]>,
 }
 
-/// A persistence-safe, identity-free constraint definition for a new table.
-/// Column references remain logical ordinals until the catalog writer assigns
-/// durable `ColumnId` values.
+/// A persistence-safe constraint definition for a new table. Local column
+/// references remain logical ordinals until the catalog writer assigns durable
+/// `ColumnId` values; a foreign key retains stable parent catalog identities.
 pub(crate) enum TableConstraintDefinition {
     PrimaryKey {
         name: Option<CatalogName>,
@@ -349,6 +353,14 @@ pub(crate) enum TableConstraintDefinition {
     Check {
         name: Option<CatalogName>,
         template: CheckProgramTemplate,
+        location: SqlLocation,
+    },
+    ForeignKey {
+        name: Option<CatalogName>,
+        columns: Box<[u16]>,
+        parent_table: BoundTable,
+        parent_constraint_id: ConstraintId,
+        parent_columns: Box<[BoundColumn]>,
         location: SqlLocation,
     },
 }
@@ -410,6 +422,18 @@ impl TableConstraintDefinition {
                 name: name.clone(),
                 template,
             },
+            Self::ForeignKey {
+                name,
+                columns,
+                parent_table,
+                parent_constraint_id,
+                ..
+            } => TableConstraintSpec::ForeignKey {
+                name: name.clone(),
+                columns: columns.clone(),
+                parent_table_id: parent_table.table_id,
+                parent_constraint_id: *parent_constraint_id,
+            },
         }
     }
 
@@ -418,7 +442,8 @@ impl TableConstraintDefinition {
             Self::PrimaryKey { name, .. }
             | Self::Unique { name, .. }
             | Self::NotNull { name, .. }
-            | Self::Check { name, .. } => name.as_ref(),
+            | Self::Check { name, .. }
+            | Self::ForeignKey { name, .. } => name.as_ref(),
         }
     }
 
@@ -427,7 +452,8 @@ impl TableConstraintDefinition {
             Self::PrimaryKey { location, .. }
             | Self::Unique { location, .. }
             | Self::NotNull { location, .. }
-            | Self::Check { location, .. } => *location,
+            | Self::Check { location, .. }
+            | Self::ForeignKey { location, .. } => *location,
         }
     }
 
@@ -474,10 +500,99 @@ impl TableConstraintDefinition {
                     location,
                 })
             }
-            BoundConstraint::ForeignKey { .. } => Err(DbError::new(
-                ErrorCode::Internal,
-                "foreign keys must be deferred before local constraint planning",
-            )),
+            BoundConstraint::ForeignKey {
+                name,
+                columns,
+                referenced_table,
+                referenced_columns,
+                parent_constraint_id,
+                span,
+            } => Ok(Self::ForeignKey {
+                name: name.clone(),
+                columns: columns.clone().into_boxed_slice(),
+                parent_table: *referenced_table,
+                parent_constraint_id: *parent_constraint_id,
+                parent_columns: referenced_columns.clone().into_boxed_slice(),
+                location: locations.resolve(*span)?,
+            }),
         }
     }
+}
+
+pub(crate) fn validate_foreign_key_plan(
+    definition: &TableConstraintDefinition,
+    catalog: &CatalogReader,
+) -> Result<()> {
+    let TableConstraintDefinition::ForeignKey {
+        parent_table,
+        parent_constraint_id,
+        parent_columns,
+        ..
+    } = definition
+    else {
+        return Ok(());
+    };
+    let Some(table) = catalog.find_table_by_id(parent_table.table_id) else {
+        return Err(foreign_key_schema_changed(
+            "prepared foreign key parent table is no longer present",
+        ));
+    };
+    if table.schema_version() != parent_table.schema_version {
+        return Err(foreign_key_schema_changed(
+            "prepared foreign key parent table schema version has changed",
+        ));
+    }
+    for retained in parent_columns {
+        let Some(column) = catalog.find_column_by_id(retained.column_id) else {
+            return Err(foreign_key_schema_changed(
+                "prepared foreign key parent column is no longer present",
+            ));
+        };
+        if column.table_id() != parent_table.table_id
+            || retained.table_id != parent_table.table_id
+            || column.ordinal() != retained.ordinal
+            || logical_column_type(column.column_type()) != retained.sql_type
+        {
+            return Err(foreign_key_schema_changed(
+                "prepared foreign key parent column identity has changed",
+            ));
+        }
+    }
+    let Some(constraint) = catalog.find_constraint_by_id(*parent_constraint_id) else {
+        return Err(foreign_key_schema_changed(
+            "prepared foreign key parent constraint is no longer present",
+        ));
+    };
+    if constraint.table_id() != parent_table.table_id
+        || !matches!(
+            constraint.kind(),
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique
+        )
+        || !catalog
+            .columns_for_constraint(*parent_constraint_id)
+            .map(|column| column.id())
+            .eq(parent_columns.iter().map(|column| column.column_id))
+    {
+        return Err(foreign_key_schema_changed(
+            "prepared foreign key parent constraint identity has changed",
+        ));
+    }
+    Ok(())
+}
+
+fn logical_column_type(column_type: ColumnType) -> SqlType {
+    match column_type {
+        ColumnType::Int64 => SqlType::Int64,
+        ColumnType::Decimal => SqlType::Decimal,
+        ColumnType::Float64 => SqlType::Float64,
+        ColumnType::Text => SqlType::Text,
+        ColumnType::Blob => SqlType::Blob,
+        ColumnType::Date => SqlType::Date,
+        ColumnType::Timestamp | ColumnType::TimestampWithTimeZone => SqlType::Timestamp,
+        ColumnType::Bool => SqlType::Bool,
+    }
+}
+
+fn foreign_key_schema_changed(message: &'static str) -> DbError {
+    DbError::new(ErrorCode::SchemaChanged, message)
 }

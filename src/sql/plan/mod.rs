@@ -19,7 +19,7 @@ use crate::{
 pub(crate) use expr::{AggregateDefinition, ExecExpr, ExecExprKind};
 pub(crate) use mutation::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan,
-    TableConstraintDefinition, UpdatePlan,
+    TableConstraintDefinition, UpdatePlan, validate_foreign_key_plan,
 };
 pub(crate) use query::{OrderExpression, QueryPlan};
 
@@ -104,25 +104,12 @@ impl Plan {
                 name,
                 columns,
                 constraints,
-            } => {
-                if constraints.iter().any(|constraint| {
-                    matches!(
-                        constraint,
-                        crate::sql::bound::BoundConstraint::ForeignKey { .. }
-                    )
-                }) {
-                    PlanKind::DeferredUnsupported {
-                        required_phase: "4C2-C",
-                    }
-                } else {
-                    PlanKind::CreateTable(CreateTablePlan::from_bound(
-                        name,
-                        columns,
-                        constraints,
-                        &locations,
-                    )?)
-                }
-            }
+            } => PlanKind::CreateTable(CreateTablePlan::from_bound(
+                name,
+                columns,
+                constraints,
+                &locations,
+            )?),
             BoundStatementKind::DropTable { table_id } => PlanKind::DropTable {
                 table_id: *table_id,
             },
@@ -224,9 +211,16 @@ mod tests {
             },
         },
         storage::{
-            catalog::types::{IndexId, SchemaVersion, TableId},
+            catalog::types::{
+                CatalogName, ColumnType, ConstraintId, IndexId, SchemaVersion, TableId,
+            },
+            relation::{
+                ColumnSpec, ConstrainedTableSpec, TableConstraintSpec, TableSpec,
+                create_constrained_relation,
+            },
             test_support::{
-                phase_4b_catalog_fixture, phase_4b_catalog_fixture_with_explicit_index,
+                Phase4bCatalogFixture, phase_4b_catalog_fixture,
+                phase_4b_catalog_fixture_with_explicit_index,
             },
         },
     };
@@ -313,8 +307,165 @@ mod tests {
         Plan::from_bound(&bind_fixture(sql), sql)
     }
 
+    fn foreign_key_plan_fixture() -> (Phase4bCatalogFixture, ConstraintId) {
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        let mut batch = pager.begin_write().unwrap();
+        let spec = ConstrainedTableSpec::new(
+            TableSpec::new(
+                CatalogName::new("PARENT").unwrap(),
+                vec![
+                    ColumnSpec::new(CatalogName::new("ID").unwrap(), ColumnType::Int64, false),
+                    ColumnSpec::new(CatalogName::new("ALT").unwrap(), ColumnType::Int64, false),
+                ],
+            )
+            .unwrap(),
+            vec![
+                TableConstraintSpec::PrimaryKey {
+                    name: Some(CatalogName::new("PK_PARENT").unwrap()),
+                    columns: vec![0].into_boxed_slice(),
+                },
+                TableConstraintSpec::Unique {
+                    name: Some(CatalogName::new("UQ_PARENT_ALT").unwrap()),
+                    columns: vec![1].into_boxed_slice(),
+                },
+                TableConstraintSpec::NotNull {
+                    name: Some(CatalogName::new("NN_PARENT_ALT").unwrap()),
+                    column: 1,
+                },
+            ],
+        )
+        .unwrap();
+        create_constrained_relation(&mut batch, &spec).unwrap();
+        batch.commit().unwrap();
+        let parent_constraint_id = {
+            let mut snapshot = pager.begin_read().unwrap();
+            snapshot
+                .catalog_reader()
+                .unwrap()
+                .find_constraint_by_name(&CatalogName::new("PK_PARENT").unwrap())
+                .unwrap()
+                .id()
+        };
+        (fixture, parent_constraint_id)
+    }
+
+    fn plan_create_child_with_foreign_key() -> (Plan, ConstraintId, Phase4bCatalogFixture) {
+        let (fixture, parent_constraint_id) = foreign_key_plan_fixture();
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let sql = "CREATE TABLE C (P INT64, CONSTRAINT FK FOREIGN KEY (P) REFERENCES PARENT (ID))";
+        let bound = bind_sql(
+            sql,
+            &SqlLimits::default(),
+            &catalog,
+            pager.database_uuid().unwrap(),
+        )
+        .unwrap();
+        (
+            Plan::from_bound(&bound, sql).unwrap(),
+            parent_constraint_id,
+            fixture,
+        )
+    }
+
     #[test]
-    fn local_constraint_plans_are_executable_but_foreign_keys_stay_deferred() {
+    fn planner_emits_stable_foreign_key_target_instead_of_deferred_unsupported() {
+        // Production break caught: a valid declared parent key must survive into
+        // an executable CREATE plan instead of the former Phase 4C2-C sentinel.
+        let (plan, expected_parent_constraint_id, _) = plan_create_child_with_foreign_key();
+        let PlanKind::CreateTable(create) = plan.kind() else {
+            panic!("expected executable foreign key plan")
+        };
+        let TableConstraintDefinition::ForeignKey {
+            parent_constraint_id,
+            ..
+        } = &create.constraints()[0]
+        else {
+            panic!("expected executable foreign key constraint")
+        };
+        assert_eq!(*parent_constraint_id, expected_parent_constraint_id);
+        assert!(matches!(
+            create.constraints()[0].storage_spec(),
+            crate::storage::relation::TableConstraintSpec::ForeignKey {
+                parent_constraint_id,
+                ..
+            } if parent_constraint_id == expected_parent_constraint_id
+        ));
+    }
+
+    #[test]
+    fn foreign_key_plan_revalidates_the_retained_parent_constraint_identity() {
+        // Production break caught: execution must not rebind a prepared foreign
+        // key to a later constraint that happens to have the same SQL names.
+        let (plan, parent_constraint_id, fixture) = plan_create_child_with_foreign_key();
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let PlanKind::CreateTable(create) = plan.kind() else {
+            panic!("expected CREATE TABLE")
+        };
+        assert!(super::validate_foreign_key_plan(&create.constraints()[0], &catalog).is_ok());
+        let definition = &create.constraints()[0];
+        let TableConstraintDefinition::ForeignKey {
+            name,
+            columns,
+            parent_table,
+            parent_columns,
+            location,
+            ..
+        } = definition
+        else {
+            panic!("expected foreign key")
+        };
+        let definition_with =
+            |constraint_id, parent_column_set: Box<[_]>| TableConstraintDefinition::ForeignKey {
+                name: name.clone(),
+                columns: columns.clone(),
+                parent_table: *parent_table,
+                parent_constraint_id: constraint_id,
+                parent_columns: parent_column_set,
+                location: *location,
+            };
+        let mismatched_key = catalog
+            .find_constraint_by_name(&CatalogName::new("UQ_PARENT_ALT").unwrap())
+            .unwrap()
+            .id();
+        let wrong_kind = catalog
+            .find_constraint_by_name(&CatalogName::new("NN_PARENT_ALT").unwrap())
+            .unwrap()
+            .id();
+        for invalid in [
+            definition_with(
+                ConstraintId::new(parent_constraint_id.get() + 100).unwrap(),
+                parent_columns.clone(),
+            ),
+            definition_with(mismatched_key, parent_columns.clone()),
+            definition_with(wrong_kind, parent_columns.clone()),
+        ] {
+            assert_eq!(
+                super::validate_foreign_key_plan(&invalid, &catalog)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::SchemaChanged
+            );
+        }
+        let mut wrong_ordinal = parent_columns.clone();
+        wrong_ordinal[0].ordinal = 1;
+        assert_eq!(
+            super::validate_foreign_key_plan(
+                &definition_with(parent_constraint_id, wrong_ordinal),
+                &catalog,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::SchemaChanged
+        );
+    }
+
+    #[test]
+    fn local_and_foreign_key_constraint_plans_are_executable() {
         let local = plan_sql(
             "CREATE TABLE T (ID INT64 PRIMARY KEY, U INT64 UNIQUE, N INT64 NOT NULL, CHECK (N > 0))",
         )
@@ -340,16 +491,8 @@ mod tests {
             TableConstraintDefinition::Check { .. }
         ));
 
-        let foreign = plan_sql(
-            "CREATE TABLE C (ID INT64, CONSTRAINT FK_C FOREIGN KEY (ID) REFERENCES USERS (ID))",
-        )
-        .unwrap();
-        assert!(matches!(
-            foreign.kind(),
-            PlanKind::DeferredUnsupported {
-                required_phase: "4C2-C"
-            }
-        ));
+        let (foreign, _, _) = plan_create_child_with_foreign_key();
+        assert!(matches!(foreign.kind(), PlanKind::CreateTable(_)));
     }
 
     #[test]
@@ -411,24 +554,7 @@ mod tests {
                 BoundStatementKind::Insert { .. } => matches!(self, Self::Insert(_)),
                 BoundStatementKind::Update { .. } => matches!(self, Self::Update(_)),
                 BoundStatementKind::Delete { .. } => matches!(self, Self::Delete(_)),
-                BoundStatementKind::CreateTable { constraints, .. } => {
-                    let has_foreign_key = constraints.iter().any(|constraint| {
-                        matches!(
-                            constraint,
-                            crate::sql::bound::BoundConstraint::ForeignKey { .. }
-                        )
-                    });
-                    if has_foreign_key {
-                        matches!(
-                            self,
-                            Self::DeferredUnsupported {
-                                required_phase: "4C2-C"
-                            }
-                        )
-                    } else {
-                        matches!(self, Self::CreateTable(_))
-                    }
-                }
+                BoundStatementKind::CreateTable { .. } => matches!(self, Self::CreateTable(_)),
                 BoundStatementKind::DropTable { table_id } => {
                     matches!(self, Self::DropTable { table_id: actual } if actual == table_id)
                 }
@@ -896,14 +1022,13 @@ mod tests {
                         | BoundStatementKind::CreateIndex { .. }
                         | BoundStatementKind::DropIndex { .. }
                         | BoundStatementKind::DropTable { .. }
-                ) || matches!(case.kind(), BoundStatementKind::CreateTable { constraints, .. }
-                    if !constraints.iter().any(|constraint| matches!(constraint, crate::sql::bound::BoundConstraint::ForeignKey { .. })) )
+                ) || matches!(case.kind(), BoundStatementKind::CreateTable { .. })
             );
         }
     }
 
     #[test]
-    fn only_foreign_keys_stay_deferred() {
+    fn create_table_constraints_have_executable_plans() {
         for sql in [
             "CREATE TABLE N (ID INT64 NOT NULL)",
             "CREATE TABLE N (ID INT64 PRIMARY KEY)",
@@ -915,14 +1040,8 @@ mod tests {
                 PlanKind::CreateTable(_)
             ));
         }
-        assert!(matches!(
-            plan_sql("CREATE TABLE N (ID INT64 REFERENCES USERS(ID))")
-                .unwrap()
-                .kind(),
-            PlanKind::DeferredUnsupported {
-                required_phase: "4C2-C"
-            }
-        ));
+        let (foreign, _, _) = plan_create_child_with_foreign_key();
+        assert!(matches!(foreign.kind(), PlanKind::CreateTable(_)));
     }
 
     #[test]

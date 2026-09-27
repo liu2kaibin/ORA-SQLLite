@@ -13,11 +13,14 @@ use crate::{
     sql::SqlLimits,
     storage::{
         Pager,
+        catalog::types::{RowId, TableId},
+        relation::ConstrainedTableWrite,
         test_support::{
             Phase4c1CrashPathKind, Phase4c1SqlStorageState, Phase4c2aIndexEntry,
-            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState, TempDatabase,
-            assert_commit_trace, phase_4c1_abort_wal_initialization,
-            phase_4c1_aborting_crash_pager, phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
+            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState, RawCatalogCapture,
+            TempDatabase, assert_batch_unchanged_after, assert_commit_trace,
+            phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
+            phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
             phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
             phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
             phase_4c1_validate_crash_path, phase_4c1_wal_initialization_trace,
@@ -25,7 +28,8 @@ use crate::{
             phase_4c2a_model_state, phase_4c2a_open_pager, phase_4c2a_pager_state,
             phase_4c2a_recover_and_capture, phase_4c2a_remove_recovered_files,
             phase_4c2a_wal_records, phase_4c2b_model_state, phase_4c2b_pager_state,
-            phase_4c2b_recover_and_capture,
+            phase_4c2b_recover_and_capture, phase4c2c_catalog_observed, phase4c2c_raw_capture,
+            phase4c2c_trace_catalog,
         },
     },
 };
@@ -4869,4 +4873,1462 @@ fn phase_4c2b_fixed_seed_constraint_model() {
 #[ignore = "run by the dedicated Phase 4C2-B CI job"]
 fn phase_4c2b_constraint_crash_recovery_matrix() {
     phase4c2b_run_crash_matrix();
+}
+
+const PHASE4C2C_SEED: u64 = 0x4c2c_0010;
+const PHASE4C2C_OPERATIONS: usize = 2_400;
+const PHASE4C2C_PARENT: &str = "CREATE TABLE P (ID INT64, U INT64, CONSTRAINT PK_P PRIMARY KEY (ID), CONSTRAINT UQ_P UNIQUE (U))";
+const PHASE4C2C_INDEXED: &str =
+    "CREATE TABLE CI (ID INT64, PID INT64, CONSTRAINT FK_I FOREIGN KEY (PID) REFERENCES P (ID))";
+const PHASE4C2C_SCANNED: &str =
+    "CREATE TABLE CS (ID INT64, PID INT64, CONSTRAINT FK_S FOREIGN KEY (PID) REFERENCES P (U))";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParentRow {
+    id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildRow {
+    id: i64,
+    parent: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ForeignKeyModel {
+    parents: BTreeMap<i64, ParentRow>,
+    indexed_children: BTreeMap<i64, ChildRow>,
+    scanned_children: BTreeMap<i64, ChildRow>,
+    in_transaction: Option<Box<ForeignKeyModel>>,
+}
+
+#[derive(Clone, Debug)]
+enum ForeignKeyOperation {
+    InsertParent(i64),
+    UpdateParent {
+        old: i64,
+        new: i64,
+    },
+    DeleteParent(i64),
+    InsertChild {
+        indexed: bool,
+        id: i64,
+        parent: Option<i64>,
+    },
+    UpdateChild {
+        indexed: bool,
+        id: i64,
+        parent: Option<i64>,
+    },
+    DeleteChild {
+        indexed: bool,
+        id: i64,
+    },
+    Begin,
+    Commit,
+    Rollback,
+    Reopen,
+    Checkpoint,
+}
+
+impl ForeignKeyOperation {
+    fn sql(&self) -> String {
+        let table = |indexed| if indexed { "CI" } else { "CS" };
+        let parent_sql =
+            |value: &Option<i64>| value.map_or_else(|| "NULL".into(), |v| v.to_string());
+        match self {
+            Self::InsertParent(id) => format!("INSERT INTO P VALUES ({id}, {id})"),
+            Self::UpdateParent { old, new } => {
+                format!("UPDATE P SET ID = {new}, U = {new} WHERE ID = {old}")
+            }
+            Self::DeleteParent(id) => format!("DELETE FROM P WHERE ID = {id}"),
+            Self::InsertChild {
+                indexed,
+                id,
+                parent,
+            } => format!(
+                "INSERT INTO {} VALUES ({id}, {})",
+                table(*indexed),
+                parent_sql(parent)
+            ),
+            Self::UpdateChild {
+                indexed,
+                id,
+                parent,
+            } => format!(
+                "UPDATE {} SET PID = {} WHERE ID = {id}",
+                table(*indexed),
+                parent_sql(parent)
+            ),
+            Self::DeleteChild { indexed, id } => {
+                format!("DELETE FROM {} WHERE ID = {id}", table(*indexed))
+            }
+            Self::Begin => "BEGIN".into(),
+            Self::Commit => "COMMIT".into(),
+            Self::Rollback => "ROLLBACK".into(),
+            Self::Reopen | Self::Checkpoint => panic!("storage control is not SQL"),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::InsertParent(_) => "insert-parent",
+            Self::UpdateParent { .. } => "update-parent",
+            Self::DeleteParent(_) => "delete-parent",
+            Self::InsertChild { indexed: true, .. } => "insert-indexed-child",
+            Self::InsertChild { .. } => "insert-scanned-child",
+            Self::UpdateChild { indexed: true, .. } => "update-indexed-child",
+            Self::UpdateChild { .. } => "update-scanned-child",
+            Self::DeleteChild { indexed: true, .. } => "delete-indexed-child",
+            Self::DeleteChild { .. } => "delete-scanned-child",
+            Self::Begin => "begin",
+            Self::Commit => "commit",
+            Self::Rollback => "rollback",
+            Self::Reopen => "reopen",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+}
+
+impl ForeignKeyModel {
+    fn children(&self, indexed: bool) -> &BTreeMap<i64, ChildRow> {
+        if indexed {
+            &self.indexed_children
+        } else {
+            &self.scanned_children
+        }
+    }
+
+    fn children_mut(&mut self, indexed: bool) -> &mut BTreeMap<i64, ChildRow> {
+        if indexed {
+            &mut self.indexed_children
+        } else {
+            &mut self.scanned_children
+        }
+    }
+
+    fn restricted(&self, parent: i64) -> Option<&'static str> {
+        [(true, "FK_I"), (false, "FK_S")]
+            .into_iter()
+            .find_map(|(indexed, name)| {
+                self.children(indexed)
+                    .values()
+                    .any(|row| row.parent == Some(parent))
+                    .then_some(name)
+            })
+    }
+
+    fn apply(&mut self, op: &ForeignKeyOperation) -> ConstraintStepOutcome {
+        let transaction_error = || ConstraintStepOutcome {
+            code: Some(ErrorCode::Transaction),
+            violation_name: None,
+            rows_affected: 0,
+            usable: true,
+        };
+        match *op {
+            ForeignKeyOperation::InsertParent(id) => {
+                if self.parents.contains_key(&id) {
+                    return ConstraintStepOutcome::violation("PK_P");
+                }
+                self.parents.insert(id, ParentRow { id });
+                ConstraintStepOutcome::success(1)
+            }
+            ForeignKeyOperation::UpdateParent { old, new } => {
+                if !self.parents.contains_key(&old) {
+                    return ConstraintStepOutcome::success(0);
+                }
+                if old != new {
+                    if let Some(name) = self.restricted(old) {
+                        return ConstraintStepOutcome::violation(name);
+                    }
+                    if self.parents.contains_key(&new) {
+                        return ConstraintStepOutcome::violation("PK_P");
+                    }
+                }
+                self.parents.remove(&old);
+                self.parents.insert(new, ParentRow { id: new });
+                ConstraintStepOutcome::success(1)
+            }
+            ForeignKeyOperation::DeleteParent(id) => {
+                if let Some(name) = self.restricted(id) {
+                    return ConstraintStepOutcome::violation(name);
+                }
+                ConstraintStepOutcome::success(u64::from(self.parents.remove(&id).is_some()))
+            }
+            ForeignKeyOperation::InsertChild {
+                indexed,
+                id,
+                parent,
+            }
+            | ForeignKeyOperation::UpdateChild {
+                indexed,
+                id,
+                parent,
+            } => {
+                let insert = matches!(op, ForeignKeyOperation::InsertChild { .. });
+                if !insert && !self.children(indexed).contains_key(&id) {
+                    return ConstraintStepOutcome::success(0);
+                }
+                if parent.is_some_and(|id| !self.parents.contains_key(&id)) {
+                    return ConstraintStepOutcome::violation(if indexed { "FK_I" } else { "FK_S" });
+                }
+                if insert {
+                    assert!(
+                        !self.children(indexed).contains_key(&id),
+                        "generator assigns fresh child IDs"
+                    );
+                }
+                self.children_mut(indexed)
+                    .insert(id, ChildRow { id, parent });
+                ConstraintStepOutcome::success(1)
+            }
+            ForeignKeyOperation::DeleteChild { indexed, id } => ConstraintStepOutcome::success(
+                u64::from(self.children_mut(indexed).remove(&id).is_some()),
+            ),
+            ForeignKeyOperation::Begin => {
+                if self.in_transaction.is_some() {
+                    return transaction_error();
+                }
+                self.in_transaction = Some(Box::new(self.clone()));
+                ConstraintStepOutcome::success(0)
+            }
+            ForeignKeyOperation::Commit => {
+                if self.in_transaction.take().is_none() {
+                    return transaction_error();
+                }
+                ConstraintStepOutcome::success(0)
+            }
+            ForeignKeyOperation::Rollback => {
+                let Some(before) = self.in_transaction.take() else {
+                    return transaction_error();
+                };
+                *self = *before;
+                ConstraintStepOutcome::success(0)
+            }
+            ForeignKeyOperation::Reopen => {
+                if let Some(before) = self.in_transaction.take() {
+                    *self = *before;
+                }
+                ConstraintStepOutcome::success(0)
+            }
+            ForeignKeyOperation::Checkpoint => {
+                assert!(self.in_transaction.is_none());
+                ConstraintStepOutcome::success(0)
+            }
+        }
+    }
+
+    fn expected_rows(&self, table: &str) -> Vec<Vec<Option<i64>>> {
+        match table {
+            "P" => self
+                .parents
+                .values()
+                .map(|row| vec![Some(row.id), Some(row.id)])
+                .collect(),
+            "CI" | "CS" => self
+                .children(table == "CI")
+                .values()
+                .map(|row| vec![Some(row.id), row.parent])
+                .collect(),
+            _ => panic!("unknown model table"),
+        }
+    }
+}
+
+struct ForeignKeyDatabase {
+    temp: TempDatabase,
+    open: Option<(Pager, Connection)>,
+}
+
+impl ForeignKeyDatabase {
+    fn new() -> Self {
+        let temp = TempDatabase::new("phase4c2c-model");
+        let pager = phase_4c2a_create_pager(&temp);
+        let mut connection = Connection::from_test_pager(pager.clone());
+        for sql in [
+            PHASE4C2C_PARENT,
+            PHASE4C2C_INDEXED,
+            PHASE4C2C_SCANNED,
+            "CREATE INDEX IX_CI ON CI (PID, ID)",
+            "CREATE INDEX IX_CS ON CS (ID, PID)",
+        ] {
+            assert_eq!(
+                phase4c2c_execute(&mut connection, sql),
+                ConstraintStepOutcome::success(0)
+            );
+        }
+        Self {
+            temp,
+            open: Some((pager, connection)),
+        }
+    }
+
+    fn apply(&mut self, op: &ForeignKeyOperation) -> ConstraintStepOutcome {
+        match op {
+            ForeignKeyOperation::Reopen => {
+                drop(self.open.take());
+                let pager = phase_4c2a_open_pager(self.temp.path()).unwrap();
+                self.open = Some((pager.clone(), Connection::from_test_pager(pager)));
+                ConstraintStepOutcome::success(0)
+            }
+            ForeignKeyOperation::Checkpoint => {
+                phase_4c2a_checkpoint(&self.open.as_ref().unwrap().0).unwrap();
+                ConstraintStepOutcome::success(0)
+            }
+            _ => phase4c2c_execute(&mut self.open.as_mut().unwrap().1, &op.sql()),
+        }
+    }
+
+    fn assert_state(&mut self, model: &ForeignKeyModel) {
+        let (pager, connection) = self.open.as_mut().unwrap();
+        // This public probe distinguishes Idle from SQL-write without changing
+        // state. SELECT 1 alone would also pass after a silent transaction loss.
+        match connection.begin_read() {
+            Ok(read) => {
+                assert!(model.in_transaction.is_none());
+                drop(read);
+            }
+            Err(error) => {
+                assert!(model.in_transaction.is_some());
+                assert_eq!(error.code(), ErrorCode::Transaction);
+            }
+        }
+        for table in ["P", "CI", "CS"] {
+            let sql = format!("SELECT * FROM {table} ORDER BY ID");
+            let Outcome::Rows(actual) = actual_query(connection, &sql, Parameters::none()) else {
+                panic!("model SELECT failed");
+            };
+            let expected: Vec<_> = model
+                .expected_rows(table)
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|v| v.map_or(Value::Null, Value::Int64))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(actual, expected, "visible rows for {table}");
+        }
+        let overlay = connection.phase4c2c_capture_for_test();
+        phase4c2c_assert_model_capture(model, &overlay);
+        let durable = phase4c2c_raw_capture(pager);
+        phase4c2c_assert_model_capture(model.in_transaction.as_deref().unwrap_or(model), &durable);
+    }
+}
+
+fn phase4c2c_execute(connection: &mut Connection, sql: &str) -> ConstraintStepOutcome {
+    let result = connection
+        .prepare(sql)
+        .and_then(|statement| connection.execute(&statement, Parameters::none()));
+    let (code, violation_name, rows_affected) = match result {
+        Ok(result) => (None, None, result.rows_affected()),
+        Err(error) => (
+            Some(error.code()),
+            ["PK_P", "UQ_P", "FK_I", "FK_S", "FK_EXTRA"]
+                .into_iter()
+                .find(|name| error.to_string().contains(name))
+                .map(str::to_owned),
+            0,
+        ),
+    };
+    let usable = matches!(actual_query(connection, "SELECT 1", Parameters::none()), Outcome::Rows(rows) if rows == vec![vec![Value::Int64(1)]]);
+    ConstraintStepOutcome {
+        code,
+        violation_name,
+        rows_affected,
+        usable,
+    }
+}
+
+fn phase4c2c_assert_indexes(state: &RawCatalogCapture) {
+    for (name, index) in &state.indexes {
+        let table = state
+            .tables
+            .values()
+            .find(|table| table.id == index.table)
+            .expect("index owner table");
+        let ordinals: Vec<_> = index
+            .columns
+            .iter()
+            .map(|id| {
+                table
+                    .columns
+                    .iter()
+                    .position(|c| c == id)
+                    .expect("index column owner")
+            })
+            .collect();
+        let mut expected: Vec<_> = table
+            .rows
+            .iter()
+            .map(|(rowid, row)| {
+                let mut key = Vec::new();
+                for &ordinal in &ordinals {
+                    match row[ordinal] {
+                        None => key.push(1),
+                        Some(value) => {
+                            key.push(0);
+                            key.extend_from_slice(&((value as u64) ^ (1 << 63)).to_be_bytes());
+                        }
+                    }
+                }
+                key.extend_from_slice(&rowid.to_be_bytes());
+                key
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            index.entries, expected,
+            "raw physical entries, logical values AND ROWIDs: {name}"
+        );
+        if index.owner != 0 {
+            let owner = state
+                .constraints
+                .values()
+                .find(|c| c.id == index.owner)
+                .expect("system index owner");
+            assert_eq!(
+                (owner.table, owner.index, &owner.columns),
+                (index.table, index.id, &index.columns)
+            );
+        }
+    }
+}
+
+fn assert_complete_foreign_key_graph(state: &RawCatalogCapture) {
+    let expected_edges: BTreeSet<_> =
+        state
+            .constraints
+            .values()
+            .filter(|c| c.kind == 5)
+            .map(|child| {
+                assert_eq!(child.index, 0, "FK does not own an index");
+                let parent = state
+                    .constraints
+                    .values()
+                    .find(|p| p.id == child.parent_constraint)
+                    .expect("FK parent constraint");
+                assert!([1, 2].contains(&parent.kind));
+                assert_eq!(parent.table, child.parent_table);
+                assert_eq!(parent.columns.len(), child.columns.len());
+                assert!(state.indexes.values().any(|index| index.id == parent.index
+                    && index.owner == parent.id
+                    && index.unique));
+                (parent.id, child.id)
+            })
+            .collect();
+    assert_eq!(
+        state.referenced_by, expected_edges,
+        "no missing, orphan or extra reverse edges"
+    );
+    assert_eq!(
+        state.table_constraints,
+        state
+            .constraints
+            .values()
+            .map(|c| (c.table, c.id))
+            .collect()
+    );
+    for (name, constraint) in &state.constraints {
+        // Independently check the persisted name mapping instead of accepting
+        // an executor-generated diagnostic string as the catalog identity.
+        let mut key = vec![0x30];
+        key.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        key.extend_from_slice(name.as_bytes());
+        let value = &state.records[&key];
+        assert_eq!(
+            u64::from_le_bytes(value[8..16].try_into().unwrap()),
+            constraint.id
+        );
+        let table = state
+            .tables
+            .values()
+            .find(|t| t.id == constraint.table)
+            .expect("constraint owner");
+        assert!(
+            constraint
+                .columns
+                .iter()
+                .all(|id| table.columns.contains(id))
+        );
+        if constraint.kind == 5 {
+            let parent = state
+                .tables
+                .values()
+                .find(|t| t.id == constraint.parent_table)
+                .unwrap();
+            let parent_constraint = state
+                .constraints
+                .values()
+                .find(|c| c.id == constraint.parent_constraint)
+                .unwrap();
+            let child_ordinal = table
+                .columns
+                .iter()
+                .position(|id| *id == constraint.columns[0])
+                .unwrap();
+            let parent_ordinal = parent
+                .columns
+                .iter()
+                .position(|id| *id == parent_constraint.columns[0])
+                .unwrap();
+            for row in table.rows.values() {
+                if let Some(value) = row[child_ordinal] {
+                    assert!(
+                        parent
+                            .rows
+                            .values()
+                            .any(|p| p[parent_ordinal] == Some(value)),
+                        "orphan child row"
+                    );
+                }
+            }
+        }
+    }
+    phase4c2c_assert_indexes(state);
+}
+
+fn phase4c2c_assert_model_capture(model: &ForeignKeyModel, state: &RawCatalogCapture) {
+    assert_eq!(state.tables.len(), 3);
+    assert_eq!(state.indexes.len(), 4);
+    assert_eq!(state.constraints.len(), 4);
+    assert_eq!(
+        state.tables["P"].version, 3,
+        "one parent version bump per child CREATE, no DML bumps"
+    );
+    for table in ["P", "CI", "CS"] {
+        let mut rows: Vec<_> = state.tables[table].rows.values().cloned().collect();
+        rows.sort();
+        assert_eq!(rows, model.expected_rows(table), "raw rows for {table}");
+    }
+    for (index, table, columns) in [
+        ("PK_P", "P", vec![0]),
+        ("UQ_P", "P", vec![1]),
+        ("IX_CI", "CI", vec![1, 0]),
+        ("IX_CS", "CS", vec![0, 1]),
+    ] {
+        let expected: Vec<_> = columns
+            .iter()
+            .map(|&ordinal| state.tables[table].columns[ordinal])
+            .collect();
+        assert_eq!(state.indexes[index].columns, expected);
+    }
+    for (name, child, parent) in [("FK_I", "CI", "PK_P"), ("FK_S", "CS", "UQ_P")] {
+        let fk = &state.constraints[name];
+        assert_eq!(
+            (fk.kind, fk.table, fk.parent_table, fk.parent_constraint),
+            (
+                5,
+                state.tables[child].id,
+                state.tables["P"].id,
+                state.constraints[parent].id
+            )
+        );
+        assert_eq!(
+            fk.columns,
+            vec![state.tables[child].columns[1]],
+            "exact FK child ordinal"
+        );
+    }
+    assert_eq!(state.constraints["PK_P"].kind, 1);
+    assert_eq!(state.constraints["UQ_P"].kind, 2);
+    assert_complete_foreign_key_graph(state);
+}
+
+fn phase4c2c_operation(
+    model: &ForeignKeyModel,
+    rng: &mut Generator,
+    step: usize,
+) -> ForeignKeyOperation {
+    let indexed = rng.index(2) == 0;
+    let parent = model
+        .parents
+        .keys()
+        .nth(rng.index(model.parents.len().max(1)))
+        .copied()
+        .unwrap_or(0);
+    let child = model
+        .children(indexed)
+        .keys()
+        .nth(rng.index(model.children(indexed).len().max(1)))
+        .copied()
+        .unwrap_or(-1);
+    let fresh_child = step as i64;
+    let fresh_parent = 100 + step as i64;
+    let maybe_parent = match rng.index(4) {
+        0 => None,
+        1 => Some(-10_000),
+        _ => Some(parent),
+    };
+    match step % 40 {
+        0 => ForeignKeyOperation::Begin,
+        1 => ForeignKeyOperation::InsertParent(fresh_parent),
+        2 => ForeignKeyOperation::InsertChild {
+            indexed: true,
+            id: fresh_child,
+            parent: Some(100 + step as i64 - 1),
+        },
+        3 => ForeignKeyOperation::InsertChild {
+            indexed: false,
+            id: fresh_child,
+            parent: Some(100 + step as i64 - 2),
+        },
+        4 => ForeignKeyOperation::UpdateParent {
+            old: 100 + step as i64 - 3,
+            new: fresh_parent,
+        },
+        5 => ForeignKeyOperation::InsertChild {
+            indexed,
+            id: fresh_child,
+            parent: Some(-10_000),
+        },
+        6 => ForeignKeyOperation::Begin, // nested BEGIN is a recoverable Transaction error
+        7 => ForeignKeyOperation::InsertChild {
+            indexed,
+            id: fresh_child,
+            parent: None,
+        },
+        8 => match (step / 40) % 3 {
+            0 => ForeignKeyOperation::Commit,
+            1 => ForeignKeyOperation::Rollback,
+            _ => ForeignKeyOperation::Reopen,
+        },
+        9 => ForeignKeyOperation::Checkpoint,
+        10 => ForeignKeyOperation::Commit, // idle COMMIT must not silently succeed
+        11 => ForeignKeyOperation::Rollback,
+        12 => ForeignKeyOperation::Reopen,
+        _ => match rng.index(10) {
+            0 => ForeignKeyOperation::InsertParent(fresh_parent),
+            1 => ForeignKeyOperation::InsertParent(parent),
+            2 => ForeignKeyOperation::UpdateParent {
+                old: parent,
+                new: if rng.index(4) == 0 {
+                    parent
+                } else {
+                    fresh_parent
+                },
+            },
+            3 => ForeignKeyOperation::DeleteParent(parent),
+            4 | 5 => ForeignKeyOperation::InsertChild {
+                indexed,
+                id: fresh_child,
+                parent: maybe_parent,
+            },
+            6 | 7 => ForeignKeyOperation::UpdateChild {
+                indexed,
+                id: child,
+                parent: maybe_parent,
+            },
+            _ => ForeignKeyOperation::DeleteChild { indexed, id: child },
+        },
+    }
+}
+
+#[test]
+#[ignore = "deep fixed-seed cross-table FK model; dedicated Phase 4C2-C job"]
+fn phase_4c2c_fixed_seed_foreign_key_model() {
+    // Missing child validation, parent RESTRICT, statement rollback, reverse
+    // edges, any index update, or a spurious version bump must fail this model.
+    let mut model = ForeignKeyModel::default();
+    let mut database = ForeignKeyDatabase::new();
+    let mut rng = Generator::new(PHASE4C2C_SEED);
+    let mut coverage = BTreeMap::new();
+    let mut failures = BTreeMap::new();
+    let operation_count = PHASE4C2C_OPERATIONS;
+    eprintln!("phase4c2c FK model start: seed={PHASE4C2C_SEED:#x} operations={operation_count}");
+    for step in 0..operation_count {
+        let op = phase4c2c_operation(&model, &mut rng, step);
+        let before = database
+            .open
+            .as_mut()
+            .unwrap()
+            .1
+            .phase4c2c_capture_for_test();
+        let expected = model.apply(&op);
+        let actual = database.apply(&op);
+        assert_eq!(
+            actual, expected,
+            "seed={PHASE4C2C_SEED:#x} step={step} operation={op:?}"
+        );
+        if let Some(code) = actual.code {
+            *failures
+                .entry(format!("{code:?}:{:?}", actual.violation_name))
+                .or_insert(0) += 1;
+            assert_eq!(
+                database
+                    .open
+                    .as_mut()
+                    .unwrap()
+                    .1
+                    .phase4c2c_capture_for_test(),
+                before,
+                "failed statement mutated overlay"
+            );
+        }
+        database.assert_state(&model);
+        *coverage.entry(op.name()).or_insert(0) += 1;
+        if (step + 1) % 400 == 0 {
+            eprintln!("phase4c2c FK model progress: operations={}", step + 1);
+        }
+    }
+    assert_eq!(
+        operation_count, PHASE4C2C_OPERATIONS,
+        "incomplete FK model operation budget"
+    );
+    for required in [
+        "insert-parent",
+        "update-parent",
+        "delete-parent",
+        "insert-indexed-child",
+        "insert-scanned-child",
+        "update-indexed-child",
+        "update-scanned-child",
+        "delete-indexed-child",
+        "delete-scanned-child",
+        "begin",
+        "commit",
+        "rollback",
+        "reopen",
+        "checkpoint",
+    ] {
+        assert!(
+            coverage.get(required).copied().unwrap_or(0) > 0,
+            "missing {required}"
+        );
+    }
+    for name in ["PK_P", "FK_I", "FK_S"] {
+        assert!(
+            failures.keys().any(|key| key.contains(name)),
+            "missing violation {name}"
+        );
+    }
+    eprintln!(
+        "phase4c2c FK model: seed={PHASE4C2C_SEED:#x} operations={operation_count} operation_counts={coverage:?} errors={failures:?}; every step compares outcomes, transaction, visible/durable rows, all four indexes, raw graph and parent version"
+    );
+}
+
+#[test]
+#[ignore = "deep FK crash recovery matrix; dedicated Phase 4C2-C job"]
+fn phase_4c2c_foreign_key_crash_recovery_matrix() {
+    phase4c2c_run_crash_matrix();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Phase4c2cScenario {
+    CreateForeignKey,
+    InsertChild,
+    UpdateChild,
+    UpdateParentRestricted,
+    DeleteParentRestricted,
+    DropChild,
+}
+
+impl Phase4c2cScenario {
+    const ALL: [Self; 6] = [
+        Self::CreateForeignKey,
+        Self::InsertChild,
+        Self::UpdateChild,
+        Self::UpdateParentRestricted,
+        Self::DeleteParentRestricted,
+        Self::DropChild,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::CreateForeignKey => "create-fk",
+            Self::InsertChild => "insert-child",
+            Self::UpdateChild => "update-child",
+            Self::UpdateParentRestricted => "update-parent-restricted",
+            Self::DeleteParentRestricted => "delete-parent-restricted",
+            Self::DropChild => "drop-child",
+        }
+    }
+
+    fn restricted(self) -> bool {
+        matches!(
+            self,
+            Self::UpdateParentRestricted | Self::DeleteParentRestricted
+        )
+    }
+
+    fn sql(self) -> &'static [&'static str] {
+        match self {
+            // Two references to one parent must cause ONE schema-version bump.
+            Self::CreateForeignKey => &[
+                "CREATE TABLE EXTRA (ID INT64, PID INT64, CONSTRAINT FK_EXTRA FOREIGN KEY (PID) REFERENCES P (ID), CONSTRAINT FK_EXTRA_U FOREIGN KEY (PID) REFERENCES P (U))",
+            ],
+            // Same transaction changes both parent system indexes and both
+            // child indexes, so a cross-commit/missing-root mix cannot hide.
+            Self::InsertChild => &[
+                "BEGIN",
+                "INSERT INTO P VALUES (4, 4)",
+                "INSERT INTO CI VALUES (40, 4)",
+                "INSERT INTO CS VALUES (40, 4)",
+                "COMMIT",
+            ],
+            Self::UpdateChild => &[
+                "BEGIN",
+                "UPDATE CI SET PID = 3 WHERE ID = 10",
+                "UPDATE CS SET PID = 3 WHERE ID = 20",
+                "COMMIT",
+            ],
+            Self::UpdateParentRestricted => &[
+                "UPDATE P SET ID = 9, U = 9 WHERE ID = 1",
+                "UPDATE P SET ID = 9, U = 9 WHERE ID = 2",
+            ],
+            Self::DeleteParentRestricted => {
+                &["DELETE FROM P WHERE ID = 1", "DELETE FROM P WHERE ID = 2"]
+            }
+            Self::DropChild => &["DROP TABLE CI"],
+        }
+    }
+}
+
+struct ExpectedState {
+    capture: RawCatalogCapture,
+}
+
+#[test]
+fn phase4c2c_recovery_witness_rejects_partial_graphs_and_mixed_roots() {
+    // A weakened old-or-new/graph/index oracle must not accept any of these
+    // six independently torn witnesses, including the same-row mixed-root case.
+    let fixture = phase4c2c_fixture();
+    let old = ExpectedState {
+        capture: phase4c2c_recover(fixture.path()),
+    };
+    let pager = phase_4c2a_open_pager(fixture.path()).unwrap();
+    phase4c2c_run_scenario(&pager, Phase4c2cScenario::CreateForeignKey);
+    let new = ExpectedState {
+        capture: phase4c2c_raw_capture(&pager),
+    };
+    let edge = *new
+        .capture
+        .referenced_by
+        .iter()
+        .find(|(_, child)| *child == new.capture.constraints["FK_EXTRA"].id)
+        .unwrap();
+    let mut torn = Vec::new();
+    let mut missing_edge = new.capture.clone();
+    missing_edge.referenced_by.remove(&edge);
+    torn.push(("child-without-reverse-edge", missing_edge));
+    let mut missing_definition = new.capture.clone();
+    missing_definition.constraints.remove("FK_EXTRA");
+    torn.push(("edge-without-child", missing_definition));
+    let mut unbumped_parent = new.capture.clone();
+    unbumped_parent.tables.get_mut("P").unwrap().version = old.capture.tables["P"].version;
+    torn.push(("edge-without-parent-bump", unbumped_parent));
+    let mut bumped_parent = old.capture.clone();
+    bumped_parent.tables.get_mut("P").unwrap().version += 1;
+    torn.push(("bump-without-edge", bumped_parent));
+    let mut missing_entry = new.capture.clone();
+    assert!(
+        missing_entry
+            .indexes
+            .get_mut("IX_CI")
+            .unwrap()
+            .entries
+            .pop()
+            .is_some()
+    );
+    torn.push(("row-without-index-entry", missing_entry));
+    let mut mixed_roots = new.capture.clone();
+    // Same table rows are not enough: an unrelated old index root is invalid
+    // even when the accepted LSN, definitions and reverse graph look new.
+    mixed_roots.tables.get_mut("EXTRA").unwrap().root = old.capture.indexes["PK_P"].root;
+    torn.push(("mixed-commit-owned-root", mixed_roots));
+    for (label, state) in torn {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| assert_phase4c2c_recovery(
+                &state, &old, &new
+            )))
+            .is_err(),
+            "oracle accepted {label}"
+        );
+    }
+}
+
+fn assert_phase4c2c_recovery(actual: &RawCatalogCapture, old: &ExpectedState, new: &ExpectedState) {
+    assert!(
+        actual == &old.capture || actual == &new.capture,
+        "recovery is not the complete old or new commit: actual={actual:#?}\nold={:#?}\nnew={:#?}",
+        old.capture,
+        new.capture
+    );
+    assert_complete_foreign_key_graph(actual);
+    // A version is historical, not simply an edge count (DROP bumps too).
+    // Match versions AND reverse graph AND every root to the same accepted LSN.
+    let expected = if actual.lsn == new.capture.lsn {
+        &new.capture
+    } else {
+        &old.capture
+    };
+    assert_eq!(actual.tables["P"].version, expected.tables["P"].version);
+    assert_eq!(actual.referenced_by, expected.referenced_by);
+}
+
+fn phase4c2c_fixture() -> TempDatabase {
+    let mut database = ForeignKeyDatabase::new();
+    let (pager, connection) = database.open.as_mut().unwrap();
+    for sql in [
+        "INSERT INTO P VALUES (1, 1)",
+        "INSERT INTO P VALUES (2, 2)",
+        "INSERT INTO P VALUES (3, 3)",
+        "INSERT INTO CI VALUES (10, 1)",
+        "INSERT INTO CI VALUES (11, NULL)",
+        "INSERT INTO CS VALUES (20, 2)",
+        "INSERT INTO CS VALUES (21, NULL)",
+    ] {
+        let outcome = phase4c2c_execute(connection, sql);
+        assert!(outcome.code.is_none(), "fixture: {sql}: {outcome:?}");
+    }
+    phase_4c2a_checkpoint(pager).unwrap();
+    assert_complete_foreign_key_graph(&phase4c2c_raw_capture(pager));
+    drop(database.open.take());
+    database.temp
+}
+
+fn phase4c2c_run_scenario(pager: &Pager, scenario: Phase4c2cScenario) {
+    assert!(!scenario.restricted());
+    let mut connection = Connection::from_test_pager(pager.clone());
+    for sql in scenario.sql() {
+        let outcome = phase4c2c_execute(&mut connection, sql);
+        assert!(
+            outcome.code.is_none(),
+            "{}: {sql}: {outcome:?}",
+            scenario.name()
+        );
+    }
+}
+
+fn phase4c2c_recover(path: &Path) -> RawCatalogCapture {
+    let pager = phase_4c2a_open_pager(path).expect("open/recover FK crash file");
+    phase_4c2a_checkpoint(&pager).expect("checkpoint recovered FK file");
+    let state = phase4c2c_raw_capture(&pager);
+    assert_complete_foreign_key_graph(&state);
+    state
+}
+
+fn phase4c2c_assert_restricted(fixture: &TempDatabase, scenario: Phase4c2cScenario) -> usize {
+    // Windows database locks reject reads through a separate file handle.
+    // Compare bytes outside the pager lifetime; inspect the batch and hooks
+    // before closing it, so releasing the lock cannot hide a mutation.
+    let main_bytes = fs::read(fixture.path()).unwrap();
+    let wal_bytes = fs::read(fixture.path().with_extension("db-wal")).unwrap();
+    let (pager, faults) = phase_4c1_recording_crash_pager(fixture.path());
+    let _guard = phase4c2c_trace_catalog(None);
+    let mut connection = Connection::from_test_pager(pager.clone());
+    let old = phase4c2c_raw_capture(&pager);
+    for (position, (sql, constraint)) in scenario.sql().iter().zip(["FK_I", "FK_S"]).enumerate() {
+        assert_eq!(
+            phase4c2c_execute(&mut connection, "BEGIN"),
+            ConstraintStepOutcome::success(0)
+        );
+        let before = connection.phase4c2c_capture_for_test();
+        assert_eq!(
+            phase4c2c_execute(&mut connection, sql),
+            ConstraintStepOutcome::violation(constraint)
+        );
+        assert_eq!(connection.phase4c2c_capture_for_test(), before);
+        assert_eq!(
+            connection.begin_read().err().unwrap().code(),
+            ErrorCode::Transaction,
+            "failed statement must preserve the explicit transaction"
+        );
+        // A real table write, even with no matching row, must be preparable and
+        // executable: an unrestored catalog_update_pending gate would reject it.
+        assert_eq!(
+            phase4c2c_execute(&mut connection, "UPDATE P SET ID = ID WHERE ID = -9999"),
+            ConstraintStepOutcome::success(0)
+        );
+        assert_eq!(connection.phase4c2c_capture_for_test(), before);
+        assert_eq!(
+            phase4c2c_execute(&mut connection, "ROLLBACK"),
+            ConstraintStepOutcome::success(0)
+        );
+        assert_eq!(phase4c2c_raw_capture(&pager), old);
+
+        // Writer preparation opens the catalog lifecycle gate (pending=true),
+        // but does not mutate catalog records/pages. Capture the complete batch
+        // AFTER that preparation and BEFORE the parent precheck; no SQL restore
+        // wrapper can hide a mutation by the failing replace/delete operation.
+        let mut batch = pager.try_begin_write().unwrap();
+        let mut writer =
+            ConstrainedTableWrite::open(&mut batch, TableId::new(old.tables["P"].id).unwrap())
+                .unwrap();
+        let parent_id = position as i64 + 1;
+        let (&rowid, values) = old.tables["P"]
+            .rows
+            .iter()
+            .find(|(_, row)| row[0] == Some(parent_id))
+            .unwrap();
+        let values: Vec<_> = values
+            .iter()
+            .map(|value| value.map_or(Value::Null, Value::Int64))
+            .collect();
+        let rowid = RowId::new(rowid).unwrap();
+        let mut memory = super::WorkMemory::new(64 * 1024 * 1024).unwrap();
+        let result = assert_batch_unchanged_after(&mut batch, |batch| match scenario {
+            Phase4c2cScenario::UpdateParentRestricted => writer.replace(
+                batch,
+                rowid,
+                &values,
+                &[Value::Int64(9), Value::Int64(9)],
+                64 * 1024 * 1024,
+                &mut memory,
+                64 * 1024 * 1024,
+            ),
+            Phase4c2cScenario::DeleteParentRestricted => writer
+                .delete(batch, rowid, &values, 64 * 1024 * 1024)
+                .map(|_| ()),
+            _ => unreachable!("restricted scenario only"),
+        });
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains(constraint));
+        drop(writer);
+        batch.rollback().unwrap();
+    }
+    assert!(
+        faults.observed().is_empty(),
+        "restricted operation reached page/WAL/checkpoint I/O"
+    );
+    assert!(
+        phase4c2c_catalog_observed().is_empty(),
+        "restricted operation mutated a catalog record"
+    );
+    drop(connection);
+    drop(pager);
+    assert_eq!(fs::read(fixture.path()).unwrap(), main_bytes);
+    assert_eq!(
+        fs::read(fixture.path().with_extension("db-wal")).unwrap(),
+        wal_bytes
+    );
+    4 // public SQL + prepared-writer precheck for each child access strategy
+}
+
+#[test]
+fn phase4c2c_restricted_operations_leave_files_unchanged() {
+    let mut checks = 0;
+    for scenario in [
+        Phase4c2cScenario::UpdateParentRestricted,
+        Phase4c2cScenario::DeleteParentRestricted,
+    ] {
+        checks += phase4c2c_assert_restricted(&phase4c2c_fixture(), scenario);
+    }
+    assert_eq!(checks, 8);
+}
+
+fn phase4c2c_fault_family(
+    point: FaultPoint,
+    occurrence: usize,
+    records: &[Phase4c2aWalRecord],
+    old: &RawCatalogCapture,
+    new: &RawCatalogCapture,
+) -> String {
+    match point {
+        FaultPoint::BeforeWalRecordWrite
+        | FaultPoint::AfterWalRecordHeaderPrefixWrite
+        | FaultPoint::AfterWalRecordPayloadPrefixWrite
+        | FaultPoint::AfterWalRecordWrite => match records[occurrence - 1] {
+            Phase4c2aWalRecord::Commit => "wal-commit".into(),
+            Phase4c2aWalRecord::PageFrame(id) => {
+                let family = new
+                    .pages
+                    .get(&id)
+                    .or_else(|| old.pages.get(&id))
+                    .expect("every WAL frame belongs to a captured tree or freelist");
+                if family == "freelist" {
+                    "allocator-freelist".into()
+                } else if family == "catalog" {
+                    "catalog-page".into()
+                } else if family.starts_with("table:") {
+                    "table-page".into()
+                } else if family == "index:PK_P" {
+                    "parent-primary-index".into()
+                } else if family == "index:UQ_P" {
+                    "parent-unique-index".into()
+                } else {
+                    "child-index".into()
+                }
+            }
+        },
+        FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish => "memory-publish".into(),
+        FaultPoint::BeforeMainDirectorySync
+        | FaultPoint::AfterMainDirectorySync
+        | FaultPoint::BeforeWalDirectorySync
+        | FaultPoint::AfterWalDirectorySync => "directory-sync".into(),
+        FaultPoint::BeforeWalHeaderWrite
+        | FaultPoint::AfterWalHeaderWrite
+        | FaultPoint::BeforeWalSync
+        | FaultPoint::AfterWalSync
+        | FaultPoint::BeforeWalTruncate
+        | FaultPoint::AfterWalTruncate => "wal-sync-header-truncate".into(),
+        _ => "checkpoint".into(),
+    }
+}
+
+const PHASE4C2C_CRASH_CHILD: &str = "sql::exec::test_support::phase_4c2c_foreign_key_crash_child";
+
+fn phase4c2c_check_abort(output: &std::process::Output, marker: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("running 1 test"),
+        "child not selected: {stdout}"
+    );
+    assert!(
+        stderr.lines().any(|line| line == marker),
+        "wrong abort marker expected={marker}: {stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(6),
+            "expected SIGABRT: {stderr}"
+        );
+    }
+    #[cfg(windows)]
+    assert_eq!(
+        output.status.code(),
+        Some(-1_073_740_791),
+        "expected abort fast-fail: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "only launched by the FK matrix with validated owned paths and exact trace"]
+fn phase_4c2c_foreign_key_crash_child() {
+    let scenario = std::env::var("ORA_PHASE4C2C_SCENARIO").unwrap();
+    let scenario = Phase4c2cScenario::ALL
+        .into_iter()
+        .find(|s| s.name() == scenario)
+        .expect("valid crash scenario");
+    assert!(!scenario.restricted());
+    let path = phase_4c1_validate_crash_path(
+        PathBuf::from(std::env::var_os("ORA_PHASE4C2C_PATH").unwrap()),
+        Phase4c1CrashPathKind::Sql,
+    );
+    let target: usize = std::env::var("ORA_PHASE4C2C_OCCURRENCE")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(target > 0);
+    let kind = std::env::var("ORA_PHASE4C2C_KIND").unwrap();
+    if kind == "catalog" {
+        let trace: Vec<_> = std::env::var("ORA_PHASE4C2C_TRACE")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        assert!(target <= trace.len());
+        let _guard = phase4c2c_trace_catalog(Some((target, trace)));
+        let pager = phase_4c2a_open_pager(&path).unwrap();
+        phase4c2c_run_scenario(&pager, scenario);
+    } else {
+        assert_eq!(kind, "io");
+        let point = parse_sql_fault_point(&std::env::var("ORA_PHASE4C2C_POINT").unwrap()).unwrap();
+        let trace: Vec<_> = std::env::var("ORA_PHASE4C2C_TRACE")
+            .unwrap()
+            .split(',')
+            .map(|s| parse_sql_fault_point(s).unwrap())
+            .collect();
+        assert!(trace.iter().filter(|&&p| p == point).count() >= target);
+        let pager = phase_4c1_aborting_crash_pager(
+            &path,
+            trace,
+            point,
+            target,
+            format!("PHASE4C2C_ABORT {}", scenario.name()),
+        );
+        phase4c2c_run_scenario(&pager, scenario);
+        phase_4c2a_checkpoint(&pager).unwrap();
+    }
+    panic!("configured FK crash point was not reached");
+}
+
+fn phase4c2c_run_crash_matrix() {
+    let mut scenarios = 0;
+    let mut crashes = 0;
+    let mut restricted_checks = 0;
+    let mut families = BTreeMap::<String, usize>::new();
+    let mut hooks = BTreeMap::<String, usize>::new();
+    for scenario in Phase4c2cScenario::ALL {
+        let fixture = phase4c2c_fixture();
+        if scenario.restricted() {
+            restricted_checks += phase4c2c_assert_restricted(&fixture, scenario);
+            scenarios += 1;
+            continue;
+        }
+        let old = ExpectedState {
+            capture: phase4c2c_recover(fixture.path()),
+        };
+        let traced = phase_4c1_copy_crash_pair(fixture.path());
+        let (pager, faults) = phase_4c1_recording_crash_pager(traced.path());
+        let wal_start = fs::metadata(traced.path().with_extension("db-wal"))
+            .unwrap()
+            .len();
+        let catalog_guard = phase4c2c_trace_catalog(None);
+        phase4c2c_run_scenario(&pager, scenario);
+        let catalog_trace = phase4c2c_catalog_observed();
+        drop(catalog_guard);
+        let records = phase_4c2a_wal_records(traced.path(), wal_start).unwrap();
+        phase_4c2a_checkpoint(&pager).unwrap();
+        let trace = faults.observed();
+        let new = ExpectedState {
+            capture: phase4c2c_raw_capture(&pager),
+        };
+        assert_complete_foreign_key_graph(&new.capture);
+        assert_eq!(
+            new.capture.lsn,
+            old.capture.lsn.map(|lsn| lsn + 1),
+            "scenario publishes exactly one commit"
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|&&p| p == FaultPoint::AfterWalRecordWrite)
+                .count(),
+            records.len()
+        );
+        if matches!(
+            scenario,
+            Phase4c2cScenario::CreateForeignKey | Phase4c2cScenario::DropChild
+        ) {
+            assert!(!catalog_trace.is_empty(), "DDL must change catalog records");
+        }
+        match scenario {
+            Phase4c2cScenario::CreateForeignKey => {
+                assert!(new.capture.tables["EXTRA"].rows.is_empty());
+                for table in ["P", "CI", "CS"] {
+                    assert_eq!(
+                        new.capture.tables[table].rows,
+                        old.capture.tables[table].rows
+                    );
+                }
+                assert_eq!(
+                    new.capture.referenced_by.len(),
+                    old.capture.referenced_by.len() + 2
+                );
+                assert_eq!(
+                    new.capture.tables["P"].version,
+                    old.capture.tables["P"].version + 1
+                );
+            }
+            Phase4c2cScenario::DropChild => {
+                assert_eq!(
+                    new.capture.referenced_by.len() + 1,
+                    old.capture.referenced_by.len()
+                );
+                assert_eq!(
+                    new.capture.tables["P"].version,
+                    old.capture.tables["P"].version + 1
+                );
+                assert!(!new.capture.tables.contains_key("CI"));
+                assert!(!new.capture.indexes.contains_key("IX_CI"));
+                for table in ["P", "CS"] {
+                    assert_eq!(
+                        new.capture.tables[table].rows,
+                        old.capture.tables[table].rows
+                    );
+                }
+            }
+            Phase4c2cScenario::InsertChild => {
+                for (table, values) in [
+                    ("P", vec![Some(4), Some(4)]),
+                    ("CI", vec![Some(40), Some(4)]),
+                    ("CS", vec![Some(40), Some(4)]),
+                ] {
+                    let before = &old.capture.tables[table];
+                    let mut expected = before.rows.clone();
+                    assert!(expected.insert(before.next_rowid, values).is_none());
+                    assert_eq!(
+                        new.capture.tables[table].rows, expected,
+                        "exact INSERT post-state: {table}"
+                    );
+                    assert_eq!(new.capture.tables[table].next_rowid, before.next_rowid + 1);
+                }
+                assert_eq!(
+                    new.capture.tables["P"].version,
+                    old.capture.tables["P"].version
+                );
+            }
+            Phase4c2cScenario::UpdateChild => {
+                for (table, id) in [("CI", 10), ("CS", 20)] {
+                    let mut expected = old.capture.tables[table].rows.clone();
+                    for row in expected.values_mut().filter(|row| row[0] == Some(id)) {
+                        row[1] = Some(3);
+                    }
+                    assert_eq!(
+                        new.capture.tables[table].rows, expected,
+                        "exact UPDATE post-state: {table}"
+                    );
+                    assert_eq!(
+                        new.capture.tables[table].next_rowid,
+                        old.capture.tables[table].next_rowid
+                    );
+                }
+                assert_eq!(new.capture.tables["P"], old.capture.tables["P"]);
+            }
+            _ => unreachable!("restricted scenarios were handled without mutation"),
+        }
+        drop(pager);
+        let mut targeted = BTreeSet::new();
+        for (position, &point) in trace.iter().enumerate() {
+            let occurrence = trace[..=position].iter().filter(|&&p| p == point).count();
+            assert!(targeted.insert((format!("{point:?}"), occurrence)));
+            let family =
+                phase4c2c_fault_family(point, occurrence, &records, &old.capture, &new.capture);
+            let copy = phase_4c1_copy_crash_pair(fixture.path());
+            let path = fs::canonicalize(copy.path()).unwrap();
+            let output = phase_4c1_exact_crash_child_command(PHASE4C2C_CRASH_CHILD)
+                .env("ORA_PHASE4C2C_PATH", &path)
+                .env("ORA_PHASE4C2C_SCENARIO", scenario.name())
+                .env("ORA_PHASE4C2C_KIND", "io")
+                .env("ORA_PHASE4C2C_OCCURRENCE", occurrence.to_string())
+                .env("ORA_PHASE4C2C_POINT", format!("{point:?}"))
+                .env(
+                    "ORA_PHASE4C2C_TRACE",
+                    trace
+                        .iter()
+                        .map(|p| format!("{p:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+                .output()
+                .expect("reap FK I/O crash child");
+            phase4c2c_check_abort(
+                &output,
+                &format!("PHASE4C2C_ABORT {} {point:?} {occurrence}", scenario.name()),
+            );
+            let recovered = phase4c2c_recover(&path);
+            assert_phase4c2c_recovery(&recovered, &old, &new);
+            assert_eq!(
+                phase4c2c_recover(&path),
+                recovered,
+                "repeat recovery changed state"
+            );
+            phase_4c2a_remove_recovered_files(&path);
+            crashes += 1;
+            *families.entry(family).or_default() += 1;
+            *hooks.entry(format!("{point:?}")).or_default() += 1;
+        }
+        assert_eq!(
+            targeted.len(),
+            trace.len(),
+            "every observed I/O occurrence targeted"
+        );
+        for occurrence in 1..=catalog_trace.len() {
+            let copy = phase_4c1_copy_crash_pair(fixture.path());
+            let path = fs::canonicalize(copy.path()).unwrap();
+            let output = phase_4c1_exact_crash_child_command(PHASE4C2C_CRASH_CHILD)
+                .env("ORA_PHASE4C2C_PATH", &path)
+                .env("ORA_PHASE4C2C_SCENARIO", scenario.name())
+                .env("ORA_PHASE4C2C_KIND", "catalog")
+                .env("ORA_PHASE4C2C_OCCURRENCE", occurrence.to_string())
+                .env("ORA_PHASE4C2C_TRACE", catalog_trace.join(","))
+                .output()
+                .expect("reap FK catalog crash child");
+            phase4c2c_check_abort(&output, &format!("PHASE4C2C_CATALOG_ABORT {occurrence}"));
+            let recovered = phase4c2c_recover(&path);
+            assert_phase4c2c_recovery(&recovered, &old, &new);
+            assert_eq!(
+                recovered, old.capture,
+                "catalog crash happened before COMMIT"
+            );
+            assert_eq!(phase4c2c_recover(&path), recovered);
+            phase_4c2a_remove_recovered_files(&path);
+            crashes += 1;
+            *families
+                .entry(format!("catalog-record:{}", catalog_trace[occurrence - 1]))
+                .or_default() += 1;
+            *hooks.entry("CatalogRecord".into()).or_default() += 1;
+        }
+        scenarios += 1;
+        eprintln!(
+            "phase4c2c crash progress: scenario={} io_occurrences={} catalog_occurrences={} cumulative_crashes={crashes}",
+            scenario.name(),
+            trace.len(),
+            catalog_trace.len()
+        );
+    }
+    // Directory fsync is only on WAL initialization, not ordinary SQL commit.
+    // Supplemental evidence covers BOTH directory occurrences after the two
+    // headers exist. Initial WAL header-prefix recovery is a separate contract:
+    // a <128-byte WAL is currently rejected and is not an FK SQL mutation.
+    let fixture = phase4c2c_fixture();
+    let trace_copy = phase_4c1_copy_main_only(fixture.path());
+    let trace = phase_4c1_wal_initialization_trace(trace_copy.path());
+    let expected = ExpectedState {
+        capture: phase4c2c_recover(trace_copy.path()),
+    };
+    assert!(trace.contains(&FaultPoint::BeforeWalDirectorySync));
+    assert!(trace.contains(&FaultPoint::AfterWalDirectorySync));
+    let mut directory_targets = 0;
+    for (position, &point) in trace.iter().enumerate() {
+        if !matches!(
+            point,
+            FaultPoint::BeforeWalDirectorySync | FaultPoint::AfterWalDirectorySync
+        ) {
+            continue;
+        }
+        let occurrence = trace[..=position].iter().filter(|&&p| p == point).count();
+        let copy = phase_4c1_copy_main_only(fixture.path());
+        let path = fs::canonicalize(copy.path()).unwrap();
+        let output = phase_4c1_exact_crash_child_command(SQL_CRASH_CHILD)
+            .env(SQL_CRASH_PATH_ENV, &path)
+            .env(SQL_CRASH_PROGRAM_ENV, "initialize")
+            .env(SQL_CRASH_POINT_ENV, format!("{point:?}"))
+            .env(SQL_CRASH_OCCURRENCE_ENV, occurrence.to_string())
+            .env(
+                SQL_CRASH_TRACE_ENV,
+                trace
+                    .iter()
+                    .map(|p| format!("{p:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .output()
+            .expect("reap FK WAL initialization crash child");
+        phase4c2c_check_abort(
+            &output,
+            &format!("PHASE4C1_ABORT initialize {point:?} {occurrence}"),
+        );
+        let recovered = phase4c2c_recover(&path);
+        assert_phase4c2c_recovery(&recovered, &expected, &expected);
+        assert_eq!(phase4c2c_recover(&path), recovered);
+        phase_4c2a_remove_recovered_files(&path);
+        crashes += 1;
+        directory_targets += 1;
+        *families.entry("directory-sync".into()).or_default() += 1;
+        *hooks.entry(format!("{point:?}")).or_default() += 1;
+    }
+    assert_eq!(scenarios, 6);
+    assert_eq!(directory_targets, 2);
+    assert_eq!(restricted_checks, 8);
+    for required in [
+        "catalog-page",
+        "table-page",
+        "parent-primary-index",
+        "parent-unique-index",
+        "child-index",
+        "allocator-freelist",
+        "wal-commit",
+        "memory-publish",
+        "checkpoint",
+        "directory-sync",
+        "wal-sync-header-truncate",
+        "catalog-record:insert:34",
+        "catalog-record:delete:34",
+    ] {
+        assert!(
+            families.get(required).copied().unwrap_or(0) > 0,
+            "missing crash family {required}: {families:?}"
+        );
+    }
+    assert_eq!(crashes, hooks.values().sum::<usize>());
+    eprintln!(
+        "phase4c2c FK crash matrix: seed={PHASE4C2C_SEED:#x} model_operations={PHASE4C2C_OPERATIONS} scenarios={scenarios} restricted_zero_mutation_checks={restricted_checks} crashes={crashes} directory_supplement={directory_targets}/2 record_family_counts={families:?} hook_occurrence_counts={hooks:?}; every FK-scenario occurrence targeted, every recovery exactly old-or-new and repeat-stable; initial-WAL header-prefix recovery outside scope"
+    );
 }

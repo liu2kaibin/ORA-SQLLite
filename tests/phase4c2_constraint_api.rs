@@ -5,6 +5,31 @@ use ora_sqllite::{DataType, ErrorCode, Parameters, Value};
 
 use common::{assert_constraint, assert_no_table, collect, execute_sql};
 
+fn create_foreign_key_parent_and_child(connection: &mut ora_sqllite::Connection) {
+    execute_sql(
+        connection,
+        "CREATE TABLE P (
+            ID INT64 CONSTRAINT PK_P PRIMARY KEY,
+            NOTE TEXT
+        )",
+    );
+    execute_sql(
+        connection,
+        "CREATE TABLE C (
+            ID INT64 CONSTRAINT PK_C PRIMARY KEY,
+            P_ID INT64,
+            CONSTRAINT FK_C_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+        )",
+    );
+}
+
+fn database_file_bytes(files: &common::TempPaths) -> (Vec<u8>, Option<Vec<u8>>) {
+    (
+        std::fs::read(files.main()).expect("read database file"),
+        std::fs::read(files.wal()).ok(),
+    )
+}
+
 fn assert_unsupported_without_mutation(connection: &mut ora_sqllite::Connection, sql: &str) {
     match connection.prepare(sql) {
         Ok(statement) => {
@@ -57,6 +82,232 @@ fn legacy_format2_without_feature_opens_and_plain_crud_remains_byte_compatible()
         support::format2::catalog_record_families(files.main()).expect("scan legacy catalog bytes"),
         vec![0x00, 0x10, 0x11, 0x12, 0x13, 0x14]
     );
+}
+
+#[test]
+fn raw_foreign_key_catalog_capture_exposes_parent_and_reverse_edge() {
+    // Breaks caught: the independent byte witness silently skipping family
+    // 0x34, or decoding the child without its persisted parent identities.
+    let (files, database) = common::new_database("phase4c2c-raw-foreign-key");
+    let mut connection = database.connect().expect("connect raw FK fixture");
+    create_foreign_key_parent_and_child(&mut connection);
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture checkpointed FK catalog bytes");
+    let parent = &capture.tables["P"];
+    let child = &capture.tables["C"];
+    let parent_key = &capture.constraints["PK_P"];
+    let foreign_key = &capture.constraints["FK_C_P"];
+    assert_eq!(capture.feature_bits & 2, 2);
+    assert_eq!(foreign_key.table_id, child.id);
+    assert_eq!(foreign_key.kind, 5);
+    assert_eq!(foreign_key.parent_table_id, Some(parent.id));
+    assert_eq!(foreign_key.parent_constraint_id, Some(parent_key.id));
+    assert_eq!(
+        capture.referenced_by,
+        std::collections::BTreeMap::from([(parent_key.id, vec![foreign_key.id])])
+    );
+
+    let local = &capture.constraints["PK_C"];
+    assert_eq!(local.parent_table_id, None);
+    assert_eq!(local.parent_constraint_id, None);
+}
+
+#[test]
+fn raw_foreign_key_parser_keeps_local_constraint_graph_parentless() {
+    // Breaks caught: interpreting the reserved zero parent fields on a
+    // pre-FK local-constraint catalog as identities or synthesizing 0x34 edges.
+    let (files, database) = common::new_database("phase4c2b-raw-local-graph");
+    let mut connection = database.connect().expect("connect local graph fixture");
+    execute_sql(
+        &mut connection,
+        "CREATE TABLE T (
+            ID INT64 CONSTRAINT PK_T PRIMARY KEY,
+            EMAIL TEXT CONSTRAINT UQ_T UNIQUE,
+            SCORE INT64 CONSTRAINT NN_T NOT NULL,
+            CONSTRAINT CK_T CHECK (SCORE BETWEEN 0 AND 100)
+        )",
+    );
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture local-only constraint graph");
+    assert!(capture.referenced_by.is_empty());
+    assert!(capture.constraints.values().all(|constraint| {
+        constraint.parent_table_id.is_none() && constraint.parent_constraint_id.is_none()
+    }));
+}
+
+#[test]
+fn pre_constraint_format2_file_remains_writable_and_first_fk_uses_existing_feature_bit() {
+    // Breaks caught: requiring a migration before the first constrained DDL,
+    // allocating a second feature bit for FKs, or omitting the reverse edge.
+    let files = support::format2::legacy_catalog_fixture();
+    let before = support::format2::raw_catalog_capture(files.main())
+        .expect("capture pre-constraint format-2 file");
+    assert_eq!(before.feature_bits, 1);
+    assert!(before.constraints.is_empty());
+    assert!(before.referenced_by.is_empty());
+
+    let database = ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default())
+        .expect("open pre-constraint format-2 file for FK DDL");
+    let mut connection = database.connect().expect("connect legacy FK writer");
+    create_foreign_key_parent_and_child(&mut connection);
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture first FK in legacy file");
+    assert_eq!(capture.feature_bits, 3);
+    assert_eq!(capture.referenced_by.len(), 1);
+    assert_eq!(capture.constraints["FK_C_P"].kind, 5);
+}
+
+#[test]
+fn old_snapshot_keeps_old_cross_table_graph_and_roots() {
+    // Breaks caught: refreshing a held reader to the child CREATE's catalog
+    // root, or mixing the old parent relation root with the new FK graph.
+    let (files, database) = common::new_database("phase4c2c-snapshot-graph");
+    let mut seed = database.connect().expect("connect snapshot seed");
+    execute_sql(
+        &mut seed,
+        "CREATE TABLE P (ID INT64 CONSTRAINT PK_P PRIMARY KEY, NOTE TEXT)",
+    );
+    execute_sql(&mut seed, "INSERT INTO P VALUES (1, 'old')");
+    drop(seed);
+    drop(database);
+    checkpoint_file(files.main());
+    let old_capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture parent-only catalog root");
+    assert!(!old_capture.tables.contains_key("C"));
+    assert!(old_capture.referenced_by.is_empty());
+
+    let database = ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default())
+        .expect("open snapshot graph database");
+    let mut old_connection = database.connect().expect("connect old graph reader");
+    let mut old = old_connection
+        .begin_read()
+        .expect("begin old graph snapshot");
+    assert_eq!(
+        collect_read_transaction(&mut old, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("old".into())]]
+    );
+
+    let mut writer = database.connect().expect("connect graph writer");
+    execute_sql(
+        &mut writer,
+        "CREATE TABLE C (
+            ID INT64 CONSTRAINT PK_C PRIMARY KEY,
+            P_ID INT64,
+            CONSTRAINT FK_C_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+        )",
+    );
+    execute_sql(&mut writer, "INSERT INTO P VALUES (2, 'new')");
+    execute_sql(&mut writer, "INSERT INTO C VALUES (20, 2)");
+
+    assert_eq!(
+        collect_read_transaction(&mut old, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("old".into())]],
+        "held snapshot must retain the old parent relation root"
+    );
+    let error = old
+        .prepare("SELECT ID, P_ID FROM C")
+        .expect_err("held snapshot must not see the child catalog entry");
+    assert_eq!(error.code(), ErrorCode::Bind);
+
+    let mut fresh = database.connect().expect("connect fresh graph reader");
+    assert_eq!(
+        collect(&mut fresh, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![
+            vec![Value::Int64(1), Value::Text("old".into())],
+            vec![Value::Int64(2), Value::Text("new".into())],
+        ]
+    );
+    assert_eq!(
+        collect(&mut fresh, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(20), Value::Int64(2)]]
+    );
+    drop(fresh);
+    drop(writer);
+    drop(old);
+    drop(old_connection);
+    drop(database);
+
+    checkpoint_file(files.main());
+    let new_capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture complete cross-table graph");
+    assert_ne!(old_capture.accepted_lsn, new_capture.accepted_lsn);
+    assert_eq!(old_capture.tables["P"].root, new_capture.tables["P"].root);
+    assert_eq!(
+        new_capture.tables["P"].schema_version,
+        old_capture.tables["P"].schema_version + 1,
+        "publishing the incoming FK edge must bump the parent schema version"
+    );
+    let parent_key = &new_capture.constraints["PK_P"];
+    let foreign_key = &new_capture.constraints["FK_C_P"];
+    assert_eq!(
+        new_capture.referenced_by[&parent_key.id],
+        vec![foreign_key.id]
+    );
+    assert_eq!(
+        foreign_key.parent_table_id,
+        Some(new_capture.tables["P"].id)
+    );
+    assert_eq!(foreign_key.parent_constraint_id, Some(parent_key.id));
+}
+
+#[test]
+fn foreign_key_graph_survives_checkpoint_reopen_and_read_only_open_without_writes() {
+    // Breaks caught: losing either graph direction at checkpoint/recovery, or
+    // allowing a read-only open to rewrite/truncate the main/WAL pair.
+    let (files, database) = common::new_database("phase4c2c-reopen-graph");
+    let mut connection = database.connect().expect("connect reopen fixture");
+    create_foreign_key_parent_and_child(&mut connection);
+    execute_sql(&mut connection, "INSERT INTO P VALUES (1, 'parent')");
+    execute_sql(&mut connection, "INSERT INTO C VALUES (10, 1)");
+    drop(connection);
+    drop(database);
+    checkpoint_file(files.main());
+
+    let before_capture =
+        support::format2::raw_catalog_capture(files.main()).expect("capture checkpointed FK graph");
+    let database = common::reopen(&files);
+    let mut connection = database.connect().expect("connect reopened FK graph");
+    assert_constraint(&mut connection, "INSERT INTO C VALUES (11, 99)", "FK_C_P");
+    assert_constraint(&mut connection, "DELETE FROM P WHERE ID = 1", "FK_C_P");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(1)]]
+    );
+    drop(connection);
+    drop(database);
+
+    let before_read_only = database_file_bytes(&files);
+    let read_only =
+        ora_sqllite::Database::open(files.main(), ora_sqllite::Options::default().read_only())
+            .expect("open FK graph read-only");
+    let mut connection = read_only.connect().expect("connect read-only FK graph");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("parent".into())]]
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(1)]]
+    );
+    drop(connection);
+    drop(read_only);
+    assert_eq!(database_file_bytes(&files), before_read_only);
+
+    let after_capture =
+        support::format2::raw_catalog_capture(files.main()).expect("re-capture read-only FK graph");
+    assert_eq!(after_capture, before_capture);
 }
 
 fn collect_read_transaction(
@@ -912,10 +1163,6 @@ fn unsupported_constraint_and_phase5_forms_leave_catalog_unchanged() {
     );
     for (sql, absent) in [
         (
-            "CREATE TABLE FOREIGN_KEY (ID INT64, PARENT_ID INT64, CONSTRAINT FK FOREIGN KEY (PARENT_ID) REFERENCES PARENT (ID))",
-            "FOREIGN_KEY",
-        ),
-        (
             "CREATE TABLE SELF_REF (ID INT64 PRIMARY KEY, PARENT_ID INT64 REFERENCES SELF_REF (ID))",
             "SELF_REF",
         ),
@@ -957,4 +1204,330 @@ fn unsupported_constraint_and_phase5_forms_leave_catalog_unchanged() {
         collect(&mut connection, "SELECT ID FROM PARENT"),
         Vec::<Vec<Value>>::new()
     );
+}
+
+#[test]
+fn foreign_keys_observe_current_write_batch_for_parent_and_child_changes() {
+    // Breaks caught: FK probes opening an older snapshot instead of the SQL
+    // transaction's current WriteBatch, or a failed statement poisoning that
+    // transaction rather than restoring only its statement checkpoint.
+    let (_files, database) = common::new_database("phase4c2c-current-write-batch");
+    let mut connection = database.connect().unwrap();
+    create_foreign_key_parent_and_child(&mut connection);
+
+    execute_sql(&mut connection, "BEGIN");
+    execute_sql(&mut connection, "INSERT INTO P VALUES (1, 'phase-a')");
+    execute_sql(&mut connection, "INSERT INTO C VALUES (10, 1)");
+    assert_constraint(&mut connection, "DELETE FROM P WHERE ID = 1", "FK_C_P");
+    execute_sql(&mut connection, "INSERT INTO P VALUES (2, 'after-error')");
+    execute_sql(&mut connection, "ROLLBACK");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID FROM P ORDER BY ID"),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        Vec::<Vec<Value>>::new()
+    );
+
+    execute_sql(&mut connection, "BEGIN");
+    execute_sql(&mut connection, "INSERT INTO P VALUES (1, 'committed')");
+    execute_sql(&mut connection, "INSERT INTO C VALUES (10, 1)");
+    execute_sql(&mut connection, "COMMIT");
+
+    execute_sql(&mut connection, "BEGIN");
+    execute_sql(&mut connection, "DELETE FROM C WHERE ID = 10");
+    execute_sql(&mut connection, "DELETE FROM P WHERE ID = 1");
+    execute_sql(&mut connection, "INSERT INTO P VALUES (2, 'retry-usable')");
+    execute_sql(&mut connection, "ROLLBACK");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, NOTE FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1), Value::Text("committed".into())]]
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn named_foreign_key_errors_restore_only_the_failing_statement() {
+    // Breaks caught: unstable diagnostics for any of the four immediate FK
+    // paths, loss of prior transaction work, or inability to continue/commit.
+    let (_files, database) = common::new_database("phase4c2c-named-statement-rollback");
+    let mut connection = database.connect().unwrap();
+    create_foreign_key_parent_and_child(&mut connection);
+
+    execute_sql(&mut connection, "BEGIN");
+    execute_sql(&mut connection, "INSERT INTO P VALUES (1, 'first')");
+    execute_sql(&mut connection, "INSERT INTO P VALUES (2, 'second')");
+    assert_constraint(&mut connection, "INSERT INTO C VALUES (99, 99)", "FK_C_P");
+    execute_sql(&mut connection, "INSERT INTO C VALUES (10, 1)");
+    assert_constraint(
+        &mut connection,
+        "UPDATE C SET P_ID = 99 WHERE ID = 10",
+        "FK_C_P",
+    );
+    assert_constraint(
+        &mut connection,
+        "UPDATE P SET ID = 3 WHERE ID = 1",
+        "FK_C_P",
+    );
+    assert_constraint(&mut connection, "DELETE FROM P WHERE ID = 1", "FK_C_P");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(1)]]
+    );
+
+    execute_sql(&mut connection, "UPDATE C SET P_ID = 2 WHERE ID = 10");
+    execute_sql(&mut connection, "DELETE FROM P WHERE ID = 1");
+    execute_sql(&mut connection, "COMMIT");
+    assert_eq!(
+        collect(&mut connection, "SELECT ID FROM P ORDER BY ID"),
+        vec![vec![Value::Int64(2)]]
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID, P_ID FROM C ORDER BY ID"),
+        vec![vec![Value::Int64(10), Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn prepared_foreign_key_create_and_parent_dml_recheck_stable_identities() {
+    // Breaks caught: rebinding a prepared FK CREATE by table/column name,
+    // retaining parent DML across a changed reverse-FK graph, or treating
+    // ordinary row/index-root changes as schema changes.
+    let (_files, database) = common::new_database("phase4c2c-prepared-identities");
+    let mut prepared_connection = database.connect().unwrap();
+    let mut schema_connection = database.connect().unwrap();
+    execute_sql(
+        &mut schema_connection,
+        "CREATE TABLE P (ID INT64 CONSTRAINT PK_P PRIMARY KEY, NOTE TEXT)",
+    );
+
+    let version_stale = prepared_connection
+        .prepare(
+            "CREATE TABLE C_VERSION (
+                P_ID INT64,
+                CONSTRAINT FK_C_VERSION_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+            )",
+        )
+        .unwrap();
+    execute_sql(&mut schema_connection, "CREATE INDEX IX_P_NOTE ON P (NOTE)");
+    let error = prepared_connection
+        .execute(&version_stale, Parameters::none())
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::SchemaChanged);
+    assert_no_table(&mut prepared_connection, "C_VERSION");
+    execute_sql(&mut schema_connection, "DROP INDEX IX_P_NOTE");
+
+    let identity_stale = prepared_connection
+        .prepare(
+            "CREATE TABLE C_IDENTITY (
+                P_ID INT64,
+                CONSTRAINT FK_C_IDENTITY_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+            )",
+        )
+        .unwrap();
+    execute_sql(&mut schema_connection, "DROP TABLE P");
+    execute_sql(
+        &mut schema_connection,
+        "CREATE TABLE P (ID INT64 CONSTRAINT PK_P PRIMARY KEY, NOTE TEXT)",
+    );
+    let error = prepared_connection
+        .execute(&identity_stale, Parameters::none())
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::SchemaChanged);
+    assert_no_table(&mut prepared_connection, "C_IDENTITY");
+
+    let update_before_add = prepared_connection
+        .prepare("UPDATE P SET NOTE = :1 WHERE ID = :2")
+        .unwrap();
+    let delete_before_add = prepared_connection
+        .prepare("DELETE FROM P WHERE ID = :1")
+        .unwrap();
+    execute_sql(
+        &mut schema_connection,
+        "CREATE TABLE C_GRAPH (
+            ID INT64 CONSTRAINT PK_C_GRAPH PRIMARY KEY,
+            P_ID INT64,
+            CONSTRAINT FK_C_GRAPH_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+        )",
+    );
+    let update_values = [Value::Text("stale".into()).into(), Value::Int64(1).into()];
+    assert_eq!(
+        prepared_connection
+            .execute(&update_before_add, Parameters::positional(&update_values))
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+    let delete_values = [Value::Int64(1).into()];
+    assert_eq!(
+        prepared_connection
+            .execute(&delete_before_add, Parameters::positional(&delete_values))
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+
+    let update_before_remove = prepared_connection
+        .prepare("UPDATE P SET NOTE = :1 WHERE ID = :2")
+        .unwrap();
+    let delete_before_remove = prepared_connection
+        .prepare("DELETE FROM P WHERE ID = :1")
+        .unwrap();
+    execute_sql(&mut schema_connection, "DROP TABLE C_GRAPH");
+    assert_eq!(
+        prepared_connection
+            .execute(
+                &update_before_remove,
+                Parameters::positional(&update_values),
+            )
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+    assert_eq!(
+        prepared_connection
+            .execute(
+                &delete_before_remove,
+                Parameters::positional(&delete_values),
+            )
+            .unwrap_err()
+            .code(),
+        ErrorCode::SchemaChanged
+    );
+
+    execute_sql(
+        &mut schema_connection,
+        "CREATE TABLE C_ACTIVE (
+            ID INT64,
+            P_ID INT64,
+            PAYLOAD TEXT,
+            CONSTRAINT FK_C_ACTIVE_P FOREIGN KEY (P_ID) REFERENCES P (ID)
+        )",
+    );
+    let update_after_graph = prepared_connection
+        .prepare("UPDATE P SET NOTE = :1 WHERE ID = :2")
+        .unwrap();
+    let delete_after_graph = prepared_connection
+        .prepare("DELETE FROM P WHERE ID = :1")
+        .unwrap();
+    let insert = prepared_connection
+        .prepare("INSERT INTO P VALUES (:1, :2)")
+        .unwrap();
+    for id in 1..=160 {
+        let values = [
+            Value::Int64(id).into(),
+            Value::Text(format!("root-split-{id:03}-{}", "x".repeat(96))).into(),
+        ];
+        prepared_connection
+            .execute(&insert, Parameters::positional(&values))
+            .unwrap();
+    }
+    let child_insert = prepared_connection
+        .prepare("INSERT INTO C_ACTIVE VALUES (:1, :2, :3)")
+        .unwrap();
+    for id in 1..=160 {
+        let values = [
+            Value::Int64(id).into(),
+            Value::Null.into(),
+            Value::Text(format!("child-root-split-{id:03}-{}", "y".repeat(96))).into(),
+        ];
+        prepared_connection
+            .execute(&child_insert, Parameters::positional(&values))
+            .unwrap();
+    }
+    let update_values = [
+        Value::Text("after-root-split".into()).into(),
+        Value::Int64(159).into(),
+    ];
+    assert_eq!(
+        prepared_connection
+            .execute(&update_after_graph, Parameters::positional(&update_values))
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    let delete_values = [Value::Int64(160).into()];
+    assert_eq!(
+        prepared_connection
+            .execute(&delete_after_graph, Parameters::positional(&delete_values))
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        collect(
+            &mut prepared_connection,
+            "SELECT NOTE FROM P WHERE ID = 159"
+        ),
+        vec![vec![Value::Text("after-root-split".into())]]
+    );
+    assert!(collect(&mut prepared_connection, "SELECT ID FROM P WHERE ID = 160").is_empty());
+}
+
+#[test]
+fn unsupported_foreign_key_forms_leave_catalog_and_allocator_unchanged() {
+    // Breaks caught: parsing/binding future syntax only after a CREATE/DROP has
+    // allocated catalog identities or published bytes to either database file.
+    let (files, database) = common::new_database("phase4c2c-unsupported-foreign-key");
+    let mut connection = database.connect().unwrap();
+    execute_sql(
+        &mut connection,
+        "CREATE TABLE P (ID INT64 CONSTRAINT PK_P PRIMARY KEY)",
+    );
+    drop(connection);
+    drop(database);
+
+    for (sql, absent) in [
+        (
+            "CREATE TABLE SELF_REF (ID INT64 PRIMARY KEY, P_ID INT64 REFERENCES SELF_REF (ID))",
+            Some("SELF_REF"),
+        ),
+        (
+            "CREATE TABLE DELETE_ACTION (P_ID INT64 REFERENCES P (ID) ON DELETE CASCADE)",
+            Some("DELETE_ACTION"),
+        ),
+        (
+            "CREATE TABLE UPDATE_ACTION (P_ID INT64 REFERENCES P (ID) ON UPDATE SET NULL)",
+            Some("UPDATE_ACTION"),
+        ),
+        (
+            "CREATE TABLE DEFERRED_FK (P_ID INT64 REFERENCES P (ID) DEFERRABLE)",
+            Some("DEFERRED_FK"),
+        ),
+        ("DROP TABLE P CASCADE CONSTRAINTS", None),
+    ] {
+        let before = database_file_bytes(&files);
+        let database = common::reopen(&files);
+        let mut connection = database.connect().unwrap();
+        assert_unsupported_without_mutation(&mut connection, sql);
+        if let Some(table) = absent {
+            assert_no_table(&mut connection, table);
+        }
+        assert_eq!(
+            collect(&mut connection, "SELECT ID FROM P"),
+            Vec::<Vec<Value>>::new()
+        );
+        drop(connection);
+        drop(database);
+        assert_eq!(database_file_bytes(&files), before, "{sql}");
+    }
+
+    // If any rejected form consumed an allocator identity, this raw checkpoint
+    // exposes the gap before a later successful CREATE can hide it.
+    checkpoint_file(files.main());
+    let capture = support::format2::raw_catalog_capture(files.main())
+        .expect("capture unsupported-form catalog");
+    assert_eq!(
+        capture.tables.keys().collect::<Vec<_>>(),
+        vec![&"P".to_owned()]
+    );
+    assert_eq!(capture.next_object_id, 5);
 }
