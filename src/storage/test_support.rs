@@ -43,6 +43,388 @@ use super::{
 static NEXT_TEMP_DATABASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_QUERY_DATABASE_UUID: AtomicU8 = AtomicU8::new(1);
 
+// Phase 4C2-C's deliberately narrow INT64 fixture witness. The B+Tree page
+// reader is shared with storage, but catalog envelopes, FK edges, row layouts
+// and physical index keys are decoded here, NOT by CatalogReader/RowCodec/
+// IndexKeyCodec. Offsets follow tests/support/format2.rs (Task 9). This also
+// works on a private WriteBatch, which the checkpointed-file witness cannot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawCatalogCapture {
+    pub(crate) lsn: Option<u64>,
+    pub(crate) feature_bits: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) page_count: u64,
+    pub(crate) freelist: Vec<Phase4c2aFreelistTrunk>,
+    pub(crate) records: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) tables: BTreeMap<String, Phase4c2cRawTable>,
+    pub(crate) indexes: BTreeMap<String, Phase4c2cRawIndex>,
+    pub(crate) constraints: BTreeMap<String, Phase4c2cRawConstraint>,
+    pub(crate) referenced_by: BTreeSet<(u64, u64)>,
+    pub(crate) table_constraints: BTreeSet<(u64, u64)>,
+    pub(crate) pages: BTreeMap<u64, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Phase4c2cRawTable {
+    pub(crate) id: u64,
+    pub(crate) version: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) next_rowid: u64,
+    pub(crate) columns: Vec<u64>,
+    pub(crate) rows: BTreeMap<u64, Vec<Option<i64>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Phase4c2cRawIndex {
+    pub(crate) id: u64,
+    pub(crate) table: u64,
+    pub(crate) root: Phase4c2aPageRef,
+    pub(crate) owner: u64,
+    pub(crate) unique: bool,
+    pub(crate) columns: Vec<u64>,
+    pub(crate) entries: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Phase4c2cRawConstraint {
+    pub(crate) id: u64,
+    pub(crate) table: u64,
+    pub(crate) kind: u8,
+    pub(crate) index: u64,
+    pub(crate) parent_table: u64,
+    pub(crate) parent_constraint: u64,
+    pub(crate) columns: Vec<u64>,
+}
+
+fn phase4c2c_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("raw u64"))
+}
+
+fn phase4c2c_be(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().expect("raw BE u64"))
+}
+
+fn phase4c2c_u16(bytes: &[u8], offset: usize) -> usize {
+    usize::from(u16::from_le_bytes(
+        bytes[offset..offset + 2].try_into().unwrap(),
+    ))
+}
+
+fn phase4c2c_u32(bytes: &[u8], offset: usize) -> usize {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+}
+
+fn phase4c2c_payload(value: &[u8], family: u8) -> &[u8] {
+    assert!(value.len() >= 8, "raw envelope is truncated");
+    assert_eq!(&value[..4], &[family, 1, 0, 0]);
+    let length = if family == 0x34 {
+        u32::from_be_bytes(value[4..8].try_into().unwrap()) as usize
+    } else {
+        phase4c2c_u32(value, 4)
+    };
+    assert_eq!(value.len(), 8 + length, "raw envelope length");
+    &value[8..]
+}
+
+fn phase4c2c_name(payload: &[u8], length_offset: usize, start: usize) -> String {
+    let len = phase4c2c_u16(payload, length_offset);
+    assert_eq!(start + len, payload.len());
+    String::from_utf8(payload[start..].to_vec()).expect("raw catalog name UTF-8")
+}
+
+pub(crate) fn phase4c2c_raw_capture(pager: &Pager) -> RawCatalogCapture {
+    let mut snapshot = pager.begin_read().expect("raw snapshot");
+    let tree = snapshot.catalog_tree(TreeKind::Table).unwrap().unwrap();
+    let features = snapshot.feature_bits();
+    let lsn = snapshot.lsn().0;
+    phase4c2c_raw_source(&mut snapshot, tree, features, Some(lsn))
+}
+
+pub(crate) fn phase4c2c_raw_batch_capture(batch: &mut WriteBatch) -> RawCatalogCapture {
+    let (tree, _) = batch
+        .catalog_tree_with_report(TreeKind::Table)
+        .unwrap()
+        .unwrap();
+    phase4c2c_raw_source(batch, tree, batch.feature_bits(), None)
+}
+
+fn phase4c2c_raw_source(
+    source: &mut impl PageSource,
+    catalog: BTree,
+    feature_bits: u64,
+    lsn: Option<u64>,
+) -> RawCatalogCapture {
+    let records: BTreeMap<_, _> = collect_all(&catalog, source).unwrap().into_iter().collect();
+    let mut state = RawCatalogCapture {
+        lsn,
+        feature_bits,
+        root: catalog.root().into(),
+        page_count: source.page_count().unwrap(),
+        freelist: Vec::new(),
+        records,
+        tables: BTreeMap::new(),
+        indexes: BTreeMap::new(),
+        constraints: BTreeMap::new(),
+        referenced_by: BTreeSet::new(),
+        table_constraints: BTreeSet::new(),
+        pages: BTreeMap::new(),
+    };
+    for page in validate_tree(source, &catalog).unwrap().all_live_pages() {
+        assert!(state.pages.insert(page.0, "catalog".into()).is_none());
+    }
+    let ordered_ids = |family, id| -> Vec<u64> {
+        let mappings: Vec<_> = state
+            .records
+            .iter()
+            .filter(|(k, _)| k.len() == 11 && k[0] == family && phase4c2c_be(k, 1) == id)
+            .collect();
+        mappings
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (key, value))| {
+                assert_eq!(
+                    u16::from_be_bytes(key[9..11].try_into().unwrap()) as usize,
+                    ordinal
+                );
+                phase4c2c_u64(phase4c2c_payload(value, family), 0)
+            })
+            .collect()
+    };
+    for (key, value) in &state.records {
+        let family = key[0];
+        let payload = phase4c2c_payload(value, family);
+        match family {
+            0x11 => {
+                assert_eq!(key.len(), 9);
+                let id = phase4c2c_u64(payload, 0);
+                assert_eq!(id, phase4c2c_be(key, 1));
+                state.tables.insert(
+                    phase4c2c_name(payload, 42, 44),
+                    Phase4c2cRawTable {
+                        id,
+                        version: phase4c2c_u64(payload, 8),
+                        root: Phase4c2aPageRef {
+                            page_id: phase4c2c_u64(payload, 16),
+                            generation: phase4c2c_u64(payload, 24),
+                        },
+                        next_rowid: phase4c2c_u64(payload, 32),
+                        columns: ordered_ids(0x13, id),
+                        rows: BTreeMap::new(),
+                    },
+                );
+            }
+            0x21 => {
+                assert_eq!(key.len(), 9);
+                let id = phase4c2c_u64(payload, 0);
+                assert_eq!(id, phase4c2c_be(key, 1));
+                state.indexes.insert(
+                    phase4c2c_name(payload, 46, 48),
+                    Phase4c2cRawIndex {
+                        id,
+                        table: phase4c2c_u64(payload, 8),
+                        root: Phase4c2aPageRef {
+                            page_id: phase4c2c_u64(payload, 16),
+                            generation: phase4c2c_u64(payload, 24),
+                        },
+                        unique: payload[34] == 1,
+                        owner: phase4c2c_u64(payload, 38),
+                        columns: ordered_ids(0x23, id),
+                        entries: Vec::new(),
+                    },
+                );
+                assert!(payload[34] <= 1);
+                assert_eq!(payload[35] == 1, phase4c2c_u64(payload, 38) != 0);
+            }
+            0x31 => {
+                assert_eq!(key.len(), 9);
+                let id = phase4c2c_u64(payload, 0);
+                assert_eq!(id, phase4c2c_be(key, 1));
+                assert_eq!(
+                    phase4c2c_u32(payload, 48),
+                    0,
+                    "fixture has no CHECK programs"
+                );
+                state.constraints.insert(
+                    phase4c2c_name(payload, 52, 56),
+                    Phase4c2cRawConstraint {
+                        id,
+                        table: phase4c2c_u64(payload, 8),
+                        kind: payload[16],
+                        index: phase4c2c_u64(payload, 20),
+                        parent_table: phase4c2c_be(payload, 28),
+                        parent_constraint: phase4c2c_be(payload, 36),
+                        columns: ordered_ids(0x33, id),
+                    },
+                );
+            }
+            0x32 | 0x34 => {
+                assert_eq!(key.len(), 17);
+                let pair = (phase4c2c_be(key, 1), phase4c2c_be(key, 9));
+                assert_eq!(payload.len(), 8);
+                assert_eq!(
+                    pair.1,
+                    if family == 0x34 {
+                        phase4c2c_be(payload, 0)
+                    } else {
+                        phase4c2c_u64(payload, 0)
+                    }
+                );
+                if family == 0x34 {
+                    state.referenced_by.insert(pair);
+                } else {
+                    state.table_constraints.insert(pair);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, table) in &mut state.tables {
+        let root = PageRef::new(PageId(table.root.page_id), table.root.generation).unwrap();
+        let tree = BTree::from_root(TreeKind::Table, root);
+        for page in validate_tree(source, &tree).unwrap().all_live_pages() {
+            assert!(
+                state
+                    .pages
+                    .insert(page.0, format!("table:{name}"))
+                    .is_none()
+            );
+        }
+        for (key, bytes) in collect_all(&tree, source).unwrap() {
+            assert_eq!(key.len(), 8);
+            assert_eq!(&bytes[..8], b"OROW\x01\0\0\0");
+            assert!((1..=table.version).contains(&phase4c2c_u64(&bytes, 8)));
+            let count = phase4c2c_u16(&bytes, 16);
+            let bitmap = phase4c2c_u16(&bytes, 18);
+            assert_eq!(count, table.columns.len());
+            assert_eq!(bitmap, count.div_ceil(8));
+            assert_eq!(phase4c2c_u32(&bytes, 20), count * 8);
+            let data = 32 + bitmap + count * 8;
+            assert_eq!(bytes.len(), data + phase4c2c_u32(&bytes, 24));
+            let values = (0..count)
+                .map(|column| {
+                    let directory = 32 + bitmap + column * 8;
+                    let offset = phase4c2c_u32(&bytes, directory);
+                    let len = phase4c2c_u32(&bytes, directory + 4);
+                    if bytes[32 + column / 8] & (1 << (column % 8)) != 0 {
+                        assert_eq!((offset, len), (0, 0));
+                        None
+                    } else {
+                        assert_eq!(len, 8, "this witness accepts only fixture INT64 rows");
+                        Some(phase4c2c_u64(&bytes, data + offset) as i64)
+                    }
+                })
+                .collect();
+            assert!(table.rows.insert(phase4c2c_be(&key, 0), values).is_none());
+        }
+    }
+    for (name, index) in &mut state.indexes {
+        let root = PageRef::new(PageId(index.root.page_id), index.root.generation).unwrap();
+        let tree = BTree::from_root(TreeKind::Index, root);
+        for page in validate_tree(source, &tree).unwrap().all_live_pages() {
+            assert!(
+                state
+                    .pages
+                    .insert(page.0, format!("index:{name}"))
+                    .is_none()
+            );
+        }
+        index.entries = collect_all(&tree, source)
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| {
+                assert!(value.is_empty());
+                key
+            })
+            .collect();
+    }
+    let mut next = source.freelist_root().unwrap().0;
+    while next != 0 {
+        assert!(state.pages.insert(next, "freelist".into()).is_none());
+        let frame = source.read_page_by_id(PageId(next)).unwrap();
+        let trunk = Freelist::decode(&frame).unwrap();
+        state.freelist.push(Phase4c2aFreelistTrunk {
+            reference: Phase4c2aPageRef {
+                page_id: next,
+                generation: frame.header().generation(),
+            },
+            leaves: trunk.leaves().iter().map(|page| page.0).collect(),
+        });
+        next = trunk.next().map_or(0, |reference| reference.page_id().0);
+    }
+    let mut free_leaves = BTreeSet::new();
+    for trunk in &state.freelist {
+        for &page in &trunk.leaves {
+            assert!(
+                page > 0 && page < state.page_count,
+                "free leaf outside accepted extent"
+            );
+            assert!(
+                !state.pages.contains_key(&page),
+                "freelist overlaps a live tree or trunk"
+            );
+            assert!(free_leaves.insert(page), "duplicate free leaf");
+        }
+    }
+    state
+}
+
+#[derive(Default)]
+struct Phase4c2cCatalogTrace {
+    observed: Vec<String>,
+    abort_at: Option<(usize, Vec<String>)>,
+}
+
+thread_local! {
+    static PHASE4C2C_CATALOG_TRACE: std::cell::RefCell<Option<Phase4c2cCatalogTrace>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct Phase4c2cCatalogTraceGuard;
+
+impl Drop for Phase4c2cCatalogTraceGuard {
+    fn drop(&mut self) {
+        PHASE4C2C_CATALOG_TRACE.with(|trace| *trace.borrow_mut() = None);
+    }
+}
+
+pub(crate) fn phase4c2c_trace_catalog(
+    abort_at: Option<(usize, Vec<String>)>,
+) -> Phase4c2cCatalogTraceGuard {
+    PHASE4C2C_CATALOG_TRACE.with(|trace| {
+        assert!(trace.borrow().is_none(), "catalog traces must not nest");
+        *trace.borrow_mut() = Some(Phase4c2cCatalogTrace {
+            observed: Vec::new(),
+            abort_at,
+        });
+    });
+    Phase4c2cCatalogTraceGuard
+}
+
+pub(crate) fn phase4c2c_catalog_observed() -> Vec<String> {
+    PHASE4C2C_CATALOG_TRACE.with(|trace| trace.borrow().as_ref().unwrap().observed.clone())
+}
+
+pub(crate) fn phase4c2c_catalog_record(family: u8, action: &str) {
+    PHASE4C2C_CATALOG_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(trace) = trace.as_mut() else {
+            return;
+        };
+        trace.observed.push(format!("{action}:{family:02x}"));
+        if let Some((target, expected)) = &trace.abort_at {
+            let count = trace.observed.len();
+            assert_eq!(
+                trace.observed,
+                expected[..count],
+                "catalog trace diverged before abort"
+            );
+            if count == *target {
+                eprintln!("PHASE4C2C_CATALOG_ABORT {count}");
+                std::process::abort();
+            }
+        }
+    });
+}
+
 pub(crate) struct TempDatabase {
     path: PathBuf,
 }

@@ -65,6 +65,23 @@ impl Connection {
         )
     }
 
+    /// Read-only test witness of the SQL transaction's private page overlay.
+    /// No batch escapes this method and no production API is added.
+    #[cfg(test)]
+    pub(crate) fn phase4c2c_capture_for_test(
+        &mut self,
+    ) -> crate::storage::test_support::RawCatalogCapture {
+        match &mut self.state {
+            ConnectionState::Idle => {
+                crate::storage::test_support::phase4c2c_raw_capture(&self.pager)
+            }
+            ConnectionState::SqlWrite(batch) => {
+                crate::storage::test_support::phase4c2c_raw_batch_capture(batch)
+            }
+            _ => panic!("foreign-key model connection is not usable"),
+        }
+    }
+
     /// Prepares one SQL statement against the connection's current catalog view.
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
         if self.state_kind() == ConnectionStateKind::SqlWrite {

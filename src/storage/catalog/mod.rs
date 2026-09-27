@@ -1317,6 +1317,8 @@ impl CatalogWriter {
                     &key::catalog_meta_key(),
                     &record::encode_catalog_meta(&meta),
                 )?;
+                #[cfg(test)]
+                crate::storage::test_support::phase4c2c_catalog_record(0x00, "insert");
                 batch.enable_feature_bits(CATALOG_V1)?;
                 Ok(Self { tree, dirty: true })
             } else {
@@ -1424,11 +1426,15 @@ impl CatalogWriter {
                 &key::table_definition_key(table.id()),
                 &record::encode_table_definition(table),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x11, "insert");
             tree.insert(
                 batch,
                 &name_key,
                 &record::encode_table_name_mapping(table.id()),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x10, "insert");
             if TreeKind::from_root_page_type(batch.read(table.root())?.header().page_type())
                 != Some(TreeKind::Table)
             {
@@ -1463,16 +1469,25 @@ impl CatalogWriter {
                 &key::column_definition_key(column.id()),
                 &record::encode_column_definition(column),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x14, "insert");
             tree.insert(
                 batch,
                 &name_key,
                 &record::encode_column_name_mapping(column.id()),
             )?;
-            tree.insert(
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x12, "insert");
+            let result = tree.insert(
                 batch,
                 &ordinal_key,
                 &record::encode_column_ordinal_mapping(column.id()),
-            )
+            );
+            #[cfg(test)]
+            if result.is_ok() {
+                crate::storage::test_support::phase4c2c_catalog_record(0x13, "insert");
+            }
+            result
         })
     }
 
@@ -1542,16 +1557,22 @@ impl CatalogWriter {
                 &key::index_definition_key(index.id()),
                 &record::encode_index_definition(index),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x21, "insert");
             tree.insert(
                 batch,
                 &name_key,
                 &record::encode_index_name_mapping(index.id()),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x20, "insert");
             tree.insert(
                 batch,
                 &key::table_index_key(index.table_id(), index.id()),
                 &record::encode_table_index_mapping(index.id()),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x22, "insert");
             for (ordinal, column_id) in columns.iter().copied().enumerate() {
                 let ordinal = u16::try_from(ordinal).map_err(|_| {
                     DbError::new(ErrorCode::Type, "index column ordinal exceeds u16")
@@ -1561,6 +1582,8 @@ impl CatalogWriter {
                     &key::index_column_key(index.id(), ordinal),
                     &record::encode_index_column_mapping(column_id),
                 )?;
+                #[cfg(test)]
+                crate::storage::test_support::phase4c2c_catalog_record(0x23, "insert");
             }
             batch.track_tree(TreeKind::Index, index.root())?;
             batch.enable_feature_bits(INDEX_CONSTRAINT_V1)
@@ -1763,18 +1786,24 @@ impl CatalogWriter {
                 &key::constraint_definition_key(definition.id()),
                 &record::encode_constraint_definition(definition),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x31, "insert");
             record_written()?;
             tree.insert(
                 batch,
                 &constraint_name_key,
                 &record::encode_constraint_name_mapping(definition.id()),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x30, "insert");
             record_written()?;
             tree.insert(
                 batch,
                 &table_constraint_key,
                 &record::encode_table_constraint_mapping(definition.id()),
             )?;
+            #[cfg(test)]
+            crate::storage::test_support::phase4c2c_catalog_record(0x32, "insert");
             record_written()?;
             for (ordinal, column_id) in bundle.columns.iter().copied().enumerate() {
                 let ordinal = u16::try_from(ordinal).map_err(|_| {
@@ -1785,6 +1814,8 @@ impl CatalogWriter {
                     &key::constraint_column_key(definition.id(), ordinal),
                     &record::encode_constraint_column_mapping(column_id),
                 )?;
+                #[cfg(test)]
+                crate::storage::test_support::phase4c2c_catalog_record(0x33, "insert");
                 record_written()?;
             }
             if let Some(target) = foreign_key_target {
@@ -1797,18 +1828,24 @@ impl CatalogWriter {
                     &key::index_definition_key(index.id()),
                     &record::encode_index_definition(index),
                 )?;
+                #[cfg(test)]
+                crate::storage::test_support::phase4c2c_catalog_record(0x21, "insert");
                 record_written()?;
                 tree.insert(
                     batch,
                     &index_name_key,
                     &record::encode_index_name_mapping(index.id()),
                 )?;
+                #[cfg(test)]
+                crate::storage::test_support::phase4c2c_catalog_record(0x20, "insert");
                 record_written()?;
                 tree.insert(
                     batch,
                     &table_index_key,
                     &record::encode_table_index_mapping(index.id()),
                 )?;
+                #[cfg(test)]
+                crate::storage::test_support::phase4c2c_catalog_record(0x22, "insert");
                 record_written()?;
                 for (ordinal, column_id) in index_columns.iter().copied().enumerate() {
                     let ordinal = u16::try_from(ordinal).map_err(|_| {
@@ -1819,6 +1856,8 @@ impl CatalogWriter {
                         &key::index_column_key(index.id(), ordinal),
                         &record::encode_index_column_mapping(column_id),
                     )?;
+                    #[cfg(test)]
+                    crate::storage::test_support::phase4c2c_catalog_record(0x23, "insert");
                     record_written()?;
                 }
                 batch.track_tree(TreeKind::Index, index.root())?;
@@ -2214,7 +2253,14 @@ fn replace_record(
     if tree.delete(batch, key)?.is_none() {
         return Err(corruption("catalog replacement record is missing"));
     }
-    tree.insert(batch, key, value)
+    #[cfg(test)]
+    crate::storage::test_support::phase4c2c_catalog_record(key[0], "delete");
+    let result = tree.insert(batch, key, value);
+    #[cfg(test)]
+    if result.is_ok() {
+        crate::storage::test_support::phase4c2c_catalog_record(key[0], "insert");
+    }
+    result
 }
 
 fn insert_referenced_by(
@@ -2225,7 +2271,12 @@ fn insert_referenced_by(
 ) -> Result<()> {
     let key = key::referenced_by_key(parent, child);
     require_available_key(tree, batch, &key, "duplicate referenced-by mapping")?;
-    tree.insert(batch, &key, &record::encode_referenced_by_mapping(child))
+    let result = tree.insert(batch, &key, &record::encode_referenced_by_mapping(child));
+    #[cfg(test)]
+    if result.is_ok() {
+        crate::storage::test_support::phase4c2c_catalog_record(0x34, "insert");
+    }
+    result
 }
 
 fn remove_referenced_by(
@@ -2401,6 +2452,8 @@ fn delete_required_record(tree: &mut BTree, batch: &mut WriteBatch, key: &[u8]) 
     if tree.delete(batch, key)?.is_none() {
         return Err(corruption("catalog record is missing during mutation"));
     }
+    #[cfg(test)]
+    crate::storage::test_support::phase4c2c_catalog_record(key[0], "delete");
     Ok(())
 }
 
