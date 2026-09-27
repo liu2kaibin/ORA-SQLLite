@@ -3,7 +3,8 @@ mod query;
 mod statement;
 
 pub(crate) use query::{
-    BoundJoin, BoundOrderExpression, BoundOrderItem, BoundQuery, BoundSource, SourceId,
+    BoundIndex, BoundIndexColumn, BoundJoin, BoundOrderExpression, BoundOrderItem, BoundQuery,
+    BoundSource, SourceId,
 };
 
 pub(crate) use expr::{
