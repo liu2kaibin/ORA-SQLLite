@@ -103,6 +103,9 @@ fn parse_statement_inner(sql: &str, limits: &SqlLimits) -> Result<AstStatement> 
     {
         return Err(unsupported(&source_map, Some(token_index.span(1))));
     }
+    if let Some(span) = token_index.drop_table_cascade_constraints_span(&source_map) {
+        return Err(unsupported(&source_map, Some(span)));
+    }
 
     if token_index.starts_with_keyword(Keyword::SELECT) {
         preflight_unparsed_query_syntax(&tokens, &source_map)?;
@@ -1726,6 +1729,31 @@ impl StatementTokenIndex {
         SqlSpan::new(begin.span.start(), trailing_semicolon.span.end()).ok()
     }
 
+    fn drop_table_cascade_constraints_span(&self, source_map: &SourceMap<'_>) -> Option<SqlSpan> {
+        let body_len = self.tokens.len()
+            - usize::from(
+                self.tokens
+                    .last()
+                    .is_some_and(|token| token.kind == IndexedTokenKind::Semicolon),
+            );
+        let [drop, table, name, cascade, constraints] = self.tokens.get(..body_len)? else {
+            return None;
+        };
+        let Token::Word(name_word) = &name.token else {
+            return None;
+        };
+        let Token::Word(constraints_word) = &constraints.token else {
+            return None;
+        };
+        (drop.keyword == Keyword::DROP
+            && table.keyword == Keyword::TABLE
+            && identifier_from_word(name_word, name.span, source_map).is_ok()
+            && cascade.keyword == Keyword::CASCADE
+            && constraints_word.quote_style.is_none()
+            && constraints_word.value.eq_ignore_ascii_case("CONSTRAINTS"))
+        .then_some(cascade.span)
+    }
+
     fn normalize_local_time_zone(
         &self,
         tokens: &[TokenWithSpan],
@@ -2299,6 +2327,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS T (ID INT64)",
             "CREATE TABLE T AS SELECT ID FROM U",
             "DROP TABLE IF EXISTS T",
+            "DROP TABLE T CASCADE CONSTRAINTS",
             "ALTER TABLE T ADD C INT64",
             "MERGE INTO T USING U ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET T.C = U.C",
             "TRUNCATE TABLE T",
@@ -2316,6 +2345,35 @@ mod tests {
                     .unwrap_err()
                     .code(),
                 ErrorCode::Unsupported,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_table_cascade_constraints_recognition_is_exact_and_non_executable() {
+        for sql in [
+            "DROP TABLE P CASCADE CONSTRAINTS",
+            "DROP TABLE \"Quoted P\" CASCADE CONSTRAINTS;",
+        ] {
+            assert_eq!(
+                parse_statement(sql, &SqlLimits::default())
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Unsupported,
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "DROP TABLE P CASCADE CONSTRAINT",
+            "DROP TABLE P, Q CASCADE CONSTRAINTS",
+        ] {
+            assert_eq!(
+                parse_statement(sql, &SqlLimits::default())
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Syntax,
                 "{sql}"
             );
         }
