@@ -148,6 +148,19 @@ impl IndexKeyCodec {
         }
         (lower, Bound::Unbounded)
     }
+
+    pub(crate) fn checked_prefix_bounds(
+        logical: &[u8],
+    ) -> Result<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
+        if logical.is_empty() {
+            return Err(corruption("index logical key prefix is empty"));
+        }
+        let bounds = Self::prefix_bounds(logical);
+        if matches!(bounds.1, Bound::Unbounded) {
+            return Err(corruption("index logical key prefix has no upper bound"));
+        }
+        Ok(bounds)
+    }
 }
 
 fn check_encoded_size(logical_len: usize) -> Result<()> {

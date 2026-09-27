@@ -227,6 +227,7 @@ fn execute_update(
                         })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let foreign_key_work_bytes = memory.remaining();
             writer.replace(
                 batch,
                 rowid,
@@ -234,6 +235,7 @@ fn execute_update(
                 &replacement,
                 max_row_bytes,
                 memory,
+                foreign_key_work_bytes,
             )?;
             Ok(true)
         })();
@@ -622,6 +624,17 @@ mod tests {
         batch.commit().unwrap();
     }
 
+    fn execute_in_batch(
+        pager: &crate::storage::Pager,
+        batch: &mut crate::storage::WriteBatch,
+        sql: &str,
+    ) -> crate::Result<crate::ExecutionResult> {
+        let statement = prepare(pager, sql);
+        let validated =
+            validate_write_execution(batch, &statement, Parameters::none(), 64 * 1024 * 1024)?;
+        execute_validated_write_plan(batch, validated)
+    }
+
     fn table_values(batch: &mut crate::storage::WriteBatch, name: &str) -> Vec<Vec<Value>> {
         let table_id = batch
             .catalog_reader()
@@ -636,6 +649,23 @@ mod tests {
             rows.push(row.into_values().into_vec());
         }
         rows
+    }
+
+    fn table_and_index_roots(
+        batch: &mut crate::storage::WriteBatch,
+        name: &str,
+    ) -> (crate::storage::PageRef, Vec<crate::storage::PageRef>) {
+        let catalog = batch.catalog_reader().unwrap();
+        let table = catalog
+            .find_table_by_name(&CatalogName::new(name).unwrap())
+            .unwrap();
+        (
+            table.root(),
+            catalog
+                .indexes_for_table(table.id())
+                .map(|index| index.root())
+                .collect(),
+        )
     }
 
     #[test]
@@ -762,6 +792,144 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::SchemaChanged);
             batch.rollback().unwrap();
         }
+    }
+
+    #[test]
+    fn foreign_key_null_components_and_int64_decimal_normalization_are_exact() {
+        // Production breaks caught: checking a partially NULL composite key,
+        // preserving child INT64 instead of widening it to parent DECIMAL, or
+        // probing parent columns in child-table rather than declared-key order.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_PARENT_DECIMAL (D DECIMAL, CODE TEXT, CONSTRAINT PK_FK_PARENT_DECIMAL PRIMARY KEY (D, CODE), CONSTRAINT UQ_FK_PARENT_DECIMAL_D UNIQUE (D))",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_CHILD_DECIMAL (CODE TEXT, I INT64, CONSTRAINT FK_CHILD_PARENT FOREIGN KEY (I, CODE) REFERENCES FK_PARENT_DECIMAL (D, CODE))",
+        );
+
+        execute_committed(
+            &pager,
+            "INSERT INTO FK_CHILD_DECIMAL VALUES ('missing', NULL)",
+        );
+        execute_committed(&pager, "INSERT INTO FK_CHILD_DECIMAL VALUES (NULL, 7)");
+        execute_committed(&pager, "INSERT INTO FK_PARENT_DECIMAL VALUES (7, 'A')");
+        execute_committed(&pager, "INSERT INTO FK_CHILD_DECIMAL VALUES ('A', 7)");
+
+        let mut batch = pager.begin_write().unwrap();
+        let error = execute_in_batch(
+            &pager,
+            &mut batch,
+            "INSERT INTO FK_CHILD_DECIMAL VALUES ('A', 8)",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("FK_CHILD_PARENT"), "{error}");
+        batch.rollback().unwrap();
+
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let error = bind_sql(
+            "CREATE TABLE FK_CHILD_FLOAT (F FLOAT64, CONSTRAINT FK_FLOAT_DECIMAL FOREIGN KEY (F) REFERENCES FK_PARENT_DECIMAL (D))",
+            &SqlLimits::default(),
+            &catalog,
+            pager.database_uuid().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+    }
+
+    #[test]
+    fn child_insert_and_update_probe_parent_system_index_before_mutation() {
+        // Production breaks caught: consulting the parent table instead of its
+        // declared-key index, mutating a child page before a failed probe, or
+        // losing the persisted child constraint name on INSERT/UPDATE.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_PARENT_KEYED (ID INT64 CONSTRAINT PK_FK_PARENT_KEYED PRIMARY KEY)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_CHILD_KEYED (ID INT64 CONSTRAINT PK_FK_CHILD_KEYED PRIMARY KEY, PARENT_ID INT64, CONSTRAINT FK_CHILD_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_PARENT_KEYED (ID))",
+        );
+
+        let mut batch = pager.begin_write().unwrap();
+        let before = table_and_index_roots(&mut batch, "FK_CHILD_KEYED");
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let error = execute_in_batch(
+            &pager,
+            &mut batch,
+            "INSERT INTO FK_CHILD_KEYED VALUES (10, 1)",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("FK_CHILD_PARENT"), "{error}");
+        batch.restore_statement(checkpoint);
+        assert_eq!(table_and_index_roots(&mut batch, "FK_CHILD_KEYED"), before);
+        assert!(table_values(&mut batch, "FK_CHILD_KEYED").is_empty());
+        batch.rollback().unwrap();
+
+        execute_committed(&pager, "INSERT INTO FK_PARENT_KEYED VALUES (1)");
+        execute_committed(&pager, "INSERT INTO FK_CHILD_KEYED VALUES (10, 1)");
+
+        let mut batch = pager.begin_write().unwrap();
+        let before = table_and_index_roots(&mut batch, "FK_CHILD_KEYED");
+        let checkpoint = batch.statement_checkpoint().unwrap();
+        let error = execute_in_batch(
+            &pager,
+            &mut batch,
+            "UPDATE FK_CHILD_KEYED SET PARENT_ID = 2 WHERE ID = 10",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Constraint);
+        assert!(error.to_string().contains("FK_CHILD_PARENT"), "{error}");
+        batch.restore_statement(checkpoint);
+        assert_eq!(table_and_index_roots(&mut batch, "FK_CHILD_KEYED"), before);
+        assert_eq!(
+            table_values(&mut batch, "FK_CHILD_KEYED"),
+            vec![vec![Value::Int64(10), Value::Int64(1)]]
+        );
+        batch.rollback().unwrap();
+    }
+
+    #[test]
+    fn child_foreign_key_probe_sees_parent_inserted_in_current_batch() {
+        // Production break caught: resolving a committed parent root or reading
+        // outside the WriteBatch makes an earlier same-transaction parent row
+        // invisible to the child statement.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let pager = fixture.pager();
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_BATCH_PARENT (ID INT64 CONSTRAINT PK_FK_BATCH_PARENT PRIMARY KEY)",
+        );
+        execute_committed(
+            &pager,
+            "CREATE TABLE FK_BATCH_CHILD (ID INT64 CONSTRAINT PK_FK_BATCH_CHILD PRIMARY KEY, PARENT_ID INT64, CONSTRAINT FK_BATCH_CHILD_PARENT FOREIGN KEY (PARENT_ID) REFERENCES FK_BATCH_PARENT (ID))",
+        );
+
+        let mut batch = pager.begin_write().unwrap();
+        execute_in_batch(
+            &pager,
+            &mut batch,
+            "INSERT INTO FK_BATCH_PARENT VALUES (41)",
+        )
+        .unwrap();
+        execute_in_batch(
+            &pager,
+            &mut batch,
+            "INSERT INTO FK_BATCH_CHILD VALUES (1, 41)",
+        )
+        .unwrap();
+        assert_eq!(
+            table_values(&mut batch, "FK_BATCH_CHILD"),
+            vec![vec![Value::Int64(1), Value::Int64(41)]]
+        );
+        batch.rollback().unwrap();
     }
 
     #[test]

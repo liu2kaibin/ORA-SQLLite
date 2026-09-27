@@ -1,4 +1,7 @@
+mod foreign_key;
 pub(crate) mod program;
+
+pub(crate) use foreign_key::ForeignKeyCatalog;
 
 use std::collections::BTreeMap;
 
@@ -70,14 +73,12 @@ impl ConstraintCatalog {
                         )?,
                     },
                     ConstraintKind::ForeignKey => {
-                        return Err(DbError::new(
-                            ErrorCode::Unsupported,
-                            "foreign-key enforcement is not available",
-                        ));
+                        return Ok(None);
                     }
                 };
-                Ok((definition.id(), local, definition.index_id()))
+                Ok(Some((definition.id(), local, definition.index_id())))
             })
+            .filter_map(Result::transpose)
             .collect::<Result<Vec<_>>>()?;
         ordered.sort_by_key(|(id, _, _)| *id);
 

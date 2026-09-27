@@ -20,7 +20,7 @@ use super::{
         },
     },
     constraint::{
-        ConstraintCatalog,
+        ConstraintCatalog, ForeignKeyCatalog,
         program::{CheckMemory, CheckProgramTemplate},
     },
     index::{IndexStorage, PreparedIndexEntry},
@@ -114,6 +114,7 @@ pub(crate) struct TableWrite {
 pub(crate) struct ConstrainedTableWrite {
     schema: Relation,
     constraints: ConstraintCatalog,
+    foreign_keys: ForeignKeyCatalog,
     rows: BTree,
     indexes: Box<[IndexStorage]>,
     catalog: CatalogWriter,
@@ -692,16 +693,22 @@ impl TableWrite {
 
 impl ConstrainedTableWrite {
     pub(crate) fn open(batch: &mut WriteBatch, table_id: TableId) -> Result<Self> {
-        let (schema, constraints, indexes) = {
+        let (schema, constraints, foreign_keys, indexes) = {
             let catalog = batch.catalog_reader()?;
             let schema = Relation::open(&catalog, table_id)?;
             let constraints = ConstraintCatalog::open(&catalog, table_id)?;
+            let foreign_keys = ForeignKeyCatalog::open(&catalog, table_id)?;
             let mut indexes = catalog
                 .indexes_for_table(table_id)
                 .map(|index| IndexStorage::open(&catalog, index.id()))
                 .collect::<Result<Vec<_>>>()?;
             indexes.sort_by_key(IndexStorage::id);
-            (schema, constraints, indexes.into_boxed_slice())
+            (
+                schema,
+                constraints,
+                foreign_keys,
+                indexes.into_boxed_slice(),
+            )
         };
         let original_table_root = schema.table.root();
         let next_rowid = schema.table.next_rowid();
@@ -710,6 +717,7 @@ impl ConstrainedTableWrite {
         Ok(Self {
             schema,
             constraints,
+            foreign_keys,
             rows,
             indexes,
             catalog,
@@ -766,6 +774,7 @@ impl ConstrainedTableWrite {
         memory: &mut impl CheckMemory,
     ) -> Result<RowId> {
         self.validate_row(values, memory)?;
+        self.foreign_keys.validate_child_row(batch, values)?;
         let encoded = RowCodec::encode(
             &self.schema.table,
             &self.schema.columns,
@@ -818,8 +827,13 @@ impl ConstrainedTableWrite {
         new: &[Value],
         max_row_bytes: usize,
         memory: &mut impl CheckMemory,
+        foreign_key_work_bytes: u64,
     ) -> Result<()> {
+        // Task 6 consumes this available caller budget for parent-side
+        // restrict scans. Child probes are index-bounded and allocate no row.
+        let _ = foreign_key_work_bytes;
         self.validate_row(new, memory)?;
+        self.foreign_keys.validate_child_row(batch, new)?;
         let encoded =
             RowCodec::encode(&self.schema.table, &self.schema.columns, new, max_row_bytes)?;
         let old_entries = self.prepare_entries(old, rowid)?;
@@ -2355,6 +2369,7 @@ mod tests {
                 &[Value::Int64(2)],
                 usize::MAX,
                 &mut memory,
+                u64::MAX,
             )
             .unwrap();
         let row = writer
@@ -2526,6 +2541,7 @@ mod tests {
                 &[Value::Int64(2)],
                 usize::MAX,
                 &mut memory,
+                u64::MAX,
             )
             .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Constraint);
@@ -2538,6 +2554,7 @@ mod tests {
                 &[Value::Int64(1)],
                 usize::MAX,
                 &mut memory,
+                u64::MAX,
             )
             .unwrap();
         writer.finish(&mut batch).unwrap();
