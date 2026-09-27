@@ -117,13 +117,7 @@ pub(super) fn encode_constraint_column_mapping(id: ColumnId) -> Vec<u8> {
 }
 
 pub(super) fn encode_referenced_by_mapping(id: ConstraintId) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ENVELOPE_LEN + MAPPING_PAYLOAD_LEN);
-    bytes.push(RecordKind::ReferencedBy.byte());
-    bytes.push(RECORD_VERSION_V1);
-    bytes.extend_from_slice(&0_u16.to_be_bytes());
-    bytes.extend_from_slice(&(MAPPING_PAYLOAD_LEN as u32).to_be_bytes());
-    bytes.extend_from_slice(&id.get().to_be_bytes());
-    bytes
+    encode_envelope(RecordKind::ReferencedBy, id.get().to_be_bytes().to_vec())
 }
 
 pub(super) fn encode_constraint_definition(definition: &ConstraintDef) -> Vec<u8> {
@@ -163,11 +157,14 @@ pub(super) fn encode_constraint_definition(definition: &ConstraintDef) -> Vec<u8
 }
 
 pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<CatalogRecord> {
-    let payload = if expected == RecordKind::ReferencedBy {
-        decode_referenced_by_envelope(bytes)?
-    } else {
-        decode_envelope(expected, bytes)?
-    };
+    if expected == RecordKind::ReferencedBy
+        && bytes
+            .first()
+            .is_some_and(|kind| *kind != RecordKind::ReferencedBy.byte())
+    {
+        return Err(corruption("catalog key and record kind disagree"));
+    }
+    let payload = decode_envelope(expected, bytes)?;
     match expected {
         RecordKind::CatalogMeta => {
             decode_catalog_meta_payload(payload).map(CatalogRecord::CatalogMeta)
@@ -427,54 +424,6 @@ fn strict_payload(bytes: &[u8]) -> Result<&[u8]> {
     );
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| corruption("catalog record payload length exceeds this platform"))?;
-    let total_len = ENVELOPE_LEN
-        .checked_add(payload_len)
-        .ok_or_else(|| corruption("catalog record payload length overflow"))?;
-    if bytes.len() != total_len {
-        return Err(corruption(
-            "catalog record length does not match its payload length",
-        ));
-    }
-    bytes
-        .get(ENVELOPE_LEN..total_len)
-        .ok_or_else(truncated_record)
-}
-
-fn decode_referenced_by_envelope(bytes: &[u8]) -> Result<&[u8]> {
-    let kind = *bytes.first().ok_or_else(truncated_record)?;
-    if kind != RecordKind::ReferencedBy.byte() {
-        return Err(corruption("catalog key and record kind disagree"));
-    }
-    let version = *bytes.get(1).ok_or_else(truncated_record)?;
-    if version > RECORD_VERSION_V1 {
-        return Err(DbError::new(
-            ErrorCode::Unsupported,
-            "catalog record version is newer than V1",
-        ));
-    }
-    if version != RECORD_VERSION_V1 {
-        return Err(corruption("catalog record version zero is invalid"));
-    }
-    if u16::from_be_bytes(
-        bytes
-            .get(2..4)
-            .ok_or_else(truncated_record)?
-            .try_into()
-            .map_err(|_| truncated_record())?,
-    ) != 0
-    {
-        return Err(corruption(
-            "catalog record envelope reserved bytes are nonzero",
-        ));
-    }
-    let payload_len = usize::try_from(u32::from_be_bytes(
-        bytes
-            .get(4..ENVELOPE_LEN)
-            .ok_or_else(truncated_record)?
-            .try_into()
-            .map_err(|_| truncated_record())?,
-    ))
-    .map_err(|_| corruption("catalog record payload length exceeds this platform"))?;
     let total_len = ENVELOPE_LEN
         .checked_add(payload_len)
         .ok_or_else(|| corruption("catalog record payload length overflow"))?;
@@ -1401,7 +1350,7 @@ mod tests {
     fn referenced_by_mapping_is_exact_and_rejects_wrong_kind_or_trailing_bytes() {
         let child = ConstraintId::new(9).unwrap();
         let bytes = encode_referenced_by_mapping(child);
-        assert_eq!(bytes, [0x34, 1, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 9]);
+        assert_eq!(bytes, [0x34, 1, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
         assert_eq!(decode_referenced_by_mapping(&bytes).unwrap(), child);
 
         let mut wrong_kind = bytes.clone();

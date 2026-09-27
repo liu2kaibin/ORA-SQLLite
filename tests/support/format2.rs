@@ -1478,8 +1478,7 @@ fn raw_mapping_id(value: &[u8], family: u8, label: &str) -> Result<u64, String> 
 }
 
 fn raw_referenced_by_child(value: &[u8]) -> Result<u64, String> {
-    if value.len() != 16 || value.get(0..4) != Some(&[0x34, 1, 0, 0]) || read_be_u32(value, 4)? != 8
-    {
+    if value.len() != 16 || value.get(0..4) != Some(&[0x34, 1, 0, 0]) || read_u32(value, 4)? != 8 {
         return Err("raw referenced-by payload is malformed".into());
     }
     read_be_u64(value, 8)
@@ -1488,17 +1487,6 @@ fn raw_referenced_by_child(value: &[u8]) -> Result<u64, String> {
 fn read_be_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     let end = offset.checked_add(2).ok_or("integer offset overflow")?;
     Ok(u16::from_be_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or("truncated disk value")?
-            .try_into()
-            .map_err(|_| "truncated disk value")?,
-    ))
-}
-
-fn read_be_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let end = offset.checked_add(4).ok_or("integer offset overflow")?;
-    Ok(u32::from_be_bytes(
         bytes
             .get(offset..end)
             .ok_or("truncated disk value")?

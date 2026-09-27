@@ -117,11 +117,7 @@ fn phase4c2c_u32(bytes: &[u8], offset: usize) -> usize {
 fn phase4c2c_payload(value: &[u8], family: u8) -> &[u8] {
     assert!(value.len() >= 8, "raw envelope is truncated");
     assert_eq!(&value[..4], &[family, 1, 0, 0]);
-    let length = if family == 0x34 {
-        u32::from_be_bytes(value[4..8].try_into().unwrap()) as usize
-    } else {
-        phase4c2c_u32(value, 4)
-    };
+    let length = phase4c2c_u32(value, 4);
     assert_eq!(value.len(), 8 + length, "raw envelope length");
     &value[8..]
 }
@@ -1019,7 +1015,7 @@ fn phase_4c2c_id_ordinal_key(family: u8, id: u64, ordinal: u16) -> Vec<u8> {
 }
 
 fn phase_4c2c_referenced_by_value(child: u64) -> Vec<u8> {
-    let mut value = vec![0x34, 1, 0, 0, 0, 0, 0, 8];
+    let mut value = vec![0x34, 1, 0, 0, 8, 0, 0, 0];
     value.extend_from_slice(&child.to_be_bytes());
     value
 }
