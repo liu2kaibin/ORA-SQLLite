@@ -994,7 +994,7 @@ fn bind_error(message: &'static str) -> DbError {
 mod tests {
     use super::GroupIndex;
     use crate::{
-        ErrorCode, Value,
+        Database, ErrorCode, Options, Parameters, Value,
         api::{ColumnMetadata, DataType},
         sql::{
             Identifier, SqlLimits, SqlSpan, SqlType,
@@ -1039,6 +1039,60 @@ mod tests {
         assert_eq!(
             query.sources[0].indexes()[0].columns()[0].column_type(),
             ColumnType::Int64
+        );
+    }
+
+    #[test]
+    fn query_sources_preserve_multiple_index_ids_and_table_column_ordinals() {
+        // Production break caught: treating table column ordinals as index-key
+        // positions rejects valid non-leading and composite indexes during binding.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let database = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE INDEX IX_USERS_AMOUNT ON USERS (AMOUNT)",
+            "CREATE UNIQUE INDEX UX_USERS_ID_AMOUNT ON USERS (ID, AMOUNT)",
+        ] {
+            let statement = connection.prepare(sql).unwrap();
+            connection.execute(&statement, Parameters::none()).unwrap();
+        }
+        drop(connection);
+        drop(database);
+
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let bound = bind_sql(
+            "SELECT AMOUNT FROM USERS WHERE AMOUNT = 7",
+            &SqlLimits::default(),
+            &catalog,
+            pager.database_uuid().unwrap(),
+        )
+        .unwrap();
+        let BoundStatementKind::Query { query } = bound.kind else {
+            panic!()
+        };
+        assert_eq!(
+            query.sources[0]
+                .indexes()
+                .iter()
+                .map(|index| index.id().get())
+                .collect::<Vec<_>>(),
+            [9, 10]
+        );
+        assert_eq!(
+            query.sources[0]
+                .indexes()
+                .iter()
+                .map(|index| {
+                    index
+                        .columns()
+                        .iter()
+                        .map(|column| column.ordinal())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            [vec![2], vec![0, 2]]
         );
     }
 

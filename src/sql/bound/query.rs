@@ -52,15 +52,10 @@ pub(crate) struct BoundIndex {
 
 impl BoundIndex {
     pub(crate) fn new(id: IndexId, unique: bool, columns: Box<[BoundIndexColumn]>) -> Result<Self> {
-        if columns.is_empty()
-            || columns
-                .iter()
-                .enumerate()
-                .any(|(ordinal, column)| u16::try_from(ordinal).ok() != Some(column.ordinal()))
-        {
+        if columns.is_empty() {
             return Err(DbError::new(
                 ErrorCode::Internal,
-                "bound index columns must be non-empty and contiguous",
+                "bound index must contain at least one column",
             ));
         }
         Ok(Self {
