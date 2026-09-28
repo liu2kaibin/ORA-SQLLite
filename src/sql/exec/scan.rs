@@ -23,7 +23,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn take_access_paths() -> Vec<&'static str> {
+pub(super) fn take_access_paths() -> Vec<&'static str> {
     ACCESS_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
 }
 
