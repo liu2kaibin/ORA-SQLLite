@@ -3,13 +3,37 @@ mod support;
 use ora_sqllite::Value;
 
 #[test]
-fn large_scale_gate_requires_explicit_opt_in_and_thirty_gb() {
+fn large_scale_gate_requires_explicit_opt_in_and_eighty_gb() {
     // Break caught: an opt-in typo or insufficient disk must not grant a
     // destructive-to-capacity multi-gigabyte import.
     assert!(support::validate_large_scale_gate(None, u64::MAX).is_err());
     assert!(support::validate_large_scale_gate(Some("true"), u64::MAX).is_err());
-    assert!(support::validate_large_scale_gate(Some("1"), 29_999_999_999).is_err());
-    assert!(support::validate_large_scale_gate(Some("1"), 30_000_000_000).is_ok());
+    assert!(support::validate_large_scale_gate(Some("1"), 30_000_000_000).is_err());
+    assert!(support::validate_large_scale_gate(Some("1"), 79_999_999_999).is_err());
+    assert!(support::validate_large_scale_gate(Some("1"), 80_000_000_000).is_ok());
+}
+
+#[test]
+fn large_scale_budget_contains_the_fixture_and_reserves_wal_and_working_space() {
+    // Break caught: a gate that admits a fixture which the configured database
+    // limit cannot store, or whose database + WAL can exhaust the admitted disk.
+    // Independent page-count finding, not derived from these helper constants.
+    const TABLE_LEAF_AND_OVERFLOW_MIN_BYTES: u64 = 40_959_991_808;
+    let options = support::scale_options();
+    assert!(
+        options.max_database_bytes()
+            >= TABLE_LEAF_AND_OVERFLOW_MIN_BYTES
+                .checked_add(20_000_000_000)
+                .unwrap()
+    );
+    let peak_with_reserve = options
+        .max_database_bytes()
+        .checked_add(options.max_wal_bytes())
+        .unwrap()
+        .checked_add(10_000_000_000)
+        .unwrap();
+    assert!(peak_with_reserve <= 80_000_000_000);
+    assert!(support::validate_large_scale_gate(Some("1"), 80_000_000_000).is_ok());
 }
 
 #[test]
@@ -45,7 +69,7 @@ fn phase_4c2d_hundred_thousand_row_index_scan_smoke() {
 }
 
 #[test]
-#[ignore = "requires explicit ORA_SQLLITE_LARGE_SCALE=1 and at least 30 GB free"]
+#[ignore = "requires explicit ORA_SQLLITE_LARGE_SCALE=1 and at least 80 GB free"]
 fn phase_4c2d_ten_million_row_ten_gb_acceptance() {
     // This gate is checked before constructing/owning any temporary database.
     support::require_large_scale_gate();

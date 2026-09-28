@@ -192,6 +192,16 @@ struct ScaleMetrics {
     wal_peak_bytes: u64,
 }
 
+// Decimal GB throughout this gate. The 10m x 1,024-byte fixture needs at
+// least 40,959,991,808 bytes for table leaf/overflow pages alone. A 64-GB cap
+// leaves >23 GB for table/internal/catalog growth and both scalar indexes.
+const SCALE_DATABASE_MAX_BYTES: u64 = 64_000_000_000;
+const SCALE_WAL_MAX_BYTES: u64 = 1_073_741_824;
+const SCALE_NON_DATABASE_HEADROOM_BYTES: u64 = 16_000_000_000;
+const LARGE_SCALE_MIN_FREE_BYTES: u64 = SCALE_DATABASE_MAX_BYTES
+    .checked_add(SCALE_NON_DATABASE_HEADROOM_BYTES)
+    .expect("large fixture database plus headroom must fit u64");
+
 pub fn validate_large_scale_gate(
     opt_in: Option<&str>,
     available_bytes: u64,
@@ -199,8 +209,8 @@ pub fn validate_large_scale_gate(
     if opt_in != Some("1") {
         return Err("requires explicit ORA_SQLLITE_LARGE_SCALE=1");
     }
-    if available_bytes < 30_000_000_000 {
-        return Err("requires at least 30 GB available on the temporary-file volume");
+    if available_bytes < LARGE_SCALE_MIN_FREE_BYTES {
+        return Err("requires at least 80 GB available on the temporary-file volume");
     }
     Ok(())
 }
@@ -214,13 +224,18 @@ pub fn require_large_scale_gate() {
         fs4::available_space(std::env::temp_dir()).expect("probe temporary volume capacity");
     validate_large_scale_gate(opt_in.as_deref(), available)
         .expect("large acceptance capacity gate");
-    eprintln!("phase4c2d_large_gate available_bytes={available} required_bytes=30000000000");
+    eprintln!(
+        "phase4c2d_large_gate available_bytes={available} required_bytes={LARGE_SCALE_MIN_FREE_BYTES} database_limit_bytes={SCALE_DATABASE_MAX_BYTES} wal_limit_bytes={SCALE_WAL_MAX_BYTES}"
+    );
 }
 
-fn scale_options() -> Options {
-    // Payload alone exceeds the default 10-GiB limit after page/index overhead.
-    // Bounded batches and a 64-MiB checkpoint threshold keep WAL growth bounded.
-    Options::default().with_max_database_bytes(25_000_000_000)
+pub fn scale_options() -> Options {
+    // The same named limits configure every create/checkpoint/reopen and the
+    // capacity gate. The 16-GB non-database budget includes this 1-GiB WAL cap,
+    // leaving 14,926,258,176 bytes for filesystem/operational headroom.
+    Options::default()
+        .with_max_database_bytes(SCALE_DATABASE_MAX_BYTES)
+        .with_max_wal_bytes(SCALE_WAL_MAX_BYTES)
 }
 
 impl ScaleDatabase {
