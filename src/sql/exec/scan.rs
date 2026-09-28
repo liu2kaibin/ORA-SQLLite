@@ -1,9 +1,17 @@
-use crate::sql::bound::SourceId;
-use crate::storage::relation::RelationScan;
-use crate::{Result, Value};
+use crate::sql::{
+    bound::{BoundSource, SourceId},
+    plan::IndexAccessPlan,
+};
+use crate::storage::{
+    catalog::types::ColumnType,
+    index::scan::{IndexRowIdScan, IndexScanBound, IndexScanRange},
+    relation::{Relation, RelationScan},
+};
+use crate::{DbError, Decimal, ErrorCode, Result, Value};
 
 use super::memory::owned_values_bytes;
 use super::operator::{EvalRow, ExecutionContext, Operator};
+use super::{ParameterFrame, eval};
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -11,6 +19,12 @@ use std::cell::RefCell;
 #[cfg(test)]
 thread_local! {
     static PAYLOAD_TRANSFERS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+    static ACCESS_PATHS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn take_access_paths() -> Vec<&'static str> {
+    ACCESS_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -68,6 +82,8 @@ impl TableScan {
 
 impl Operator for TableScan {
     fn next(&mut self, context: &mut ExecutionContext<'_>) -> Result<Option<EvalRow>> {
+        #[cfg(test)]
+        ACCESS_PATHS.with(|paths| paths.borrow_mut().push("TableScan"));
         let Some(row) = context.next_relation(&mut self.scan)? else {
             return Ok(None);
         };
@@ -83,12 +99,438 @@ impl Operator for TableScan {
     }
 }
 
+pub(crate) struct IndexScan {
+    source: BoundSource,
+    access: IndexAccessPlan,
+    max_row_bytes: usize,
+    state: IndexScanState,
+}
+
+enum IndexScanState {
+    Uninitialized,
+    Empty,
+    Scanning {
+        relation: Relation,
+        scan: IndexRowIdScan,
+    },
+}
+
+impl IndexScan {
+    pub(crate) fn new(source: BoundSource, access: IndexAccessPlan, max_row_bytes: usize) -> Self {
+        Self {
+            source,
+            access,
+            max_row_bytes,
+            state: IndexScanState::Uninitialized,
+        }
+    }
+
+    fn initialize_bounds(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
+        if !matches!(self.state, IndexScanState::Uninitialized) {
+            return Ok(());
+        }
+        let (relation, index) = context.open_index(&self.source, &self.access)?;
+        self.state = match evaluate_bounds(&self.access, context.params())? {
+            Some(range) => IndexScanState::Scanning {
+                relation,
+                scan: index.scan_rowids(&range)?,
+            },
+            None => IndexScanState::Empty,
+        };
+        Ok(())
+    }
+}
+
+impl Operator for IndexScan {
+    fn next(&mut self, context: &mut ExecutionContext<'_>) -> Result<Option<EvalRow>> {
+        #[cfg(test)]
+        ACCESS_PATHS.with(|paths| paths.borrow_mut().push("IndexScan"));
+        self.initialize_bounds(context)?;
+        let IndexScanState::Scanning { relation, scan } = &mut self.state else {
+            return Ok(None);
+        };
+        let Some(entry) = context.next_index(scan)? else {
+            return Ok(None);
+        };
+        let row = context
+            .get_relation(relation, entry.rowid(), self.max_row_bytes)?
+            .ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Corruption,
+                    "index entry references a missing table row",
+                )
+            })?;
+        scan.validate_row(&entry, row.values())?;
+        #[cfg(test)]
+        let decoded_payload = first_payload_ptr(row.values());
+        let values = row.into_values();
+        #[cfg(test)]
+        record_payload_transfer(decoded_payload, &values);
+        let memory_bytes = owned_values_bytes(values.iter())?;
+        let row = EvalRow::with_source(self.source.source_id, values, memory_bytes)?;
+        context.memory().reserve(memory_bytes)?;
+        Ok(Some(row))
+    }
+}
+
+fn evaluate_bounds(
+    access: &IndexAccessPlan,
+    params: &ParameterFrame,
+) -> Result<Option<IndexScanRange>> {
+    let row = EvalRow::default();
+    let mut equality = Vec::with_capacity(access.equality().len());
+    for (column_type, value) in access.equality() {
+        if value.is_null() {
+            equality.push(Value::Null);
+        } else {
+            let expression = value.expression().ok_or_else(invalid_bound)?;
+            let value = eval(expression, &row, params)?;
+            if matches!(value, Value::Null) {
+                return Ok(None);
+            }
+            equality.push(normalize_bound(value, *column_type)?);
+        }
+    }
+    let mut range = IndexScanRange {
+        equality: equality.into_boxed_slice(),
+        lower: None,
+        upper: None,
+    };
+    if let Some(template) = access.range() {
+        for (bound, output) in [
+            (template.lower(), &mut range.lower),
+            (template.upper(), &mut range.upper),
+        ] {
+            if let Some(bound) = bound {
+                let value = eval(bound.expression(), &row, params)?;
+                if matches!(value, Value::Null) {
+                    return Ok(None);
+                }
+                *output = Some(IndexScanBound {
+                    value: normalize_bound(value, template.column_type())?,
+                    inclusive: bound.inclusive(),
+                });
+            }
+        }
+    }
+    Ok(Some(range))
+}
+
+fn normalize_bound(value: Value, column_type: ColumnType) -> Result<Value> {
+    let valid = match (column_type, &value) {
+        (ColumnType::Decimal, Value::Int64(value)) => {
+            return Decimal::new(*value < 0, 0, u128::from(value.unsigned_abs()))
+                .map(Value::Decimal);
+        }
+        (ColumnType::Int64, Value::Int64(_))
+        | (ColumnType::Decimal, Value::Decimal(_))
+        | (ColumnType::Text, Value::Text(_))
+        | (ColumnType::Blob, Value::Blob(_))
+        | (ColumnType::Date, Value::Date(_))
+        | (ColumnType::Bool, Value::Bool(_)) => true,
+        (ColumnType::Float64, Value::Float64(value)) => value.is_finite(),
+        (ColumnType::Timestamp, Value::Timestamp(value)) => value.offset_minutes().is_none(),
+        (ColumnType::TimestampWithTimeZone, Value::Timestamp(value)) => {
+            value.offset_minutes().is_some()
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(value)
+    } else {
+        Err(invalid_bound())
+    }
+}
+
+fn invalid_bound() -> DbError {
+    DbError::new(
+        ErrorCode::Internal,
+        "index bound does not match its planned column type",
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::storage::test_support::phase_4c1_query_relation_fixture;
-    use crate::{Database, ErrorCode, Options, Parameters, Value};
+    use crate::storage::test_support::{TempDatabase, phase_4c1_query_relation_fixture};
+    use crate::{Connection, Database, ErrorCode, Options, Parameters, Value};
 
-    use super::take_payload_transfers;
+    use super::{take_access_paths, take_payload_transfers};
+
+    fn execute(connection: &mut Connection, sql: &str) {
+        let statement = connection.prepare(sql).unwrap();
+        connection.execute(&statement, Parameters::none()).unwrap();
+    }
+
+    fn indexed_query_fixture() -> (TempDatabase, Database) {
+        let temp = TempDatabase::new("index-query");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE T (ID INT64 PRIMARY KEY, A INT64, B TEXT)",
+            "CREATE INDEX IX_T_A ON T (A)",
+            "INSERT INTO T VALUES (1, NULL, 'null')",
+            "INSERT INTO T VALUES (2, 5, 'keep')",
+            "INSERT INTO T VALUES (3, 5, 'reject')",
+            "INSERT INTO T VALUES (7, NULL, 'null-2')",
+        ] {
+            execute(&mut connection, sql);
+        }
+        (temp, database)
+    }
+
+    fn assert_index_path() {
+        let paths = take_access_paths();
+        assert!(!paths.is_empty(), "query did not pull an access operator");
+        assert!(
+            paths.iter().all(|path| *path == "IndexScan"),
+            "wrong access path: {paths:?}"
+        );
+    }
+
+    fn query_ids(connection: &mut Connection, sql: &str, parameters: &[Value]) -> Vec<i64> {
+        let statement = connection.prepare(sql).unwrap();
+        let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+            panic!("query plan");
+        };
+        assert!(
+            query.index_access().is_some(),
+            "fixture must be index-eligible: {sql}"
+        );
+        let parameters = parameters
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        let _ = take_access_paths();
+        let mut rows = connection
+            .query(&statement, Parameters::positional(&parameters))
+            .unwrap();
+        let mut actual = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            let Value::Int64(id) = row.values()[0] else {
+                panic!("integer ID")
+            };
+            actual.push(id);
+        }
+        assert_index_path();
+        actual
+    }
+
+    #[test]
+    fn index_scan_distinguishes_null_parameter_from_is_null_and_rechecks_where() {
+        // Breaks caught: falling back to TableScan, treating NULL comparisons as
+        // IS NULL, or discarding any part of the original WHERE predicate.
+        let (_temp, database) = indexed_query_fixture();
+        let mut connection = database.connect().unwrap();
+        assert_eq!(
+            query_ids(
+                &mut connection,
+                "SELECT ID FROM T WHERE A = :1",
+                &[Value::Null]
+            ),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            query_ids(&mut connection, "SELECT ID FROM T WHERE A IS NULL", &[]),
+            [1, 7]
+        );
+        assert_eq!(
+            query_ids(
+                &mut connection,
+                "SELECT ID FROM T WHERE A = 5 AND B <> 'reject'",
+                &[]
+            ),
+            [2]
+        );
+        assert_eq!(
+            query_ids(
+                &mut connection,
+                "SELECT ID FROM T WHERE A >= :1 AND A < 6",
+                &[Value::Int64(5)]
+            ),
+            [2, 3]
+        );
+        assert_eq!(
+            query_ids(
+                &mut connection,
+                "SELECT ID FROM T WHERE A < :1",
+                &[Value::Null]
+            ),
+            Vec::<i64>::new()
+        );
+    }
+
+    #[test]
+    fn index_scan_reads_current_write_batch_after_an_indexed_insert() {
+        // Break caught: resolving a plan's index/table root before a write,
+        // or reading the committed snapshot instead of the private overlay.
+        let (_temp, database) = indexed_query_fixture();
+        let mut connection = database.connect().unwrap();
+        let statement = connection.prepare("SELECT ID FROM T WHERE A = 9").unwrap();
+        let mut transaction = connection.begin_write().unwrap();
+        let insert = transaction
+            .prepare("INSERT INTO T VALUES (8, 9, 'private')")
+            .unwrap();
+        transaction.execute(&insert, Parameters::none()).unwrap();
+        let _ = take_access_paths();
+        let mut rows = transaction.query(&statement, Parameters::none()).unwrap();
+        assert_eq!(rows.next().unwrap().unwrap().values(), &[Value::Int64(8)]);
+        assert!(rows.next().unwrap().is_none());
+        assert_index_path();
+    }
+
+    #[test]
+    fn index_scan_promotes_integer_bounds_for_decimal_keys() {
+        // Break caught: encoding an Int64 bound for a Decimal key without the
+        // exact promotion already permitted by SQL comparison semantics.
+        let temp = TempDatabase::new("index-decimal-query");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE T (ID INT64 PRIMARY KEY, A DECIMAL)",
+            "CREATE INDEX IX_T_A ON T (A)",
+            "INSERT INTO T VALUES (1, 4)",
+            "INSERT INTO T VALUES (2, 5)",
+            "INSERT INTO T VALUES (3, 6)",
+        ] {
+            execute(&mut connection, sql);
+        }
+        assert_eq!(
+            query_ids(&mut connection, "SELECT ID FROM T WHERE A = 5", &[]),
+            [2]
+        );
+        assert_eq!(
+            query_ids(
+                &mut connection,
+                "SELECT ID FROM T WHERE A >= 5 AND A < 6",
+                &[]
+            ),
+            [2]
+        );
+    }
+
+    #[test]
+    fn index_scan_transfers_text_and_blob_at_exact_row_plus_parameter_memory_boundary() {
+        // Breaks caught: cloning admitted decoded payloads, failing to charge
+        // the parameter frame, or requiring an extra full-row buffer.
+        for (column_type, payload) in [
+            ("TEXT", Value::Text("x".repeat(20_000))),
+            ("BLOB", Value::Blob(vec![0x5a; 20_000])),
+        ] {
+            let temp = TempDatabase::new("index-query-memory");
+            let database = Database::create(temp.path(), Options::default()).unwrap();
+            let mut connection = database.connect().unwrap();
+            execute(
+                &mut connection,
+                &format!("CREATE TABLE T (ID INT64 PRIMARY KEY, A INT64, B {column_type})"),
+            );
+            execute(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+            let insert = connection
+                .prepare("INSERT INTO T VALUES (1, 5, :1)")
+                .unwrap();
+            connection
+                .execute(&insert, Parameters::positional(&[payload.into()]))
+                .unwrap();
+            drop(connection);
+            drop(database);
+            let value_bytes = std::mem::size_of::<Value>() as u64;
+            let exact = (32 + value_bytes) + (32 + 3 * value_bytes + 20_000);
+            for (limit, accepted) in [(exact - 1, false), (exact, true)] {
+                let database = Database::open(
+                    temp.path(),
+                    Options::default().with_max_query_memory_bytes(limit),
+                )
+                .unwrap();
+                let mut connection = database.connect().unwrap();
+                let statement = connection
+                    .prepare("SELECT B FROM T WHERE A = :1 AND FALSE")
+                    .unwrap();
+                let _ = take_access_paths();
+                let _ = take_payload_transfers();
+                let mut rows = connection
+                    .query(
+                        &statement,
+                        Parameters::positional(&[Value::Int64(5).into()]),
+                    )
+                    .unwrap();
+                if accepted {
+                    assert!(rows.next().unwrap().is_none());
+                    let transfers = take_payload_transfers();
+                    assert_eq!(transfers.len(), 1);
+                    assert_eq!(
+                        transfers[0].0, transfers[0].1,
+                        "IndexScan must transfer decoded payload ownership"
+                    );
+                } else {
+                    assert_eq!(rows.next().unwrap_err().code(), ErrorCode::ResourceLimit);
+                }
+                assert_index_path();
+            }
+        }
+    }
+
+    #[test]
+    fn index_scan_reports_missing_or_mismatched_rows_before_the_full_filter() {
+        // Breaks caught: ignoring dangling ROWIDs or applying WHERE before
+        // verifying that the complete fetched row reproduces the index key.
+        use crate::sql::exec::{ExecutionContext, ExecutionStorage, prepare_query};
+        use crate::storage::{
+            catalog::types::{CatalogName, RowId},
+            relation::TableWrite,
+            test_support::phase_4c2a_open_pager,
+        };
+        for missing in [true, false] {
+            let (temp, database) = indexed_query_fixture();
+            let mut connection = database.connect().unwrap();
+            let statement = connection
+                .prepare("SELECT ID FROM T WHERE A = 5 AND FALSE")
+                .unwrap();
+            drop(connection);
+            drop(database);
+            let pager = phase_4c2a_open_pager(temp.path()).unwrap();
+            let mut batch = pager.begin_write().unwrap();
+            let table = batch
+                .catalog_reader()
+                .unwrap()
+                .find_table_by_name(&CatalogName::new("T").unwrap())
+                .unwrap()
+                .id();
+            let mut writer = TableWrite::open(&mut batch, table).unwrap();
+            if missing {
+                assert!(writer.delete(&mut batch, RowId::new(2).unwrap()).unwrap());
+            } else {
+                writer
+                    .replace(
+                        &mut batch,
+                        RowId::new(2).unwrap(),
+                        &[
+                            Value::Int64(2),
+                            Value::Int64(99),
+                            Value::Text("keep".into()),
+                        ],
+                    )
+                    .unwrap();
+            }
+            writer.finish(&mut batch).unwrap();
+            let execution = prepare_query(
+                &statement,
+                Parameters::none(),
+                &batch.catalog_reader().unwrap(),
+                batch.database_uuid(),
+                1_000_000,
+            )
+            .unwrap();
+            let (mut root, params, mut memory) = execution.into_parts();
+            let mut context =
+                ExecutionContext::new(ExecutionStorage::Write(&mut batch), &params, &mut memory);
+            match root.next(&mut context) {
+                Err(error) => assert_eq!(error.code(), ErrorCode::Corruption),
+                Ok(_) => panic!(
+                    "missing/mismatched index row must fail before FALSE filter; missing={missing}"
+                ),
+            }
+        }
+    }
 
     #[test]
     fn filtered_large_row_transfers_its_decoded_payload_at_the_exact_memory_boundary() {
