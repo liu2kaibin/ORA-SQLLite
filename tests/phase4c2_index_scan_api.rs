@@ -537,8 +537,37 @@ fn selected_index_and_table_descendant_corruption_return_corruption() {
     let mut index_page = None;
     let mut table_page = None;
 
+    let undamaged = copied_database(&reference, "candidate-undamaged.db");
+    let database = Database::open(&undamaged, Options::default())
+        .expect("open undamaged copied main and WAL pair");
+    let mut connection = database
+        .connect()
+        .expect("connect undamaged copied fixture");
+    assert_eq!(
+        collect_outcome(
+            &mut connection,
+            "SELECT ID FROM C WHERE A = :1",
+            &[far_value.clone().into()]
+        ),
+        Ok(ids(&[16])),
+        "undamaged equality query must establish the IndexScan baseline"
+    );
+    assert_eq!(
+        collect_outcome(
+            &mut connection,
+            "SELECT ID FROM C WHERE A = :1 OR FALSE",
+            &[far_value.clone().into()]
+        ),
+        Ok(ids(&[16])),
+        "undamaged OR FALSE query must establish the TableScan baseline"
+    );
+    drop(connection);
+    drop(database);
+    remove_corruption_candidate(&undamaged);
+
     for page in 1..page_count {
-        let candidate = copied_corruption_database(&reference, page);
+        let candidate = copied_database(&reference, &format!("candidate-page-{page}.db"));
+        flip_page_data_byte(&candidate, page);
         let outcome = match Database::open(&candidate, Options::default()) {
             Ok(database) => {
                 let mut connection = database.connect().expect("connect corrupt fixture");
@@ -635,15 +664,12 @@ fn flip_page_data_byte(path: &std::path::Path, page: u64) {
     file.sync_all().expect("sync corruption byte");
 }
 
-fn copied_corruption_database(files: &common::TempPaths, page: u64) -> std::path::PathBuf {
-    let candidate = files
-        .main()
-        .with_file_name(format!("candidate-page-{page}.db"));
+fn copied_database(files: &common::TempPaths, name: &str) -> std::path::PathBuf {
+    let candidate = files.main().with_file_name(name);
     fs::copy(files.main(), &candidate).expect("copy owned corruption fixture");
     if files.wal().is_file() {
         fs::copy(files.wal(), corruption_wal_path(&candidate)).expect("copy owned corruption WAL");
     }
-    flip_page_data_byte(&candidate, page);
     candidate
 }
 
@@ -824,7 +850,11 @@ fn write_batches_and_read_snapshots_keep_their_public_indexed_views() {
     let insert = root_writer
         .prepare("INSERT INTO T VALUES (:1, 11, :2, NULL, NULL, X'01', NULL, NULL, TRUE, :3)")
         .unwrap();
-    for id in 10_000..10_016 {
+    // The long B values are overflow-backed table fields. Sixteen rows occupy
+    // 4054 bytes and can remain one leaf; 32 rows exceed that leaf even when
+    // each payload is only a small overflow reference. Their full index keys
+    // still split IX_T_A_B much sooner.
+    for id in 10_000..10_032 {
         let values = [
             Value::Int64(id).into(),
             Value::Text(split_text("snapshot", id)).into(),
@@ -835,15 +865,22 @@ fn write_batches_and_read_snapshots_keep_their_public_indexed_views() {
             .unwrap();
     }
     root_writer.commit().expect("commit snapshot root writer");
+    assert_eq!(before, ids(&[4, 5, 8]));
     assert_eq!(
         collect_read(&mut old, "SELECT ID FROM T WHERE A = 1 ORDER BY ID"),
-        before,
+        ids(&[4, 5, 8]),
         "held read transaction must retain its old complete indexed view"
     );
     let mut fresh = fixture.connect();
     assert_eq!(
         collect(&mut fresh, "SELECT ID FROM T WHERE A = 11 ORDER BY ID"),
-        ids(&std::iter::once(4).chain(10_000..10_016).collect::<Vec<_>>())
+        ids(&std::iter::once(4).chain(10_000..10_032).collect::<Vec<_>>())
+    );
+    assert_query_ids(
+        &mut fresh,
+        "SELECT ID FROM T WHERE A = 11 AND B = :1 ORDER BY ID",
+        &[Value::Text(split_text("snapshot", 10_031)).into()],
+        &[10_031],
     );
 }
 
