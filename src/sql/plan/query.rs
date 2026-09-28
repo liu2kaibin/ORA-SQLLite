@@ -1,4 +1,6 @@
-use super::{AggregateDefinition, ExecExpr, expr::ExprCompiler};
+use super::{
+    AggregateDefinition, ExecExpr, IndexAccessPlan, expr::ExprCompiler, index::choose_index,
+};
 use crate::{
     Result,
     api::ColumnMetadata,
@@ -12,6 +14,7 @@ pub(crate) struct QueryPlan {
     sources: Box<[BoundSource]>,
     joins: Box<[JoinPlan]>,
     selection: Option<ExecExpr>,
+    index_access: Option<IndexAccessPlan>,
     group_by: Box<[ExecExpr]>,
     aggregates: Box<[AggregateDefinition]>,
     having: Option<ExecExpr>,
@@ -50,6 +53,16 @@ impl QueryPlan {
             .as_ref()
             .map(|expr| expressions.compile(expr))
             .transpose()?;
+        let index_access = if bound.sources.len() == 1 && bound.joins.is_empty() {
+            match bound.selection.as_ref() {
+                Some(selection) => choose_index(&bound.sources[0], selection)
+                    .map(|choice| IndexAccessPlan::from_choice(choice, expressions))
+                    .transpose()?,
+                None => None,
+            }
+        } else {
+            None
+        };
         let group_by = bound
             .group_by
             .iter()
@@ -81,6 +94,7 @@ impl QueryPlan {
             sources: bound.sources.as_slice().into(),
             joins,
             selection,
+            index_access,
             group_by,
             aggregates: expressions.take_aggregates(),
             having,
@@ -100,6 +114,9 @@ impl QueryPlan {
     }
     pub(crate) fn selection(&self) -> Option<&ExecExpr> {
         self.selection.as_ref()
+    }
+    pub(crate) fn index_access(&self) -> Option<&IndexAccessPlan> {
+        self.index_access.as_ref()
     }
     pub(crate) fn group_by(&self) -> &[ExecExpr] {
         &self.group_by

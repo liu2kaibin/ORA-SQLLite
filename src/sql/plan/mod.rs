@@ -1,6 +1,7 @@
 //! Immutable, storage-independent compilation of the project's bound SQL IR.
 mod check;
 mod expr;
+mod index;
 mod mutation;
 mod query;
 
@@ -17,6 +18,7 @@ use crate::{
     storage::catalog::types::TableId,
 };
 pub(crate) use expr::{AggregateDefinition, ExecExpr, ExecExprKind};
+pub(crate) use index::IndexAccessPlan;
 pub(crate) use mutation::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan,
     TableConstraintDefinition, UpdatePlan, validate_foreign_key_plan,
@@ -621,6 +623,40 @@ mod tests {
         assert_eq!(create.table().table_id().get(), 1);
         assert_eq!(create.columns()[0].column_id().get(), 2);
         assert_eq!(create.columns()[0].ordinal(), 0);
+    }
+
+    #[test]
+    fn single_table_index_access_compiles_values_separately_from_the_filter() {
+        // Losing either compilation would leave the selected path without a
+        // runtime value or make the residual Filter disappear for duplicates.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let sql = "SELECT ID FROM USERS WHERE ID = :1";
+        let bound = bind_sql(
+            sql,
+            &SqlLimits::default(),
+            &catalog,
+            pager.database_uuid().unwrap(),
+        )
+        .unwrap();
+        let plan = Plan::from_bound(&bound, sql).unwrap();
+        let PlanKind::Query(query) = plan.kind() else {
+            panic!("query")
+        };
+        let access = query.index_access().expect("single-table index access");
+        assert_eq!(access.source(), SourceId(0));
+        assert_eq!(access.index_id(), fixture.index_id());
+        assert_eq!(access.equality().len(), 1);
+        assert!(matches!(
+            access.equality()[0].1.expression().unwrap().kind(),
+            ExecExprKind::Parameter { slot: 0 }
+        ));
+        let ExecExprKind::Binary { right, .. } = query.selection().unwrap().kind() else {
+            panic!("selection")
+        };
+        assert!(matches!(right.kind(), ExecExprKind::Parameter { slot: 0 }));
     }
 
     #[test]
