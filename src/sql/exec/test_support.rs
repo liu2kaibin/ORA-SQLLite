@@ -17,10 +17,10 @@ use crate::{
         relation::ConstrainedTableWrite,
         test_support::{
             Phase4c1CrashPathKind, Phase4c1SqlStorageState, Phase4c2aIndexEntry,
-            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState, RawCatalogCapture,
-            TempDatabase, assert_batch_unchanged_after, assert_commit_trace,
-            phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
-            phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
+            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState,
+            Phase4c2dIndexScanMutation, RawCatalogCapture, TempDatabase,
+            assert_batch_unchanged_after, assert_commit_trace, phase_4c1_abort_wal_initialization,
+            phase_4c1_aborting_crash_pager, phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
             phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
             phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
             phase_4c1_validate_crash_path, phase_4c1_wal_initialization_trace,
@@ -28,8 +28,8 @@ use crate::{
             phase_4c2a_model_state, phase_4c2a_open_pager, phase_4c2a_pager_state,
             phase_4c2a_recover_and_capture, phase_4c2a_remove_recovered_files,
             phase_4c2a_wal_records, phase_4c2b_model_state, phase_4c2b_pager_state,
-            phase_4c2b_recover_and_capture, phase4c2c_catalog_observed, phase4c2c_raw_capture,
-            phase4c2c_trace_catalog,
+            phase_4c2b_recover_and_capture, phase_4c2d_commit_index_scan_corruption,
+            phase4c2c_catalog_observed, phase4c2c_raw_capture, phase4c2c_trace_catalog,
         },
     },
 };
@@ -3151,6 +3151,115 @@ fn phase4c2a_recover_case(
     assert_eq!(repeat, recovered, "repeat recovery changed state");
     phase_4c2a_remove_recovered_files(&path);
     drop(crash_copy);
+}
+
+fn phase4c2d_index_corruption_fixture() -> (TempDatabase, Pager) {
+    let temp = TempDatabase::new("phase4c2d-index-corruption");
+    let pager = phase_4c2a_create_pager(&temp);
+    let mut connection = Connection::from_test_pager(pager.clone());
+    for (sql, affected) in [
+        ("CREATE TABLE T (ID INT64 PRIMARY KEY, A INT64)", 0),
+        ("CREATE INDEX IX_T_A ON T (A)", 0),
+        ("INSERT INTO T VALUES (1, 7)", 1),
+        ("INSERT INTO T VALUES (2, 99)", 1),
+    ] {
+        assert_eq!(
+            actual_execute(&mut connection, sql, Parameters::none()),
+            Outcome::Affected(affected),
+            "{sql}"
+        );
+    }
+    // A blanket error, wrong range, or missing residual Filter must not make a
+    // corruption witness pass: first pin both healthy buckets and AND FALSE.
+    for (sql, expected) in [
+        ("SELECT ID FROM T WHERE A = 7", vec![vec![Value::Int64(1)]]),
+        ("SELECT ID FROM T WHERE A = 99", vec![vec![Value::Int64(2)]]),
+        ("SELECT ID FROM T WHERE A = 7 AND FALSE", vec![]),
+    ] {
+        assert_eq!(
+            actual_query(&mut connection, sql, Parameters::none()),
+            Outcome::Rows(expected),
+            "undamaged fixture: {sql}"
+        );
+    }
+    (temp, pager)
+}
+
+fn phase4c2d_assert_corruption_on_pull(
+    connection: &mut Connection,
+    mutation: Phase4c2dIndexScanMutation,
+    sql: &str,
+) {
+    let statement = connection
+        .prepare(sql)
+        .expect("prepare corrupted-range query");
+    let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+        panic!("expected query plan");
+    };
+    assert!(
+        query.index_access().is_some(),
+        "must select the A index: {sql}"
+    );
+    let mut rows = connection
+        .query(&statement, Parameters::none())
+        .expect("logical corruption must remain lazy until row retrieval");
+    let error = rows
+        .next()
+        .expect_err("selected corruption must not be filtered or emitted");
+    assert_eq!(error.code(), ErrorCode::Corruption, "{mutation:?}: {sql}");
+}
+
+fn assert_index_scan_corruption(mutation: Phase4c2dIndexScanMutation, sql: &str) {
+    let (temp, pager) = phase4c2d_index_corruption_fixture();
+    phase_4c2d_commit_index_scan_corruption(&pager, mutation, 7)
+        .expect("commit one selected raw mutation");
+    drop(pager);
+    let database = Database::open(temp.path(), Options::default())
+        .expect("logical index corruption must not become open-time validation");
+    let mut connection = database.connect().unwrap();
+    phase4c2d_assert_corruption_on_pull(&mut connection, mutation, sql);
+    eprintln!("phase4c2d {mutation:?}: Corruption on pull before AND FALSE");
+}
+
+#[test]
+fn phase_4c2d_index_scan_corruption_matrix() {
+    // Breaks caught: skipping missing-row/byte-for-byte validation, accepting
+    // nonempty values or malformed/zero-ROWID keys, or allowing residual FALSE
+    // to hide corruption. The duplicate case first filters a legitimate entry.
+    for mutation in Phase4c2dIndexScanMutation::ALL {
+        assert_index_scan_corruption(mutation, "SELECT ID FROM T WHERE A = 7 AND FALSE");
+    }
+}
+
+#[test]
+fn phase_4c2d_index_scan_corruption_outside_selected_range_is_deferred() {
+    // Break caught: scanning/validating the whole index instead of the selected
+    // A prefix, or never rejecting the damaged entry when it is later selected.
+    for mutation in Phase4c2dIndexScanMutation::ALL {
+        let (temp, pager) = phase4c2d_index_corruption_fixture();
+        phase_4c2d_commit_index_scan_corruption(&pager, mutation, 99)
+            .expect("commit one out-of-range raw mutation");
+        drop(pager);
+        let database = Database::open(temp.path(), Options::default())
+            .expect("out-of-range corruption must survive reopen");
+        let mut connection = database.connect().unwrap();
+        assert_eq!(
+            actual_query(
+                &mut connection,
+                "SELECT ID FROM T WHERE A = 7",
+                Parameters::none()
+            ),
+            Outcome::Rows(vec![vec![Value::Int64(1)]]),
+            "{mutation:?}: unrelated A=99 corruption must not affect A=7"
+        );
+        for sql in [
+            "SELECT ID FROM T WHERE A = 99",
+            "SELECT ID FROM T WHERE A = 99 AND FALSE",
+        ] {
+            phase4c2d_assert_corruption_on_pull(&mut connection, mutation, sql);
+        }
+        eprintln!("phase4c2d {mutation:?}: A=7 returns ID=1; A=99 returns Corruption");
+    }
 }
 
 fn phase4c2a_assert_corrupt_complete_candidate_is_not_hidden() {
