@@ -71,6 +71,65 @@ impl IndexedFixture {
     }
 }
 
+struct ScalarIndexedFixture {
+    _files: common::TempPaths,
+    database: Database,
+}
+
+impl ScalarIndexedFixture {
+    fn new(label: &str) -> Self {
+        let (files, database) = common::new_database(label);
+        let mut connection = database.connect().expect("connect scalar-index fixture");
+        execute_sql(
+            &mut connection,
+            "CREATE TABLE S (
+                ID INT64 PRIMARY KEY,
+                F FLOAT64,
+                D DATE,
+                TS TIMESTAMP,
+                FLAG BOOL
+            )",
+        );
+        for sql in [
+            "CREATE INDEX IX_S_F ON S(F)",
+            "CREATE INDEX IX_S_D ON S(D)",
+            "CREATE INDEX IX_S_TS ON S(TS)",
+            "CREATE INDEX IX_S_FLAG ON S(FLAG)",
+        ] {
+            execute_sql(&mut connection, sql);
+        }
+        let insert = connection
+            .prepare("INSERT INTO S VALUES (:1, :2, :3, :4, :5)")
+            .expect("prepare scalar-index insert");
+        let date = |day| OracleDate::new(2026, 3, day, 0, 0, 0).unwrap();
+        for (id, float, day, flag) in [(1, -1.5, 1, false), (2, 0.0, 2, true), (3, 1.5, 3, false)] {
+            let timestamp =
+                OracleTimestamp::new(date(day), u32::try_from(day).unwrap() * 10, None).unwrap();
+            let values = [
+                Value::Int64(id).into(),
+                Value::Float64(float).into(),
+                Value::Date(date(day)).into(),
+                Value::Timestamp(timestamp).into(),
+                Value::Bool(flag).into(),
+            ];
+            connection
+                .execute(&insert, Parameters::positional(&values))
+                .expect("insert scalar-index row");
+        }
+        drop(connection);
+        Self {
+            _files: files,
+            database,
+        }
+    }
+
+    fn connect(&self) -> ora_sqllite::Connection {
+        self.database
+            .connect()
+            .expect("connect scalar-index fixture")
+    }
+}
+
 fn fixture_rows() -> Vec<[ParameterValue; 10]> {
     let date = |day| OracleDate::new(2026, 1, day, 12, 0, 0).unwrap();
     let stamp = |day| OracleTimestamp::new(date(day), u32::from(day) * 1_000, None).unwrap();
@@ -159,6 +218,18 @@ fn fixture_rows() -> Vec<[ParameterValue; 10]> {
             Value::Bool(true).into(),
             Value::Null.into(),
         ],
+        [
+            Value::Int64(8).into(),
+            Value::Int64(1).into(),
+            Value::Null.into(),
+            Value::Decimal(decimal(false, 0, 8)).into(),
+            Value::Float64(8.0).into(),
+            Value::Blob(vec![8]).into(),
+            Value::Date(date(8)).into(),
+            Value::Timestamp(stamp(8)).into(),
+            Value::Bool(false).into(),
+            Value::Int64(800).into(),
+        ],
     ]
 }
 
@@ -215,7 +286,7 @@ fn indexed_point_range_null_and_residual_queries_match_expected_rows() {
         (
             "SELECT ID FROM T WHERE A = :1 ORDER BY ID",
             vec![Value::Int64(1).into()],
-            vec![4, 5],
+            vec![4, 5, 8],
         ),
         (
             "SELECT ID FROM T WHERE A = :1 AND B >= :2 AND B < :3 ORDER BY ID",
@@ -237,7 +308,7 @@ fn indexed_point_range_null_and_residual_queries_match_expected_rows() {
         (
             "SELECT ID FROM T WHERE A BETWEEN :1 AND :2 ORDER BY ID",
             vec![Value::Int64(0).into(), Value::Int64(1).into()],
-            vec![3, 4, 5],
+            vec![3, 4, 5, 8],
         ),
         (
             "SELECT ID FROM T WHERE A IS NULL ORDER BY ID",
@@ -252,7 +323,7 @@ fn indexed_point_range_null_and_residual_queries_match_expected_rows() {
         (
             "SELECT ID FROM T WHERE :1 < A ORDER BY ID",
             vec![Value::Int64(0).into()],
-            vec![4, 5, 6],
+            vec![4, 5, 6, 8],
         ),
         (
             "SELECT ID FROM T WHERE C >= :1 AND C < :2 ORDER BY ID",
@@ -267,27 +338,71 @@ fn indexed_point_range_null_and_residual_queries_match_expected_rows() {
         (
             "SELECT ID FROM T WHERE F >= :1 ORDER BY ID",
             vec![Value::Float64(1.5).into()],
-            vec![5, 6, 7],
-        ),
-        (
-            "SELECT ID FROM T WHERE D = :1 ORDER BY ID",
-            vec![Value::Date(date).into()],
-            vec![5],
-        ),
-        (
-            "SELECT ID FROM T WHERE TS = :1 ORDER BY ID",
-            vec![Value::Timestamp(timestamp).into()],
-            vec![5],
-        ),
-        (
-            "SELECT ID FROM T WHERE FLAG = :1 ORDER BY ID",
-            vec![Value::Bool(true).into()],
-            vec![3, 5, 7],
+            vec![5, 6, 7, 8],
         ),
         (
             "SELECT ID FROM T WHERE A = 1 AND B <> :1 ORDER BY ID",
             vec![Value::Text("beta".into()).into()],
             vec![5],
+        ),
+    ] {
+        assert_query_ids(&mut connection, sql, &parameters, &expected);
+    }
+    assert_query_ids(
+        &mut connection,
+        "SELECT ID FROM T WHERE A = 1 AND B IS NULL ORDER BY ID",
+        &[],
+        &[8],
+    );
+    assert_query_ids(
+        &mut connection,
+        "SELECT ID FROM T WHERE D = :1 ORDER BY ID",
+        &[Value::Date(date).into()],
+        &[5],
+    );
+    assert_query_ids(
+        &mut connection,
+        "SELECT ID FROM T WHERE TS = :1 ORDER BY ID",
+        &[Value::Timestamp(timestamp).into()],
+        &[5],
+    );
+    assert_query_ids(
+        &mut connection,
+        "SELECT ID FROM T WHERE FLAG = :1 ORDER BY ID",
+        &[Value::Bool(true).into()],
+        &[3, 5, 7],
+    );
+}
+
+#[test]
+fn dedicated_scalar_indexes_preserve_float_date_timestamp_and_bool_results() {
+    // Production breaks caught: a scalar-specific encoded index key or range
+    // returns a different public row set than the typed predicate requires.
+    let fixture = ScalarIndexedFixture::new("phase4c2d-public-scalar-indexes");
+    let mut connection = fixture.connect();
+    let date = OracleDate::new(2026, 3, 2, 0, 0, 0).unwrap();
+    let timestamp =
+        OracleTimestamp::new(OracleDate::new(2026, 3, 3, 0, 0, 0).unwrap(), 30, None).unwrap();
+    for (sql, parameters, expected) in [
+        (
+            "SELECT ID FROM S WHERE F >= :1 ORDER BY ID",
+            vec![Value::Float64(0.0).into()],
+            vec![2, 3],
+        ),
+        (
+            "SELECT ID FROM S WHERE D = :1 ORDER BY ID",
+            vec![Value::Date(date).into()],
+            vec![2],
+        ),
+        (
+            "SELECT ID FROM S WHERE TS = :1 ORDER BY ID",
+            vec![Value::Timestamp(timestamp).into()],
+            vec![3],
+        ),
+        (
+            "SELECT ID FROM S WHERE FLAG = :1 ORDER BY ID",
+            vec![Value::Bool(false).into()],
+            vec![1, 3],
         ),
     ] {
         assert_query_ids(&mut connection, sql, &parameters, &expected);
@@ -413,65 +528,97 @@ fn public_bind_resource_schema_and_corruption_errors_remain_stable() {
 }
 
 #[test]
-fn selected_index_and_table_corruption_return_corruption() {
-    // Production break caught: mapping physical corruption in an indexed or
-    // table-only source fixture to any public class other than Corruption.
-    for (label, create_index) in [
-        ("phase4c2d-public-corrupt-index", true),
-        ("phase4c2d-public-corrupt-table", false),
-    ] {
-        let (files, database) = common::new_database(label);
-        let mut setup = database.connect().expect("connect corruption fixture");
-        execute_sql(&mut setup, "CREATE TABLE C (ID INT64 PRIMARY KEY, A INT64)");
-        let mut write = setup.begin_write().expect("begin corruption setup writer");
-        let insert = write.prepare("INSERT INTO C VALUES (:1, :2)").unwrap();
-        for id in 1..=96 {
-            let values = [Value::Int64(id).into(), Value::Int64(id).into()];
-            write
-                .execute(&insert, Parameters::positional(&values))
-                .unwrap();
-        }
-        write.commit().unwrap();
-        if create_index {
-            execute_sql(&mut setup, "CREATE INDEX IX_C_A ON C(A)");
-        }
-        drop(setup);
-        drop(database);
-        common::checkpoint(&files);
-        flip_final_data_byte(files.main());
-        if create_index {
-            assert_eq!(
-                Database::open(files.main(), Options::default())
-                    .map(|_| ())
-                    .map_err(|error| error.code()),
-                Err(ErrorCode::Corruption),
-                "{label}"
-            );
-        } else {
-            let database = Database::open(files.main(), Options::default())
-                .expect("open table-corruption fixture");
-            let mut connection = database
-                .connect()
-                .expect("connect table-corruption fixture");
-            assert_eq!(
-                collect_outcome(
+fn selected_index_and_table_descendant_corruption_return_corruption() {
+    // Production break caught: IndexScan must propagate a corrupt selected
+    // index/table descendant before it can return a far-side matching row.
+    let reference = corruption_fixture("phase4c2d-public-corrupt-reference");
+    let page_count = physical_page_count(reference.main());
+    let far_value = Value::Text(split_text("corrupt", 16));
+    let mut index_page = None;
+    let mut table_page = None;
+
+    for page in 1..page_count {
+        let candidate = copied_corruption_database(&reference, page);
+        let outcome = match Database::open(&candidate, Options::default()) {
+            Ok(database) => {
+                let mut connection = database.connect().expect("connect corrupt fixture");
+                let indexed = collect_outcome(
                     &mut connection,
-                    "SELECT ID FROM C WHERE A >= :1 ORDER BY ID",
-                    &[Value::Int64(0).into()]
-                ),
-                Err(ErrorCode::Corruption),
-                "{label}"
-            );
+                    "SELECT ID FROM C WHERE A = :1",
+                    &[far_value.clone().into()],
+                );
+                let table_scan = collect_outcome(
+                    &mut connection,
+                    "SELECT ID FROM C WHERE A = :1 OR FALSE",
+                    &[far_value.clone().into()],
+                );
+                drop(connection);
+                drop(database);
+                Ok((indexed, table_scan))
+            }
+            Err(error) => Err(error.code()),
+        };
+        remove_corruption_candidate(&candidate);
+        let Ok((indexed, table_scan)) = outcome else {
+            assert_eq!(outcome, Err(ErrorCode::Corruption), "page {page}");
+            continue;
+        };
+        match (indexed, table_scan) {
+            (Err(ErrorCode::Corruption), Ok(rows)) if rows == ids(&[16]) => {
+                index_page.get_or_insert(page);
+            }
+            (Err(ErrorCode::Corruption), Err(ErrorCode::Corruption)) => {
+                table_page.get_or_insert(page);
+            }
+            _ => {}
         }
     }
+    assert!(
+        index_page.is_some(),
+        "a corrupt index descendant must survive open and fail only IndexScan"
+    );
+    assert!(
+        table_page.is_some(),
+        "a corrupt table descendant must survive open and fail both IndexScan and TableScan"
+    );
 }
 
-fn flip_final_data_byte(path: &std::path::Path) {
+fn corruption_fixture(label: &str) -> common::TempPaths {
+    let (files, database) = common::new_database(label);
+    let mut setup = database.connect().expect("connect corruption fixture");
+    execute_sql(&mut setup, "CREATE TABLE C (ID INT64 PRIMARY KEY, A TEXT)");
+    let mut write = setup.begin_write().expect("begin corruption setup writer");
+    let insert = write.prepare("INSERT INTO C VALUES (:1, :2)").unwrap();
+    for id in 1..=16 {
+        let values = [
+            Value::Int64(id).into(),
+            Value::Text(split_text("corrupt", id)).into(),
+        ];
+        write
+            .execute(&insert, Parameters::positional(&values))
+            .unwrap();
+    }
+    write.commit().unwrap();
+    execute_sql(&mut setup, "CREATE INDEX IX_C_A ON C(A)");
+    drop(setup);
+    drop(database);
+    common::checkpoint(&files);
+    files
+}
+
+fn physical_page_count(path: &std::path::Path) -> u64 {
     let length = fs::metadata(path)
         .expect("read corruption fixture metadata")
         .len();
-    assert!(length > 1, "fixture must have physical data to corrupt");
-    let offset = length - 1;
+    assert_eq!(length % 4_096, 0, "default database uses complete pages");
+    length / 4_096
+}
+
+fn flip_page_data_byte(path: &std::path::Path, page: u64) {
+    let offset = page
+        .checked_mul(4_096)
+        .and_then(|offset| offset.checked_add(80))
+        .expect("page corruption offset fits");
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -486,6 +633,29 @@ fn flip_final_data_byte(path: &std::path::Path) {
     file.write_all(&[byte[0] ^ 0x01])
         .expect("write corruption byte");
     file.sync_all().expect("sync corruption byte");
+}
+
+fn copied_corruption_database(files: &common::TempPaths, page: u64) -> std::path::PathBuf {
+    let candidate = files
+        .main()
+        .with_file_name(format!("candidate-page-{page}.db"));
+    fs::copy(files.main(), &candidate).expect("copy owned corruption fixture");
+    if files.wal().is_file() {
+        fs::copy(files.wal(), corruption_wal_path(&candidate)).expect("copy owned corruption WAL");
+    }
+    flip_page_data_byte(&candidate, page);
+    candidate
+}
+
+fn remove_corruption_candidate(path: &std::path::Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(corruption_wal_path(path));
+}
+
+fn corruption_wal_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    std::path::PathBuf::from(wal)
 }
 
 #[test]
@@ -503,11 +673,14 @@ fn prepared_index_scan_reopens_current_roots_but_rejects_index_ddl() {
         .unwrap();
     let date = OracleDate::new(2026, 2, 1, 0, 0, 0).unwrap();
     let timestamp = OracleTimestamp::new(date, 0, None).unwrap();
-    for id in 9_000..9_064 {
+    // Sixteen 720-byte second-key values overflow both the table's row leaves
+    // and IX_T_A_B's physical key leaves at the default 4096-byte page size.
+    // The far-side point probe below must therefore reopen descendant roots.
+    for id in 9_000..9_016 {
         let values = [
             Value::Int64(id).into(),
             Value::Int64(id).into(),
-            Value::Text(format!("split-{id:04}")).into(),
+            Value::Text(split_text("roots", id)).into(),
             Value::Decimal(decimal(false, 0, id as u128)).into(),
             Value::Float64(id as f64).into(),
             Value::Blob(id.to_le_bytes().to_vec()).into(),
@@ -522,15 +695,15 @@ fn prepared_index_scan_reopens_current_roots_but_rejects_index_ddl() {
     }
     transaction.commit().unwrap();
     assert_eq!(
-        collect_params(&mut connection, &statement, &[Value::Int64(9_000).into()]),
-        ids(&[9_000])
+        collect_params(&mut connection, &statement, &[Value::Int64(9_015).into()]),
+        ids(&[9_015])
     );
     execute_sql(&mut connection, "DROP INDEX IX_T_A_B");
     assert_eq!(
         connection
             .query(
                 &statement,
-                Parameters::positional(&[Value::Int64(9_000).into()])
+                Parameters::positional(&[Value::Int64(9_015).into()])
             )
             .expect_err("drop must invalidate selected-index statement")
             .code(),
@@ -605,6 +778,24 @@ fn write_batches_and_read_snapshots_keep_their_public_indexed_views() {
         values
     };
     assert_eq!(rows, ids(&[4, 80]));
+    let affected_bucket = write
+        .prepare("SELECT ID FROM T WHERE A = :1 ORDER BY ID")
+        .unwrap();
+    assert_eq!(
+        {
+            let parameters = [Value::Int64(1).into()];
+            let mut rows = write
+                .query(&affected_bucket, Parameters::positional(&parameters))
+                .unwrap();
+            let mut values = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                values.push(row.values().to_vec());
+            }
+            values
+        },
+        ids(&[8]),
+        "the indexed A=1 bucket must exclude both updated ID 4 and deleted ID 5"
+    );
     write.rollback().unwrap();
     assert_eq!(
         collect(
@@ -612,6 +803,11 @@ fn write_batches_and_read_snapshots_keep_their_public_indexed_views() {
             "SELECT ID FROM T WHERE ID IN (4, 5, 80) ORDER BY ID"
         ),
         ids(&[4, 5])
+    );
+    assert_eq!(
+        collect(&mut connection, "SELECT ID FROM T WHERE A = 1 ORDER BY ID"),
+        ids(&[4, 5, 8]),
+        "rollback must restore both the deleted row and the updated index entry"
     );
 
     let mut old_connection = fixture.connect();
@@ -628,10 +824,10 @@ fn write_batches_and_read_snapshots_keep_their_public_indexed_views() {
     let insert = root_writer
         .prepare("INSERT INTO T VALUES (:1, 11, :2, NULL, NULL, X'01', NULL, NULL, TRUE, :3)")
         .unwrap();
-    for id in 10_000..10_064 {
+    for id in 10_000..10_016 {
         let values = [
             Value::Int64(id).into(),
-            Value::Text(format!("snapshot-{id}")).into(),
+            Value::Text(split_text("snapshot", id)).into(),
             Value::Int64(id).into(),
         ];
         root_writer
@@ -647,8 +843,12 @@ fn write_batches_and_read_snapshots_keep_their_public_indexed_views() {
     let mut fresh = fixture.connect();
     assert_eq!(
         collect(&mut fresh, "SELECT ID FROM T WHERE A = 11 ORDER BY ID"),
-        ids(&std::iter::once(4).chain(10_000..10_064).collect::<Vec<_>>())
+        ids(&std::iter::once(4).chain(10_000..10_016).collect::<Vec<_>>())
     );
+}
+
+fn split_text(prefix: &str, id: i64) -> String {
+    format!("{prefix}-{id:04}-{}", "x".repeat(704))
 }
 
 fn collect_read(transaction: &mut ora_sqllite::ReadTransaction<'_>, sql: &str) -> Vec<Vec<Value>> {
