@@ -54,6 +54,52 @@ impl DecodedIndexKey {
 pub(crate) struct IndexKeyCodec;
 
 impl IndexKeyCodec {
+    /// Whether a query prefix fits the bounded stored-key encoder. An oversized
+    /// comparison operand is legal SQL, so report it separately from errors.
+    /// This does not change encode/encode_prefix's persisted-key size contract.
+    pub(crate) fn prefix_is_representable(
+        columns: &[ColumnDef],
+        values: &[&Value],
+    ) -> Result<bool> {
+        if columns.is_empty() || columns.len() != values.len() {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index prefix requires one value per column",
+            ));
+        }
+        let limit = MAX_INDEX_KEY_BYTES - ROWID_BYTES;
+        let mut prefix = Vec::with_capacity(INDEX_KEY_BUFFER_BYTES);
+        for (column, value) in columns.iter().zip(values) {
+            if matches!(value, Value::Null) {
+                prefix.push(1);
+            } else {
+                prefix.push(0);
+                let bytes = match (column.column_type(), value) {
+                    (ColumnType::Text, Value::Text(value)) => Some(value.as_bytes()),
+                    (ColumnType::Blob, Value::Blob(value)) => Some(value.as_slice()),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    // Check before allocating/encoding the payload, including
+                    // zero-byte escaping and the two-byte component terminator.
+                    if bytes.len() > limit {
+                        return Ok(false);
+                    }
+                    let encoded_len =
+                        bytes.len() + bytes.iter().filter(|byte| **byte == 0).count() + 2;
+                    if encoded_len > limit.saturating_sub(prefix.len()) {
+                        return Ok(false);
+                    }
+                }
+                encode_scalar(column.column_type(), value, &mut prefix)?;
+            }
+            if prefix.len() > limit {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn encode_prefix(columns: &[ColumnDef], values: &[Value]) -> Result<Vec<u8>> {
         if columns.is_empty() {
             return Err(DbError::new(

@@ -32,7 +32,7 @@ enum BuiltRange {
 }
 
 impl IndexScanRange {
-    fn build(&self, columns: &[ColumnDef]) -> Result<BuiltRange> {
+    fn validate(&self, columns: &[ColumnDef]) -> Result<()> {
         let equalities = self.equality.len();
         let has_range = self.lower.is_some() || self.upper.is_some();
         if equalities > columns.len() || (has_range && equalities == columns.len()) {
@@ -47,6 +47,12 @@ impl IndexScanRange {
                 "Blob index scans support equality only",
             ));
         }
+        Ok(())
+    }
+
+    fn build(&self, columns: &[ColumnDef]) -> Result<BuiltRange> {
+        self.validate(columns)?;
+        let equalities = self.equality.len();
         let equality = if equalities == 0 {
             Vec::new()
         } else {
@@ -121,6 +127,27 @@ pub(crate) struct IndexRowIdScan {
 }
 
 impl IndexStorage {
+    /// False is a legal query bound that cannot use this bounded access path,
+    /// not a query resource failure. No storage I/O or error-code suppression.
+    pub(crate) fn range_is_representable(&self, range: &IndexScanRange) -> Result<bool> {
+        let columns = &self.schema.columns;
+        range.validate(columns)?;
+        let mut values = range.equality.iter().collect::<Vec<_>>();
+        if !values.is_empty()
+            && !IndexKeyCodec::prefix_is_representable(&columns[..values.len()], &values)?
+        {
+            return Ok(false);
+        }
+        for bound in [&range.lower, &range.upper].into_iter().flatten() {
+            values.push(&bound.value);
+            if !IndexKeyCodec::prefix_is_representable(&columns[..values.len()], &values)? {
+                return Ok(false);
+            }
+            values.pop();
+        }
+        Ok(true)
+    }
+
     pub(crate) fn scan_rowids(self, range: &IndexScanRange) -> Result<IndexRowIdScan> {
         let state = match range.build(&self.schema.columns)? {
             BuiltRange::Empty => None,

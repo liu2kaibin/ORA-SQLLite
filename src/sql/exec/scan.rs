@@ -109,6 +109,7 @@ pub(crate) struct IndexScan {
 enum IndexScanState {
     Uninitialized,
     Empty,
+    TableScan(TableScan),
     Scanning {
         relation: Relation,
         scan: IndexRowIdScan,
@@ -131,6 +132,14 @@ impl IndexScan {
         }
         let (relation, index) = context.open_index(&self.source, &self.access)?;
         self.state = match evaluate_bounds(&self.access, context.params())? {
+            Some(range) if !index.range_is_representable(&range)? => {
+                // Legal SQL operands need not fit a persisted index key. Keep
+                // the current view, decode bound, and original outer Filter.
+                IndexScanState::TableScan(TableScan::new(
+                    self.source.source_id,
+                    relation.scan(self.max_row_bytes),
+                ))
+            }
             Some(range) => IndexScanState::Scanning {
                 relation,
                 scan: index.scan_rowids(&range)?,
@@ -146,6 +155,9 @@ impl Operator for IndexScan {
         #[cfg(test)]
         ACCESS_PATHS.with(|paths| paths.borrow_mut().push("IndexScan"));
         self.initialize_bounds(context)?;
+        if let IndexScanState::TableScan(scan) = &mut self.state {
+            return scan.next(context);
+        }
         let IndexScanState::Scanning { relation, scan } = &mut self.state else {
             return Ok(None);
         };
@@ -407,6 +419,185 @@ mod tests {
             ),
             [2]
         );
+    }
+
+    fn long_bound_fixture(blob: bool) -> (TempDatabase, Database) {
+        let temp = TempDatabase::new("index-long-bound");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        let column_type = if blob { "BLOB" } else { "TEXT" };
+        execute(
+            &mut connection,
+            &format!("CREATE TABLE T (ID INT64 PRIMARY KEY, A {column_type}, B TEXT)"),
+        );
+        execute(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+        let insert = connection
+            .prepare("INSERT INTO T VALUES (:1, :2, :3)")
+            .unwrap();
+        for (id, value, note) in [
+            (1, Some("a"), "keep"),
+            (2, Some("a"), "reject"),
+            (3, Some("b"), "keep"),
+            (4, None, "keep"),
+        ] {
+            let value = match value {
+                Some(value) if blob => Value::Blob(value.as_bytes().to_vec()),
+                Some(value) => Value::Text(value.into()),
+                None => Value::Null,
+            };
+            connection
+                .execute(
+                    &insert,
+                    Parameters::positional(&[
+                        Value::Int64(id).into(),
+                        value.into(),
+                        Value::Text(note.into()).into(),
+                    ]),
+                )
+                .unwrap();
+        }
+        (temp, database)
+    }
+
+    fn long_bound_result(
+        connection: &mut Connection,
+        comparison: &str,
+        parameter: &Value,
+        force_table_scan: bool,
+    ) -> std::result::Result<Vec<i64>, ErrorCode> {
+        // OR FALSE is equivalent under SQL three-valued logic, but not a
+        // supported access term. Verify both plans instead of assuming this.
+        let predicate = format!("A {comparison} :1");
+        let predicate = if force_table_scan {
+            format!("({predicate} OR FALSE)")
+        } else {
+            predicate
+        };
+        let statement = connection
+            .prepare(&format!(
+                "SELECT ID FROM T WHERE {predicate} AND B <> 'reject'"
+            ))
+            .unwrap();
+        let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+            panic!("query plan")
+        };
+        assert_eq!(query.index_access().is_some(), !force_table_scan);
+        let parameters = [parameter.clone().into()];
+        let result = (|| {
+            let mut rows = connection.query(&statement, Parameters::positional(&parameters))?;
+            let mut result = Vec::new();
+            while let Some(row) = rows.next()? {
+                let Value::Int64(id) = row.values()[0] else {
+                    panic!("integer ID")
+                };
+                result.push(id);
+            }
+            result.sort_unstable();
+            crate::Result::Ok(result)
+        })();
+        result.map_err(|error| error.code())
+    }
+
+    fn assert_long_bound_matches_table_scan(
+        blob: bool,
+        comparisons: &[&str],
+        parameter: Value,
+        expected: &[i64],
+    ) {
+        let (_temp, database) = long_bound_fixture(blob);
+        let mut connection = database.connect().unwrap();
+        for comparison in comparisons {
+            let table = long_bound_result(&mut connection, comparison, &parameter, true);
+            assert_eq!(
+                table,
+                Ok(expected.to_vec()),
+                "full-filter reference {comparison}"
+            );
+            let indexed = long_bound_result(&mut connection, comparison, &parameter, false);
+            assert_eq!(
+                indexed, table,
+                "indexed {comparison} must accept a legal long comparison operand"
+            );
+        }
+    }
+
+    #[test]
+    fn index_scan_long_text_equality_matches_full_filter() {
+        // Break caught: applying the persisted key byte limit to a legal
+        // no-match equality operand, including escape-expanded short text.
+        for parameter in ["z".repeat(1014), "\0".repeat(507)] {
+            assert_long_bound_matches_table_scan(false, &["="], Value::Text(parameter), &[]);
+        }
+    }
+
+    #[test]
+    fn index_scan_long_text_upper_bounds_match_full_filter() {
+        // Break caught: rejecting valid upper fences or losing the full
+        // residual predicate when handling an oversized physical bound.
+        assert_long_bound_matches_table_scan(
+            false,
+            &["<", "<="],
+            Value::Text("z".repeat(1014)),
+            &[1, 3],
+        );
+    }
+
+    #[test]
+    fn index_scan_long_text_lower_bounds_match_full_filter() {
+        // Break caught: treating an unrepresentable lower bound as empty,
+        // even though the stored nonzero-byte strings compare above it.
+        assert_long_bound_matches_table_scan(
+            false,
+            &[">", ">="],
+            Value::Text("\0".repeat(507)),
+            &[1, 3],
+        );
+    }
+
+    #[test]
+    fn index_scan_long_blob_equality_matches_full_filter() {
+        // Break caught: confusing the stored Blob key limit with the public
+        // parameter/value domain; escaped zero bytes count toward key size.
+        for parameter in [vec![0x5a; 1014], vec![0; 507]] {
+            assert_long_bound_matches_table_scan(true, &["="], Value::Blob(parameter), &[]);
+        }
+    }
+
+    #[test]
+    fn index_scan_long_bound_preserves_parameter_and_row_memory_limits() {
+        // Break caught: suppressing genuine query ResourceLimit errors, or
+        // failing to charge the long parameter alongside input/output rows.
+        let (temp, database) = long_bound_fixture(false);
+        drop(database);
+        let value_bytes = std::mem::size_of::<Value>() as u64;
+        let parameter_bytes = 32 + value_bytes + 1014;
+        let exact = parameter_bytes + (32 + 3 * value_bytes + 5) + (32 + value_bytes);
+        for (limit, accepted) in [
+            (parameter_bytes - 1, false),
+            (exact - 1, false),
+            (exact, true),
+        ] {
+            let database = Database::open(
+                temp.path(),
+                Options::default().with_max_query_memory_bytes(limit),
+            )
+            .unwrap();
+            let mut connection = database.connect().unwrap();
+            let parameter = Value::Text("z".repeat(1014));
+            let table = long_bound_result(&mut connection, "<", &parameter, true);
+            assert_eq!(
+                table,
+                if accepted {
+                    Ok(vec![1, 3])
+                } else {
+                    Err(ErrorCode::ResourceLimit)
+                }
+            );
+            assert_eq!(
+                long_bound_result(&mut connection, "<", &parameter, false),
+                table
+            );
+        }
     }
 
     #[test]
