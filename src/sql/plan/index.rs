@@ -195,28 +195,22 @@ struct CandidateScore {
 }
 
 struct ColumnTerms<'a> {
-    equality: Option<ChoiceEquality<'a>>,
-    lower: Option<ChoiceRangeBound<'a>>,
-    upper: Option<ChoiceRangeBound<'a>>,
+    equality: Vec<ChoiceEquality<'a>>,
+    lower: Vec<ChoiceRangeBound<'a>>,
+    upper: Vec<ChoiceRangeBound<'a>>,
 }
 
 impl<'a> ColumnTerms<'a> {
     fn record_equality(&mut self, value: ChoiceEquality<'a>) {
-        if self.equality.is_none() {
-            self.equality = Some(value);
-        }
+        self.equality.push(value);
     }
 
     fn record_lower(&mut self, value: ChoiceRangeBound<'a>) {
-        if self.lower.is_none() {
-            self.lower = Some(value);
-        }
+        self.lower.push(value);
     }
 
     fn record_upper(&mut self, value: ChoiceRangeBound<'a>) {
-        if self.upper.is_none() {
-            self.upper = Some(value);
-        }
+        self.upper.push(value);
     }
 }
 
@@ -289,9 +283,9 @@ fn extract_terms<'a>(source: SourceId, root: &'a BoundExpr) -> BTreeMap<ColumnId
 
 fn default_terms<'a>() -> ColumnTerms<'a> {
     ColumnTerms {
-        equality: None,
-        lower: None,
-        upper: None,
+        equality: Vec::new(),
+        lower: Vec::new(),
+        upper: Vec::new(),
     }
 }
 
@@ -425,7 +419,7 @@ fn candidate<'a>(
     for column in index.columns() {
         let Some(value) = terms
             .get(&column.column_id())
-            .and_then(|terms| terms.equality)
+            .and_then(|terms| first_compatible_equality(terms, column.column_type()))
         else {
             break;
         };
@@ -443,23 +437,14 @@ fn candidate<'a>(
         }
     }
     unique_point_form &= equality.len() == index.columns().len();
-    // A bounded interval on another searchable column is not a point form,
-    // even if this particular unique key is fully constrained by equality.
-    unique_point_form &= !terms
-        .values()
-        .any(|terms| terms.lower.is_some() && terms.upper.is_some());
 
     let range = index.columns().get(equality.len()).and_then(|column| {
         if column.column_type() == ColumnType::Blob {
             return None;
         }
         let terms = terms.get(&column.column_id())?;
-        let lower = terms
-            .lower
-            .filter(|bound| searchable_value(bound.expression, column.column_type()));
-        let upper = terms
-            .upper
-            .filter(|bound| searchable_value(bound.expression, column.column_type()));
+        let lower = first_compatible_bound(&terms.lower, column.column_type());
+        let upper = first_compatible_bound(&terms.upper, column.column_type());
         if lower.is_none() && upper.is_none() {
             None
         } else {
@@ -492,6 +477,26 @@ fn candidate<'a>(
             range,
         },
     ))
+}
+
+fn first_compatible_equality<'a>(
+    terms: &ColumnTerms<'a>,
+    column_type: ColumnType,
+) -> Option<ChoiceEquality<'a>> {
+    terms.equality.iter().copied().find(|value| match value {
+        ChoiceEquality::Expression(expression) => searchable_value(expression, column_type),
+        ChoiceEquality::IsNull => true,
+    })
+}
+
+fn first_compatible_bound<'a>(
+    bounds: &[ChoiceRangeBound<'a>],
+    column_type: ColumnType,
+) -> Option<ChoiceRangeBound<'a>> {
+    bounds
+        .iter()
+        .copied()
+        .find(|bound| searchable_value(bound.expression, column_type))
 }
 
 #[cfg(test)]
@@ -560,8 +565,146 @@ mod tests {
         );
         assert_eq!(
             choose_index(&source, &range_only).unwrap().index_id().get(),
+            30
+        );
+    }
+
+    #[test]
+    fn range_scoring_prefers_presence_then_more_bounds_without_a_unique_point() {
+        let presence_source = source(vec![
+            index(
+                10,
+                false,
+                &[(1, 4, ColumnType::Int64), (3, 12, ColumnType::Int64)],
+            ),
+            index(
+                20,
+                false,
+                &[(1, 4, ColumnType::Int64), (2, 9, ColumnType::Int64)],
+            ),
+        ]);
+        let presence_predicate = and(
+            eq_col(1, 1),
+            between(
+                column(2, 9, SqlType::Int64),
+                literal(Value::Int64(5), SqlType::Int64),
+                literal(Value::Int64(9), SqlType::Int64),
+            ),
+        );
+        assert_eq!(
+            choose_index(&presence_source, &presence_predicate)
+                .unwrap()
+                .index_id()
+                .get(),
             20
         );
+
+        let bounds_source = source(vec![
+            index(
+                10,
+                false,
+                &[(1, 4, ColumnType::Int64), (3, 12, ColumnType::Int64)],
+            ),
+            index(
+                20,
+                false,
+                &[(1, 4, ColumnType::Int64), (2, 9, ColumnType::Int64)],
+            ),
+        ]);
+        let bounds_predicate = and(
+            and(
+                eq_col(1, 1),
+                between(
+                    column(2, 9, SqlType::Int64),
+                    literal(Value::Int64(5), SqlType::Int64),
+                    literal(Value::Int64(9), SqlType::Int64),
+                ),
+            ),
+            binary(
+                column(3, 12, SqlType::Int64),
+                BoundBinaryOp::GreaterThan,
+                literal(Value::Int64(5), SqlType::Int64),
+            ),
+        );
+        assert_eq!(
+            choose_index(&bounds_source, &bounds_predicate)
+                .unwrap()
+                .index_id()
+                .get(),
+            20
+        );
+    }
+
+    #[test]
+    fn incompatible_first_terms_do_not_mask_later_compatible_equality_or_bounds() {
+        let equality_source = single_index_source();
+        let equality = and(
+            binary(
+                column(1, 4, SqlType::Int64),
+                BoundBinaryOp::Equal,
+                parameter(1, SqlType::Decimal),
+            ),
+            eq_col(1, 7),
+        );
+        let choice = choose_index(&equality_source, &equality).unwrap();
+        let ChoiceEquality::Expression(expression) = choice.equality()[0].1 else {
+            panic!("the later compatible equality must be selected")
+        };
+        assert!(matches!(
+            expression.kind,
+            BoundExprKind::Literal(Value::Int64(7))
+        ));
+
+        let range_source = source(vec![index(
+            11,
+            false,
+            &[(1, 4, ColumnType::Int64), (2, 9, ColumnType::Int64)],
+        )]);
+        let lower = and(
+            and(
+                eq_col(1, 1),
+                binary(
+                    column(2, 9, SqlType::Int64),
+                    BoundBinaryOp::GreaterThan,
+                    parameter(1, SqlType::Decimal),
+                ),
+            ),
+            binary(
+                column(2, 9, SqlType::Int64),
+                BoundBinaryOp::GreaterThanOrEqual,
+                literal(Value::Int64(5), SqlType::Int64),
+            ),
+        );
+        let choice = choose_index(&range_source, &lower).unwrap();
+        let lower = choice.range().unwrap().lower.as_ref().unwrap();
+        assert!(lower.inclusive);
+        assert!(matches!(
+            lower.expression.kind,
+            BoundExprKind::Literal(Value::Int64(5))
+        ));
+
+        let upper = and(
+            and(
+                eq_col(1, 1),
+                binary(
+                    column(2, 9, SqlType::Int64),
+                    BoundBinaryOp::LessThan,
+                    parameter(1, SqlType::Decimal),
+                ),
+            ),
+            binary(
+                column(2, 9, SqlType::Int64),
+                BoundBinaryOp::LessThanOrEqual,
+                literal(Value::Int64(9), SqlType::Int64),
+            ),
+        );
+        let choice = choose_index(&range_source, &upper).unwrap();
+        let upper = choice.range().unwrap().upper.as_ref().unwrap();
+        assert!(upper.inclusive);
+        assert!(matches!(
+            upper.expression.kind,
+            BoundExprKind::Literal(Value::Int64(9))
+        ));
     }
 
     #[test]
