@@ -8,7 +8,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ora_sqllite::{Connection, Database, ErrorCode, ExecutionResult, Options, Parameters, Value};
+use ora_sqllite::{
+    Connection, Database, ErrorCode, ExecutionResult, Options, ParameterValue, Parameters,
+    Statement, Value,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -103,6 +106,16 @@ pub fn reopen(files: &TempPaths) -> Database {
     Database::open(files.main(), Options::default()).unwrap()
 }
 
+pub fn checkpoint(files: &TempPaths) {
+    let database = Database::open(
+        files.main(),
+        Options::default().with_checkpoint_wal_bytes(1),
+    )
+    .unwrap();
+    let mut connection = database.connect().unwrap();
+    connection.begin_write().unwrap().rollback().unwrap();
+}
+
 pub fn execute_sql(connection: &mut Connection, sql: &str) -> ExecutionResult {
     let statement = connection.prepare(sql).unwrap();
     connection.execute(&statement, Parameters::none()).unwrap()
@@ -110,7 +123,23 @@ pub fn execute_sql(connection: &mut Connection, sql: &str) -> ExecutionResult {
 
 pub fn collect(connection: &mut Connection, sql: &str) -> Vec<Vec<Value>> {
     let statement = connection.prepare(sql).unwrap();
-    let mut rows = connection.query(&statement, Parameters::none()).unwrap();
+    collect_statement(connection, &statement, Parameters::none())
+}
+
+pub fn collect_params(
+    connection: &mut Connection,
+    statement: &Statement,
+    parameters: &[ParameterValue],
+) -> Vec<Vec<Value>> {
+    collect_statement(connection, statement, Parameters::positional(parameters))
+}
+
+pub fn collect_statement(
+    connection: &mut Connection,
+    statement: &Statement,
+    parameters: Parameters<'_>,
+) -> Vec<Vec<Value>> {
+    let mut rows = connection.query(statement, parameters).unwrap();
     let mut values = Vec::new();
     while let Some(row) = rows.next().unwrap() {
         values.push(row.values().to_vec());
