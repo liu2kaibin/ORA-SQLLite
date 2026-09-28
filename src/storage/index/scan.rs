@@ -148,7 +148,10 @@ impl IndexRowIdScan {
         let Some(state) = self.state.as_mut() else {
             return Ok(None);
         };
-        let Some((physical, value)) = state.next(source)? else {
+        let Some((physical, value)) = state.next_value_limited_with_error(source, 0, || {
+            corruption("index leaf value must be empty")
+        })?
+        else {
             return Ok(None);
         };
         if !value.is_empty() {
@@ -186,6 +189,7 @@ mod tests {
             TableId,
         },
         index::{IndexSchema, IndexStorage, UniqueViolationName, key::IndexKeyCodec},
+        page::PageType,
         pager::PageSource,
         test_support::{TempDatabase, test_pager},
     };
@@ -584,15 +588,98 @@ mod tests {
     struct CountingSource<'a> {
         batch: &'a mut WriteBatch,
         reads: usize,
+        overflow_reads: usize,
     }
 
     impl PageSource for CountingSource<'_> {
         fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
             self.reads += 1;
-            self.batch.read_page(reference)
+            let handle = self.batch.read_page(reference)?;
+            if handle.header().page_type() == PageType::Overflow {
+                self.overflow_reads += 1;
+            }
+            Ok(handle)
         }
         fn page_count(&self) -> Result<u64> {
             self.batch.page_count()
+        }
+    }
+
+    // A post-materialization invariant check reads the entire overflow chain
+    // before reporting corruption. Only the index leaf should be read here.
+    #[test]
+    fn nonempty_overflow_value_is_corruption_before_any_overflow_read() {
+        let mut fixture = range_fixture(&[]);
+        let entry = fixture
+            .storage
+            .prepare(&[Value::Int64(1), Value::Int64(5)], RowId::new(1).unwrap())
+            .unwrap();
+        let payload = vec![7; 16 * 1024];
+        fixture
+            .storage
+            .tree
+            .insert(&mut fixture.batch, &entry.physical, &payload)
+            .unwrap();
+        let mut unrestricted = fixture
+            .storage
+            .tree
+            .scan_state(Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        let mut scan = fixture.start(unbounded()).unwrap();
+        let mut source = CountingSource {
+            batch: &mut fixture.batch,
+            reads: 0,
+            overflow_reads: 0,
+        };
+        // Prove this real B+Tree entry is backed by real overflow pages.
+        assert_eq!(unrestricted.next(&mut source).unwrap().unwrap().1, payload);
+        assert!(source.overflow_reads > 0);
+        source.reads = 0;
+        source.overflow_reads = 0;
+
+        let error = scan
+            .next(&mut source)
+            .err()
+            .expect("nonempty index value must fail");
+        assert_eq!(error.code(), ErrorCode::Corruption);
+        assert_eq!(
+            source.overflow_reads, 0,
+            "index invariant must precede overflow reads"
+        );
+        assert_eq!(source.reads, 1, "only the root index leaf is needed");
+    }
+
+    struct ErrorSource<'a> {
+        batch: &'a mut WriteBatch,
+        code: ErrorCode,
+    }
+
+    impl PageSource for ErrorSource<'_> {
+        fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
+            self.batch.read_page(reference)?;
+            Err(DbError::new(self.code, "injected page-source failure").with_oracle_code(12345))
+        }
+        fn page_count(&self) -> Result<u64> {
+            self.batch.page_count()
+        }
+    }
+
+    // The empty-value invariant must not relabel a source's own failures.
+    #[test]
+    fn page_source_errors_keep_their_original_code_and_metadata() {
+        let mut fixture = range_fixture(&[([1, 5], 1)]);
+        for code in [ErrorCode::ResourceLimit, ErrorCode::Io, ErrorCode::Internal] {
+            let mut scan = fixture.start(unbounded()).unwrap();
+            let mut source = ErrorSource {
+                batch: &mut fixture.batch,
+                code,
+            };
+            let error = scan
+                .next(&mut source)
+                .err()
+                .expect("source failure must propagate");
+            assert_eq!(error.code(), code);
+            assert_eq!(error.oracle_code(), Some(12345));
         }
     }
 
@@ -615,6 +702,7 @@ mod tests {
         let mut source = CountingSource {
             batch: &mut fixture.batch,
             reads: 0,
+            overflow_reads: 0,
         };
         assert!(empty.next(&mut source).unwrap().is_none());
         assert!(empty.next(&mut source).unwrap().is_none());

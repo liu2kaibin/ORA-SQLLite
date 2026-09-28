@@ -139,8 +139,24 @@ impl BTreeScanState {
         source: &mut impl PageSource,
         max_value_bytes: u64,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.next_value_limited_with_error(source, max_value_bytes, || {
+            DbError::new(
+                ErrorCode::ResourceLimit,
+                "B+Tree value exceeds the work memory limit",
+            )
+        })
+    }
+
+    /// Only a declared-length violation uses `limit_error`; page-source and
+    /// structural errors propagate unchanged, before or after this check.
+    pub(in crate::storage) fn next_value_limited_with_error(
+        &mut self,
+        source: &mut impl PageSource,
+        max_value_bytes: u64,
+        limit_error: fn() -> DbError,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.initialize_if_needed(source)?;
-        self.next_validated_cell(source, Some(max_value_bytes))
+        self.next_validated_cell(source, Some((max_value_bytes, limit_error)))
     }
 
     fn initialize_if_needed(&mut self, source: &mut impl PageSource) -> Result<()> {
@@ -180,7 +196,7 @@ impl BTreeScanState {
     fn next_validated_cell(
         &mut self,
         source: &mut impl PageSource,
-        max_value_bytes: Option<u64>,
+        value_limit: Option<(u64, fn() -> DbError)>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
             if self.current.is_none() {
@@ -198,11 +214,10 @@ impl BTreeScanState {
                     self.leaf = None;
                     return Ok(None);
                 }
-                if max_value_bytes.is_some_and(|limit| cell.total_value_len() > limit) {
-                    return Err(DbError::new(
-                        ErrorCode::ResourceLimit,
-                        "B+Tree value exceeds the work memory limit",
-                    ));
+                if let Some((_, limit_error)) =
+                    value_limit.filter(|(limit, _)| cell.total_value_len() > *limit)
+                {
+                    return Err(limit_error());
                 }
                 let cell = cell.clone();
                 self.next_slot = self
