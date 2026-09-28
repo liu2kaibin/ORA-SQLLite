@@ -150,15 +150,24 @@ impl IndexKeyCodec {
     }
 
     pub(crate) fn prefix_bounds(logical: &[u8]) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
-        let lower = Bound::Included(logical.to_vec());
+        (
+            Bound::Included(logical.to_vec()),
+            Self::prefix_successor(logical).map_or(Bound::Unbounded, Bound::Excluded),
+        )
+    }
+
+    /// The least byte prefix strictly beyond every extension of `logical`.
+    /// None means no finite successor; callers choose empty vs. unbounded
+    /// according to whether this is a strict lower or inclusive upper fence.
+    pub(crate) fn prefix_successor(logical: &[u8]) -> Option<Vec<u8>> {
         let mut upper = logical.to_vec();
         while let Some(last) = upper.pop() {
             if let Some(next) = last.checked_add(1) {
                 upper.push(next);
-                return (lower, Bound::Excluded(upper));
+                return Some(upper);
             }
         }
-        (lower, Bound::Unbounded)
+        None
     }
 
     // Preserve the standard lower/upper Bound pair shared with prefix_bounds.
@@ -861,6 +870,17 @@ mod tests {
         let mut oversized = exact.physical().to_vec();
         oversized.insert(1, b'x');
         assert_corruption(ColumnType::Text, &oversized);
+    }
+
+    #[test]
+    fn prefix_successor_carries_and_reports_overflow_without_wrapping() {
+        assert_eq!(IndexKeyCodec::prefix_successor(&[1, 5]), Some(vec![1, 6]));
+        assert_eq!(
+            IndexKeyCodec::prefix_successor(&[0, 255, 255]),
+            Some(vec![1])
+        );
+        assert_eq!(IndexKeyCodec::prefix_successor(&[255, 255]), None);
+        assert_eq!(IndexKeyCodec::prefix_successor(&[]), None);
     }
 
     #[test]

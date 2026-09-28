@@ -1,4 +1,5 @@
 pub(crate) mod key;
+pub(crate) mod scan;
 
 use crate::storage::{
     PageRef, WriteBatch,
