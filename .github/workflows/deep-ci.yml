@@ -127,6 +127,19 @@ jobs:
       - name: Run 100,000-row foreign-key smoke
         run: rustup run stable cargo test --profile exhaustive --test phase4c2_constraint_scale phase_4c2c_hundred_thousand_row_foreign_key_smoke -- --exact --ignored --nocapture
 
+  phase4c2d-index-scan:
+    name: Linux Phase 4C2-D IndexScan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Run deterministic IndexScan differential model
+        run: rustup run stable cargo test sql::exec::test_support::phase_4c2d_fixed_seed_index_scan_model -- --exact --ignored --nocapture
+      - name: Run 100,000-row IndexScan smoke
+        run: rustup run stable cargo test --profile exhaustive --test phase4c2_index_scan_scale phase_4c2d_hundred_thousand_row_index_scan_smoke -- --exact --ignored --nocapture
+
   windows:
     name: Windows stable
     runs-on: windows-latest

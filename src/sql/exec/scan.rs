@@ -299,6 +299,145 @@ mod tests {
         );
     }
 
+    fn arithmetic_query_fixture() -> (TempDatabase, Database) {
+        let temp = TempDatabase::new("index-arithmetic-equivalence");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        execute(
+            &mut connection,
+            "CREATE TABLE T (ID INT64, A INT64, D INT64, F FLOAT64)",
+        );
+        execute(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+        let insert = connection
+            .prepare("INSERT INTO T VALUES (:1, :2, :3, :4)")
+            .unwrap();
+        // ROWID order is 1,2,3; index order is 3,2,1. The excluded/error row
+        // follows a visible row, and Float64 addition overflows in only one order.
+        for (id, a, divisor, value) in [
+            (1, 3, 1, f64::MAX),
+            (2, 2, 0, f64::MAX),
+            (3, 1, 1, -f64::MAX),
+        ] {
+            connection
+                .execute(
+                    &insert,
+                    Parameters::positional(&[
+                        Value::Int64(id).into(),
+                        Value::Int64(a).into(),
+                        Value::Int64(divisor).into(),
+                        Value::Float64(value).into(),
+                    ]),
+                )
+                .unwrap();
+        }
+        (temp, database)
+    }
+
+    fn arithmetic_query_outcome(
+        connection: &mut Connection,
+        projection: &str,
+        predicate: &str,
+        force_table_scan: bool,
+    ) -> (Vec<Vec<Value>>, Option<ErrorCode>) {
+        let predicate = if force_table_scan {
+            format!("({predicate}) OR FALSE")
+        } else {
+            predicate.to_owned()
+        };
+        let statement = connection
+            .prepare(&format!("SELECT {projection} FROM T WHERE {predicate}"))
+            .unwrap();
+        if force_table_scan {
+            let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+                panic!("query plan")
+            };
+            assert!(
+                query.index_access().is_none(),
+                "reference must be TableScan"
+            );
+        }
+        let _ = take_access_paths();
+        let mut rows = connection.query(&statement, Parameters::none()).unwrap();
+        let mut values = Vec::new();
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => values.push(row.values().to_vec()),
+                Ok(None) => return (values, None),
+                Err(error) => return (values, Some(error.code())),
+            }
+        }
+    }
+
+    fn assert_arithmetic_query_error_equivalence(
+        projection: &str,
+        predicate: &str,
+        emitted: Vec<Vec<Value>>,
+    ) {
+        let (_temp, database) = arithmetic_query_fixture();
+        let mut connection = database.connect().unwrap();
+        let reference = arithmetic_query_outcome(&mut connection, projection, predicate, true);
+        assert_eq!(reference, (emitted, Some(ErrorCode::Type)));
+        let actual = arithmetic_query_outcome(&mut connection, projection, predicate, false);
+        assert_eq!(actual, reference, "{projection} WHERE {predicate}");
+        let paths = take_access_paths();
+        assert!(!paths.is_empty() && paths.iter().all(|path| *path == "TableScan"));
+    }
+
+    #[test]
+    fn arithmetic_equivalence_preserves_constant_filter_errors_without_candidates() {
+        // Break caught: an empty index range must not hide eager WHERE errors.
+        assert_arithmetic_query_error_equivalence("ID", "A = 999 AND 1 / 0 = 0", vec![]);
+    }
+
+    #[test]
+    fn arithmetic_equivalence_preserves_excluded_row_errors_after_partial_output() {
+        // Break caught: candidate-only Filter must not skip the second row's
+        // division by zero after returning the first, matching row.
+        assert_arithmetic_query_error_equivalence(
+            "ID",
+            "A = 3 AND 1 / D = 1",
+            vec![vec![Value::Int64(1)]],
+        );
+    }
+
+    #[test]
+    fn arithmetic_equivalence_preserves_projection_rows_before_error() {
+        // Break caught: index order emits ID 3 before error, whereas ROWID order
+        // emits ID 1. Comparing only the eventual Type code misses the defect.
+        assert_arithmetic_query_error_equivalence(
+            "ID, 1 / D",
+            "A >= 1",
+            vec![vec![Value::Int64(1), Value::Int64(1)]],
+        );
+    }
+
+    #[test]
+    fn arithmetic_equivalence_preserves_sum_overflow() {
+        // MAX + MAX overflows before cancellation only in ROWID input order.
+        assert_arithmetic_query_error_equivalence("SUM(F)", "A >= 1", vec![]);
+    }
+
+    #[test]
+    fn arithmetic_equivalence_preserves_avg_overflow() {
+        // AVG uses the same fallible running sum before dividing by count.
+        assert_arithmetic_query_error_equivalence("AVG(F)", "A >= 1", vec![]);
+    }
+
+    #[test]
+    fn arithmetic_equivalence_retains_safe_aggregate_index_access() {
+        // A blanket ban on aggregation would lose safe COUNT/MIN/MAX access.
+        let (_temp, database) = arithmetic_query_fixture();
+        let mut connection = database.connect().unwrap();
+        assert_eq!(
+            arithmetic_query_outcome(&mut connection, "COUNT(*), MIN(A), MAX(A)", "A >= 1", false,),
+            (
+                vec![vec![Value::Int64(3), Value::Int64(1), Value::Int64(3)]],
+                None,
+            )
+        );
+        assert_index_path();
+    }
+
     fn query_ids(connection: &mut Connection, sql: &str, parameters: &[Value]) -> Vec<i64> {
         let statement = connection.prepare(sql).unwrap();
         let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {

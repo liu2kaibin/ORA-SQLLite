@@ -39,7 +39,7 @@ impl fmt::Debug for Plan {
 }
 
 pub(crate) enum PlanKind {
-    Query(QueryPlan),
+    Query(Box<QueryPlan>),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
@@ -77,7 +77,7 @@ impl Plan {
         let mut expressions = expr::ExprCompiler::new(bound.parameters(), &locations)?;
         let kind = match &bound.kind {
             BoundStatementKind::Query { query } => {
-                PlanKind::Query(QueryPlan::from_bound(query, &mut expressions)?)
+                PlanKind::Query(Box::new(QueryPlan::from_bound(query, &mut expressions)?))
             }
             BoundStatementKind::Insert {
                 table,
@@ -684,6 +684,89 @@ mod tests {
             drop.table().location(),
             SqlLocation::new(11, 1, 12).unwrap()
         );
+    }
+
+    #[test]
+    fn arithmetic_equivalence_checks_all_query_clauses_before_index_selection() {
+        // Break caught: checking only top-level WHERE terms misses nested
+        // arithmetic, projections, grouping, HAVING, sorting and aggregates.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        for (sql, eligible) in [
+            ("SELECT ID FROM USERS WHERE ID = 1 AND 1 / 0 = 0", false),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND ID + 1 = 2", false),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND ID - 1 = 0", false),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND ID * 2 = 2", false),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND ID % 0 = 0", false),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND -ID < 0", false),
+            (
+                "SELECT ID FROM USERS WHERE ID = 1 AND (1 / 0) IS NULL",
+                false,
+            ),
+            (
+                "SELECT ID FROM USERS WHERE ID = 1 AND ID IN (1, 1 / 0)",
+                false,
+            ),
+            (
+                "SELECT ID FROM USERS WHERE ID = 1 AND ID BETWEEN 0 AND 1 / 0",
+                false,
+            ),
+            (
+                "SELECT ID FROM USERS WHERE ID = 1 AND NOT (1 / 0 = 0)",
+                false,
+            ),
+            (
+                "SELECT ID FROM USERS WHERE ID = 1 AND (FALSE OR 1 / 0 = 0)",
+                false,
+            ),
+            ("SELECT 1 / ID FROM USERS WHERE ID = 1", false),
+            (
+                "SELECT COUNT(*) FROM USERS WHERE ID = 1 GROUP BY ID / 0",
+                false,
+            ),
+            (
+                "SELECT COUNT(*) FROM USERS WHERE ID = 1 HAVING COUNT(*) > 1 / 0",
+                false,
+            ),
+            ("SELECT ID FROM USERS WHERE ID = 1 ORDER BY 1 / ID", false),
+            ("SELECT SUM(ID) FROM USERS WHERE ID = 1", false),
+            ("SELECT AVG(ID) FROM USERS WHERE ID = 1", false),
+            ("SELECT COUNT(ID / 0) FROM USERS WHERE ID = 1", false),
+            ("SELECT MIN(ID / 0) FROM USERS WHERE ID = 1", false),
+            ("SELECT MAX(ID / 0) FROM USERS WHERE ID = 1", false),
+            (
+                "SELECT COUNT(*) FROM USERS WHERE ID = 1 HAVING SUM(ID) > 0",
+                false,
+            ),
+            ("SELECT ID FROM USERS WHERE ID = 1", true),
+            ("SELECT +ID FROM USERS WHERE ID = 1", true),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND NAME LIKE 'a%'", true),
+            ("SELECT ID FROM USERS WHERE ID = 1 AND ID IN (1, 2)", true),
+            (
+                "SELECT COUNT(*), MIN(ID), MAX(ID) FROM USERS WHERE ID = 1",
+                true,
+            ),
+            (
+                "SELECT ID, COUNT(*) FROM USERS WHERE ID >= 1 GROUP BY ID HAVING COUNT(*) > 0 ORDER BY ID",
+                true,
+            ),
+        ] {
+            let bound = bind_sql(
+                sql,
+                &SqlLimits::default(),
+                &catalog,
+                pager.database_uuid().unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let plan = Plan::from_bound(&bound, sql).unwrap();
+            let PlanKind::Query(query) = plan.kind() else {
+                panic!("query")
+            };
+            assert_eq!(query.index_access().is_some(), eligible, "{sql}");
+            assert!(query.selection().is_some(), "keep the full WHERE Filter");
+        }
     }
 
     #[test]

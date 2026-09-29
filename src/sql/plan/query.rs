@@ -6,7 +6,10 @@ use crate::{
     api::ColumnMetadata,
     sql::{
         ast::{JoinKind, NullPlacement, OrderDirection},
-        bound::{BoundOrderExpression, BoundQuery, BoundSource, SchemaDependency, SourceId},
+        bound::{
+            BoundAggregateFunction, BoundBinaryOp, BoundExprKind, BoundOrderExpression, BoundQuery,
+            BoundSource, BoundUnaryOp, SchemaDependency, SourceId,
+        },
     },
 };
 
@@ -53,7 +56,10 @@ impl QueryPlan {
             .as_ref()
             .map(|expr| expressions.compile(expr))
             .transpose()?;
-        let index_access = if bound.sources.len() == 1 && bound.joins.is_empty() {
+        let index_access = if bound.sources.len() == 1
+            && bound.joins.is_empty()
+            && index_scan_preserves_expression_evaluation(bound)
+        {
             match bound.selection.as_ref() {
                 Some(selection) => choose_index(&bound.sources[0], selection)
                     .map(|choice| IndexAccessPlan::from_choice(choice, expressions))
@@ -142,6 +148,83 @@ impl QueryPlan {
     pub(crate) fn dependencies(&self) -> &[SchemaDependency] {
         &self.dependencies
     }
+}
+
+fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
+    // WHERE is eager: skipped rows can hide arithmetic errors. Reordering
+    // candidates can also change projection rows emitted before an error, or
+    // SUM/AVG overflow and rounding. Keep ROWID order for these computations,
+    // including expressions nested inside otherwise safe residual predicates.
+    let mut work: Vec<_> = bound
+        .projection
+        .iter()
+        .chain(bound.selection.iter())
+        .chain(bound.group_by.iter())
+        .chain(bound.having.iter())
+        .collect();
+    work.extend(
+        bound
+            .order_by
+            .iter()
+            .map(|item| item.expression.expression(&bound.projection)),
+    );
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            BoundExprKind::Unary { op, expr } => match op {
+                BoundUnaryOp::Negative => return false,
+                BoundUnaryOp::Positive | BoundUnaryOp::Not => work.push(expr),
+            },
+            BoundExprKind::Binary { left, op, right } => match op {
+                BoundBinaryOp::Add
+                | BoundBinaryOp::Subtract
+                | BoundBinaryOp::Multiply
+                | BoundBinaryOp::Divide
+                | BoundBinaryOp::Modulo => return false,
+                BoundBinaryOp::Equal
+                | BoundBinaryOp::NotEqual
+                | BoundBinaryOp::LessThan
+                | BoundBinaryOp::LessThanOrEqual
+                | BoundBinaryOp::GreaterThan
+                | BoundBinaryOp::GreaterThanOrEqual
+                | BoundBinaryOp::And
+                | BoundBinaryOp::Or => {
+                    work.push(left);
+                    work.push(right);
+                }
+            },
+            BoundExprKind::IsNull { expr, .. } => work.push(expr),
+            BoundExprKind::InList { expr, values, .. } => {
+                work.push(expr);
+                work.extend(values);
+            }
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => {
+                work.push(expr);
+                work.push(low);
+                work.push(high);
+            }
+            BoundExprKind::Like { expr, pattern, .. } => {
+                work.push(expr);
+                work.push(pattern);
+            }
+            BoundExprKind::Aggregate { function, argument } => match function {
+                BoundAggregateFunction::Sum | BoundAggregateFunction::Avg => return false,
+                BoundAggregateFunction::Count
+                | BoundAggregateFunction::Min
+                | BoundAggregateFunction::Max => {
+                    if let Some(argument) = argument {
+                        work.push(argument);
+                    }
+                }
+            },
+            BoundExprKind::Literal(_)
+            | BoundExprKind::Column { .. }
+            | BoundExprKind::Parameter(_) => {}
+            BoundExprKind::NewTableColumn { .. } => return false,
+        }
+    }
+    true
 }
 
 pub(crate) struct JoinPlan {

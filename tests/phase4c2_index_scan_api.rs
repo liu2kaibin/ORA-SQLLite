@@ -103,8 +103,7 @@ impl ScalarIndexedFixture {
             .expect("prepare scalar-index insert");
         let date = |day| OracleDate::new(2026, 3, day, 0, 0, 0).unwrap();
         for (id, float, day, flag) in [(1, -1.5, 1, false), (2, 0.0, 2, true), (3, 1.5, 3, false)] {
-            let timestamp =
-                OracleTimestamp::new(date(day), u32::try_from(day).unwrap() * 10, None).unwrap();
+            let timestamp = OracleTimestamp::new(date(day), u32::from(day) * 10, None).unwrap();
             let values = [
                 Value::Int64(id).into(),
                 Value::Float64(float).into(),
@@ -128,6 +127,90 @@ impl ScalarIndexedFixture {
             .connect()
             .expect("connect scalar-index fixture")
     }
+}
+
+#[test]
+fn arithmetic_equivalence_preserves_public_rows_and_errors_with_indexes() {
+    // Break caught: adding an index must neither hide arithmetic errors nor
+    // change the rows already emitted before an eventual arithmetic error.
+    let (_files, database) = common::new_database("arithmetic-index-equivalence");
+    let mut connection = database.connect().unwrap();
+    execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID INT64, A INT64, D INT64, F FLOAT64)",
+    );
+    execute_sql(&mut connection, "CREATE INDEX IX_T_A ON T (A)");
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (:1, :2, :3, :4)")
+        .unwrap();
+    for (id, key, divisor, value) in [
+        (1, 3, 1, f64::MAX),
+        (2, 2, 0, f64::MAX),
+        (3, 1, 1, -f64::MAX),
+    ] {
+        connection
+            .execute(
+                &insert,
+                Parameters::positional(&[
+                    Value::Int64(id).into(),
+                    Value::Int64(key).into(),
+                    Value::Int64(divisor).into(),
+                    Value::Float64(value).into(),
+                ]),
+            )
+            .unwrap();
+    }
+
+    fn outcome(
+        connection: &mut ora_sqllite::Connection,
+        sql: &str,
+    ) -> (Vec<Vec<Value>>, Option<ErrorCode>) {
+        let statement = connection.prepare(sql).unwrap();
+        let mut rows = connection.query(&statement, Parameters::none()).unwrap();
+        let mut output = Vec::new();
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => output.push(row.values().to_vec()),
+                Ok(None) => return (output, None),
+                Err(error) => return (output, Some(error.code())),
+            }
+        }
+    }
+
+    for (projection, predicate, emitted) in [
+        ("ID", "A = 999 AND 1 / 0 = 0", vec![]),
+        ("ID", "A = 3 AND 1 / D = 1", vec![vec![Value::Int64(1)]]),
+        (
+            "ID, 1 / D",
+            "A >= 1",
+            vec![vec![Value::Int64(1), Value::Int64(1)]],
+        ),
+        ("SUM(F)", "A >= 1", vec![]),
+        ("AVG(F)", "A >= 1", vec![]),
+    ] {
+        let reference = outcome(
+            &mut connection,
+            &format!("SELECT {projection} FROM T WHERE ({predicate}) OR FALSE"),
+        );
+        assert_eq!(reference, (emitted, Some(ErrorCode::Type)));
+        assert_eq!(
+            outcome(
+                &mut connection,
+                &format!("SELECT {projection} FROM T WHERE {predicate}"),
+            ),
+            reference,
+            "{projection} WHERE {predicate}",
+        );
+    }
+    execute_sql(&mut connection, "DELETE FROM T");
+    assert_eq!(
+        outcome(
+            &mut connection,
+            "SELECT ID FROM T WHERE A = 999 AND 1 / 0 = 0",
+        ),
+        (vec![], None),
+        "an empty table must not eagerly evaluate a row predicate",
+    );
 }
 
 fn fixture_rows() -> Vec<[ParameterValue; 10]> {
