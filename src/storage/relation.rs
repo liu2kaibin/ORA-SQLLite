@@ -569,7 +569,13 @@ impl Relation {
         max_row_bytes: usize,
     ) -> Result<Option<StoredRow>> {
         let rows = BTree::from_root(TreeKind::Table, self.table.root());
-        let Some(bytes) = rows.get(source, &encode_rowid_key(rowid))? else {
+        let Some(bytes) = rows.get_value_limited_with_error(
+            source,
+            &encode_rowid_key(rowid),
+            max_row_bytes as u64,
+            row_limit_error,
+        )?
+        else {
             return Ok(None);
         };
         self.decode_stored_row(rowid, &bytes, max_row_bytes)
@@ -586,6 +592,10 @@ impl Relation {
             RowCodec::decode(&self.table, &self.columns, bytes, max_row_bytes)?.into_boxed_slice();
         Ok(StoredRow { rowid, values })
     }
+}
+
+fn row_limit_error() -> DbError {
+    DbError::new(ErrorCode::Type, "row exceeds the caller resource limit")
 }
 
 fn invalid_value_shape(column: &ColumnDef, value: &Value) -> Option<DbError> {
@@ -1718,8 +1728,9 @@ mod tests {
     };
     use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
-        Pager,
+        PageRef, Pager,
         btree::{BTree, TreeKind},
+        cache::PageHandle,
         catalog::{
             CatalogReader, CatalogWriter, ConstraintBundleFaultPoint, ConstraintRemovalFaultPoint,
             fail_constraint_removal_at_for_test,
@@ -1734,7 +1745,8 @@ mod tests {
         },
         features::INDEX_CONSTRAINT_V1,
         file::OpenMode,
-        pager::PagerConfig,
+        page::PageType,
+        pager::{PageSource, PagerConfig},
         row::{RowCodec, encode_rowid_key},
         test_support::{
             Phase4bCatalogFixture, TempDatabase, phase_4b_catalog_fixture,
@@ -3534,6 +3546,59 @@ mod tests {
     }
 
     #[test]
+    fn relation_snapshot_point_lookup_rejects_overflow_before_materializing_it() {
+        // Production break caught: changing Relation::get_from back to unbounded
+        // BTree::get would materialize the overflow value before RowCodec sees
+        // the caller's row limit.
+        let fixture = point_read_fixture();
+        let pager = fixture.storage.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let relation = {
+            let catalog = snapshot.catalog_reader().unwrap();
+            Relation::open(&catalog, fixture.storage.users_id()).unwrap()
+        };
+        let mut source = OverflowCountingSource::new(snapshot);
+
+        let error =
+            match relation.get_from(&mut source, RowId::new(1).unwrap(), LARGE_ROW_BYTES - 1) {
+                Err(error) => error,
+                Ok(_) => panic!("over-limit snapshot point read must fail"),
+            };
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(
+            source.overflow_reads, 0,
+            "the snapshot point read must reject the declared row length before overflow I/O"
+        );
+    }
+
+    #[test]
+    fn relation_batch_point_lookup_rejects_overflow_before_materializing_it() {
+        // Production break caught: changing Relation::get_from back to unbounded
+        // BTree::get would make WriteBatch point reads follow overflow pages
+        // before reporting the existing relation-layer Type limit error.
+        let fixture = point_read_fixture();
+        let pager = fixture.storage.pager();
+        let mut batch = pager.begin_write().unwrap();
+        let relation = {
+            let catalog = batch.catalog_reader().unwrap();
+            Relation::open(&catalog, fixture.storage.users_id()).unwrap()
+        };
+        let mut source = OverflowCountingSource::new(batch);
+
+        let error =
+            match relation.get_from(&mut source, RowId::new(1).unwrap(), LARGE_ROW_BYTES - 1) {
+                Err(error) => error,
+                Ok(_) => panic!("over-limit batch point read must fail"),
+            };
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(
+            source.overflow_reads, 0,
+            "the batch point read must reject the declared row length before overflow I/O"
+        );
+        source.source.rollback().unwrap();
+    }
+
+    #[test]
     fn relation_scan_honors_caller_row_limit_for_snapshot_and_batch() {
         let fixture = phase_4a_large_relation_fixture();
         let mut snapshot = fixture.pager().begin_read().unwrap();
@@ -3588,6 +3653,34 @@ mod tests {
 
     struct PointReadFixture {
         storage: Phase4bCatalogFixture,
+    }
+
+    struct OverflowCountingSource<S> {
+        source: S,
+        overflow_reads: usize,
+    }
+
+    impl<S> OverflowCountingSource<S> {
+        const fn new(source: S) -> Self {
+            Self {
+                source,
+                overflow_reads: 0,
+            }
+        }
+    }
+
+    impl<S: PageSource> PageSource for OverflowCountingSource<S> {
+        fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
+            let page = self.source.read_page(reference)?;
+            if page.header().page_type() == PageType::Overflow {
+                self.overflow_reads += 1;
+            }
+            Ok(page)
+        }
+
+        fn page_count(&self) -> Result<u64> {
+            self.source.page_count()
+        }
     }
 
     impl PointReadFixture {

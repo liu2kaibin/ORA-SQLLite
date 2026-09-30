@@ -77,6 +77,27 @@ impl BTree {
         read_value(source, cell).map(Some)
     }
 
+    /// Reject a selected leaf value from its declared length before cloning an
+    /// inline value or following/materializing an overflow chain.
+    pub(in crate::storage) fn get_value_limited_with_error(
+        &self,
+        source: &mut impl PageSource,
+        key: &[u8],
+        max_value_bytes: u64,
+        limit_error: fn() -> DbError,
+    ) -> Result<Option<Vec<u8>>> {
+        validate_key(key)?;
+        let (_, leaf) = descend_to_leaf(source, self.kind, self.root, key)?;
+        let index = lower_bound(&leaf.cells, key);
+        let Some(cell) = leaf.cells.get(index).filter(|cell| cell.key() == key) else {
+            return Ok(None);
+        };
+        if cell.total_value_len() > max_value_bytes {
+            return Err(limit_error());
+        }
+        read_value(source, cell).map(Some)
+    }
+
     pub(in crate::storage) fn scan<'a, S: PageSource>(
         &self,
         source: &'a mut S,
@@ -883,6 +904,43 @@ mod tests {
             tree.get(&mut snapshot, b"blob").expect("overflow lookup"),
             Some(value)
         );
+    }
+
+    #[test]
+    fn bounded_point_lookup_rejects_overflow_before_value_materialization() {
+        // Production break caught: moving this declared-length check after
+        // read_value would traverse the overflow chain before returning the
+        // caller's limit error.
+        let (_temp, pager) = test_pager(4096).expect("test pager");
+        let payload = vec![0x5a; 20_000];
+        let tree = {
+            let mut batch = pager.begin_write().expect("begin write");
+            let mut tree = BTree::create(&mut batch, TreeKind::Table).expect("create tree");
+            tree.insert(&mut batch, b"blob", &payload)
+                .expect("insert overflow value");
+            batch.commit().expect("commit overflow value");
+            tree
+        };
+        let mut source = CountingSource::new(pager.begin_read().expect("begin read"));
+
+        let error = tree
+            .get_value_limited_with_error(&mut source, b"blob", payload.len() as u64 - 1, || {
+                crate::DbError::new(ErrorCode::Type, "row exceeds the caller resource limit")
+            })
+            .expect_err("over-limit point lookup must fail");
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(
+            source.overflow_loads, 0,
+            "declared length must be checked before overflow I/O"
+        );
+        assert_eq!(
+            tree.get_value_limited_with_error(&mut source, b"blob", payload.len() as u64, || {
+                crate::DbError::new(ErrorCode::Type, "row exceeds the caller resource limit")
+            })
+            .unwrap(),
+            Some(payload)
+        );
+        assert!(source.overflow_loads > 0);
     }
 
     #[test]
