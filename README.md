@@ -98,6 +98,9 @@ predicate errors, and reordering candidates must not change rows emitted before
 an error or aggregate overflow/rounding. `COUNT`/`MIN`/`MAX` with otherwise safe
 arguments remain index-eligible. This is a conservative eligibility rule, not
 constant folding or a change to expression evaluation.
+Unary positive and comparisons (including IN/BETWEEN) also retain `TableScan`
+when operand types remain unknown. Typed index parameters and inert unknown
+parameter uses in projection, `IS NULL`, and `COUNT` remain eligible.
 Legal bounds that exceed the index key representation limit fall
 back to the same-view `TableScan` and full Filter, without suppressing real query
 resource or storage errors. Index access does not remove sorting, DISTINCT,

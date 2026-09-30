@@ -333,6 +333,170 @@ mod tests {
         (temp, database)
     }
 
+    fn dynamic_query_outcome(
+        connection: &mut Connection,
+        predicate: &str,
+        parameters: &[crate::ParameterValue],
+        force_table_scan: bool,
+    ) -> (Vec<Vec<Value>>, Option<ErrorCode>) {
+        let predicate = if force_table_scan {
+            format!("({predicate}) OR FALSE")
+        } else {
+            predicate.to_owned()
+        };
+        let statement = connection
+            .prepare(&format!("SELECT ID FROM T WHERE {predicate}"))
+            .unwrap();
+        if force_table_scan {
+            let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+                panic!("query")
+            };
+            assert!(query.index_access().is_none(), "TableScan reference");
+        }
+        let _ = take_access_paths();
+        let mut rows = connection
+            .query(&statement, Parameters::positional(parameters))
+            .unwrap();
+        let mut output = Vec::new();
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => output.push(row.values().to_vec()),
+                Ok(None) => return (output, None),
+                Err(error) => return (output, Some(error.code())),
+            }
+        }
+    }
+
+    fn assert_dynamic_error_equivalence(predicate: &str, parameters: &[crate::ParameterValue]) {
+        let (_temp, database) = indexed_query_fixture();
+        let mut connection = database.connect().unwrap();
+        let reference = dynamic_query_outcome(&mut connection, predicate, parameters, true);
+        assert_eq!(reference, (vec![], Some(ErrorCode::Type)));
+        let actual = dynamic_query_outcome(&mut connection, predicate, parameters, false);
+        let paths = take_access_paths();
+        assert_eq!(actual, reference, "{predicate}: actual paths {paths:?}");
+        assert!(!paths.is_empty() && paths.iter().all(|path| *path == "TableScan"));
+    }
+
+    #[test]
+    fn dynamic_type_equivalence_unary_positive_preserves_type_error() {
+        // Mutation caught: accepting Unknown unary + skips its Text type error
+        // when the nonempty table has no A=999 index candidate.
+        assert_dynamic_error_equivalence(
+            "A = 999 AND (+:1) IS NULL",
+            &[Value::Text("x".into()).into()],
+        );
+    }
+
+    #[test]
+    fn dynamic_type_equivalence_binary_comparisons_preserve_type_error() {
+        // Mutation caught: accepting either Unknown comparison operand hides
+        // incompatible Text/Int64 evaluation for every comparison operator.
+        for operator in ["=", "<>", "<", "<=", ">", ">="] {
+            assert_dynamic_error_equivalence(
+                &format!("A = 999 AND :1 {operator} :2"),
+                &[Value::Text("x".into()).into(), Value::Int64(1).into()],
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_type_equivalence_in_list_preserves_type_error() {
+        // Mutation caught: guarding binary comparison but not IN's comparison
+        // allows the same incompatible Unknown values to bypass evaluation.
+        assert_dynamic_error_equivalence(
+            "A = 999 AND :1 IN (:2)",
+            &[Value::Text("x".into()).into(), Value::Int64(1).into()],
+        );
+    }
+
+    #[test]
+    fn dynamic_type_equivalence_between_preserves_type_error() {
+        // Mutation caught: leaving BETWEEN's Unknown bounds unguarded hides
+        // its incompatible ordered comparisons when no index key matches.
+        assert_dynamic_error_equivalence(
+            "A = 999 AND :1 BETWEEN :2 AND :3",
+            &[
+                Value::Text("x".into()).into(),
+                Value::Int64(1).into(),
+                Value::Int64(2).into(),
+            ],
+        );
+    }
+
+    #[test]
+    fn dynamic_type_equivalence_empty_table_does_not_evaluate_unknown_operations() {
+        // Mutation caught: evaluating expressions during planning/open rather
+        // than choosing TableScan would introduce errors on an empty table.
+        let (_temp, database) = indexed_query_fixture();
+        let mut connection = database.connect().unwrap();
+        execute(&mut connection, "DELETE FROM T");
+        for (predicate, parameters) in [
+            (
+                "A = 999 AND (+:1) IS NULL",
+                vec![Value::Text("x".into()).into()],
+            ),
+            (
+                "A = 999 AND :1 = :2",
+                vec![Value::Text("x".into()).into(), Value::Int64(1).into()],
+            ),
+            (
+                "A = 999 AND :1 IN (:2)",
+                vec![Value::Text("x".into()).into(), Value::Int64(1).into()],
+            ),
+            (
+                "A = 999 AND :1 BETWEEN :2 AND :3",
+                vec![
+                    Value::Text("x".into()).into(),
+                    Value::Int64(1).into(),
+                    Value::Int64(2).into(),
+                ],
+            ),
+        ] {
+            for forced in [false, true] {
+                assert_eq!(
+                    dynamic_query_outcome(&mut connection, predicate, &parameters, forced),
+                    (vec![], None),
+                    "{predicate}, forced={forced}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_type_equivalence_retains_typed_and_inert_parameter_index_access() {
+        // Mutation caught: banning every parameter/Unknown leaf would discard
+        // valid typed index bounds and inert projection/IS NULL/COUNT uses.
+        let (_temp, database) = indexed_query_fixture();
+        let mut connection = database.connect().unwrap();
+        for (sql, parameters, expected) in [
+            (
+                "SELECT ID FROM T WHERE ID = :1 AND +:1 = 2 AND :1 = :2",
+                vec![Value::Int64(2).into(), Value::Int64(2).into()],
+                vec![Value::Int64(2)],
+            ),
+            (
+                "SELECT :1 FROM T WHERE ID = 2 AND :1 IS NOT NULL",
+                vec![Value::Text("x".into()).into()],
+                vec![Value::Text("x".into())],
+            ),
+            (
+                "SELECT COUNT(:1) FROM T WHERE ID = 2",
+                vec![Value::Text("x".into()).into()],
+                vec![Value::Int64(1)],
+            ),
+        ] {
+            let statement = connection.prepare(sql).unwrap();
+            let _ = take_access_paths();
+            let mut rows = connection
+                .query(&statement, Parameters::positional(&parameters))
+                .unwrap();
+            assert_eq!(rows.next().unwrap().unwrap().values(), expected);
+            assert!(rows.next().unwrap().is_none());
+            assert_index_path();
+        }
+    }
+
     fn arithmetic_query_outcome(
         connection: &mut Connection,
         projection: &str,

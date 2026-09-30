@@ -770,6 +770,67 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_type_equivalence_requires_safe_operands_without_banning_parameters() {
+        // Mutation caught: treating Unknown operands as total in any clause,
+        // or disabling all parameters instead of only fallible operations.
+        let fixture = phase_4b_catalog_fixture_with_explicit_index(4096, "IX_USERS_ID");
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        for (sql, eligible) in [
+            (
+                "SELECT ID FROM USERS WHERE ID = 999 AND (+:1) IS NULL",
+                false,
+            ),
+            ("SELECT ID FROM USERS WHERE ID = 999 AND :1 = :2", false),
+            ("SELECT ID FROM USERS WHERE ID = 999 AND :1 IN (:2)", false),
+            (
+                "SELECT ID FROM USERS WHERE ID = 999 AND :1 BETWEEN :2 AND :3",
+                false,
+            ),
+            ("SELECT +:1 FROM USERS WHERE ID = 999", false),
+            ("SELECT :1 = :2 FROM USERS WHERE ID = 999", false),
+            (
+                "SELECT COUNT(*) FROM USERS WHERE ID = 999 GROUP BY +:1",
+                false,
+            ),
+            (
+                "SELECT COUNT(*) FROM USERS WHERE ID = 999 HAVING :1 = :2",
+                false,
+            ),
+            ("SELECT ID FROM USERS WHERE ID = 999 ORDER BY +:1", false),
+            ("SELECT COUNT(+:1) FROM USERS WHERE ID = 999", false),
+            ("SELECT ID FROM USERS WHERE ID = :1", true),
+            ("SELECT +:1 FROM USERS WHERE ID = :1", true),
+            ("SELECT ID FROM USERS WHERE ID = :1 AND :1 = :2", true),
+            ("SELECT ID FROM USERS WHERE ID = 2 AND :1 IN (1, 2)", true),
+            (
+                "SELECT ID FROM USERS WHERE ID = 2 AND :1 BETWEEN 1 AND 2",
+                true,
+            ),
+            ("SELECT :1 FROM USERS WHERE ID = 2 AND :1 IS NULL", true),
+            (
+                "SELECT COUNT(:1), MIN(ID), MAX(ID) FROM USERS WHERE ID = 2",
+                true,
+            ),
+            ("SELECT +NULL FROM USERS WHERE ID = 2", true),
+        ] {
+            let bound = bind_sql(
+                sql,
+                &SqlLimits::default(),
+                &catalog,
+                pager.database_uuid().unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let plan = Plan::from_bound(&bound, sql).unwrap();
+            let PlanKind::Query(query) = plan.kind() else {
+                panic!("query")
+            };
+            assert_eq!(query.index_access().is_some(), eligible, "{sql}");
+        }
+    }
+
+    #[test]
     fn executable_expressions_retain_project_sql_locations() {
         let plan = plan_sql("SELECT 1 / :1 FROM USERS").unwrap();
         assert_eq!(

@@ -5,6 +5,7 @@ use crate::{
     Result,
     api::ColumnMetadata,
     sql::{
+        SqlType,
         ast::{JoinKind, NullPlacement, OrderDirection},
         bound::{
             BoundAggregateFunction, BoundBinaryOp, BoundExprKind, BoundOrderExpression, BoundQuery,
@@ -172,6 +173,7 @@ fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
         match &expression.kind {
             BoundExprKind::Unary { op, expr } => match op {
                 BoundUnaryOp::Negative => return false,
+                BoundUnaryOp::Positive if expr.sql_type == SqlType::Unknown => return false,
                 BoundUnaryOp::Positive | BoundUnaryOp::Not => work.push(expr),
             },
             BoundExprKind::Binary { left, op, right } => match op {
@@ -185,21 +187,41 @@ fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
                 | BoundBinaryOp::LessThan
                 | BoundBinaryOp::LessThanOrEqual
                 | BoundBinaryOp::GreaterThan
-                | BoundBinaryOp::GreaterThanOrEqual
-                | BoundBinaryOp::And
-                | BoundBinaryOp::Or => {
+                | BoundBinaryOp::GreaterThanOrEqual => {
+                    // Unknown parameters are validated independently; binding
+                    // has not proved their runtime comparison types compatible.
+                    if left.sql_type == SqlType::Unknown || right.sql_type == SqlType::Unknown {
+                        return false;
+                    }
+                    work.push(left);
+                    work.push(right);
+                }
+                BoundBinaryOp::And | BoundBinaryOp::Or => {
                     work.push(left);
                     work.push(right);
                 }
             },
             BoundExprKind::IsNull { expr, .. } => work.push(expr),
             BoundExprKind::InList { expr, values, .. } => {
+                if expr.sql_type == SqlType::Unknown
+                    || values
+                        .iter()
+                        .any(|value| value.sql_type == SqlType::Unknown)
+                {
+                    return false;
+                }
                 work.push(expr);
                 work.extend(values);
             }
             BoundExprKind::Between {
                 expr, low, high, ..
             } => {
+                if [expr, low, high]
+                    .iter()
+                    .any(|operand| operand.sql_type == SqlType::Unknown)
+                {
+                    return false;
+                }
                 work.push(expr);
                 work.push(low);
                 work.push(high);
