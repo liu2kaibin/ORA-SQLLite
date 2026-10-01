@@ -54,6 +54,52 @@ impl DecodedIndexKey {
 pub(crate) struct IndexKeyCodec;
 
 impl IndexKeyCodec {
+    /// Whether a query prefix fits the bounded stored-key encoder. An oversized
+    /// comparison operand is legal SQL, so report it separately from errors.
+    /// This does not change encode/encode_prefix's persisted-key size contract.
+    pub(crate) fn prefix_is_representable(
+        columns: &[ColumnDef],
+        values: &[&Value],
+    ) -> Result<bool> {
+        if columns.is_empty() || columns.len() != values.len() {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "index prefix requires one value per column",
+            ));
+        }
+        let limit = MAX_INDEX_KEY_BYTES - ROWID_BYTES;
+        let mut prefix = Vec::with_capacity(INDEX_KEY_BUFFER_BYTES);
+        for (column, value) in columns.iter().zip(values) {
+            if matches!(value, Value::Null) {
+                prefix.push(1);
+            } else {
+                prefix.push(0);
+                let bytes = match (column.column_type(), value) {
+                    (ColumnType::Text, Value::Text(value)) => Some(value.as_bytes()),
+                    (ColumnType::Blob, Value::Blob(value)) => Some(value.as_slice()),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    // Check before allocating/encoding the payload, including
+                    // zero-byte escaping and the two-byte component terminator.
+                    if bytes.len() > limit {
+                        return Ok(false);
+                    }
+                    let encoded_len =
+                        bytes.len() + bytes.iter().filter(|byte| **byte == 0).count() + 2;
+                    if encoded_len > limit.saturating_sub(prefix.len()) {
+                        return Ok(false);
+                    }
+                }
+                encode_scalar(column.column_type(), value, &mut prefix)?;
+            }
+            if prefix.len() > limit {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn encode_prefix(columns: &[ColumnDef], values: &[Value]) -> Result<Vec<u8>> {
         if columns.is_empty() {
             return Err(DbError::new(
@@ -150,15 +196,24 @@ impl IndexKeyCodec {
     }
 
     pub(crate) fn prefix_bounds(logical: &[u8]) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
-        let lower = Bound::Included(logical.to_vec());
+        (
+            Bound::Included(logical.to_vec()),
+            Self::prefix_successor(logical).map_or(Bound::Unbounded, Bound::Excluded),
+        )
+    }
+
+    /// The least byte prefix strictly beyond every extension of `logical`.
+    /// None means no finite successor; callers choose empty vs. unbounded
+    /// according to whether this is a strict lower or inclusive upper fence.
+    pub(crate) fn prefix_successor(logical: &[u8]) -> Option<Vec<u8>> {
         let mut upper = logical.to_vec();
         while let Some(last) = upper.pop() {
             if let Some(next) = last.checked_add(1) {
                 upper.push(next);
-                return (lower, Bound::Excluded(upper));
+                return Some(upper);
             }
         }
-        (lower, Bound::Unbounded)
+        None
     }
 
     // Preserve the standard lower/upper Bound pair shared with prefix_bounds.
@@ -861,6 +916,17 @@ mod tests {
         let mut oversized = exact.physical().to_vec();
         oversized.insert(1, b'x');
         assert_corruption(ColumnType::Text, &oversized);
+    }
+
+    #[test]
+    fn prefix_successor_carries_and_reports_overflow_without_wrapping() {
+        assert_eq!(IndexKeyCodec::prefix_successor(&[1, 5]), Some(vec![1, 6]));
+        assert_eq!(
+            IndexKeyCodec::prefix_successor(&[0, 255, 255]),
+            Some(vec![1])
+        );
+        assert_eq!(IndexKeyCodec::prefix_successor(&[255, 255]), None);
+        assert_eq!(IndexKeyCodec::prefix_successor(&[]), None);
     }
 
     #[test]

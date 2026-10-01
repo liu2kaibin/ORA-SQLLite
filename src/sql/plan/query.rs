@@ -1,10 +1,16 @@
-use super::{AggregateDefinition, ExecExpr, expr::ExprCompiler};
+use super::{
+    AggregateDefinition, ExecExpr, IndexAccessPlan, expr::ExprCompiler, index::choose_index,
+};
 use crate::{
     Result,
     api::ColumnMetadata,
     sql::{
+        SqlType,
         ast::{JoinKind, NullPlacement, OrderDirection},
-        bound::{BoundOrderExpression, BoundQuery, BoundSource, SchemaDependency, SourceId},
+        bound::{
+            BoundAggregateFunction, BoundBinaryOp, BoundExprKind, BoundOrderExpression, BoundQuery,
+            BoundSource, BoundUnaryOp, SchemaDependency, SourceId,
+        },
     },
 };
 
@@ -12,6 +18,7 @@ pub(crate) struct QueryPlan {
     sources: Box<[BoundSource]>,
     joins: Box<[JoinPlan]>,
     selection: Option<ExecExpr>,
+    index_access: Option<IndexAccessPlan>,
     group_by: Box<[ExecExpr]>,
     aggregates: Box<[AggregateDefinition]>,
     having: Option<ExecExpr>,
@@ -50,6 +57,19 @@ impl QueryPlan {
             .as_ref()
             .map(|expr| expressions.compile(expr))
             .transpose()?;
+        let index_access = if bound.sources.len() == 1
+            && bound.joins.is_empty()
+            && index_scan_preserves_expression_evaluation(bound)
+        {
+            match bound.selection.as_ref() {
+                Some(selection) => choose_index(&bound.sources[0], selection)
+                    .map(|choice| IndexAccessPlan::from_choice(choice, expressions))
+                    .transpose()?,
+                None => None,
+            }
+        } else {
+            None
+        };
         let group_by = bound
             .group_by
             .iter()
@@ -81,6 +101,7 @@ impl QueryPlan {
             sources: bound.sources.as_slice().into(),
             joins,
             selection,
+            index_access,
             group_by,
             aggregates: expressions.take_aggregates(),
             having,
@@ -100,6 +121,9 @@ impl QueryPlan {
     }
     pub(crate) fn selection(&self) -> Option<&ExecExpr> {
         self.selection.as_ref()
+    }
+    pub(crate) fn index_access(&self) -> Option<&IndexAccessPlan> {
+        self.index_access.as_ref()
     }
     pub(crate) fn group_by(&self) -> &[ExecExpr] {
         &self.group_by
@@ -125,6 +149,104 @@ impl QueryPlan {
     pub(crate) fn dependencies(&self) -> &[SchemaDependency] {
         &self.dependencies
     }
+}
+
+fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
+    // WHERE is eager: skipped rows can hide arithmetic errors. Reordering
+    // candidates can also change projection rows emitted before an error, or
+    // SUM/AVG overflow and rounding. Keep ROWID order for these computations,
+    // including expressions nested inside otherwise safe residual predicates.
+    let mut work: Vec<_> = bound
+        .projection
+        .iter()
+        .chain(bound.selection.iter())
+        .chain(bound.group_by.iter())
+        .chain(bound.having.iter())
+        .collect();
+    work.extend(
+        bound
+            .order_by
+            .iter()
+            .map(|item| item.expression.expression(&bound.projection)),
+    );
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            BoundExprKind::Unary { op, expr } => match op {
+                BoundUnaryOp::Negative => return false,
+                BoundUnaryOp::Positive if expr.sql_type == SqlType::Unknown => return false,
+                BoundUnaryOp::Positive | BoundUnaryOp::Not => work.push(expr),
+            },
+            BoundExprKind::Binary { left, op, right } => match op {
+                BoundBinaryOp::Add
+                | BoundBinaryOp::Subtract
+                | BoundBinaryOp::Multiply
+                | BoundBinaryOp::Divide
+                | BoundBinaryOp::Modulo => return false,
+                BoundBinaryOp::Equal
+                | BoundBinaryOp::NotEqual
+                | BoundBinaryOp::LessThan
+                | BoundBinaryOp::LessThanOrEqual
+                | BoundBinaryOp::GreaterThan
+                | BoundBinaryOp::GreaterThanOrEqual => {
+                    // Unknown parameters are validated independently; binding
+                    // has not proved their runtime comparison types compatible.
+                    if left.sql_type == SqlType::Unknown || right.sql_type == SqlType::Unknown {
+                        return false;
+                    }
+                    work.push(left);
+                    work.push(right);
+                }
+                BoundBinaryOp::And | BoundBinaryOp::Or => {
+                    work.push(left);
+                    work.push(right);
+                }
+            },
+            BoundExprKind::IsNull { expr, .. } => work.push(expr),
+            BoundExprKind::InList { expr, values, .. } => {
+                if expr.sql_type == SqlType::Unknown
+                    || values
+                        .iter()
+                        .any(|value| value.sql_type == SqlType::Unknown)
+                {
+                    return false;
+                }
+                work.push(expr);
+                work.extend(values);
+            }
+            BoundExprKind::Between {
+                expr, low, high, ..
+            } => {
+                if [expr, low, high]
+                    .iter()
+                    .any(|operand| operand.sql_type == SqlType::Unknown)
+                {
+                    return false;
+                }
+                work.push(expr);
+                work.push(low);
+                work.push(high);
+            }
+            BoundExprKind::Like { expr, pattern, .. } => {
+                work.push(expr);
+                work.push(pattern);
+            }
+            BoundExprKind::Aggregate { function, argument } => match function {
+                BoundAggregateFunction::Sum | BoundAggregateFunction::Avg => return false,
+                BoundAggregateFunction::Count
+                | BoundAggregateFunction::Min
+                | BoundAggregateFunction::Max => {
+                    if let Some(argument) = argument {
+                        work.push(argument);
+                    }
+                }
+            },
+            BoundExprKind::Literal(_)
+            | BoundExprKind::Column { .. }
+            | BoundExprKind::Parameter(_) => {}
+            BoundExprKind::NewTableColumn { .. } => return false,
+        }
+    }
+    true
 }
 
 pub(crate) struct JoinPlan {

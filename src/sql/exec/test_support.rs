@@ -17,10 +17,10 @@ use crate::{
         relation::ConstrainedTableWrite,
         test_support::{
             Phase4c1CrashPathKind, Phase4c1SqlStorageState, Phase4c2aIndexEntry,
-            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState, RawCatalogCapture,
-            TempDatabase, assert_batch_unchanged_after, assert_commit_trace,
-            phase_4c1_abort_wal_initialization, phase_4c1_aborting_crash_pager,
-            phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
+            Phase4c2aStorageState, Phase4c2aWalRecord, Phase4c2bStorageState,
+            Phase4c2dIndexScanMutation, RawCatalogCapture, TempDatabase,
+            assert_batch_unchanged_after, assert_commit_trace, phase_4c1_abort_wal_initialization,
+            phase_4c1_aborting_crash_pager, phase_4c1_copy_crash_pair, phase_4c1_copy_main_only,
             phase_4c1_exact_crash_child_command, phase_4c1_main_only_crash_fixture,
             phase_4c1_recording_crash_pager, phase_4c1_recovered_lsn, phase_4c1_sql_storage_state,
             phase_4c1_validate_crash_path, phase_4c1_wal_initialization_trace,
@@ -28,8 +28,8 @@ use crate::{
             phase_4c2a_model_state, phase_4c2a_open_pager, phase_4c2a_pager_state,
             phase_4c2a_recover_and_capture, phase_4c2a_remove_recovered_files,
             phase_4c2a_wal_records, phase_4c2b_model_state, phase_4c2b_pager_state,
-            phase_4c2b_recover_and_capture, phase4c2c_catalog_observed, phase4c2c_raw_capture,
-            phase4c2c_trace_catalog,
+            phase_4c2b_recover_and_capture, phase_4c2d_commit_index_scan_corruption,
+            phase4c2c_catalog_observed, phase4c2c_raw_capture, phase4c2c_trace_catalog,
         },
     },
 };
@@ -3151,6 +3151,914 @@ fn phase4c2a_recover_case(
     assert_eq!(repeat, recovered, "repeat recovery changed state");
     phase_4c2a_remove_recovered_files(&path);
     drop(crash_copy);
+}
+
+#[test]
+#[ignore = "run by the manual Phase 4C2D Deep CI job"]
+fn phase_4c2d_fixed_seed_index_scan_model() {
+    // Breaks caught: incorrect prefix/range selection, missing residuals,
+    // unsafe numeric narrowing, lost duplicate/NULL rows, stale roots or
+    // snapshots, and silent transaction loss. Expected rows use only this
+    // Rust row model, never the SQL evaluator or index-key implementation.
+    run_index_scan_model(0x4c2d_2026_0927, 4_000);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum QueryShape {
+    UniquePoint,
+    CompositePoint,
+    CompositeRange,
+    IsNull,
+    ReversedRange,
+    ResidualAnd,
+    OrFallback,
+    NonLeadingFallback,
+    InFallback,
+    LikeFallback,
+    BlobEquality,
+    BlobRangeFallback,
+}
+
+impl QueryShape {
+    const ALL: [Self; 12] = [
+        Self::UniquePoint,
+        Self::CompositePoint,
+        Self::CompositeRange,
+        Self::IsNull,
+        Self::ReversedRange,
+        Self::ResidualAnd,
+        Self::OrFallback,
+        Self::NonLeadingFallback,
+        Self::InFallback,
+        Self::LikeFallback,
+        Self::BlobEquality,
+        Self::BlobRangeFallback,
+    ];
+
+    fn indexed(self) -> bool {
+        matches!(
+            self,
+            Self::UniquePoint
+                | Self::CompositePoint
+                | Self::CompositeRange
+                | Self::IsNull
+                | Self::ReversedRange
+                | Self::ResidualAnd
+                | Self::BlobEquality
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IndexScanModelRow {
+    id: i64,
+    a: Option<i64>,
+    b: i64,
+    half_units: i64,
+    note: String,
+    blob: Vec<u8>,
+}
+
+impl IndexScanModelRow {
+    fn new(id: i64) -> Self {
+        Self {
+            id,
+            a: (id % 9 != 0).then_some(id % 7 - 3),
+            b: id * 7 % 23 - 11,
+            half_units: id % 17 - 8,
+            note: format!(
+                "{}-{}",
+                if id % 2 == 0 { "keep" } else { "drop" },
+                "x".repeat(120)
+            ),
+            blob: vec![(id % 5) as u8; 40],
+        }
+    }
+
+    fn values(&self) -> Vec<Value> {
+        vec![
+            Value::Int64(self.id),
+            self.a.map_or(Value::Null, Value::Int64),
+            Value::Int64(self.b),
+            Value::Decimal(
+                Decimal::new(
+                    self.half_units < 0,
+                    1,
+                    u128::from(self.half_units.unsigned_abs()) * 5,
+                )
+                .unwrap(),
+            ),
+            Value::Text(self.note.clone()),
+            Value::Blob(self.blob.clone()),
+        ]
+    }
+}
+
+// Unlike Outcome, retain rows already emitted if a later pull fails: a
+// partial-result divergence must not be hidden by comparing error codes only.
+#[derive(Debug, PartialEq)]
+struct IndexScanQueryOutcome {
+    rows: Vec<Vec<Value>>,
+    error: Option<ErrorCode>,
+}
+
+fn index_scan_collect(result: crate::Result<crate::Rows<'_>>) -> IndexScanQueryOutcome {
+    let mut output = IndexScanQueryOutcome {
+        rows: Vec::new(),
+        error: None,
+    };
+    match result {
+        Err(error) => output.error = Some(error.code()),
+        Ok(mut rows) => loop {
+            match rows.next() {
+                Ok(Some(row)) => output.rows.push(row.values().to_vec()),
+                Ok(None) => break,
+                Err(error) => {
+                    output.error = Some(error.code());
+                    break;
+                }
+            }
+        },
+    }
+    output
+}
+
+struct IndexScanModelDatabase {
+    temp: TempDatabase,
+    table: &'static str,
+    open: Option<(Pager, Connection)>,
+    statements: BTreeMap<String, Statement>,
+}
+
+impl IndexScanModelDatabase {
+    fn new(indexed: bool) -> Self {
+        let table = if indexed { "T_INDEXED" } else { "T_SCAN" };
+        let temp = TempDatabase::new(table);
+        let pager = phase_4c2a_create_pager(&temp);
+        let mut side = Self {
+            temp,
+            table,
+            open: Some((pager.clone(), Connection::from_test_pager(pager))),
+            statements: BTreeMap::new(),
+        };
+        let primary = if indexed { "PRIMARY KEY" } else { "" };
+        assert_eq!(side.execute(&format!("CREATE TABLE {table} (ID INT64 {primary}, A INT64, B INT64, D DECIMAL, NOTE TEXT, P BLOB)"), &[]), Outcome::Affected(0));
+        if indexed {
+            for (name, columns) in [("AB", "A, B"), ("D", "D"), ("P", "P"), ("NOTE", "NOTE")] {
+                assert_eq!(
+                    side.execute(
+                        &format!("CREATE INDEX IX_{name} ON {table} ({columns})"),
+                        &[]
+                    ),
+                    Outcome::Affected(0)
+                );
+            }
+        }
+        side
+    }
+
+    fn connection(&mut self) -> &mut Connection {
+        &mut self.open.as_mut().unwrap().1
+    }
+
+    fn execute(&mut self, sql: &str, parameters: &[ParameterValue]) -> Outcome {
+        actual_execute(self.connection(), sql, Parameters::positional(parameters))
+    }
+
+    fn query(
+        &mut self,
+        predicate: &str,
+        ordered: bool,
+        parameters: &[ParameterValue],
+    ) -> (IndexScanQueryOutcome, Vec<&'static str>) {
+        let order = if ordered { " ORDER BY ID DESC" } else { "" };
+        let sql = format!(
+            "SELECT ID, A, B, D, NOTE, P FROM {} WHERE {predicate}{order}",
+            self.table
+        );
+        let _ = super::scan::take_access_paths();
+        if !self.statements.contains_key(&sql) {
+            let statement = match self.connection().prepare(&sql) {
+                Ok(statement) => statement,
+                Err(error) => {
+                    return (
+                        IndexScanQueryOutcome {
+                            rows: Vec::new(),
+                            error: Some(error.code()),
+                        },
+                        super::scan::take_access_paths(),
+                    );
+                }
+            };
+            self.statements.insert(sql.clone(), statement);
+        }
+        // Reuse plans across DML/root changes and reopen; only schema changes
+        // deliberately clear the cache after the stale-statement assertion.
+        let statement = &self.statements[&sql];
+        let connection = &mut self.open.as_mut().unwrap().1;
+        let mut outcome =
+            index_scan_collect(connection.query(statement, Parameters::positional(parameters)));
+        let paths = super::scan::take_access_paths();
+        if !ordered {
+            outcome.rows.sort_by_key(|row| int_at(row, 0));
+        }
+        (outcome, paths)
+    }
+
+    fn transaction_state(&mut self) -> bool {
+        match self.connection().begin_read() {
+            Ok(read) => {
+                drop(read);
+                false
+            }
+            Err(error) => {
+                assert_eq!(error.code(), ErrorCode::Transaction);
+                true
+            }
+        }
+    }
+
+    fn reopen(&mut self) {
+        drop(self.open.take());
+        let pager = phase_4c2a_open_pager(self.temp.path()).unwrap();
+        self.open = Some((pager.clone(), Connection::from_test_pager(pager)));
+    }
+
+    fn capture(&self) -> Phase4c2aStorageState {
+        phase_4c2a_model_state(&self.open.as_ref().unwrap().0, self.temp.path()).unwrap()
+    }
+}
+
+struct IndexScanModel {
+    rows: BTreeMap<i64, IndexScanModelRow>,
+    saved: Option<BTreeMap<i64, IndexScanModelRow>>,
+    indexed: IndexScanModelDatabase,
+    scan: IndexScanModelDatabase,
+    seed: u64,
+    operations: usize,
+    digest: u64,
+    paths: BTreeMap<&'static str, usize>,
+    coverage: BTreeMap<String, usize>,
+}
+
+impl IndexScanModel {
+    fn record(&mut self, label: &str) {
+        *self.coverage.entry(label.to_owned()).or_default() += 1;
+    }
+
+    fn control(&mut self, sql: &str) {
+        let expected = match sql {
+            "BEGIN" if self.saved.is_none() => {
+                self.saved = Some(self.rows.clone());
+                Outcome::Affected(0)
+            }
+            "COMMIT" if self.saved.is_some() => {
+                self.saved = None;
+                Outcome::Affected(0)
+            }
+            "ROLLBACK" if self.saved.is_some() => {
+                self.rows = self.saved.take().unwrap();
+                Outcome::Affected(0)
+            }
+            _ => Outcome::Error(ErrorCode::Transaction),
+        };
+        assert_eq!(self.indexed.execute(sql, &[]), expected, "indexed {sql}");
+        assert_eq!(self.scan.execute(sql, &[]), expected, "scan {sql}");
+        self.record(sql);
+    }
+
+    fn insert(&mut self, row: IndexScanModelRow) {
+        let parameters: Vec<_> = row.values().into_iter().map(Into::into).collect();
+        for side in [&mut self.indexed, &mut self.scan] {
+            assert_eq!(
+                side.execute(&insert_sql(side.table, 6), &parameters),
+                Outcome::Affected(1)
+            );
+        }
+        assert!(self.rows.insert(row.id, row).is_none());
+        self.record("insert");
+    }
+
+    fn mutate(&mut self, random: &mut Generator, operation: usize) {
+        match (operation / 17) % 3 {
+            0 => self.insert(IndexScanModelRow::new(10_000 + operation as i64)),
+            1 => {
+                let id = *self.rows.keys().nth(random.index(self.rows.len())).unwrap();
+                let row = self.rows.get_mut(&id).unwrap();
+                row.a = (operation % 5 != 0).then_some(random.small_i64());
+                row.b = random.small_i64();
+                row.half_units = random.small_i64();
+                row.note = if operation % 2 == 0 {
+                    "keep-updated"
+                } else {
+                    "drop-updated"
+                }
+                .into();
+                row.blob = vec![random.index(5) as u8; 40];
+                let values = row.values();
+                let parameters: Vec<_> = values[1..]
+                    .iter()
+                    .cloned()
+                    .chain([Value::Int64(id)])
+                    .map(Into::into)
+                    .collect();
+                for side in [&mut self.indexed, &mut self.scan] {
+                    assert_eq!(side.execute(&format!("UPDATE {} SET A = :1, B = :2, D = :3, NOTE = :4, P = :5 WHERE ID = :6", side.table), &parameters), Outcome::Affected(1));
+                }
+                self.record("update");
+            }
+            _ => {
+                let id = *self.rows.keys().nth(random.index(self.rows.len())).unwrap();
+                for side in [&mut self.indexed, &mut self.scan] {
+                    assert_eq!(
+                        side.execute(
+                            &format!("DELETE FROM {} WHERE ID = :1", side.table),
+                            &[Value::Int64(id).into()]
+                        ),
+                        Outcome::Affected(1)
+                    );
+                }
+                self.rows.remove(&id);
+                self.record("delete");
+            }
+        }
+    }
+
+    fn assert_rows(&mut self) {
+        let expected: Vec<_> = self
+            .rows
+            .values()
+            .rev()
+            .map(IndexScanModelRow::values)
+            .collect();
+        for side in [&mut self.indexed, &mut self.scan] {
+            let (actual, _) = side.query("TRUE", true, &[]);
+            assert_eq!(
+                actual,
+                IndexScanQueryOutcome {
+                    rows: expected.clone(),
+                    error: None
+                }
+            );
+        }
+    }
+
+    fn split_with_snapshots(&mut self) {
+        assert!(self.saved.is_none());
+        let pre = self.indexed.capture();
+        let mut indexed_reader =
+            Connection::from_test_pager(self.indexed.open.as_ref().unwrap().0.clone());
+        let mut scan_reader =
+            Connection::from_test_pager(self.scan.open.as_ref().unwrap().0.clone());
+        let mut indexed_snapshot = indexed_reader.begin_read().unwrap();
+        let mut scan_snapshot = scan_reader.begin_read().unwrap();
+        let indexed_statement = indexed_snapshot
+            .prepare("SELECT ID, A, B, D, NOTE, P FROM T_INDEXED WHERE A >= 0 ORDER BY ID")
+            .unwrap();
+        let scan_statement = scan_snapshot
+            .prepare("SELECT ID, A, B, D, NOTE, P FROM T_SCAN WHERE A >= 0 ORDER BY ID")
+            .unwrap();
+        let expected: Vec<_> = self
+            .rows
+            .values()
+            .filter(|row| row.a.is_some_and(|a| a >= 0))
+            .map(IndexScanModelRow::values)
+            .collect();
+        self.control("BEGIN");
+        for id in 100..300 {
+            self.insert(IndexScanModelRow::new(id));
+        }
+        self.assert_rows();
+        self.control("COMMIT");
+        for side in [&mut self.indexed, &mut self.scan] {
+            phase_4c2a_checkpoint(&side.open.as_ref().unwrap().0).unwrap();
+        }
+        let _ = super::scan::take_access_paths();
+        let indexed =
+            index_scan_collect(indexed_snapshot.query(&indexed_statement, Parameters::none()));
+        let paths = super::scan::take_access_paths();
+        assert!(
+            paths.contains(&"IndexScan") && !paths.contains(&"TableScan"),
+            "held snapshot access paths: {paths:?}"
+        );
+        let scan = index_scan_collect(scan_snapshot.query(&scan_statement, Parameters::none()));
+        assert_eq!(
+            indexed, scan,
+            "held snapshots diverged after split/commit/checkpoint"
+        );
+        assert_eq!(
+            indexed,
+            IndexScanQueryOutcome {
+                rows: expected,
+                error: None
+            }
+        );
+        drop(indexed_snapshot);
+        drop(scan_snapshot);
+        let post = self.indexed.capture();
+        assert!(
+            post.tables["T_INDEXED"].height > pre.tables["T_INDEXED"].height,
+            "DML must split the table root"
+        );
+        assert!(
+            post.indexes["IX_AB"].height > pre.indexes["IX_AB"].height,
+            "DML must split the composite index root"
+        );
+        assert!(
+            self.scan.capture().indexes.is_empty(),
+            "scan twin must have no indexes"
+        );
+        self.record("split-and-held-snapshot");
+    }
+
+    fn rebuild(&mut self) {
+        assert!(self.saved.is_none());
+        let stale = self
+            .indexed
+            .connection()
+            .prepare("SELECT ID FROM T_INDEXED WHERE A = 1")
+            .unwrap();
+        assert_eq!(
+            self.indexed.execute("DROP INDEX IX_AB", &[]),
+            Outcome::Affected(0)
+        );
+        assert_eq!(
+            self.indexed
+                .execute("CREATE INDEX IX_AB ON T_INDEXED (A, B)", &[]),
+            Outcome::Affected(0)
+        );
+        assert_eq!(
+            actual_query_statement(self.indexed.connection(), &stale, Parameters::none()),
+            Outcome::Error(ErrorCode::SchemaChanged)
+        );
+        self.indexed.statements.clear();
+        self.scan.statements.clear();
+        self.assert_rows();
+        self.record("rebuild-and-stale-statement");
+    }
+
+    fn query(&mut self, random: &mut Generator, operation: usize) {
+        let shape = QueryShape::ALL[operation % QueryShape::ALL.len()];
+        let a = random.small_i64();
+        let b = random.small_i64();
+        let id = *self.rows.keys().nth(random.index(self.rows.len())).unwrap();
+        let blob = vec![random.index(5) as u8; 40];
+        let null = (operation / 12) % 7 == 0;
+        let ordered = (operation / 12) % 2 == 0;
+        let int_param = |value| {
+            if null {
+                if operation % 2 == 0 {
+                    ParameterValue::typed_null(DataType::Int64).unwrap()
+                } else {
+                    Value::Null.into()
+                }
+            } else {
+                Value::Int64(value).into()
+            }
+        };
+        let (predicate, parameters): (String, Vec<ParameterValue>) = match shape {
+            QueryShape::UniquePoint => ("ID = :1".into(), vec![int_param(id)]),
+            QueryShape::CompositePoint => (
+                "A = :1 AND B = :2".into(),
+                vec![int_param(a), Value::Int64(b).into()],
+            ),
+            QueryShape::CompositeRange => (
+                "A = :1 AND B >= :2 AND B < :3".into(),
+                vec![
+                    Value::Int64(a).into(),
+                    int_param(b),
+                    Value::Int64(b + 5).into(),
+                ],
+            ),
+            QueryShape::IsNull => ("A IS NULL".into(), vec![]),
+            QueryShape::ReversedRange => (
+                ":1 <= B AND A = :2".into(),
+                vec![int_param(b), Value::Int64(a).into()],
+            ),
+            QueryShape::ResidualAnd => (
+                "A = :1 AND B >= :2 AND NOTE <> :3".into(),
+                vec![
+                    int_param(a),
+                    Value::Int64(b).into(),
+                    Value::Text("drop-updated".into()).into(),
+                ],
+            ),
+            QueryShape::OrFallback => (
+                "A = :1 OR B = :2".into(),
+                vec![int_param(a), Value::Int64(b).into()],
+            ),
+            QueryShape::NonLeadingFallback => ("B = :1".into(), vec![int_param(b)]),
+            QueryShape::InFallback => (
+                "A IN (:1, :2)".into(),
+                vec![int_param(a), Value::Int64(b).into()],
+            ),
+            QueryShape::LikeFallback => (
+                "NOTE LIKE :1".into(),
+                vec![if null {
+                    ParameterValue::typed_null(DataType::Text).unwrap()
+                } else {
+                    Value::Text("keep%".into()).into()
+                }],
+            ),
+            QueryShape::BlobEquality | QueryShape::BlobRangeFallback => (
+                format!(
+                    "P {} :1",
+                    if matches!(shape, QueryShape::BlobEquality) {
+                        "="
+                    } else {
+                        ">="
+                    }
+                ),
+                vec![if null {
+                    Value::Null.into()
+                } else {
+                    Value::Blob(blob.clone()).into()
+                }],
+            ),
+        };
+        let mut expected: Vec<_> = self
+            .rows
+            .values()
+            .filter(|row| match shape {
+                QueryShape::UniquePoint => !null && row.id == id,
+                QueryShape::CompositePoint => !null && row.a == Some(a) && row.b == b,
+                QueryShape::CompositeRange => {
+                    !null && row.a == Some(a) && row.b >= b && row.b < b + 5
+                }
+                QueryShape::IsNull => row.a.is_none(),
+                QueryShape::ReversedRange => !null && row.a == Some(a) && row.b >= b,
+                QueryShape::ResidualAnd => {
+                    !null && row.a == Some(a) && row.b >= b && row.note != "drop-updated"
+                }
+                QueryShape::OrFallback => (!null && row.a == Some(a)) || row.b == b,
+                QueryShape::NonLeadingFallback => !null && row.b == b,
+                QueryShape::InFallback => (!null && row.a == Some(a)) || row.a == Some(b),
+                QueryShape::LikeFallback => !null && row.note.starts_with("keep"),
+                QueryShape::BlobEquality => !null && row.blob == blob,
+                QueryShape::BlobRangeFallback => !null && row.blob >= blob,
+            })
+            .map(IndexScanModelRow::values)
+            .collect();
+        let (predicate, parameters, indexed, error, label) = match operation % 97 {
+            1 => {
+                expected = self
+                    .rows
+                    .values()
+                    .filter(|row| row.half_units >= a * 2)
+                    .map(IndexScanModelRow::values)
+                    .collect();
+                (
+                    "D >= :1".into(),
+                    vec![Value::Int64(a).into()],
+                    true,
+                    None,
+                    "int64-to-decimal".into(),
+                )
+            }
+            2 => {
+                // Fractional and out-of-Int64 literals must not be narrowed
+                // into integer keys. The expected comparisons are exact.
+                let huge = (operation / 97) % 2 == 0;
+                expected = self
+                    .rows
+                    .values()
+                    .filter(|row| row.a.is_some_and(|a| huge || a >= 2))
+                    .map(IndexScanModelRow::values)
+                    .collect();
+                (
+                    if huge {
+                        "A < 9223372036854775808.5"
+                    } else {
+                        "A > 1.5"
+                    }
+                    .into(),
+                    vec![],
+                    false,
+                    None,
+                    "unsafe-decimal-fallback".into(),
+                )
+            }
+            3 => {
+                expected.clear();
+                (
+                    "ID = :1".into(),
+                    vec![],
+                    true,
+                    Some(ErrorCode::Bind),
+                    "missing-parameter".into(),
+                )
+            }
+            4 => {
+                expected.clear();
+                (
+                    "ID = :1".into(),
+                    vec![ParameterValue::typed_null(DataType::Text).unwrap()],
+                    true,
+                    Some(ErrorCode::Type),
+                    "wrong-typed-null".into(),
+                )
+            }
+            _ => {
+                // Public SQL currently rejects ordered BLOB comparisons at
+                // binding. Preserve this Type outcome, not a fictitious
+                // runtime fallback that the public API cannot reach.
+                let error =
+                    matches!(shape, QueryShape::BlobRangeFallback).then_some(ErrorCode::Type);
+                if error.is_some() {
+                    expected.clear();
+                }
+                (
+                    predicate,
+                    parameters,
+                    shape.indexed(),
+                    error,
+                    format!("{shape:?}"),
+                )
+            }
+        };
+        if ordered {
+            expected.reverse();
+        }
+        let (actual, indexed_paths) = self.indexed.query(&predicate, ordered, &parameters);
+        let (scan, scan_paths) = self.scan.query(&predicate, ordered, &parameters);
+        assert_eq!(
+            actual, scan,
+            "seed={:#x} operation={operation} {label} {predicate}",
+            self.seed
+        );
+        assert_eq!(
+            actual,
+            IndexScanQueryOutcome {
+                rows: expected,
+                error
+            },
+            "reference operation={operation} {label}"
+        );
+        if error.is_none() {
+            let wanted = if indexed { "IndexScan" } else { "TableScan" };
+            assert!(
+                !indexed_paths.is_empty() && indexed_paths.iter().all(|path| *path == wanted),
+                "operation={operation} {label}: expected {wanted}, got {indexed_paths:?}"
+            );
+            assert!(!scan_paths.is_empty() && scan_paths.iter().all(|path| *path == "TableScan"));
+        } else {
+            assert!(
+                indexed_paths.is_empty() && scan_paths.is_empty(),
+                "bind/type errors must precede scanning"
+            );
+        }
+        for path in indexed_paths.into_iter().chain(scan_paths) {
+            *self.paths.entry(path).or_default() += 1;
+        }
+        assert_eq!(self.indexed.transaction_state(), self.saved.is_some());
+        assert_eq!(self.scan.transaction_state(), self.saved.is_some());
+        self.record(&label);
+        if error.is_none()
+            && parameters
+                .iter()
+                .any(|parameter| matches!(parameter.value(), Value::Null))
+        {
+            self.record("null-parameters");
+            if parameters
+                .iter()
+                .any(|parameter| matches!(parameter, ParameterValue::TypedNull(_)))
+            {
+                self.record("typed-null");
+            } else {
+                self.record("untyped-null");
+            }
+        }
+        if ordered {
+            self.record("ordered");
+        } else {
+            self.record("multiset");
+        }
+        // Fixed FNV-1a, not RandomState/DefaultHasher: no randomized seed,
+        // file path, ROWID allocation, clock or hash iteration enters digest.
+        for byte in format!(
+            "{operation}:{label}:{predicate}:{parameters:?}:{actual:?}:{}",
+            self.saved.is_some()
+        )
+        .bytes()
+        {
+            self.digest = (self.digest ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+        self.operations += 1;
+    }
+}
+
+fn run_index_scan_model(seed: u64, operations: usize) {
+    let mut model = IndexScanModel {
+        rows: BTreeMap::new(),
+        saved: None,
+        indexed: IndexScanModelDatabase::new(true),
+        scan: IndexScanModelDatabase::new(false),
+        seed,
+        operations: 0,
+        digest: 0xcbf2_9ce4_8422_2325,
+        paths: BTreeMap::new(),
+        coverage: BTreeMap::new(),
+    };
+    let mut random = Generator::new(seed);
+    model.control("BEGIN");
+    for id in 1..9 {
+        model.insert(IndexScanModelRow::new(id));
+    }
+    model.control("COMMIT");
+    for operation in 0..operations {
+        if operation == 200 {
+            model.split_with_snapshots();
+        }
+        match operation % 200 {
+            0 | 100 => model.control("BEGIN"),
+            75 => model.control("COMMIT"),
+            175 => model.control("ROLLBACK"),
+            190 => {
+                for side in [&mut model.indexed, &mut model.scan] {
+                    phase_4c2a_checkpoint(&side.open.as_ref().unwrap().0).unwrap();
+                }
+                model.record("checkpoint");
+            }
+            199 => {
+                model.indexed.reopen();
+                model.scan.reopen();
+                model.assert_rows();
+                model.record("reopen");
+            }
+            _ => {}
+        }
+        if operation % 1000 == 390 {
+            model.rebuild();
+        }
+        if operation % 1000 == 349 {
+            model.indexed.reopen();
+            model.scan.reopen();
+            model.rows = model
+                .saved
+                .take()
+                .expect("reopen discards active SQL write");
+            model.assert_rows();
+            model.record("reopen-rollback");
+        }
+        if operation % 17 == 0 {
+            model.mutate(&mut random, operation);
+            model.assert_rows();
+        }
+        model.query(&mut random, operation);
+        if (operation + 1) % 1000 == 0 {
+            eprintln!("phase4c2d model progress: operations={}", operation + 1);
+        }
+    }
+    if model.saved.is_some() {
+        model.control("ROLLBACK");
+    }
+    model.assert_rows();
+    assert_eq!(model.operations, operations);
+    assert!(model.paths.get("IndexScan").copied().unwrap_or(0) > 0);
+    assert!(model.paths.get("TableScan").copied().unwrap_or(0) > 0);
+    for shape in QueryShape::ALL {
+        assert!(model.coverage[&format!("{shape:?}")] > 0);
+    }
+    for label in [
+        "int64-to-decimal",
+        "unsafe-decimal-fallback",
+        "missing-parameter",
+        "wrong-typed-null",
+        "null-parameters",
+        "typed-null",
+        "untyped-null",
+        "ordered",
+        "multiset",
+        "insert",
+        "update",
+        "delete",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "checkpoint",
+        "reopen",
+        "reopen-rollback",
+        "split-and-held-snapshot",
+        "rebuild-and-stale-statement",
+    ] {
+        assert!(
+            model.coverage.get(label).copied().unwrap_or(0) > 0,
+            "missing {label}"
+        );
+    }
+    eprintln!(
+        "phase4c2d index scan model: seed={seed:#x} operations={} digest={:016x} paths={:?} coverage={:?}",
+        model.operations, model.digest, model.paths, model.coverage
+    );
+}
+
+fn phase4c2d_index_corruption_fixture() -> (TempDatabase, Pager) {
+    let temp = TempDatabase::new("phase4c2d-index-corruption");
+    let pager = phase_4c2a_create_pager(&temp);
+    let mut connection = Connection::from_test_pager(pager.clone());
+    for (sql, affected) in [
+        ("CREATE TABLE T (ID INT64 PRIMARY KEY, A INT64)", 0),
+        ("CREATE INDEX IX_T_A ON T (A)", 0),
+        ("INSERT INTO T VALUES (1, 7)", 1),
+        ("INSERT INTO T VALUES (2, 99)", 1),
+    ] {
+        assert_eq!(
+            actual_execute(&mut connection, sql, Parameters::none()),
+            Outcome::Affected(affected),
+            "{sql}"
+        );
+    }
+    // A blanket error, wrong range, or missing residual Filter must not make a
+    // corruption witness pass: first pin both healthy buckets and AND FALSE.
+    for (sql, expected) in [
+        ("SELECT ID FROM T WHERE A = 7", vec![vec![Value::Int64(1)]]),
+        ("SELECT ID FROM T WHERE A = 99", vec![vec![Value::Int64(2)]]),
+        ("SELECT ID FROM T WHERE A = 7 AND FALSE", vec![]),
+    ] {
+        assert_eq!(
+            actual_query(&mut connection, sql, Parameters::none()),
+            Outcome::Rows(expected),
+            "undamaged fixture: {sql}"
+        );
+    }
+    (temp, pager)
+}
+
+fn phase4c2d_assert_corruption_on_pull(
+    connection: &mut Connection,
+    mutation: Phase4c2dIndexScanMutation,
+    sql: &str,
+) {
+    let statement = connection
+        .prepare(sql)
+        .expect("prepare corrupted-range query");
+    let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+        panic!("expected query plan");
+    };
+    assert!(
+        query.index_access().is_some(),
+        "must select the A index: {sql}"
+    );
+    let mut rows = connection
+        .query(&statement, Parameters::none())
+        .expect("logical corruption must remain lazy until row retrieval");
+    let error = rows
+        .next()
+        .expect_err("selected corruption must not be filtered or emitted");
+    assert_eq!(error.code(), ErrorCode::Corruption, "{mutation:?}: {sql}");
+}
+
+fn assert_index_scan_corruption(mutation: Phase4c2dIndexScanMutation, sql: &str) {
+    let (temp, pager) = phase4c2d_index_corruption_fixture();
+    phase_4c2d_commit_index_scan_corruption(&pager, mutation, 7)
+        .expect("commit one selected raw mutation");
+    drop(pager);
+    let database = Database::open(temp.path(), Options::default())
+        .expect("logical index corruption must not become open-time validation");
+    let mut connection = database.connect().unwrap();
+    phase4c2d_assert_corruption_on_pull(&mut connection, mutation, sql);
+    eprintln!("phase4c2d {mutation:?}: Corruption on pull before AND FALSE");
+}
+
+#[test]
+fn phase_4c2d_index_scan_corruption_matrix() {
+    // Breaks caught: skipping missing-row/byte-for-byte validation, accepting
+    // nonempty values or malformed/zero-ROWID keys, or allowing residual FALSE
+    // to hide corruption. The duplicate case first filters a legitimate entry.
+    for mutation in Phase4c2dIndexScanMutation::ALL {
+        assert_index_scan_corruption(mutation, "SELECT ID FROM T WHERE A = 7 AND FALSE");
+    }
+}
+
+#[test]
+fn phase_4c2d_index_scan_corruption_outside_selected_range_is_deferred() {
+    // Break caught: scanning/validating the whole index instead of the selected
+    // A prefix, or never rejecting the damaged entry when it is later selected.
+    for mutation in Phase4c2dIndexScanMutation::ALL {
+        let (temp, pager) = phase4c2d_index_corruption_fixture();
+        phase_4c2d_commit_index_scan_corruption(&pager, mutation, 99)
+            .expect("commit one out-of-range raw mutation");
+        drop(pager);
+        let database = Database::open(temp.path(), Options::default())
+            .expect("out-of-range corruption must survive reopen");
+        let mut connection = database.connect().unwrap();
+        assert_eq!(
+            actual_query(
+                &mut connection,
+                "SELECT ID FROM T WHERE A = 7",
+                Parameters::none()
+            ),
+            Outcome::Rows(vec![vec![Value::Int64(1)]]),
+            "{mutation:?}: unrelated A=99 corruption must not affect A=7"
+        );
+        for sql in [
+            "SELECT ID FROM T WHERE A = 99",
+            "SELECT ID FROM T WHERE A = 99 AND FALSE",
+        ] {
+            phase4c2d_assert_corruption_on_pull(&mut connection, mutation, sql);
+        }
+        eprintln!("phase4c2d {mutation:?}: A=7 returns ID=1; A=99 returns Corruption");
+    }
 }
 
 fn phase4c2a_assert_corrupt_complete_candidate_is_not_hidden() {

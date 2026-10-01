@@ -1,5 +1,5 @@
 use crate::sql::bound::BoundSource;
-use crate::sql::plan::{PlanKind, QueryPlan};
+use crate::sql::plan::{IndexAccessPlan, PlanKind, QueryPlan};
 use crate::storage::catalog::CatalogReader;
 use crate::{DbError, ErrorCode, Parameters, Result, Statement};
 
@@ -65,7 +65,10 @@ fn query_factory(
 ) -> Result<OperatorFactory> {
     let mut input = match query.sources() {
         [] if query.joins().is_empty() => OperatorFactory::OneRow,
-        [first, ..] => source_factory(first, catalog, max_row_bytes)?,
+        [only] if query.joins().is_empty() => {
+            source_factory(only, query.index_access(), catalog, max_row_bytes)?
+        }
+        [first, ..] => source_factory(first, None, catalog, max_row_bytes)?,
         [] => return Err(invalid_join_plan()),
     };
     if query.sources().len() != query.joins().len().saturating_add(1) && !query.sources().is_empty()
@@ -82,7 +85,7 @@ fn query_factory(
         }
         input = OperatorFactory::Join {
             left: Box::new(input),
-            right: Box::new(source_factory(source, catalog, max_row_bytes)?),
+            right: Box::new(source_factory(source, None, catalog, max_row_bytes)?),
             on: join.condition().clone(),
             kind: join.kind(),
         };
@@ -98,9 +101,17 @@ fn query_factory(
 
 fn source_factory(
     source: &BoundSource,
+    access: Option<&IndexAccessPlan>,
     catalog: &CatalogReader,
     max_row_bytes: usize,
 ) -> Result<OperatorFactory> {
+    if let Some(access) = access.filter(|access| access.source() == source.source_id) {
+        return Ok(OperatorFactory::IndexScan {
+            source: source.clone(),
+            access: access.clone(),
+            max_row_bytes,
+        });
+    }
     OperatorFactory::table_scan(source.source_id, source.table_id, catalog, max_row_bytes)
 }
 

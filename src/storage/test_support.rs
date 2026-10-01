@@ -2979,6 +2979,105 @@ pub(crate) fn phase_4c2a_wal_records(path: &Path, start: u64) -> Result<Vec<Phas
     Ok(records)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Phase4c2dIndexScanMutation {
+    RemoveReferencedTableRow,
+    PointKeyAtWrongExistingRow,
+    ReplaceLeafValueWithNonEmpty,
+    TruncatePhysicalKey,
+    ZeroPhysicalRowId,
+    DuplicateLogicalEntryForExistingRow,
+}
+
+impl Phase4c2dIndexScanMutation {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::RemoveReferencedTableRow,
+        Self::PointKeyAtWrongExistingRow,
+        Self::ReplaceLeafValueWithNonEmpty,
+        Self::TruncatePhysicalKey,
+        Self::ZeroPhysicalRowId,
+        Self::DuplicateLogicalEntryForExistingRow,
+    ];
+}
+
+/// Bypass constrained writes only here: leave a structurally sound, committed
+/// T/IX_T_A fixture with exactly one logical mutation for a query-time witness.
+pub(crate) fn phase_4c2d_commit_index_scan_corruption(
+    pager: &Pager,
+    mutation: Phase4c2dIndexScanMutation,
+    target_a: i64,
+) -> Result<()> {
+    // Independent IndexKey V1 bytes: non-NULL tag, sign-flipped INT64 BE,
+    // then ROWID BE. Do not use the decoder/encoder under test to make these.
+    const KEY_7: [u8; 17] = [0, 0x80, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1];
+    const KEY_99: [u8; 17] = [0, 0x80, 0, 0, 0, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0, 2];
+    let (physical, rowid, other_rowid) = match target_a {
+        7 => (KEY_7, 1_u64, 2_u64),
+        99 => (KEY_99, 2_u64, 1_u64),
+        _ => panic!("index corruption fixture supports only A=7 or A=99"),
+    };
+    let mut snapshot = pager.begin_read()?;
+    let catalog = snapshot.catalog_reader()?;
+    let table = catalog.find_table_by_name(&CatalogName::new("T")?).unwrap();
+    let index = catalog
+        .find_index_by_name(&CatalogName::new("IX_T_A")?)
+        .unwrap();
+    let mut rows = BTree::from_root(TreeKind::Table, table.root());
+    let mut entries = BTree::from_root(TreeKind::Index, index.root());
+    assert_eq!(
+        collect_all(&entries, &mut snapshot)?,
+        vec![(KEY_7.to_vec(), vec![]), (KEY_99.to_vec(), vec![])],
+        "raw mutation must start from the two hand-encoded fixture entries"
+    );
+    assert!(rows.get(&mut snapshot, &rowid.to_be_bytes())?.is_some());
+    assert!(
+        rows.get(&mut snapshot, &other_rowid.to_be_bytes())?
+            .is_some()
+    );
+    drop(snapshot);
+
+    let before_lsn = pager.latest_lsn()?;
+    let mut batch = pager.begin_write()?;
+    let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+    if matches!(
+        mutation,
+        Phase4c2dIndexScanMutation::RemoveReferencedTableRow
+    ) {
+        assert!(rows.delete(&mut batch, &rowid.to_be_bytes())?.is_some());
+        writer.update_table_root(&mut batch, table.id(), rows.root())?;
+    } else {
+        let mut replacement = physical.to_vec();
+        let mut value = Vec::new();
+        match mutation {
+            Phase4c2dIndexScanMutation::PointKeyAtWrongExistingRow
+            | Phase4c2dIndexScanMutation::DuplicateLogicalEntryForExistingRow => {
+                replacement[9..].copy_from_slice(&other_rowid.to_be_bytes());
+            }
+            Phase4c2dIndexScanMutation::ReplaceLeafValueWithNonEmpty => value.push(0x5a),
+            Phase4c2dIndexScanMutation::TruncatePhysicalKey => {
+                // Preserve the complete A prefix so the range still selects it.
+                replacement.pop();
+            }
+            Phase4c2dIndexScanMutation::ZeroPhysicalRowId => replacement[9..].fill(0),
+            Phase4c2dIndexScanMutation::RemoveReferencedTableRow => unreachable!(),
+        }
+        if !matches!(
+            mutation,
+            Phase4c2dIndexScanMutation::DuplicateLogicalEntryForExistingRow
+        ) {
+            assert_eq!(entries.delete(&mut batch, &physical)?, Some(vec![]));
+        }
+        // The duplicate case retains both legitimate entries and adds a second
+        // logical value for the other existing ROWID, not a duplicate BTree key.
+        entries.insert(&mut batch, &replacement, &value)?;
+        writer.update_index_root(&mut batch, index.id(), entries.root())?;
+    }
+    writer.finish(&mut batch)?;
+    batch.commit()?;
+    assert!(pager.latest_lsn()? > before_lsn, "raw mutation must commit");
+    Ok(())
+}
+
 pub(crate) fn phase_4c2a_commit_malformed_index(pager: &Pager, name: &str) -> Result<()> {
     let mut snapshot = pager.begin_read()?;
     let catalog = snapshot.catalog_reader()?;

@@ -1,19 +1,109 @@
 use super::{BoundExpr, SchemaDependency};
 use crate::{
+    DbError, ErrorCode, Result,
     api::ColumnMetadata,
     sql::ast::{JoinKind, NullPlacement, OrderDirection},
-    storage::catalog::types::{SchemaVersion, TableId},
+    storage::catalog::types::{ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId},
 };
 
 /// Query-local occurrence, not a catalog identity. Ordered from FROM through JOINs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SourceId(pub(crate) usize);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundIndexColumn {
+    column_id: ColumnId,
+    ordinal: u16,
+    column_type: ColumnType,
+}
+
+impl BoundIndexColumn {
+    pub(crate) const fn new(column_id: ColumnId, ordinal: u16, column_type: ColumnType) -> Self {
+        Self {
+            column_id,
+            ordinal,
+            column_type,
+        }
+    }
+
+    pub(crate) fn from_column(column: &ColumnDef) -> Self {
+        Self::new(column.id(), column.ordinal(), column.column_type())
+    }
+
+    pub(crate) const fn column_id(&self) -> ColumnId {
+        self.column_id
+    }
+
+    pub(crate) const fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    pub(crate) const fn column_type(&self) -> ColumnType {
+        self.column_type
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundIndex {
+    id: IndexId,
+    unique: bool,
+    columns: Box<[BoundIndexColumn]>,
+}
+
+impl BoundIndex {
+    pub(crate) fn new(id: IndexId, unique: bool, columns: Box<[BoundIndexColumn]>) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "bound index must contain at least one column",
+            ));
+        }
+        Ok(Self {
+            id,
+            unique,
+            columns,
+        })
+    }
+
+    pub(crate) const fn id(&self) -> IndexId {
+        self.id
+    }
+
+    pub(crate) const fn unique(&self) -> bool {
+        self.unique
+    }
+
+    pub(crate) fn columns(&self) -> &[BoundIndexColumn] {
+        &self.columns
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundSource {
     pub(crate) source_id: SourceId,
     pub(crate) table_id: TableId,
     pub(crate) schema_version: SchemaVersion,
+    indexes: Box<[BoundIndex]>,
+}
+
+impl BoundSource {
+    pub(crate) fn new(
+        source_id: SourceId,
+        table_id: TableId,
+        schema_version: SchemaVersion,
+        indexes: Box<[BoundIndex]>,
+    ) -> Self {
+        Self {
+            source_id,
+            table_id,
+            schema_version,
+            indexes,
+        }
+    }
+
+    pub(crate) fn indexes(&self) -> &[BoundIndex] {
+        &self.indexes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

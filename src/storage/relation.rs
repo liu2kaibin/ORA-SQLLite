@@ -521,6 +521,24 @@ impl Relation {
         }
     }
 
+    pub(crate) fn get_snapshot(
+        &self,
+        snapshot: &mut ReadSnapshot,
+        rowid: RowId,
+        max_row_bytes: usize,
+    ) -> Result<Option<StoredRow>> {
+        self.get_from(snapshot, rowid, max_row_bytes)
+    }
+
+    pub(crate) fn get_batch(
+        &self,
+        batch: &mut WriteBatch,
+        rowid: RowId,
+        max_row_bytes: usize,
+    ) -> Result<Option<StoredRow>> {
+        self.get_from(batch, rowid, max_row_bytes)
+    }
+
     /// Conservative peak for raw materialization + decoded payload + directory
     /// and Value bodies. Unlike ordinary scans, enforce this before value I/O.
     pub(crate) fn scan_with_work_budget(&self, work_bytes: u64) -> Result<RelationScan> {
@@ -543,6 +561,41 @@ impl Relation {
         scan.bounded_materialization = true;
         Ok(scan)
     }
+
+    fn get_from(
+        &self,
+        source: &mut impl PageSource,
+        rowid: RowId,
+        max_row_bytes: usize,
+    ) -> Result<Option<StoredRow>> {
+        let rows = BTree::from_root(TreeKind::Table, self.table.root());
+        let Some(bytes) = rows.get_value_limited_with_error(
+            source,
+            &encode_rowid_key(rowid),
+            max_row_bytes as u64,
+            row_limit_error,
+        )?
+        else {
+            return Ok(None);
+        };
+        self.decode_stored_row(rowid, &bytes, max_row_bytes)
+            .map(Some)
+    }
+
+    fn decode_stored_row(
+        &self,
+        rowid: RowId,
+        bytes: &[u8],
+        max_row_bytes: usize,
+    ) -> Result<StoredRow> {
+        let values =
+            RowCodec::decode(&self.table, &self.columns, bytes, max_row_bytes)?.into_boxed_slice();
+        Ok(StoredRow { rowid, values })
+    }
+}
+
+fn row_limit_error() -> DbError {
+    DbError::new(ErrorCode::Type, "row exceeds the caller resource limit")
 }
 
 fn invalid_value_shape(column: &ColumnDef, value: &Value) -> Option<DbError> {
@@ -599,14 +652,9 @@ impl RelationScan {
             return Ok(None);
         };
         let rowid = decode_rowid_key(&key)?;
-        let values = RowCodec::decode(
-            &self.relation.table,
-            &self.relation.columns,
-            &bytes,
-            self.max_row_bytes,
-        )?
-        .into_boxed_slice();
-        Ok(Some(StoredRow { rowid, values }))
+        self.relation
+            .decode_stored_row(rowid, &bytes, self.max_row_bytes)
+            .map(Some)
     }
 }
 
@@ -1675,13 +1723,14 @@ mod tests {
     use super::{
         ColumnSpec, ConstrainedCreateFaultPoint, ConstrainedDropFaultPoint, ConstrainedTableSpec,
         ConstrainedTableWrite, Relation, TableConstraintSpec, TableSpec, TableWrite,
-        create_constrained_relation, create_relation, drop_relation,
+        corrupt_relation_row_for_test, create_constrained_relation, create_relation, drop_relation,
         fail_constrained_create_at_for_test, fail_constrained_drop_at_for_test,
     };
     use crate::storage::index::{IndexSpec, create_index};
     use crate::storage::{
-        Pager,
+        PageRef, Pager,
         btree::{BTree, TreeKind},
+        cache::PageHandle,
         catalog::{
             CatalogReader, CatalogWriter, ConstraintBundleFaultPoint, ConstraintRemovalFaultPoint,
             fail_constraint_removal_at_for_test,
@@ -1696,9 +1745,13 @@ mod tests {
         },
         features::INDEX_CONSTRAINT_V1,
         file::OpenMode,
-        pager::PagerConfig,
+        page::PageType,
+        pager::{PageSource, PagerConfig},
         row::{RowCodec, encode_rowid_key},
-        test_support::{TempDatabase, phase_4b_catalog_fixture, test_pager},
+        test_support::{
+            Phase4bCatalogFixture, TempDatabase, phase_4b_catalog_fixture,
+            phase_4c1_query_relation_fixture, test_pager,
+        },
     };
     use crate::{Database, ErrorCode, Options, Parameters, Result, Value};
 
@@ -3459,6 +3512,93 @@ mod tests {
     }
 
     #[test]
+    fn relation_point_lookup_distinguishes_present_missing_limit_and_corruption() {
+        // Production break caught: a lookup that treats a present row as absent,
+        // skips caller limits, or converts corrupt stored bytes into None.
+        let fixture = point_read_fixture();
+        assert_eq!(
+            fixture
+                .get(1, LARGE_ROW_BYTES)
+                .unwrap()
+                .unwrap()
+                .rowid()
+                .get(),
+            1
+        );
+        assert!(fixture.get(999, LARGE_ROW_BYTES).unwrap().is_none());
+        assert_eq!(
+            fixture
+                .get(1, LARGE_ROW_BYTES - 1)
+                .err()
+                .expect("smaller caller limit must reject the row")
+                .code(),
+            ErrorCode::Type
+        );
+        fixture.corrupt_row(1);
+        assert_eq!(
+            fixture
+                .get(1, LARGE_ROW_BYTES)
+                .err()
+                .expect("corrupt stored bytes must be rejected")
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn relation_snapshot_point_lookup_rejects_overflow_before_materializing_it() {
+        // Production break caught: changing Relation::get_from back to unbounded
+        // BTree::get would materialize the overflow value before RowCodec sees
+        // the caller's row limit.
+        let fixture = point_read_fixture();
+        let pager = fixture.storage.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let relation = {
+            let catalog = snapshot.catalog_reader().unwrap();
+            Relation::open(&catalog, fixture.storage.users_id()).unwrap()
+        };
+        let mut source = OverflowCountingSource::new(snapshot);
+
+        let error =
+            match relation.get_from(&mut source, RowId::new(1).unwrap(), LARGE_ROW_BYTES - 1) {
+                Err(error) => error,
+                Ok(_) => panic!("over-limit snapshot point read must fail"),
+            };
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(
+            source.overflow_reads, 0,
+            "the snapshot point read must reject the declared row length before overflow I/O"
+        );
+    }
+
+    #[test]
+    fn relation_batch_point_lookup_rejects_overflow_before_materializing_it() {
+        // Production break caught: changing Relation::get_from back to unbounded
+        // BTree::get would make WriteBatch point reads follow overflow pages
+        // before reporting the existing relation-layer Type limit error.
+        let fixture = point_read_fixture();
+        let pager = fixture.storage.pager();
+        let mut batch = pager.begin_write().unwrap();
+        let relation = {
+            let catalog = batch.catalog_reader().unwrap();
+            Relation::open(&catalog, fixture.storage.users_id()).unwrap()
+        };
+        let mut source = OverflowCountingSource::new(batch);
+
+        let error =
+            match relation.get_from(&mut source, RowId::new(1).unwrap(), LARGE_ROW_BYTES - 1) {
+                Err(error) => error,
+                Ok(_) => panic!("over-limit batch point read must fail"),
+            };
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(
+            source.overflow_reads, 0,
+            "the batch point read must reject the declared row length before overflow I/O"
+        );
+        source.source.rollback().unwrap();
+    }
+
+    #[test]
     fn relation_scan_honors_caller_row_limit_for_snapshot_and_batch() {
         let fixture = phase_4a_large_relation_fixture();
         let mut snapshot = fixture.pager().begin_read().unwrap();
@@ -3511,6 +3651,63 @@ mod tests {
         table_id: TableId,
     }
 
+    struct PointReadFixture {
+        storage: Phase4bCatalogFixture,
+    }
+
+    struct OverflowCountingSource<S> {
+        source: S,
+        overflow_reads: usize,
+    }
+
+    impl<S> OverflowCountingSource<S> {
+        const fn new(source: S) -> Self {
+            Self {
+                source,
+                overflow_reads: 0,
+            }
+        }
+    }
+
+    impl<S: PageSource> PageSource for OverflowCountingSource<S> {
+        fn read_page(&mut self, reference: PageRef) -> Result<PageHandle> {
+            let page = self.source.read_page(reference)?;
+            if page.header().page_type() == PageType::Overflow {
+                self.overflow_reads += 1;
+            }
+            Ok(page)
+        }
+
+        fn page_count(&self) -> Result<u64> {
+            self.source.page_count()
+        }
+    }
+
+    impl PointReadFixture {
+        fn get(&self, rowid: u64, max_row_bytes: usize) -> Result<Option<super::StoredRow>> {
+            let pager = self.storage.pager();
+            let mut snapshot = pager.begin_read()?;
+            let relation = {
+                let catalog = snapshot.catalog_reader()?;
+                Relation::open(&catalog, self.storage.users_id())?
+            };
+            relation.get_snapshot(&mut snapshot, RowId::new(rowid)?, max_row_bytes)
+        }
+
+        fn corrupt_row(&self, rowid: u64) {
+            let pager = self.storage.pager();
+            let mut batch = pager.begin_write().expect("begin row corruption write");
+            corrupt_relation_row_for_test(
+                &mut batch,
+                self.storage.users_id(),
+                RowId::new(rowid).expect("test rowid"),
+                b"not-a-valid-row",
+            )
+            .expect("corrupt stored row");
+            batch.commit().expect("commit row corruption");
+        }
+    }
+
     impl Phase4aRelationFixture {
         fn pager(&self) -> &Pager {
             &self.pager
@@ -3529,6 +3726,15 @@ mod tests {
             _temp: temp,
             pager,
             table_id,
+        }
+    }
+
+    fn point_read_fixture() -> PointReadFixture {
+        // USERS has four columns: 32-byte header + one-byte NULL bitmap +
+        // 32-byte directory + eight-byte ID leaves this many NAME bytes.
+        let payload = "x".repeat(LARGE_ROW_BYTES - 73);
+        PointReadFixture {
+            storage: phase_4c1_query_relation_fixture(&[(1, &payload)]),
         }
     }
 

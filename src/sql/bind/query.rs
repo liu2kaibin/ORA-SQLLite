@@ -8,11 +8,11 @@ use crate::{
         ast::{AstExpr, AstExprKind, AstQuery, NullPlacement, OrderDirection, SelectItem},
         bound::{BoundExpr, BoundExprKind, SchemaDependency},
     },
-    storage::catalog::CatalogReader,
+    storage::catalog::{CatalogReader, types::TableId},
 };
 
 use super::{BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_expr};
-use crate::sql::bound::{BoundJoin, BoundSource, SourceId};
+use crate::sql::bound::{BoundIndex, BoundIndexColumn, BoundJoin, BoundSource, SourceId};
 pub(crate) use crate::sql::bound::{BoundOrderExpression, BoundOrderItem, BoundQuery};
 
 #[derive(Clone, Copy)]
@@ -75,12 +75,15 @@ pub(crate) fn bind_query(
     let sources = scope
         .source_identities()
         .enumerate()
-        .map(|(index, identity)| BoundSource {
-            source_id: SourceId(index),
-            table_id: identity.table_id,
-            schema_version: identity.schema_version,
+        .map(|(index, identity)| {
+            Ok(BoundSource::new(
+                SourceId(index),
+                identity.table_id,
+                identity.schema_version,
+                indexes_for_source(catalog, identity.table_id)?,
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let mut joins = Vec::with_capacity(query.joins.len());
     for (index, join) in query.joins.iter().enumerate() {
         let condition_scope = join_scope.scope_for_join_condition(query, index)?;
@@ -205,6 +208,21 @@ pub(crate) fn bind_query(
         columns,
         dependencies,
     })
+}
+
+fn indexes_for_source(catalog: &CatalogReader, table_id: TableId) -> Result<Box<[BoundIndex]>> {
+    catalog
+        .indexes_for_table(table_id)
+        .map(|index| {
+            let columns = catalog
+                .columns_for_index(index.id())
+                .map(BoundIndexColumn::from_column)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            BoundIndex::new(index.id(), index.unique(), columns)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
 }
 
 fn bind_condition(
@@ -976,10 +994,10 @@ fn bind_error(message: &'static str) -> DbError {
 mod tests {
     use super::GroupIndex;
     use crate::{
-        ErrorCode, Value,
+        Database, ErrorCode, Options, Parameters, Value,
         api::{ColumnMetadata, DataType},
         sql::{
-            Identifier, SqlSpan, SqlType,
+            Identifier, SqlLimits, SqlSpan, SqlType,
             ast::{
                 AstExpr, AstExprKind, AstQuery, BinaryOp, Join, JoinKind, NullPlacement,
                 OrderDirection, OrderItem, SelectItem, TableSource,
@@ -988,10 +1006,95 @@ mod tests {
                 BindingScope, BoundOrderExpression, ParameterCollector, bind_query,
                 test_support::prepare_fixture,
             },
+            bind_sql,
             bound::{BoundExpr, BoundExprKind, BoundStatementKind},
         },
-        storage::test_support::phase_4b_catalog_fixture,
+        storage::{
+            catalog::types::ColumnType,
+            test_support::{phase_4b_catalog_fixture, phase_4c2b_constraint_fixture},
+        },
     };
+
+    #[test]
+    fn query_sources_capture_indexes_in_stable_id_and_column_order() {
+        // Production break caught: omitting catalog indexes or changing their
+        // validated ID/column order would give the query planner an unstable
+        // candidate set.
+        let fixture = phase_4c2b_constraint_fixture();
+        let mut snapshot = fixture.pager().begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let bound = bind_sql(
+            "SELECT ID FROM T WHERE ID = 7",
+            &SqlLimits::default(),
+            &catalog,
+            fixture.pager().database_uuid().unwrap(),
+        )
+        .unwrap();
+        let BoundStatementKind::Query { query } = bound.kind else {
+            panic!()
+        };
+        assert_eq!(query.sources[0].indexes().len(), 1);
+        assert_eq!(query.sources[0].indexes()[0].id(), fixture.index_id());
+        assert_eq!(query.sources[0].indexes()[0].columns()[0].ordinal(), 0);
+        assert_eq!(
+            query.sources[0].indexes()[0].columns()[0].column_type(),
+            ColumnType::Int64
+        );
+    }
+
+    #[test]
+    fn query_sources_preserve_multiple_index_ids_and_table_column_ordinals() {
+        // Production break caught: treating table column ordinals as index-key
+        // positions rejects valid non-leading and composite indexes during binding.
+        let fixture = phase_4b_catalog_fixture(4096);
+        let database = Database::open(fixture.main_path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE INDEX IX_USERS_AMOUNT ON USERS (AMOUNT)",
+            "CREATE UNIQUE INDEX UX_USERS_ID_AMOUNT ON USERS (ID, AMOUNT)",
+        ] {
+            let statement = connection.prepare(sql).unwrap();
+            connection.execute(&statement, Parameters::none()).unwrap();
+        }
+        drop(connection);
+        drop(database);
+
+        let pager = fixture.pager();
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = snapshot.catalog_reader().unwrap();
+        let bound = bind_sql(
+            "SELECT AMOUNT FROM USERS WHERE AMOUNT = 7",
+            &SqlLimits::default(),
+            &catalog,
+            pager.database_uuid().unwrap(),
+        )
+        .unwrap();
+        let BoundStatementKind::Query { query } = bound.kind else {
+            panic!()
+        };
+        assert_eq!(
+            query.sources[0]
+                .indexes()
+                .iter()
+                .map(|index| index.id().get())
+                .collect::<Vec<_>>(),
+            [9, 10]
+        );
+        assert_eq!(
+            query.sources[0]
+                .indexes()
+                .iter()
+                .map(|index| {
+                    index
+                        .columns()
+                        .iter()
+                        .map(|column| column.ordinal())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+            [vec![2], vec![0, 2]]
+        );
+    }
 
     #[test]
     fn join_group_alias_and_order_bind_to_stable_ids() {

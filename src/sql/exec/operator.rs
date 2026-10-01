@@ -1,16 +1,23 @@
 use crate::sql::{
     ast::JoinKind,
-    bound::SourceId,
-    plan::{ExecExpr, OrderExpression, QueryPlan},
+    bound::{BoundSource, SourceId},
+    plan::{ExecExpr, IndexAccessPlan, OrderExpression, QueryPlan},
 };
-use crate::storage::catalog::{CatalogReader, types::TableId};
+use crate::storage::catalog::{
+    CatalogReader,
+    types::{RowId, TableId},
+};
+use crate::storage::index::{
+    IndexStorage,
+    scan::{IndexRowIdScan, ScannedIndexEntry},
+};
 use crate::storage::relation::{Relation, RelationScan, StoredRow};
 use crate::storage::{ReadSnapshot, WriteBatch};
 use crate::{DbError, ErrorCode, Result, Row, Value};
 
 use super::join::NestedLoopJoin;
 use super::memory::{checked_add_bytes, owned_values_bytes, resource_limit};
-use super::scan::{OneRow, TableScan};
+use super::scan::{IndexScan, OneRow, TableScan};
 use super::{ParameterFrame, WorkMemory, eval};
 
 pub(crate) trait Operator {
@@ -27,6 +34,13 @@ pub(crate) enum OperatorFactory {
     TableScan {
         source: SourceId,
         relation: Relation,
+        max_row_bytes: usize,
+    },
+    // Root-free like the immutable plan: resolve both storage facades from
+    // this execution's snapshot/batch when the operator is first pulled.
+    IndexScan {
+        source: BoundSource,
+        access: IndexAccessPlan,
         max_row_bytes: usize,
     },
     Filter {
@@ -63,6 +77,15 @@ impl OperatorFactory {
                 relation,
                 max_row_bytes,
             } => Box::new(TableScan::new(*source, relation.scan(*max_row_bytes))),
+            Self::IndexScan {
+                source,
+                access,
+                max_row_bytes,
+            } => Box::new(IndexScan::new(
+                source.clone(),
+                access.clone(),
+                *max_row_bytes,
+            )),
             Self::Filter { input, predicate } => Box::new(Filter {
                 input: input.build()?,
                 predicate: predicate.clone(),
@@ -158,6 +181,96 @@ impl<'a> ExecutionContext<'a> {
             ExecutionStorage::Read(snapshot) => scan.next_snapshot(snapshot),
             ExecutionStorage::Write(batch) => scan.next_batch(batch),
         };
+        result.map_err(|error| {
+            if error.code() == ErrorCode::Type {
+                resource_limit()
+            } else {
+                error
+            }
+        })
+    }
+
+    pub(crate) fn open_index(
+        &mut self,
+        source: &BoundSource,
+        access: &IndexAccessPlan,
+    ) -> Result<(Relation, IndexStorage)> {
+        if source.source_id != access.source() {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "index access source is inconsistent",
+            ));
+        }
+        let retained = source
+            .indexes()
+            .iter()
+            .find(|index| index.id() == access.index_id())
+            .ok_or_else(|| {
+                DbError::new(ErrorCode::Internal, "index access identity was not bound")
+            })?;
+        let catalog = match &mut self.storage {
+            ExecutionStorage::Read(snapshot) => snapshot.catalog_reader()?,
+            ExecutionStorage::Write(batch) => batch.catalog_reader()?,
+        };
+        let changed = || DbError::new(ErrorCode::SchemaChanged, "indexed source schema changed");
+        let table = catalog
+            .find_table_by_id(source.table_id)
+            .ok_or_else(changed)?;
+        if table.schema_version() != source.schema_version {
+            return Err(changed());
+        }
+        let index = catalog
+            .find_index_by_id(access.index_id())
+            .ok_or_else(changed)?;
+        let columns = catalog
+            .columns_for_index(access.index_id())
+            .collect::<Vec<_>>();
+        if index.table_id() != source.table_id
+            || index.unique() != retained.unique()
+            || columns.len() != retained.columns().len()
+            || !columns
+                .iter()
+                .zip(retained.columns())
+                .all(|(current, bound)| {
+                    current.table_id() == source.table_id
+                        && current.id() == bound.column_id()
+                        && current.ordinal() == bound.ordinal()
+                        && current.column_type() == bound.column_type()
+                })
+        {
+            return Err(changed());
+        }
+        Ok((
+            Relation::open(&catalog, source.table_id)?,
+            IndexStorage::open(&catalog, access.index_id())?,
+        ))
+    }
+
+    pub(crate) fn next_index(
+        &mut self,
+        scan: &mut IndexRowIdScan,
+    ) -> Result<Option<ScannedIndexEntry>> {
+        match &mut self.storage {
+            ExecutionStorage::Read(snapshot) => scan.next(*snapshot),
+            ExecutionStorage::Write(batch) => scan.next(*batch),
+        }
+    }
+
+    pub(crate) fn get_relation(
+        &mut self,
+        relation: &Relation,
+        rowid: RowId,
+        max_row_bytes: usize,
+    ) -> Result<Option<StoredRow>> {
+        let result = match &mut self.storage {
+            ExecutionStorage::Read(snapshot) => {
+                relation.get_snapshot(snapshot, rowid, max_row_bytes)
+            }
+            ExecutionStorage::Write(batch) => relation.get_batch(batch, rowid, max_row_bytes),
+        };
+        // The validated catalog establishes the schema; the strict row decoder's
+        // only remaining Type error is its caller-provided row-size limit.
+        // Do not apply this mapping to index/key errors or fatal storage errors.
         result.map_err(|error| {
             if error.code() == ErrorCode::Type {
                 resource_limit()
