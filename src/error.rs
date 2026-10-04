@@ -79,6 +79,14 @@ impl DbError {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Oracle normalization errors are wired into execution by later phase 5 tasks"
+    )]
+    pub(crate) fn oracle(code: ErrorCode, oracle_code: u16, message: impl Into<String>) -> Self {
+        Self::new(code, message).with_oracle_code(oracle_code)
+    }
+
     pub const fn with_oracle_code(mut self, oracle_code: u16) -> Self {
         self.oracle_code = Some(oracle_code);
         self
@@ -133,6 +141,19 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::Constraint);
         assert_eq!(error.oracle_code(), Some(1));
         assert_eq!(error.to_string(), "[1300] duplicate key");
+    }
+
+    #[test]
+    fn oracle_error_preserves_error_class_message_and_fatality() {
+        let type_error = DbError::oracle(ErrorCode::Type, 1722, "invalid number");
+        assert_eq!(type_error.code(), ErrorCode::Type);
+        assert_eq!(type_error.oracle_code(), Some(1722));
+        assert_eq!(type_error.to_string(), "[1200] invalid number");
+        assert!(!type_error.is_fatal());
+
+        let fatal_error = DbError::oracle(ErrorCode::Internal, 600, "internal failure");
+        assert_eq!(fatal_error.oracle_code(), Some(600));
+        assert!(fatal_error.is_fatal());
     }
 
     #[test]
