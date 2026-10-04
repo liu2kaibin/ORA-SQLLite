@@ -1,5 +1,6 @@
 use crate::{
     DbError, ErrorCode, Result,
+    oracle_type::OracleTypeDescriptor,
     storage::{
         PageId, PageRef,
         codec::{Decoder, Encoder},
@@ -17,6 +18,7 @@ use super::{
 };
 
 const RECORD_VERSION_V1: u8 = 1;
+const RECORD_VERSION_V2: u8 = 2;
 const CATALOG_FORMAT_VERSION_V1: u16 = 1;
 const ENVELOPE_LEN: usize = 8;
 const MAPPING_PAYLOAD_LEN: usize = 8;
@@ -54,6 +56,13 @@ pub(super) fn encode_column_ordinal_mapping(id: ColumnId) -> Vec<u8> {
 }
 
 pub(super) fn encode_column_definition(column: &ColumnDef) -> Vec<u8> {
+    match column.oracle_type() {
+        None => encode_column_definition_v1(column),
+        Some(descriptor) => encode_column_definition_v2(column, descriptor),
+    }
+}
+
+fn encode_column_definition_v1(column: &ColumnDef) -> Vec<u8> {
     let mut payload = Encoder::new();
     payload.put_u64(column.id().get());
     payload.put_u64(column.table_id().get());
@@ -66,6 +75,77 @@ pub(super) fn encode_column_definition(column: &ColumnDef) -> Vec<u8> {
     payload.put_u16(0);
     payload.put_bytes(column.name().as_bytes());
     encode_envelope(RecordKind::ColumnDefinition, payload.into_bytes())
+}
+
+fn encode_column_definition_v2(column: &ColumnDef, descriptor: OracleTypeDescriptor) -> Vec<u8> {
+    let (kind, precision, scale, length) = match descriptor {
+        OracleTypeDescriptor::Number { .. } => (
+            1,
+            descriptor.precision().expect("NUMBER has precision"),
+            descriptor.scale().expect("NUMBER has scale"),
+            0,
+        ),
+        OracleTypeDescriptor::Varchar2 { .. } => (
+            2,
+            0,
+            0,
+            descriptor
+                .length_chars()
+                .expect("VARCHAR2 has character length"),
+        ),
+        OracleTypeDescriptor::Char { .. } => (
+            3,
+            0,
+            0,
+            descriptor
+                .length_chars()
+                .expect("CHAR has character length"),
+        ),
+        OracleTypeDescriptor::Raw { .. } => (
+            4,
+            0,
+            0,
+            descriptor.length_bytes().expect("RAW has byte length"),
+        ),
+        OracleTypeDescriptor::Date => (5, 0, 0, 0),
+        OracleTypeDescriptor::Timestamp { .. } => (
+            6,
+            descriptor
+                .fractional_precision()
+                .expect("TIMESTAMP has fractional precision"),
+            0,
+            0,
+        ),
+        OracleTypeDescriptor::TimestampWithTimeZone { .. } => (
+            7,
+            descriptor
+                .fractional_precision()
+                .expect("TIMESTAMP WITH TIME ZONE has fractional precision"),
+            0,
+            0,
+        ),
+    };
+    let mut payload = Encoder::new();
+    payload.put_u64(column.id().get());
+    payload.put_u64(column.table_id().get());
+    payload.put_u16(column.ordinal());
+    payload.put_u8(column.column_type().code());
+    payload.put_u8(u8::from(column.nullable()));
+    payload.put_u8(kind);
+    payload.put_u8(precision);
+    payload.put_u8(scale as u8);
+    payload.put_u8(0);
+    payload.put_u32(length);
+    let name_len = u16::try_from(column.name().as_bytes().len())
+        .expect("checked catalog name length fits u16");
+    payload.put_u16(name_len);
+    payload.put_u16(0);
+    payload.put_bytes(column.name().as_bytes());
+    encode_envelope_with_version(
+        RecordKind::ColumnDefinition,
+        RECORD_VERSION_V2,
+        payload.into_bytes(),
+    )
 }
 
 pub(super) fn encode_index_name_mapping(id: IndexId) -> Vec<u8> {
@@ -164,7 +244,7 @@ pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<Catalo
     {
         return Err(corruption("catalog key and record kind disagree"));
     }
-    let payload = decode_envelope(expected, bytes)?;
+    let (version, payload) = decode_envelope(expected, bytes)?;
     match expected {
         RecordKind::CatalogMeta => {
             decode_catalog_meta_payload(payload).map(CatalogRecord::CatalogMeta)
@@ -177,9 +257,12 @@ pub(super) fn decode_record(expected: RecordKind, bytes: &[u8]) -> Result<Catalo
         RecordKind::ColumnOrdinal => {
             decode_column_id_mapping(payload).map(CatalogRecord::ColumnOrdinal)
         }
-        RecordKind::ColumnDefinition => {
-            decode_column_definition_payload(payload).map(CatalogRecord::ColumnDefinition)
+        RecordKind::ColumnDefinition => match version {
+            RECORD_VERSION_V1 => decode_column_definition_v1_payload(payload),
+            RECORD_VERSION_V2 => decode_column_definition_v2_payload(payload),
+            _ => unreachable!("decode_envelope validates record versions"),
         }
+        .map(CatalogRecord::ColumnDefinition),
         RecordKind::IndexName => decode_index_id_mapping(payload).map(CatalogRecord::IndexName),
         RecordKind::IndexDefinition => {
             decode_index_definition_payload(payload).map(CatalogRecord::IndexDefinition)
@@ -365,10 +448,14 @@ fn encode_mapping(kind: RecordKind, id: u64) -> Vec<u8> {
 }
 
 fn encode_envelope(kind: RecordKind, payload: Vec<u8>) -> Vec<u8> {
+    encode_envelope_with_version(kind, RECORD_VERSION_V1, payload)
+}
+
+fn encode_envelope_with_version(kind: RecordKind, version: u8, payload: Vec<u8>) -> Vec<u8> {
     let payload_len = u32::try_from(payload.len()).expect("catalog V1 payload length fits u32");
     let mut envelope = Encoder::new();
     envelope.put_u8(kind.byte());
-    envelope.put_u8(RECORD_VERSION_V1);
+    envelope.put_u8(version);
     envelope.put_u16(0);
     envelope.put_u32(payload_len);
     envelope.put_bytes(&payload);
@@ -382,23 +469,28 @@ fn put_name(payload: &mut Encoder, name: &CatalogName) {
     payload.put_bytes(name.as_bytes());
 }
 
-fn decode_envelope(expected: RecordKind, bytes: &[u8]) -> Result<&[u8]> {
+fn decode_envelope(expected: RecordKind, bytes: &[u8]) -> Result<(u8, &[u8])> {
     let kind = RecordKind::from_byte(*bytes.first().ok_or_else(truncated_record)?)?;
     let version = *bytes.get(1).ok_or_else(truncated_record)?;
-    if version > RECORD_VERSION_V1 {
+    let maximum_version = if expected == RecordKind::ColumnDefinition {
+        RECORD_VERSION_V2
+    } else {
+        RECORD_VERSION_V1
+    };
+    if version > maximum_version {
         return Err(DbError::new(
             ErrorCode::Unsupported,
-            "catalog record version is newer than V1",
+            "catalog record version is newer than this engine supports",
         ));
     }
-    if version != RECORD_VERSION_V1 {
+    if version == 0 {
         return Err(corruption("catalog record version zero is invalid"));
     }
     if kind != expected {
         return Err(corruption("catalog key and record kind disagree"));
     }
 
-    strict_payload(bytes)
+    strict_payload(bytes).map(|payload| (version, payload))
 }
 
 fn strict_payload(bytes: &[u8]) -> Result<&[u8]> {
@@ -510,7 +602,7 @@ fn decode_table_definition_payload(payload: &[u8]) -> Result<TableDef> {
         .map_err(|_| corruption("catalog table definition fields are invalid"))
 }
 
-fn decode_column_definition_payload(payload: &[u8]) -> Result<ColumnDef> {
+fn decode_column_definition_v1_payload(payload: &[u8]) -> Result<ColumnDef> {
     let mut decoder = Decoder::new(payload);
     let id = decode_column_id(decoder.get_u64()?)?;
     let table_id = decode_table_id(decoder.get_u64()?)?;
@@ -532,6 +624,63 @@ fn decode_column_definition_payload(payload: &[u8]) -> Result<ColumnDef> {
     require_eof(&decoder)?;
     ColumnDef::new(id, table_id, ordinal, column_type, nullable, name)
         .map_err(|_| corruption("catalog column definition fields are invalid"))
+}
+
+fn decode_column_definition_v2_payload(payload: &[u8]) -> Result<ColumnDef> {
+    let mut decoder = Decoder::new(payload);
+    let id = decode_column_id(decoder.get_u64()?)?;
+    let table_id = decode_table_id(decoder.get_u64()?)?;
+    let ordinal = decoder.get_u16()?;
+    let column_type = ColumnType::from_code(decoder.get_u8()?)
+        .map_err(|_| corruption("catalog column type code is invalid"))?;
+    let nullable = match decoder.get_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(corruption("catalog column nullable flag is invalid")),
+    };
+    let kind = decoder.get_u8()?;
+    let precision = decoder.get_u8()?;
+    let scale = decoder.get_u8()? as i8;
+    if decoder.get_u8()? != 0 {
+        return Err(corruption("catalog Oracle type flags are nonzero"));
+    }
+    let length = decoder.get_u32()?;
+    let name_len = usize::from(decoder.get_u16()?);
+    if decoder.get_u16()? != 0 {
+        return Err(corruption(
+            "catalog column definition reserved bytes are nonzero",
+        ));
+    }
+    let descriptor = decode_oracle_descriptor(kind, precision, scale, length)?;
+    if column_type != descriptor.physical_type() {
+        return Err(corruption(
+            "catalog Oracle type does not match its physical column type",
+        ));
+    }
+    let name = decode_name(&mut decoder, name_len)?;
+    require_eof(&decoder)?;
+    ColumnDef::new_oracle(id, table_id, ordinal, nullable, name, descriptor)
+        .map_err(|_| corruption("catalog column definition fields are invalid"))
+}
+
+fn decode_oracle_descriptor(
+    kind: u8,
+    precision: u8,
+    scale: i8,
+    length: u32,
+) -> Result<OracleTypeDescriptor> {
+    let descriptor = match kind {
+        1 if length == 0 => OracleTypeDescriptor::number(precision, scale),
+        2 if precision == 0 && scale == 0 => OracleTypeDescriptor::varchar2(length),
+        3 if precision == 0 && scale == 0 => OracleTypeDescriptor::char_type(length),
+        4 if precision == 0 && scale == 0 => OracleTypeDescriptor::raw(length),
+        5 if precision == 0 && scale == 0 && length == 0 => Ok(OracleTypeDescriptor::date()),
+        6 if scale == 0 && length == 0 => OracleTypeDescriptor::timestamp(precision),
+        7 if scale == 0 && length == 0 => OracleTypeDescriptor::timestamp_with_time_zone(precision),
+        1..=7 => return Err(corruption("catalog Oracle type parameters are invalid")),
+        _ => return Err(corruption("catalog Oracle type kind is invalid")),
+    };
+    descriptor.map_err(|_| corruption("catalog Oracle type parameters are invalid"))
 }
 
 fn decode_index_definition_payload(payload: &[u8]) -> Result<IndexDef> {
@@ -727,6 +876,7 @@ mod tests {
     use super::*;
     use crate::{
         ErrorCode,
+        oracle_type::OracleTypeDescriptor,
         storage::{
             PageId, PageRef,
             catalog::{
@@ -760,6 +910,18 @@ mod tests {
             ColumnType::TimestampWithTimeZone,
             true,
             CatalogName::new("C表").unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn oracle_number_column() -> ColumnDef {
+        ColumnDef::new_oracle(
+            ColumnId::new(3).unwrap(),
+            TableId::new(2).unwrap(),
+            0,
+            false,
+            CatalogName::new("AMOUNT").unwrap(),
+            OracleTypeDescriptor::number(12, 2).unwrap(),
         )
         .unwrap()
     }
@@ -977,6 +1139,172 @@ mod tests {
     }
 
     #[test]
+    fn column_definition_v2_has_the_stable_number_payload() {
+        let column = oracle_number_column();
+        let encoded = encode_column_definition(&column);
+        assert_eq!(encoded[1], 2);
+        assert_eq!(&encoded[8 + 20..8 + 28], &[1, 12, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            decode_column_definition(column.id(), &encoded).unwrap(),
+            column
+        );
+    }
+
+    #[test]
+    fn column_definition_v2_rejects_nonzero_reserved_and_trailing_bytes() {
+        let mut reserved = encode_column_definition(&oracle_number_column());
+        reserved[8 + 30] = 1;
+        assert_eq!(
+            decode_column_definition(ColumnId::new(3).unwrap(), &reserved)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+        let mut trailing = encode_column_definition(&oracle_number_column());
+        trailing.push(0);
+        assert_eq!(
+            decode_column_definition(ColumnId::new(3).unwrap(), &trailing)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
+    fn column_definition_v2_rejects_invalid_descriptor_fields() {
+        let valid = encode_column_definition(&oracle_number_column());
+        for (offset, replacement) in [
+            (19, 2_u8),
+            (20, 0_u8),
+            (20, 8_u8),
+            (21, 0_u8),
+            (21, 39_u8),
+            (22, 39_u8),
+            (23, 1_u8),
+            (24, 1_u8),
+            (18, ColumnType::Text.code()),
+        ] {
+            let mut bytes = valid.clone();
+            bytes[8 + offset] = replacement;
+            assert_eq!(
+                decode_column_definition(ColumnId::new(3).unwrap(), &bytes)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption,
+                "payload offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_oracle_descriptor_has_stable_v2_fields_and_round_trips() {
+        let cases = [
+            (
+                OracleTypeDescriptor::varchar2(32_767).unwrap(),
+                [2, 0, 0, 0],
+                32_767_u32,
+            ),
+            (
+                OracleTypeDescriptor::char_type(2_000).unwrap(),
+                [3, 0, 0, 0],
+                2_000,
+            ),
+            (
+                OracleTypeDescriptor::raw(32_767).unwrap(),
+                [4, 0, 0, 0],
+                32_767,
+            ),
+            (OracleTypeDescriptor::date(), [5, 0, 0, 0], 0),
+            (OracleTypeDescriptor::timestamp(9).unwrap(), [6, 9, 0, 0], 0),
+            (
+                OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap(),
+                [7, 9, 0, 0],
+                0,
+            ),
+        ];
+        for (descriptor, parameter_bytes, length) in cases {
+            let column = ColumnDef::new_oracle(
+                ColumnId::new(3).unwrap(),
+                TableId::new(2).unwrap(),
+                0,
+                false,
+                CatalogName::new("C").unwrap(),
+                descriptor,
+            )
+            .unwrap();
+            let encoded = encode_column_definition(&column);
+            assert_eq!(&encoded[28..32], &parameter_bytes);
+            assert_eq!(&encoded[32..36], &length.to_le_bytes());
+            assert_eq!(
+                decode_column_definition(column.id(), &encoded).unwrap(),
+                column
+            );
+        }
+    }
+
+    #[test]
+    fn column_definition_v2_rejects_unused_parameters_invalid_utf8_and_truncation() {
+        let descriptors = [
+            OracleTypeDescriptor::varchar2(10).unwrap(),
+            OracleTypeDescriptor::char_type(10).unwrap(),
+            OracleTypeDescriptor::raw(10).unwrap(),
+            OracleTypeDescriptor::date(),
+            OracleTypeDescriptor::timestamp(6).unwrap(),
+            OracleTypeDescriptor::timestamp_with_time_zone(6).unwrap(),
+        ];
+        for descriptor in descriptors {
+            let column = ColumnDef::new_oracle(
+                ColumnId::new(3).unwrap(),
+                TableId::new(2).unwrap(),
+                0,
+                false,
+                CatalogName::new("C").unwrap(),
+                descriptor,
+            )
+            .unwrap();
+            let encoded = encode_column_definition(&column);
+            let unused_offsets: &[usize] = match descriptor {
+                OracleTypeDescriptor::Varchar2 { .. }
+                | OracleTypeDescriptor::Char { .. }
+                | OracleTypeDescriptor::Raw { .. } => &[21, 22],
+                OracleTypeDescriptor::Date => &[21, 22, 24],
+                OracleTypeDescriptor::Timestamp { .. }
+                | OracleTypeDescriptor::TimestampWithTimeZone { .. } => &[22, 24],
+                OracleTypeDescriptor::Number { .. } => unreachable!(),
+            };
+            for offset in unused_offsets {
+                let mut nonzero_unused = encoded.clone();
+                nonzero_unused[8 + offset] = 1;
+                assert_eq!(
+                    decode_column_definition(column.id(), &nonzero_unused)
+                        .unwrap_err()
+                        .code(),
+                    ErrorCode::Corruption,
+                    "{descriptor:?} unused payload offset {offset}"
+                );
+            }
+            for end in 0..encoded.len() {
+                assert_eq!(
+                    decode_column_definition(column.id(), &encoded[..end])
+                        .unwrap_err()
+                        .code(),
+                    ErrorCode::Corruption,
+                    "{descriptor:?} truncation at {end}"
+                );
+            }
+        }
+
+        let mut invalid_utf8 = encode_column_definition(&oracle_number_column());
+        invalid_utf8[8 + 32] = 0xff;
+        assert_eq!(
+            decode_column_definition(ColumnId::new(3).unwrap(), &invalid_utf8)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+    }
+
+    #[test]
     fn all_v1_record_variants_decode_to_checked_values() {
         let meta = CatalogMeta::new(ObjectId::new(7).unwrap());
         assert_eq!(
@@ -1090,14 +1418,13 @@ mod tests {
     }
 
     #[test]
-    fn known_future_versions_are_unsupported_before_v1_shape_validation() {
+    fn known_future_versions_are_unsupported_before_shape_validation() {
         for kind in [
             RecordKind::CatalogMeta,
             RecordKind::TableName,
             RecordKind::TableDefinition,
             RecordKind::ColumnName,
             RecordKind::ColumnOrdinal,
-            RecordKind::ColumnDefinition,
         ] {
             assert_eq!(
                 decode_record(kind, &[kind.byte(), 2]).unwrap_err().code(),
@@ -1110,6 +1437,15 @@ mod tests {
                 ErrorCode::Unsupported
             );
         }
+        assert_eq!(
+            decode_record(
+                RecordKind::ColumnDefinition,
+                &[RecordKind::ColumnDefinition.byte(), 3]
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Unsupported
+        );
         assert_eq!(
             decode_record(RecordKind::CatalogMeta, &[0x20, 2])
                 .unwrap_err()
