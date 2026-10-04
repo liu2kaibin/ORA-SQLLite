@@ -9,8 +9,9 @@ ORA-SQLLite is a planned lightweight embedded database written in pure Rust. It 
 - Fixed-size pages, a pager, B+Tree tables and indexes.
 - ACID transactions, crash recovery, multiple readers and one writer.
 - Common Oracle data types, functions, sequences, pagination and NULL semantics.
-- The separate 10 GB database and 10-million-row acceptance gate remains unrun
-  and blocks Phase 5; the 100,000-row smoke does not satisfy that gate.
+- MVP scale acceptance is capped at 100,000 rows by the 2026-10-04 user ruling.
+  The retained 10-million-row/10-GB harness is optional and no longer blocks
+  Phase 5; no complete 10-million-row pass is claimed.
 
 The first release will not implement PL/SQL, packages, a network server, Oracle wire protocols, users and roles, tablespaces, RAC or distributed transactions.
 
@@ -145,36 +146,28 @@ deterministic models, crash-recovery matrices, and 100,000-row acceptance tests.
 The `phase4c2d-index-scan` job runs the ignored 4,000-operation fixed-seed
 IndexScan/TableScan differential model followed by the ignored 100,000-row
 IndexScan smoke using the exhaustive profile. It does not run the 10-million-row
-gate. Hosted execution is separate from local verification evidence.
+diagnostic harness. Under the current MVP policy, 100,000 rows is also the
+maximum local scale run. Hosted execution is separate from local verification
+evidence.
 
 Documentation-only pull requests are excluded from automatic PR CI, and pushes
 do not trigger either workflow. For a documentation-only follow-up commit on a
 pull request that already contains code, `[skip ci]` may be added to that commit
 message. Never use `[skip ci]` for source, Cargo, workflow, build, or test changes.
 
-### Pre-Phase-5 large-host acceptance
+### MVP scale acceptance
 
-The ignored `phase_4c2d_ten_million_row_ten_gb_acceptance` test is a separate,
-explicitly opted-in gate, not evidence supplied by the 100k smoke. It requires
-`ORA_SQLLITE_LARGE_SCALE=1` and at least **80 GB (80,000,000,000 bytes)** free on the
-temporary-file volume before creating a database. Its main-file cap is **64 GB**
-and WAL cap **1 GiB**; these are feasibility limits, not measured high-water marks.
-Acceptance requires 10,000,000 input rows, an actual persisted main file of at
-least 10,000,000,000 bytes, query/mutation checks, and checkpoint/reopen checks.
-The test prints row counts, checksums, actual file sizes, and elapsed times.
+The 100,000-row IndexScan smoke is the maximum future scale run for the MVP. A
+larger observation reached 4,700,000 committed rows and 18.286 GiB of owned
+temporary database/WAL data without a database assertion, panic, capacity, or
+corruption error. It was then stopped manually when the acceptance policy
+changed. This is bounded partial-scale evidence, not a completed 10-million-row
+pass.
 
-Run only on an explicitly approved, sufficiently provisioned host:
-
-```powershell
-$env:ORA_SQLLITE_LARGE_SCALE = '1'
-try {
-    rustup run stable cargo test --profile exhaustive --test phase4c2_index_scan_scale phase_4c2d_ten_million_row_ten_gb_acceptance -- --exact --ignored --nocapture
-} finally {
-    Remove-Item Env:ORA_SQLLITE_LARGE_SCALE
-}
-```
-
-This gate has not been run; its successful execution and retained metrics remain
-required before Phase 5 acceptance.
+The ignored `phase_4c2d_ten_million_row_ten_gb_acceptance` harness remains in the
+repository as optional diagnostic tooling, but it is not run under the current
+MVP policy and is not a Phase 5 gate. See the
+[MVP scale acceptance record](docs/superpowers/plans/2026-10-04-phase-4c2d-mvp-scale-acceptance.md)
+for the exact evidence boundary.
 
 - [Bootstrap plan](docs/superpowers/plans/2026-09-01-project-bootstrap.md)
