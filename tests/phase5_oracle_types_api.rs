@@ -110,3 +110,16 @@ fn foreign_keys_require_exact_oracle_descriptors_and_reject_v1_v2_mixes() {
         assert_eq!(connection.prepare(sql).unwrap_err().code() as u32, 1200);
     }
 }
+
+#[test]
+fn invalid_oracle_declaration_reports_exact_multiline_unicode_location() {
+    let (_files, database) = support::new_database("phase5-types-location");
+    let mut connection = database.connect().unwrap();
+    let sql = "CREATE TABLE T (\n  名 NUMBER\n)";
+    let error = connection.prepare(sql).unwrap_err();
+    let location = error.sql_location().unwrap();
+    assert_eq!(error.oracle_code(), Some(902));
+    assert_eq!(location.byte_offset(), sql.find("NUMBER").unwrap());
+    assert_eq!(location.line(), 2);
+    assert_eq!(location.column(), 5);
+}
