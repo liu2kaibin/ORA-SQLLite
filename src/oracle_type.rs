@@ -13,31 +13,19 @@ pub(crate) enum OracleTypeDescriptor {
 
 impl OracleTypeDescriptor {
     pub(crate) fn number(precision: u8, scale: i8) -> Result<Self> {
-        if !(1..=38).contains(&precision) || !(-38..=38).contains(&scale) {
-            return Err(invalid_declaration("invalid NUMBER precision or scale"));
-        }
-        Ok(Self::Number { precision, scale })
+        Self::Number { precision, scale }.validate()
     }
 
     pub(crate) fn varchar2(length_chars: u32) -> Result<Self> {
-        if !(1..=32_767).contains(&length_chars) {
-            return Err(invalid_declaration("invalid VARCHAR2 length"));
-        }
-        Ok(Self::Varchar2 { length_chars })
+        Self::Varchar2 { length_chars }.validate()
     }
 
     pub(crate) fn char_type(length_chars: u32) -> Result<Self> {
-        if !(1..=2_000).contains(&length_chars) {
-            return Err(invalid_declaration("invalid CHAR length"));
-        }
-        Ok(Self::Char { length_chars })
+        Self::Char { length_chars }.validate()
     }
 
     pub(crate) fn raw(length_bytes: u32) -> Result<Self> {
-        if !(1..=32_767).contains(&length_bytes) {
-            return Err(invalid_declaration("invalid RAW length"));
-        }
-        Ok(Self::Raw { length_bytes })
+        Self::Raw { length_bytes }.validate()
     }
 
     pub(crate) const fn date() -> Self {
@@ -45,25 +33,49 @@ impl OracleTypeDescriptor {
     }
 
     pub(crate) fn timestamp(fractional_precision: u8) -> Result<Self> {
-        if fractional_precision > 9 {
-            return Err(invalid_declaration(
-                "invalid TIMESTAMP fractional precision",
-            ));
-        }
-        Ok(Self::Timestamp {
+        Self::Timestamp {
             fractional_precision,
-        })
+        }
+        .validate()
     }
 
     pub(crate) fn timestamp_with_time_zone(fractional_precision: u8) -> Result<Self> {
-        if fractional_precision > 9 {
-            return Err(invalid_declaration(
-                "invalid TIMESTAMP WITH TIME ZONE fractional precision",
-            ));
-        }
-        Ok(Self::TimestampWithTimeZone {
+        Self::TimestampWithTimeZone {
             fractional_precision,
-        })
+        }
+        .validate()
+    }
+
+    pub(crate) fn validate(self) -> Result<Self> {
+        let error_message = match self {
+            Self::Number { precision, scale }
+                if !(1..=38).contains(&precision) || !(-38..=38).contains(&scale) =>
+            {
+                Some("invalid NUMBER precision or scale")
+            }
+            Self::Varchar2 { length_chars } if !(1..=32_767).contains(&length_chars) => {
+                Some("invalid VARCHAR2 length")
+            }
+            Self::Char { length_chars } if !(1..=2_000).contains(&length_chars) => {
+                Some("invalid CHAR length")
+            }
+            Self::Raw { length_bytes } if !(1..=32_767).contains(&length_bytes) => {
+                Some("invalid RAW length")
+            }
+            Self::Timestamp {
+                fractional_precision,
+            } if fractional_precision > 9 => Some("invalid TIMESTAMP fractional precision"),
+            Self::TimestampWithTimeZone {
+                fractional_precision,
+            } if fractional_precision > 9 => {
+                Some("invalid TIMESTAMP WITH TIME ZONE fractional precision")
+            }
+            _ => None,
+        };
+        match error_message {
+            Some(message) => Err(invalid_declaration(message)),
+            None => Ok(self),
+        }
     }
 
     pub(crate) const fn physical_type(self) -> ColumnType {

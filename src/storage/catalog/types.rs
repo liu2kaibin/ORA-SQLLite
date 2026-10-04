@@ -509,6 +509,7 @@ impl ColumnDef {
         name: CatalogName,
         oracle_type: OracleTypeDescriptor,
     ) -> Result<Self> {
+        let oracle_type = oracle_type.validate()?;
         if ordinal >= MAX_COLUMNS {
             return Err(DbError::new(
                 ErrorCode::Type,
@@ -667,6 +668,24 @@ mod tests {
         assert_eq!(OracleTypeDescriptor::date().length_chars(), None);
         assert_eq!(OracleTypeDescriptor::date().length_bytes(), None);
         assert_eq!(OracleTypeDescriptor::date().fractional_precision(), None);
+    }
+
+    #[test]
+    fn oracle_column_rejects_directly_forged_invalid_descriptor() {
+        let error = ColumnDef::new_oracle(
+            ColumnId::new(3).unwrap(),
+            TableId::new(2).unwrap(),
+            0,
+            false,
+            CatalogName::new("AMOUNT").unwrap(),
+            OracleTypeDescriptor::Number {
+                precision: 0,
+                scale: 0,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(error.oracle_code(), Some(902));
     }
 
     #[test]
