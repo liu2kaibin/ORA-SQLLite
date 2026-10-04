@@ -22,7 +22,7 @@
 - Search values must match the indexed column type, except lossless Int64-to-Decimal normalization. Unsafe Decimal-to-Int64 terms fall back to `TableScan`.
 - No persistent format, feature bit, catalog record, B+Tree page, WAL, or public API format changes are permitted.
 - User ruling dated 2026-09-27 overrides the older automatic-CI wording in the spec: `.github/workflows/ci.yml` remains the single Linux MVP validation job. Phase 4C2-D differential/scale gates are manual `workflow_dispatch` jobs and local acceptance commands.
-- The 10-million-row/10-GB run is an opt-in pre-Phase-5 acceptance gate. Its harness lands in this phase, but the MVP PR is not blocked when the required host capacity is unavailable; Phase 5 remains blocked until the evidence report exists.
+- User ruling dated 2026-10-04 caps future MVP scale validation at 100,000 rows. The 10-million-row/10-GB harness remains an optional diagnostic asset, is not run, and no longer blocks Phase 5. The manually stopped 4.7-million-row run is recorded only as partial scale evidence, never as a complete 10-million-row pass.
 
 ## Review Focus
 
@@ -973,7 +973,7 @@ Run: `rustup run stable cargo test sql::exec::test_support::phase_4c2b_constrain
 
 Run: `rustup run stable cargo test sql::exec::test_support::phase_4c2c_foreign_key_crash_recovery_matrix -- --exact --ignored --nocapture`
 
-Expected: the complete suite, 4,000-operation differential, 100k witness, and all three existing Phase 4C2 write/crash matrices pass. The 10-million-row/10-GB gate is reported separately and is never inferred from the 100k result.
+Expected: the complete suite, 4,000-operation differential, 100k witness, and all three existing Phase 4C2 write/crash matrices pass. Per the 2026-10-04 MVP ruling, 100k is the maximum future scale run; the retained 10-million-row/10-GB harness is not executed or inferred from the 100k result.
 
 - [ ] **Step 5: Run scope and MVP-CI audits**
 
@@ -1007,5 +1007,5 @@ git commit -m "docs: complete Phase 4C2-D acceptance"
 - [ ] Read snapshots and current WriteBatch queries each use their own complete catalog/table/index roots.
 - [ ] JOIN and UPDATE/DELETE discovery remain TableScan-only; Blob ranges and unsupported predicates fall back safely.
 - [ ] No format, catalog, WAL, feature-bit, public API, automatic PR CI, or Phase 5 behavior is added.
-- [ ] Local full tests, fixed-seed differential, and 100k acceptance are recorded. The 10-million-row/10-GB evidence is either recorded or explicitly left as a Phase-5 blocker.
+- [ ] Local full tests, fixed-seed differential, and 100k acceptance are recorded. Per the 2026-10-04 MVP ruling, the retained 10-million-row/10-GB harness is non-gating and Phase 5 may proceed without running it.
 - [ ] Existing Phase 4C2-A index, 4C2-B constraint, and 4C2-C foreign-key crash matrices remain green on the final tree.
