@@ -1,5 +1,6 @@
 use crate::{
     DbError, ErrorCode, Result,
+    oracle_type::OracleTypeDescriptor,
     sql::{
         Identifier, SqlType,
         ast::{AstQuery, Join, JoinKind, TableSource},
@@ -20,6 +21,7 @@ pub(crate) struct ResolvedColumn {
     pub(crate) column_id: ColumnId,
     pub(crate) ordinal: u16,
     pub(crate) sql_type: SqlType,
+    pub(crate) oracle_type: Option<OracleTypeDescriptor>,
     pub(crate) nullable: bool,
     pub(crate) name: String,
 }
@@ -299,6 +301,7 @@ fn resolved_column(
         column_id: column.id(),
         ordinal: column.ordinal(),
         sql_type: logical_type(column.column_type()),
+        oracle_type: column.oracle_type(),
         nullable: column.nullable(),
         name: column.name().as_str().to_owned(),
     }

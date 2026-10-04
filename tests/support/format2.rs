@@ -26,6 +26,7 @@ const PAGE_TYPE_FREELIST: u8 = 7;
 const PAGE_TYPE_OVERFLOW: u8 = 6;
 const FEATURE_CATALOG_V1: u64 = 1;
 const FEATURE_INDEX_V1: u64 = 2;
+const FEATURE_ORACLE_TYPES_V1: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct IndexVerification {
@@ -45,6 +46,14 @@ pub struct RawColumn {
     pub ordinal: u16,
     pub nullable: bool,
     pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OracleColumnCapture {
+    pub kind: u8,
+    pub precision: u8,
+    pub scale: i8,
+    pub length: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +133,7 @@ pub struct RawCatalogCapture {
     pub page_count: u64,
     pub freelist: Vec<RawFreelistTrunk>,
     pub tables: BTreeMap<String, RawTable>,
+    pub oracle_columns: BTreeMap<String, OracleColumnCapture>,
     pub indexes: BTreeMap<String, RawIndex>,
     pub constraints: BTreeMap<String, RawConstraint>,
     pub table_constraints: BTreeMap<u64, Vec<u64>>,
@@ -192,6 +202,25 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         bytes: &bytes,
         header,
     };
+    if disk.header.catalog_root == 0 {
+        return Ok(RawCatalogCapture {
+            feature_bits: disk.header.features,
+            catalog_root: RawPageRef {
+                id: 0,
+                generation: 0,
+            },
+            accepted_lsn: disk.header.checkpoint_lsn,
+            next_object_id: 0,
+            page_count: disk.header.page_count,
+            freelist: raw_freelist(&disk)?,
+            tables: BTreeMap::new(),
+            oracle_columns: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+            constraints: BTreeMap::new(),
+            table_constraints: BTreeMap::new(),
+            referenced_by: BTreeMap::new(),
+        });
+    }
     let catalog_root = RawPageRef {
         id: disk.header.catalog_root,
         generation: disk.page_generation(disk.header.catalog_root)?,
@@ -224,6 +253,7 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         page_count: disk.header.page_count,
         freelist: raw_freelist(&disk)?,
         tables: parsed.tables,
+        oracle_columns: parsed.oracle_columns,
         indexes: parsed.indexes,
         constraints: parsed.constraints,
         table_constraints: parsed.table_constraints,
@@ -1044,6 +1074,7 @@ fn explicit_index_definitions(
 struct RawCatalogParts {
     next_object_id: u64,
     tables: BTreeMap<String, RawTable>,
+    oracle_columns: BTreeMap<String, OracleColumnCapture>,
     indexes: BTreeMap<String, RawIndex>,
     constraints: BTreeMap<String, RawConstraint>,
     table_constraints: BTreeMap<u64, Vec<u64>>,
@@ -1149,19 +1180,51 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             }
             0x14 => {
                 let id = raw_id_key(key, family, "column definition")?;
-                let payload = catalog_payload(value, family, "column definition")?;
-                if payload.len() < 24 || read_u64(payload, 0)? != id || read_u16(payload, 22)? != 0
-                {
-                    return Err("raw column definition is malformed".into());
-                }
-                let column = RawColumn {
-                    id,
-                    ordinal: read_u16(payload, 16)?,
-                    nullable: payload[19] & 1 != 0,
-                    name: catalog_name(payload, 20, 24, "column")?,
+                let version = *value
+                    .get(1)
+                    .ok_or("column definition envelope is truncated")?;
+                let payload = catalog_payload_version(value, family, version, "column definition")?;
+                let (column, oracle_type) = match version {
+                    1 if payload.len() >= 24
+                        && read_u64(payload, 0)? == id
+                        && read_u16(payload, 22)? == 0
+                        && payload[19] & !1 == 0 =>
+                    {
+                        (
+                            RawColumn {
+                                id,
+                                ordinal: read_u16(payload, 16)?,
+                                nullable: payload[19] != 0,
+                                name: catalog_name(payload, 20, 24, "column")?,
+                            },
+                            None,
+                        )
+                    }
+                    2 if payload.len() >= 32
+                        && read_u64(payload, 0)? == id
+                        && read_u16(payload, 30)? == 0
+                        && payload[19] <= 1
+                        && payload[23] == 0 =>
+                    {
+                        (
+                            RawColumn {
+                                id,
+                                ordinal: read_u16(payload, 16)?,
+                                nullable: payload[19] != 0,
+                                name: catalog_name(payload, 28, 32, "column")?,
+                            },
+                            Some(OracleColumnCapture {
+                                kind: payload[20],
+                                precision: payload[21],
+                                scale: payload[22] as i8,
+                                length: read_u32(payload, 24)?,
+                            }),
+                        )
+                    }
+                    _ => return Err("raw column definition is malformed".into()),
                 };
                 if column_definitions
-                    .insert(id, (read_u64(payload, 8)?, column))
+                    .insert(id, (read_u64(payload, 8)?, column, oracle_type))
                     .is_some()
                 {
                     return Err("raw catalog has duplicate column definitions".into());
@@ -1328,6 +1391,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
 
     let next_object_id = next_object_id.ok_or("raw catalog lacks its meta record")?;
     let mut tables = BTreeMap::new();
+    let mut oracle_columns = BTreeMap::new();
     for definition in table_definitions.into_values() {
         let columns = raw_ordered_columns(
             table_columns.remove(&definition.id).unwrap_or_default(),
@@ -1335,6 +1399,14 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             definition.id,
             "table",
         )?;
+        for column in &columns {
+            if let Some(capture) = column_definitions
+                .get(&column.id)
+                .and_then(|(_, _, capture)| *capture)
+            {
+                oracle_columns.insert(format!("{}.{}", definition.name, column.name), capture);
+            }
+        }
         tables.insert(
             definition.name,
             RawTable {
@@ -1404,6 +1476,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
     Ok(RawCatalogParts {
         next_object_id,
         tables,
+        oracle_columns,
         indexes,
         constraints,
         table_constraints,
@@ -1413,7 +1486,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
 
 fn raw_ordered_columns(
     ids: BTreeMap<u16, u64>,
-    definitions: &BTreeMap<u64, (u64, RawColumn)>,
+    definitions: &BTreeMap<u64, (u64, RawColumn, Option<OracleColumnCapture>)>,
     table_id: u64,
     label: &str,
 ) -> Result<Vec<RawColumn>, String> {
@@ -1422,7 +1495,7 @@ fn raw_ordered_columns(
         if usize::from(ordinal) != expected {
             return Err(format!("raw {label} columns are not contiguous"));
         }
-        let (owner, column) = definitions
+        let (owner, column, _) = definitions
             .get(&id)
             .ok_or_else(|| format!("raw {label} column is undefined"))?;
         if *owner != table_id || column.ordinal != ordinal {
@@ -1565,7 +1638,16 @@ fn raw_freelist(disk: &Disk<'_>) -> Result<Vec<RawFreelistTrunk>, String> {
 }
 
 fn catalog_payload<'a>(value: &'a [u8], kind: u8, label: &str) -> Result<&'a [u8], String> {
-    if value.get(0..2) != Some(&[kind, 1]) || value.get(2..4) != Some(&[0, 0]) {
+    catalog_payload_version(value, kind, 1, label)
+}
+
+fn catalog_payload_version<'a>(
+    value: &'a [u8],
+    kind: u8,
+    version: u8,
+    label: &str,
+) -> Result<&'a [u8], String> {
+    if value.get(0..2) != Some(&[kind, version]) || value.get(2..4) != Some(&[0, 0]) {
         return Err(format!("{label} envelope is malformed"));
     }
     let payload_len = usize::try_from(read_u32(value, 4)?)
@@ -1864,9 +1946,10 @@ fn decode_header(bytes: &[u8]) -> Result<Header, String> {
     let catalog_root = read_u64(bytes, 64)?;
     let features = read_u64(bytes, 88)?;
     if page_count == 0
-        || catalog_root == 0
         || catalog_root >= page_count
-        || features & !(FEATURE_CATALOG_V1 | FEATURE_INDEX_V1) != 0
+        || catalog_root == 0 && features != 0
+        || features & !(FEATURE_CATALOG_V1 | FEATURE_INDEX_V1 | FEATURE_ORACLE_TYPES_V1) != 0
+        || features & FEATURE_ORACLE_TYPES_V1 != 0 && features & FEATURE_CATALOG_V1 == 0
     {
         return Err("superblock root or features are invalid".into());
     }

@@ -493,12 +493,15 @@ fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Resul
     let columns = plan
         .columns()
         .iter()
-        .map(|column| {
-            ColumnSpec::new(
+        .map(|column| match column.oracle_type() {
+            Some(descriptor) => {
+                ColumnSpec::new_oracle(column.name().clone(), descriptor, column.nullable())
+            }
+            None => ColumnSpec::new(
                 column.name().clone(),
                 column.column_type(),
                 column.nullable(),
-            )
+            ),
         })
         .collect();
     let spec = TableSpec::new(plan.name().clone(), columns)?;

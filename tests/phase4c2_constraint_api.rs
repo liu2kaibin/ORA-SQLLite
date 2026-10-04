@@ -1152,9 +1152,9 @@ fn constrained_prepared_dml_stays_usable_after_root_splits() {
 }
 
 #[test]
-fn unsupported_constraint_and_phase5_forms_leave_catalog_unchanged() {
+fn unsupported_constraint_forms_leave_catalog_unchanged() {
     // Breaks caught: treating future syntax as a partial CREATE and publishing
-    // a table before rejecting foreign-key actions, deferred checks, or Phase 5.
+    // a table before rejecting foreign-key actions or deferred checks.
     let (_files, database) = common::new_database("phase4c2-unsupported-contract");
     let mut connection = database.connect().unwrap();
     execute_sql(
@@ -1179,8 +1179,6 @@ fn unsupported_constraint_and_phase5_forms_leave_catalog_unchanged() {
             "CREATE TABLE UPDATE_ACTION (ID INT64, PARENT_ID INT64 REFERENCES PARENT (ID) ON UPDATE SET NULL)",
             "UPDATE_ACTION",
         ),
-        ("CREATE TABLE NUMBER_T (N NUMBER(10, 2))", "NUMBER_T"),
-        ("CREATE TABLE VARCHAR_T (V VARCHAR2(30))", "VARCHAR_T"),
         (
             "CREATE TABLE FUNCTION_T (V INT64 CHECK (ABS(V) > 0))",
             "FUNCTION_T",
