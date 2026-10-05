@@ -1,6 +1,6 @@
 use std::{cmp::Reverse, collections::BTreeMap};
 
-use super::{ExecExpr, ExecExprKind, expr::ExprCompiler};
+use super::{ExecExpr, expr::ExprCompiler};
 use crate::{
     Result,
     oracle_type::OracleTypeDescriptor,
@@ -31,10 +31,6 @@ impl EqualityValuePlan {
     pub(crate) const fn is_null(&self) -> bool {
         matches!(self, Self::IsNull)
     }
-
-    pub(crate) fn is_literal(&self) -> bool {
-        matches!(self, Self::Expression(expression) if matches!(expression.kind(), ExecExprKind::Literal(_)))
-    }
 }
 
 #[derive(Clone)]
@@ -50,10 +46,6 @@ impl RangeBoundPlan {
 
     pub(crate) const fn inclusive(&self) -> bool {
         self.inclusive
-    }
-
-    pub(crate) fn is_literal(&self) -> bool {
-        matches!(self.expression.kind(), ExecExprKind::Literal(_))
     }
 }
 

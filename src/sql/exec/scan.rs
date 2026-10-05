@@ -1,4 +1,3 @@
-use crate::oracle_type::normalize_for_type;
 use crate::sql::{
     bound::{BoundSource, SourceId},
     plan::{IndexAccessPlan, IndexColumnContract},
@@ -201,7 +200,7 @@ fn evaluate_bounds(
             if matches!(value, Value::Null) {
                 return Ok(None);
             }
-            equality.push(normalize_bound(value, *column, value_plan.is_literal())?);
+            equality.push(normalize_bound(value, *column)?);
         }
     }
     let mut range = IndexScanRange {
@@ -220,7 +219,7 @@ fn evaluate_bounds(
                     return Ok(None);
                 }
                 *output = Some(IndexScanBound {
-                    value: normalize_bound(value, template.column(), bound.is_literal())?,
+                    value: normalize_bound(value, template.column())?,
                     inclusive: bound.inclusive(),
                 });
             }
@@ -229,14 +228,12 @@ fn evaluate_bounds(
     Ok(Some(range))
 }
 
-fn normalize_bound(
-    value: Value,
-    column: IndexColumnContract,
-    literal_is_already_normalized: bool,
-) -> Result<Value> {
+fn normalize_bound(value: Value, column: IndexColumnContract) -> Result<Value> {
     match column.oracle_type() {
-        Some(_) if literal_is_already_normalized => Ok(value),
-        Some(descriptor) => normalize_for_type(descriptor, value),
+        // V2 literals normalize during binding, and V2 parameters normalize
+        // before the operator tree is built. Reusing that slot keeps bounds
+        // and the residual Filter on exactly the same value.
+        Some(_) => Ok(value),
         None => normalize_legacy_bound(value, column.column_type()),
     }
 }
@@ -400,6 +397,164 @@ mod tests {
             assert_index_path();
             let _ = take_access_paths();
             assert_eq!(run(&mut connection, forced), indexed_rows);
+            let paths = take_access_paths();
+            assert!(!paths.is_empty() && paths.iter().all(|path| *path == "TableScan"));
+        }
+    }
+
+    #[test]
+    fn empty_oracle_index_and_table_scans_raise_the_same_parameter_conversion_error() {
+        let temp = TempDatabase::new("oracle-empty-parameter-parity");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE T (N NUMBER(5,2), TZ TIMESTAMP(9) WITH TIME ZONE)",
+            "CREATE INDEX T_N ON T(N)",
+            "CREATE INDEX T_TZ ON T(TZ)",
+        ] {
+            execute(&mut connection, sql);
+        }
+        let outcome = |connection: &mut Connection, sql: &str, parameter: Value| {
+            let statement = connection.prepare(sql).unwrap();
+            let mut rows =
+                match connection.query(&statement, Parameters::positional(&[parameter.into()])) {
+                    Ok(rows) => rows,
+                    Err(error) => return (Vec::new(), Some(error.code())),
+                };
+            let mut output = Vec::new();
+            loop {
+                match rows.next() {
+                    Ok(Some(row)) => output.push(row.values().to_vec()),
+                    Ok(None) => return (output, None),
+                    Err(error) => return (output, Some(error.code())),
+                }
+            }
+        };
+        for (indexed, forced, invalid) in [
+            (
+                "SELECT N FROM T WHERE N = :1",
+                "SELECT N FROM T WHERE N = :1 OR FALSE",
+                Value::Text("not-a-number".into()),
+            ),
+            (
+                "SELECT TZ FROM T WHERE TZ = :1",
+                "SELECT TZ FROM T WHERE TZ = :1 OR FALSE",
+                Value::Text("not-a-timestamp".into()),
+            ),
+        ] {
+            let _ = take_access_paths();
+            let indexed_outcome = outcome(&mut connection, indexed, invalid.clone());
+            assert_eq!(indexed_outcome, (vec![], Some(ErrorCode::Type)));
+            assert!(take_access_paths().is_empty());
+            let _ = take_access_paths();
+            assert_eq!(outcome(&mut connection, forced, invalid), indexed_outcome);
+            assert!(take_access_paths().is_empty());
+        }
+    }
+
+    #[test]
+    fn oracle_range_bounds_match_for_index_and_table_scans_in_both_operand_orders() {
+        let temp = TempDatabase::new("oracle-range-index-parity");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE T (ID NUMBER(4,0), N NUMBER(5,2), TZ TIMESTAMP(9) WITH TIME ZONE)",
+            "CREATE INDEX T_N ON T(N)",
+            "CREATE INDEX T_TZ ON T(TZ)",
+        ] {
+            execute(&mut connection, sql);
+        }
+        let insert = connection
+            .prepare("INSERT INTO T VALUES (:1, :2, :3)")
+            .unwrap();
+        for (id, number, hour) in [(1, "1.00", 0), (2, "2.00", 1), (3, "3.00", 2)] {
+            connection
+                .execute(
+                    &insert,
+                    Parameters::positional(&[
+                        Value::Int64(id).into(),
+                        Value::Text(number.into()).into(),
+                        Value::Timestamp(
+                            crate::OracleTimestamp::from_nanoseconds(
+                                crate::OracleDate::new(2026, 1, 1, hour, 0, 0).unwrap(),
+                                0,
+                                Some(0),
+                            )
+                            .unwrap(),
+                        )
+                        .into(),
+                    ]),
+                )
+                .unwrap();
+        }
+        let run = |connection: &mut Connection,
+                   predicate: &str,
+                   parameters: &[crate::ParameterValue],
+                   force_table_scan: bool| {
+            let predicate = if force_table_scan {
+                format!("({predicate}) OR FALSE")
+            } else {
+                predicate.to_owned()
+            };
+            let statement = connection
+                .prepare(&format!("SELECT ID FROM T WHERE {predicate}"))
+                .unwrap();
+            let mut rows = connection
+                .query(&statement, Parameters::positional(parameters))
+                .unwrap();
+            let mut output = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                output.push(row.values().to_vec());
+            }
+            output
+        };
+        let timestamp = |hour| {
+            Value::Timestamp(
+                crate::OracleTimestamp::from_nanoseconds(
+                    crate::OracleDate::new(2026, 1, 1, hour, 0, 0).unwrap(),
+                    0,
+                    Some(0),
+                )
+                .unwrap(),
+            )
+        };
+        for (predicate, parameters) in [
+            (
+                "N >= :1 AND N < :2",
+                vec![
+                    Value::Text("1.00".into()).into(),
+                    Value::Text("3.00".into()).into(),
+                ],
+            ),
+            (
+                ":1 <= N AND :2 > N",
+                vec![
+                    Value::Text("1.00".into()).into(),
+                    Value::Text("3.00".into()).into(),
+                ],
+            ),
+            (
+                "TZ >= :1 AND TZ < :2",
+                vec![timestamp(0).into(), timestamp(2).into()],
+            ),
+            (
+                ":1 <= TZ AND :2 > TZ",
+                vec![timestamp(0).into(), timestamp(2).into()],
+            ),
+        ] {
+            let _ = take_access_paths();
+            let indexed = run(&mut connection, predicate, &parameters, false);
+            assert_eq!(
+                indexed,
+                vec![
+                    vec![Value::Decimal(crate::Decimal::new(false, 0, 1).unwrap())],
+                    vec![Value::Decimal(crate::Decimal::new(false, 0, 2).unwrap())],
+                ],
+                "{predicate}",
+            );
+            assert_index_path();
+            let _ = take_access_paths();
+            assert_eq!(run(&mut connection, predicate, &parameters, true), indexed);
             let paths = take_access_paths();
             assert!(!paths.is_empty() && paths.iter().all(|path| *path == "TableScan"));
         }

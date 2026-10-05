@@ -9,6 +9,7 @@ use crate::sql::{ParameterKey, SqlSpan};
 use crate::{
     DataType, DbError, ErrorCode, ParameterIdentifier, ParameterMetadata, ParameterValue,
     Parameters, Result, Value,
+    oracle_type::{OracleTypeDescriptor, normalize_for_type},
 };
 
 /// One immutable owned slot per logical parameter, in prepared metadata order.
@@ -97,6 +98,36 @@ impl ParameterFrame {
                 "parameter slot is absent from its frame",
             )
         })
+    }
+
+    /// Normalize descriptor-bearing Oracle parameter slots atomically before
+    /// any source operator starts. The shared frame is then visible to both
+    /// IndexScan bounds and residual expression evaluation.
+    pub(crate) fn normalize_oracle_slots(
+        &mut self,
+        slots: &[(u16, OracleTypeDescriptor)],
+        memory: &mut WorkMemory,
+    ) -> Result<()> {
+        let mut values = self.values.to_vec();
+        for (slot, descriptor) in slots {
+            let target = values.get_mut(usize::from(*slot)).ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Internal,
+                    "parameter slot is absent from its frame",
+                )
+            })?;
+            *target = normalize_for_type(*descriptor, target.clone())?;
+        }
+        let old_bytes = owned_values_bytes(self.values.iter())?;
+        let new_bytes = owned_values_bytes(values.iter())?;
+        if new_bytes > old_bytes {
+            memory.reserve(new_bytes - old_bytes)?;
+        }
+        self.values = values.into_boxed_slice();
+        if old_bytes > new_bytes {
+            memory.release(old_bytes - new_bytes)?;
+        }
+        Ok(())
     }
 }
 

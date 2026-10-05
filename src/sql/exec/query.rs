@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
+use crate::oracle_type::OracleTypeDescriptor;
 use crate::sql::bound::BoundSource;
-use crate::sql::plan::{IndexAccessPlan, PlanKind, QueryPlan};
+use crate::sql::plan::{ExecExpr, ExecExprKind, IndexAccessPlan, PlanKind, QueryPlan};
 use crate::storage::catalog::CatalogReader;
 use crate::{DbError, ErrorCode, Parameters, Result, Statement};
 
@@ -34,8 +37,9 @@ pub(crate) fn prepare_query(
         ));
     };
     let mut memory = WorkMemory::new(max_query_memory_bytes)?;
-    let params = ParameterFrame::bind(statement.parameters(), parameters, &mut memory)?;
+    let mut params = ParameterFrame::bind(statement.parameters(), parameters, &mut memory)?;
     statement.validate_schema(database_uuid, catalog)?;
+    normalize_oracle_predicate_parameters(query, &mut params, &mut memory)?;
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
     let mut input = query_factory(query, catalog, max_row_bytes)?.build()?;
     if !query.group_by().is_empty() || !query.aggregates().is_empty() || query.having().is_some() {
@@ -56,6 +60,81 @@ pub(crate) fn prepare_query(
         params,
         memory,
     })
+}
+
+fn normalize_oracle_predicate_parameters(
+    query: &QueryPlan,
+    params: &mut ParameterFrame,
+    memory: &mut WorkMemory,
+) -> Result<()> {
+    let mut contracts = BTreeMap::new();
+    if let Some(selection) = query.selection() {
+        collect_oracle_parameter_contracts(selection, &mut contracts)?;
+    }
+    params.normalize_oracle_slots(&contracts.into_iter().collect::<Vec<_>>(), memory)
+}
+
+fn collect_oracle_parameter_contracts(
+    expression: &ExecExpr,
+    contracts: &mut BTreeMap<u16, OracleTypeDescriptor>,
+) -> Result<()> {
+    match expression.kind() {
+        ExecExprKind::Binary {
+            left,
+            right,
+            oracle_contract,
+            ..
+        } => {
+            if let Some(contract) = oracle_contract {
+                collect_direct_parameter(left, contract.left(), contracts)?;
+                collect_direct_parameter(right, contract.right(), contracts)?;
+            }
+            collect_oracle_parameter_contracts(left, contracts)?;
+            collect_oracle_parameter_contracts(right, contracts)?;
+        }
+        ExecExprKind::Unary { expr, .. } | ExecExprKind::IsNull { expr, .. } => {
+            collect_oracle_parameter_contracts(expr, contracts)?;
+        }
+        ExecExprKind::InList { expr, values, .. } => {
+            collect_oracle_parameter_contracts(expr, contracts)?;
+            for value in values {
+                collect_oracle_parameter_contracts(value, contracts)?;
+            }
+        }
+        ExecExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_oracle_parameter_contracts(expr, contracts)?;
+            collect_oracle_parameter_contracts(low, contracts)?;
+            collect_oracle_parameter_contracts(high, contracts)?;
+        }
+        ExecExprKind::Like { expr, pattern, .. } => {
+            collect_oracle_parameter_contracts(expr, contracts)?;
+            collect_oracle_parameter_contracts(pattern, contracts)?;
+        }
+        ExecExprKind::Literal(_)
+        | ExecExprKind::Column { .. }
+        | ExecExprKind::Parameter { .. }
+        | ExecExprKind::Aggregate { .. } => {}
+    }
+    Ok(())
+}
+
+fn collect_direct_parameter(
+    expression: &ExecExpr,
+    descriptor: OracleTypeDescriptor,
+    contracts: &mut BTreeMap<u16, OracleTypeDescriptor>,
+) -> Result<()> {
+    let ExecExprKind::Parameter { slot } = expression.kind() else {
+        return Ok(());
+    };
+    match contracts.insert(*slot, descriptor) {
+        Some(existing) if existing != descriptor => Err(DbError::new(
+            ErrorCode::Type,
+            "parameter has incompatible Oracle comparison contracts",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn query_factory(
