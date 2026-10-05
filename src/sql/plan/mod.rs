@@ -18,7 +18,7 @@ use crate::{
     storage::catalog::types::TableId,
 };
 pub(crate) use expr::{AggregateDefinition, ExecExpr, ExecExprKind};
-pub(crate) use index::IndexAccessPlan;
+pub(crate) use index::{IndexAccessPlan, IndexColumnContract};
 pub(crate) use mutation::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan,
     TableConstraintDefinition, UpdatePlan, validate_foreign_key_plan,
@@ -1108,7 +1108,10 @@ mod tests {
         let BoundStatementKind::Query { query } = &mut bound.kind else {
             panic!("query")
         };
-        query.projection[0].kind = BoundExprKind::NewTableColumn { ordinal: 0 };
+        query.projection[0].kind = BoundExprKind::NewTableColumn {
+            ordinal: 0,
+            oracle_type: None,
+        };
         assert_eq!(
             Plan::from_bound(&bound, "SELECT ID FROM USERS")
                 .unwrap_err()

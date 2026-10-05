@@ -26,6 +26,7 @@ const PAGE_TYPE_FREELIST: u8 = 7;
 const PAGE_TYPE_OVERFLOW: u8 = 6;
 const FEATURE_CATALOG_V1: u64 = 1;
 const FEATURE_INDEX_V1: u64 = 2;
+const FEATURE_ORACLE_TYPES_V1: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct IndexVerification {
@@ -45,6 +46,125 @@ pub struct RawColumn {
     pub ordinal: u16,
     pub nullable: bool,
     pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OracleColumnCapture {
+    pub physical_type: u8,
+    pub kind: u8,
+    pub precision: u8,
+    pub scale: i8,
+    pub length: u32,
+}
+
+/// A deliberately narrow mutation surface for real-file catalog recovery
+/// witnesses. Each operation is applied only to an owned test database, then
+/// restamps the changed page or superblock checksum.
+#[derive(Clone, Copy, Debug)]
+pub enum OracleCatalogMutation {
+    ClearFeatureBit,
+    SetColumnEnvelopeVersion(u8),
+    SetOracleKind(u8),
+    SetOracleFlags(u8),
+    SetOracleScale(i8),
+    SetOracleLength(u32),
+}
+
+pub fn mutate_oracle_catalog_for_test(
+    files: &TestFiles,
+    mutation: OracleCatalogMutation,
+) -> Result<(), String> {
+    let mut bytes = fs::read(files.main()).map_err(|error| format!("read database: {error}"))?;
+    let header = select_header(&bytes)?;
+    match mutation {
+        OracleCatalogMutation::ClearFeatureBit => {
+            for offset in [0, SUPERBLOCK_LEN] {
+                let slot = bytes
+                    .get_mut(offset..offset + SUPERBLOCK_LEN)
+                    .ok_or("superblock slot is truncated")?;
+                let features = read_u64(slot, 88)? & !FEATURE_ORACLE_TYPES_V1;
+                slot[88..96].copy_from_slice(&features.to_le_bytes());
+                restamp_superblock(slot)?;
+            }
+        }
+        mutation => mutate_first_v2_column_definition(&mut bytes, &header, None, mutation)?,
+    }
+    fs::write(files.main(), bytes).map_err(|error| format!("write database: {error}"))
+}
+
+fn mutate_first_v2_column_definition(
+    bytes: &mut [u8],
+    header: &Header,
+    expected_kind: Option<u8>,
+    mutation: OracleCatalogMutation,
+) -> Result<(), String> {
+    for page_id in 1..header.page_count {
+        let start = ordinary_page_offset(page_id, header.page_size)?;
+        let end = start
+            .checked_add(header.page_size)
+            .ok_or("page extent overflow")?;
+        let page = bytes
+            .get_mut(start..end)
+            .ok_or("page lies outside database")?;
+        if page.first() != Some(&TreeKind::Table.leaf_type()) {
+            continue;
+        }
+        verify_page_checksum(page)?;
+        let count = usize::from(read_u16(page, 20)?);
+        for slot in 0..count {
+            let slot_offset = LEAF_METADATA_END + slot * SLOT_LEN;
+            let cell_offset = usize::from(read_u16(page, slot_offset)?);
+            let cell_len = usize::from(read_u16(page, slot_offset + 2)?);
+            let cell = page
+                .get_mut(cell_offset..cell_offset + cell_len)
+                .ok_or("catalog cell is truncated")?;
+            let key_len = usize::from(read_u16(cell, 0)?);
+            let key_end = 12usize.checked_add(key_len).ok_or("catalog key overflow")?;
+            if cell
+                .get(12..key_end)
+                .is_none_or(|key| key.first() != Some(&0x14))
+                || cell.get(2) != Some(&0)
+            {
+                continue;
+            }
+            let value = cell
+                .get_mut(key_end..)
+                .ok_or("catalog record value is truncated")?;
+            if value.get(0..2) != Some(&[0x14, 2]) {
+                continue;
+            }
+            if expected_kind.is_some_and(|kind| value.get(28) != Some(&kind)) {
+                continue;
+            }
+            match mutation {
+                OracleCatalogMutation::ClearFeatureBit => unreachable!("handled above"),
+                OracleCatalogMutation::SetColumnEnvelopeVersion(version) => value[1] = version,
+                OracleCatalogMutation::SetOracleKind(kind) => value[28] = kind,
+                OracleCatalogMutation::SetOracleFlags(flags) => value[31] = flags,
+                OracleCatalogMutation::SetOracleScale(scale) => value[30] = scale as u8,
+                OracleCatalogMutation::SetOracleLength(length) => {
+                    value[32..36].copy_from_slice(&length.to_le_bytes())
+                }
+            }
+            restamp_page(page)?;
+            return Ok(());
+        }
+    }
+    Err("owned database has no inline V2 column definition".into())
+}
+
+pub fn mutate_oracle_column_for_test(
+    files: &TestFiles,
+    expected_kind: u8,
+    mutation: OracleCatalogMutation,
+) -> Result<(), String> {
+    let mut bytes = fs::read(files.main()).map_err(|error| format!("read database: {error}"))?;
+    let header = select_header(&bytes)?;
+    if matches!(mutation, OracleCatalogMutation::ClearFeatureBit) {
+        return Err("feature-bit mutation does not target a column".into());
+    }
+    mutate_first_v2_column_definition(&mut bytes, &header, Some(expected_kind), mutation)?;
+    fs::write(files.main(), bytes).map_err(|error| format!("write database: {error}"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +244,7 @@ pub struct RawCatalogCapture {
     pub page_count: u64,
     pub freelist: Vec<RawFreelistTrunk>,
     pub tables: BTreeMap<String, RawTable>,
+    pub oracle_columns: BTreeMap<String, OracleColumnCapture>,
     pub indexes: BTreeMap<String, RawIndex>,
     pub constraints: BTreeMap<String, RawConstraint>,
     pub table_constraints: BTreeMap<u64, Vec<u64>>,
@@ -192,6 +313,25 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         bytes: &bytes,
         header,
     };
+    if disk.header.catalog_root == 0 {
+        return Ok(RawCatalogCapture {
+            feature_bits: disk.header.features,
+            catalog_root: RawPageRef {
+                id: 0,
+                generation: 0,
+            },
+            accepted_lsn: disk.header.checkpoint_lsn,
+            next_object_id: 0,
+            page_count: disk.header.page_count,
+            freelist: raw_freelist(&disk)?,
+            tables: BTreeMap::new(),
+            oracle_columns: BTreeMap::new(),
+            indexes: BTreeMap::new(),
+            constraints: BTreeMap::new(),
+            table_constraints: BTreeMap::new(),
+            referenced_by: BTreeMap::new(),
+        });
+    }
     let catalog_root = RawPageRef {
         id: disk.header.catalog_root,
         generation: disk.page_generation(disk.header.catalog_root)?,
@@ -206,6 +346,9 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         false,
     )?;
     let mut parsed = parse_raw_catalog(&catalog.entries)?;
+    if !parsed.oracle_columns.is_empty() && disk.header.features & FEATURE_ORACLE_TYPES_V1 == 0 {
+        return Err("raw V2 column definition lacks the Oracle type feature bit".into());
+    }
     for table in parsed.tables.values_mut() {
         table.root_page_type = disk
             .page(table.root.id, Some(table.root.generation))?
@@ -224,6 +367,7 @@ pub fn raw_catalog_capture(path: &std::path::Path) -> Result<RawCatalogCapture, 
         page_count: disk.header.page_count,
         freelist: raw_freelist(&disk)?,
         tables: parsed.tables,
+        oracle_columns: parsed.oracle_columns,
         indexes: parsed.indexes,
         constraints: parsed.constraints,
         table_constraints: parsed.table_constraints,
@@ -1044,6 +1188,7 @@ fn explicit_index_definitions(
 struct RawCatalogParts {
     next_object_id: u64,
     tables: BTreeMap<String, RawTable>,
+    oracle_columns: BTreeMap<String, OracleColumnCapture>,
     indexes: BTreeMap<String, RawIndex>,
     constraints: BTreeMap<String, RawConstraint>,
     table_constraints: BTreeMap<u64, Vec<u64>>,
@@ -1149,19 +1294,59 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             }
             0x14 => {
                 let id = raw_id_key(key, family, "column definition")?;
-                let payload = catalog_payload(value, family, "column definition")?;
-                if payload.len() < 24 || read_u64(payload, 0)? != id || read_u16(payload, 22)? != 0
-                {
-                    return Err("raw column definition is malformed".into());
-                }
-                let column = RawColumn {
-                    id,
-                    ordinal: read_u16(payload, 16)?,
-                    nullable: payload[19] & 1 != 0,
-                    name: catalog_name(payload, 20, 24, "column")?,
+                let version = *value
+                    .get(1)
+                    .ok_or("column definition envelope is truncated")?;
+                let payload = catalog_payload_version(value, family, version, "column definition")?;
+                let (column, oracle_type) = match version {
+                    1 if payload.len() >= 24
+                        && read_u64(payload, 0)? == id
+                        && read_u16(payload, 22)? == 0
+                        && payload[19] & !1 == 0 =>
+                    {
+                        (
+                            RawColumn {
+                                id,
+                                ordinal: read_u16(payload, 16)?,
+                                nullable: payload[19] != 0,
+                                name: catalog_name(payload, 20, 24, "column")?,
+                            },
+                            None,
+                        )
+                    }
+                    2 if payload.len() >= 32
+                        && read_u64(payload, 0)? == id
+                        && read_u16(payload, 30)? == 0
+                        && payload[19] <= 1
+                        && payload[23] == 0
+                        && valid_raw_oracle_descriptor(
+                            payload[18],
+                            payload[20],
+                            payload[21],
+                            payload[22] as i8,
+                            read_u32(payload, 24)?,
+                        ) =>
+                    {
+                        (
+                            RawColumn {
+                                id,
+                                ordinal: read_u16(payload, 16)?,
+                                nullable: payload[19] != 0,
+                                name: catalog_name(payload, 28, 32, "column")?,
+                            },
+                            Some(OracleColumnCapture {
+                                physical_type: payload[18],
+                                kind: payload[20],
+                                precision: payload[21],
+                                scale: payload[22] as i8,
+                                length: read_u32(payload, 24)?,
+                            }),
+                        )
+                    }
+                    _ => return Err("raw column definition is malformed".into()),
                 };
                 if column_definitions
-                    .insert(id, (read_u64(payload, 8)?, column))
+                    .insert(id, (read_u64(payload, 8)?, column, oracle_type))
                     .is_some()
                 {
                     return Err("raw catalog has duplicate column definitions".into());
@@ -1328,6 +1513,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
 
     let next_object_id = next_object_id.ok_or("raw catalog lacks its meta record")?;
     let mut tables = BTreeMap::new();
+    let mut oracle_columns = BTreeMap::new();
     for definition in table_definitions.into_values() {
         let columns = raw_ordered_columns(
             table_columns.remove(&definition.id).unwrap_or_default(),
@@ -1335,6 +1521,14 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
             definition.id,
             "table",
         )?;
+        for column in &columns {
+            if let Some(capture) = column_definitions
+                .get(&column.id)
+                .and_then(|(_, _, capture)| *capture)
+            {
+                oracle_columns.insert(format!("{}.{}", definition.name, column.name), capture);
+            }
+        }
         tables.insert(
             definition.name,
             RawTable {
@@ -1404,6 +1598,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
     Ok(RawCatalogParts {
         next_object_id,
         tables,
+        oracle_columns,
         indexes,
         constraints,
         table_constraints,
@@ -1413,7 +1608,7 @@ fn parse_raw_catalog(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<RawCatalogParts, 
 
 fn raw_ordered_columns(
     ids: BTreeMap<u16, u64>,
-    definitions: &BTreeMap<u64, (u64, RawColumn)>,
+    definitions: &BTreeMap<u64, (u64, RawColumn, Option<OracleColumnCapture>)>,
     table_id: u64,
     label: &str,
 ) -> Result<Vec<RawColumn>, String> {
@@ -1422,7 +1617,7 @@ fn raw_ordered_columns(
         if usize::from(ordinal) != expected {
             return Err(format!("raw {label} columns are not contiguous"));
         }
-        let (owner, column) = definitions
+        let (owner, column, _) = definitions
             .get(&id)
             .ok_or_else(|| format!("raw {label} column is undefined"))?;
         if *owner != table_id || column.ordinal != ordinal {
@@ -1433,6 +1628,45 @@ fn raw_ordered_columns(
         result.push(column.clone());
     }
     Ok(result)
+}
+
+/// This mirrors the on-disk contract by fixed offsets only; it deliberately
+/// does not call `OracleTypeDescriptor` or any catalog decoder.
+fn valid_raw_oracle_descriptor(
+    physical_type: u8,
+    kind: u8,
+    precision: u8,
+    scale: i8,
+    length: u32,
+) -> bool {
+    match kind {
+        1 => {
+            physical_type == 2
+                && (1..=38).contains(&precision)
+                && (-38..=38).contains(&scale)
+                && length == 0
+        }
+        2 => physical_type == 4 && precision == 0 && scale == 0 && (1..=32_767).contains(&length),
+        3 => physical_type == 4 && precision == 0 && scale == 0 && (1..=2_000).contains(&length),
+        4 => physical_type == 5 && precision == 0 && scale == 0 && (1..=32_767).contains(&length),
+        5 => physical_type == 6 && precision == 0 && scale == 0 && length == 0,
+        6 => physical_type == 7 && scale == 0 && length == 0 && precision <= 9,
+        7 => physical_type == 8 && scale == 0 && length == 0 && precision <= 9,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod raw_oracle_descriptor_tests {
+    use super::valid_raw_oracle_descriptor;
+
+    #[test]
+    fn rejects_out_of_range_numeric_and_sized_raw_descriptors() {
+        assert!(!valid_raw_oracle_descriptor(2, 1, 5, 39, 0));
+        assert!(!valid_raw_oracle_descriptor(4, 2, 0, 0, 32_768));
+        assert!(!valid_raw_oracle_descriptor(4, 3, 0, 0, 2_001));
+        assert!(!valid_raw_oracle_descriptor(5, 4, 0, 0, 32_768));
+    }
 }
 
 fn raw_ordered_ids(ids: BTreeMap<u16, u64>, label: &str) -> Result<Vec<u64>, String> {
@@ -1565,7 +1799,16 @@ fn raw_freelist(disk: &Disk<'_>) -> Result<Vec<RawFreelistTrunk>, String> {
 }
 
 fn catalog_payload<'a>(value: &'a [u8], kind: u8, label: &str) -> Result<&'a [u8], String> {
-    if value.get(0..2) != Some(&[kind, 1]) || value.get(2..4) != Some(&[0, 0]) {
+    catalog_payload_version(value, kind, 1, label)
+}
+
+fn catalog_payload_version<'a>(
+    value: &'a [u8],
+    kind: u8,
+    version: u8,
+    label: &str,
+) -> Result<&'a [u8], String> {
+    if value.get(0..2) != Some(&[kind, version]) || value.get(2..4) != Some(&[0, 0]) {
         return Err(format!("{label} envelope is malformed"));
     }
     let payload_len = usize::try_from(read_u32(value, 4)?)
@@ -1864,9 +2107,10 @@ fn decode_header(bytes: &[u8]) -> Result<Header, String> {
     let catalog_root = read_u64(bytes, 64)?;
     let features = read_u64(bytes, 88)?;
     if page_count == 0
-        || catalog_root == 0
         || catalog_root >= page_count
-        || features & !(FEATURE_CATALOG_V1 | FEATURE_INDEX_V1) != 0
+        || catalog_root == 0 && features != 0
+        || features & !(FEATURE_CATALOG_V1 | FEATURE_INDEX_V1 | FEATURE_ORACLE_TYPES_V1) != 0
+        || features & FEATURE_ORACLE_TYPES_V1 != 0 && features & FEATURE_CATALOG_V1 == 0
     {
         return Err("superblock root or features are invalid".into());
     }
@@ -1899,6 +2143,25 @@ fn verify_page_checksum(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() < 40 || read_u32(bytes, 36)? != crc32c_parts(&bytes[..36], &bytes[40..]) {
         return Err("page checksum is invalid".into());
     }
+    Ok(())
+}
+
+fn restamp_page(page: &mut [u8]) -> Result<(), String> {
+    if page.len() < 40 {
+        return Err("page is too short to restamp".into());
+    }
+    page[36..40].fill(0);
+    let checksum = crc32c_parts(&page[..36], &page[40..]);
+    page[36..40].copy_from_slice(&checksum.to_le_bytes());
+    Ok(())
+}
+
+fn restamp_superblock(slot: &mut [u8]) -> Result<(), String> {
+    if slot.len() != SUPERBLOCK_LEN {
+        return Err("superblock slot is truncated".into());
+    }
+    let checksum = crc32c(&slot[..SUPERBLOCK_LEN - 4]);
+    slot[SUPERBLOCK_LEN - 4..].copy_from_slice(&checksum.to_le_bytes());
     Ok(())
 }
 

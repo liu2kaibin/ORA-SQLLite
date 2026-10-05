@@ -1,6 +1,7 @@
 use crate::{
     Value,
     api::ParameterIdentifier,
+    oracle_type::{OracleComparisonContract, OracleTypeDescriptor},
     storage::catalog::types::{ColumnId, TableId},
 };
 
@@ -87,6 +88,7 @@ pub(crate) enum BoundExprKind {
     /// the ordinal is scoped by its enclosing `BoundStatementKind::CreateTable`.
     NewTableColumn {
         ordinal: u16,
+        oracle_type: Option<OracleTypeDescriptor>,
     },
     Parameter(ParameterIdentifier),
     Unary {
@@ -97,6 +99,7 @@ pub(crate) enum BoundExprKind {
         left: Box<BoundExpr>,
         op: BoundBinaryOp,
         right: Box<BoundExpr>,
+        oracle_contract: Option<OracleComparisonContract>,
     },
     IsNull {
         expr: Box<BoundExpr>,

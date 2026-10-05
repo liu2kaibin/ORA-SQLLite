@@ -1,0 +1,866 @@
+mod support;
+
+use ora_sqllite::{
+    Connection, Database, Decimal, ErrorCode, OracleDate, OracleTimestamp, ParameterValue,
+    Parameters, Value,
+};
+
+#[allow(dead_code, reason = "shared by later Phase 5 Oracle type API tests")]
+fn decimal_value(magnitude: u128, scale: i8) -> Value {
+    Value::Decimal(Decimal::new(false, scale, magnitude).unwrap())
+}
+
+#[allow(dead_code, reason = "shared by later Phase 5 timestamp API tests")]
+fn timestamp_value(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanos: u32,
+    offset: Option<i16>,
+) -> Value {
+    let date = OracleDate::new(year, month, day, hour, minute, second).unwrap();
+    Value::Timestamp(OracleTimestamp::from_nanoseconds(date, nanos, offset).unwrap())
+}
+
+#[allow(dead_code, reason = "shared by later Phase 5 Oracle type API tests")]
+fn collect_with_params(
+    connection: &mut Connection,
+    sql: &str,
+    values: &[ParameterValue],
+) -> Vec<Vec<Value>> {
+    let statement = connection.prepare(sql).unwrap();
+    support::collect_statement(connection, &statement, Parameters::positional(values))
+}
+
+#[test]
+fn creates_every_oracle_type_and_persists_its_arguments() {
+    let (files, database) = support::new_database("phase5-types-ddl");
+    let mut connection = database.connect().unwrap();
+    let create = connection.prepare(
+        "CREATE TABLE T (N NUMBER(12,2), V VARCHAR2(20), C CHAR(4), R RAW(16), D DATE, TS TIMESTAMP(9), TZ TIMESTAMP(3) WITH TIME ZONE)"
+    ).unwrap();
+    connection.execute(&create, Parameters::none()).unwrap();
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.feature_bits & 4, 4);
+    assert_eq!(capture.oracle_columns["T.N"].physical_type, 2);
+    assert_eq!(capture.oracle_columns["T.N"].precision, 12);
+    assert_eq!(capture.oracle_columns["T.N"].scale, 2);
+    assert_eq!(capture.oracle_columns["T.V"].length, 20);
+    assert_eq!(capture.oracle_columns["T.TS"].precision, 9);
+}
+
+#[test]
+fn v1_database_opens_without_rewrite_and_v1_v2_coexist_across_reopen() {
+    let (files, database) = support::new_database("phase5-format");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE LEGACY (ID INT64, TS TIMESTAMP)",
+    );
+    let insert = connection
+        .prepare("INSERT INTO LEGACY VALUES (1, :1)")
+        .unwrap();
+    let date = OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap();
+    let values = [Value::Timestamp(OracleTimestamp::new(date, 0, None).unwrap()).into()];
+    connection
+        .execute(&insert, Parameters::positional(&values))
+        .unwrap();
+    drop(connection);
+    drop(database);
+    let before = std::fs::read(files.main()).unwrap();
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID FROM LEGACY"),
+        vec![vec![Value::Int64(1)]]
+    );
+    drop(connection);
+    drop(reopened);
+    assert_eq!(std::fs::read(files.main()).unwrap(), before);
+
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE ORACLE_T (N NUMBER(5,2))");
+    drop(connection);
+    drop(reopened);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.feature_bits & 4, 4);
+    assert!(capture.tables.contains_key("LEGACY"));
+    assert!(capture.oracle_columns.contains_key("ORACLE_T.N"));
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID FROM LEGACY"),
+        vec![vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn v1_and_v2_columns_share_one_table_across_checkpoint_and_reopen() {
+    let (files, database) = support::new_database("phase5-mixed-columns");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE MIXED (I INT64, N NUMBER(5,2))",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO MIXED VALUES (7, 12.50)");
+    drop(connection);
+    drop(database);
+
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(
+        capture.tables["MIXED"]
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["I", "N"]
+    );
+    assert_eq!(capture.oracle_columns["MIXED.N"].kind, 1);
+
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT I, N FROM MIXED"),
+        vec![vec![Value::Int64(7), decimal_value(1_250, 2)]]
+    );
+}
+
+#[test]
+fn v2_column_records_require_bit_two_but_the_empty_post_drop_catalog_is_legal() {
+    let (files, database) = support::new_database("phase5-v2-feature-bit");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    support::format2::mutate_oracle_catalog_for_test(
+        &files,
+        support::format2::OracleCatalogMutation::ClearFeatureBit,
+    )
+    .unwrap();
+    assert_eq!(
+        Database::open(files.main(), support::scale_options())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+
+    let (files, database) = support::new_database("phase5-post-drop-feature-bit");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    support::execute_sql(&mut connection, "DROP TABLE T");
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.feature_bits & 4, 4);
+    assert!(capture.oracle_columns.is_empty());
+    assert!(support::reopen(&files).connect().is_ok());
+}
+
+#[test]
+fn corrupted_v2_column_envelope_and_descriptor_have_stable_error_classes() {
+    for (label, mutation, expected) in [
+        (
+            "unknown-version",
+            support::format2::OracleCatalogMutation::SetColumnEnvelopeVersion(3),
+            ErrorCode::Unsupported,
+        ),
+        (
+            "invalid-descriptor",
+            support::format2::OracleCatalogMutation::SetOracleKind(5),
+            ErrorCode::Corruption,
+        ),
+        (
+            "invalid-reserved-flags",
+            support::format2::OracleCatalogMutation::SetOracleFlags(1),
+            ErrorCode::Corruption,
+        ),
+    ] {
+        let (files, database) = support::new_database(&format!("phase5-{label}"));
+        let mut connection = database.connect().unwrap();
+        support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+        drop(connection);
+        drop(database);
+        support::checkpoint_accepted_state(&files);
+        support::format2::mutate_oracle_catalog_for_test(&files, mutation).unwrap();
+        assert_eq!(
+            Database::open(files.main(), support::scale_options())
+                .unwrap_err()
+                .code(),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn raw_catalog_capture_rejects_out_of_range_oracle_descriptor_fields() {
+    for (label, declaration, kind, mutation) in [
+        (
+            "number-scale",
+            "N NUMBER(5,2)",
+            1,
+            support::format2::OracleCatalogMutation::SetOracleScale(39),
+        ),
+        (
+            "varchar2-length",
+            "V VARCHAR2(1)",
+            2,
+            support::format2::OracleCatalogMutation::SetOracleLength(32_768),
+        ),
+        (
+            "char-length",
+            "C CHAR(1)",
+            3,
+            support::format2::OracleCatalogMutation::SetOracleLength(2_001),
+        ),
+        (
+            "raw-length",
+            "R RAW(1)",
+            4,
+            support::format2::OracleCatalogMutation::SetOracleLength(32_768),
+        ),
+    ] {
+        let (files, database) = support::new_database(&format!("phase5-raw-{label}"));
+        let mut connection = database.connect().unwrap();
+        support::execute_sql(&mut connection, &format!("CREATE TABLE T ({declaration})"));
+        drop(connection);
+        drop(database);
+        support::checkpoint_accepted_state(&files);
+        support::format2::mutate_oracle_column_for_test(&files, kind, mutation).unwrap();
+        assert!(
+            support::format2::raw_catalog_capture(files.main()).is_err(),
+            "raw capture accepted {label}"
+        );
+    }
+}
+
+#[test]
+fn rejects_bare_number_and_local_timezone_before_catalog_mutation() {
+    let (files, database) = support::new_database("phase5-types-reject");
+    let mut connection = database.connect().unwrap();
+    for (sql, expected_code) in [
+        ("CREATE TABLE A (N NUMBER)", ErrorCode::Type),
+        ("CREATE TABLE B (N NUMBER(0,0))", ErrorCode::Type),
+        ("CREATE TABLE C (V VARCHAR2(0))", ErrorCode::Type),
+        (
+            "CREATE TABLE D (T TIMESTAMP(6) WITH LOCAL TIME ZONE)",
+            ErrorCode::Unsupported,
+        ),
+        ("CREATE TABLE E (N NCHAR(10))", ErrorCode::Unsupported),
+    ] {
+        let error = connection.prepare(sql).unwrap_err();
+        assert_eq!(error.code(), expected_code, "{sql}: {error}");
+        assert_eq!(error.oracle_code(), Some(902));
+        assert!(error.sql_location().is_some());
+    }
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    assert_eq!(
+        support::format2::raw_catalog_capture(files.main())
+            .unwrap()
+            .feature_bits
+            & 4,
+        0
+    );
+}
+
+#[test]
+fn project_native_declarations_remain_v1_and_plain_timestamp_defaults_to_six() {
+    let (files, database) = support::new_database("phase5-types-v1");
+    let mut connection = database.connect().unwrap();
+    let core = connection
+        .prepare("CREATE TABLE CORE_TYPES (I INT64, N DECIMAL, F FLOAT64, T TEXT, B BLOB, X BOOL)")
+        .unwrap();
+    connection.execute(&core, Parameters::none()).unwrap();
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.feature_bits & 4, 0);
+    assert!(capture.oracle_columns.is_empty());
+
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    let timestamp = connection
+        .prepare("CREATE TABLE ORACLE_TS (TS TIMESTAMP)")
+        .unwrap();
+    connection.execute(&timestamp, Parameters::none()).unwrap();
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.oracle_columns["ORACLE_TS.TS"].kind, 6);
+    assert_eq!(capture.oracle_columns["ORACLE_TS.TS"].precision, 6);
+}
+
+#[test]
+fn foreign_keys_require_exact_oracle_descriptors_and_reject_v1_v2_mixes() {
+    let (_files, database) = support::new_database("phase5-types-fk");
+    let mut connection = database.connect().unwrap();
+    let parent = connection
+        .prepare("CREATE TABLE P (N NUMBER(12,2) PRIMARY KEY)")
+        .unwrap();
+    connection.execute(&parent, Parameters::none()).unwrap();
+
+    let matching = connection
+        .prepare("CREATE TABLE C_OK (N NUMBER(12,2) REFERENCES P (N))")
+        .unwrap();
+    connection.execute(&matching, Parameters::none()).unwrap();
+
+    for sql in [
+        "CREATE TABLE C_SCALE (N NUMBER(12,3) REFERENCES P (N))",
+        "CREATE TABLE C_V1 (N DECIMAL REFERENCES P (N))",
+    ] {
+        assert_eq!(connection.prepare(sql).unwrap_err().code() as u32, 1200);
+    }
+}
+
+#[test]
+fn invalid_oracle_declaration_reports_exact_multiline_unicode_location() {
+    let (_files, database) = support::new_database("phase5-types-location");
+    let mut connection = database.connect().unwrap();
+    let sql = "CREATE TABLE T (\n  名 NUMBER\n)";
+    let error = connection.prepare(sql).unwrap_err();
+    let location = error.sql_location().unwrap();
+    assert_eq!(error.oracle_code(), Some(902));
+    assert_eq!(location.byte_offset(), sql.find("NUMBER").unwrap());
+    assert_eq!(location.line(), 2);
+    assert_eq!(location.column(), 5);
+}
+
+#[test]
+fn crud_uses_one_normalized_row_for_literals_and_parameters() {
+    let (_files, database) = support::new_database("phase5-crud");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(4,0) PRIMARY KEY, N NUMBER(5,2), C CHAR(3), V VARCHAR2(3), R RAW(2))",
+    );
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (:1, :2, :3, :4, :5)")
+        .unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                Value::Text("1".into()).into(),
+                Value::Text("12.345".into()).into(),
+                Value::Text("A".into()).into(),
+                Value::Text("表A".into()).into(),
+                Value::Blob(vec![0, 255]).into(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT N,C,V,R FROM T"),
+        vec![vec![
+            decimal_value(1235, 2),
+            Value::Text("A  ".into()),
+            Value::Text("表A".into()),
+            Value::Blob(vec![0, 255]),
+        ]]
+    );
+}
+
+#[test]
+fn primary_key_conflicts_keep_the_constraint_name_and_gain_ora_00001() {
+    let (_files, database) = support::new_database("phase5-unique-ora");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(3,0) CONSTRAINT PK_T PRIMARY KEY)",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1)");
+    let duplicate = connection.prepare("INSERT INTO T VALUES (1)").unwrap();
+    let error = connection
+        .execute(&duplicate, Parameters::none())
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Constraint, Some(1))
+    );
+    assert!(error.to_string().contains("PK_T"));
+}
+
+#[test]
+fn failed_normalization_leaves_rowid_and_indexes_unchanged() {
+    let (files, database) = support::new_database("phase5-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(2,0) PRIMARY KEY, N NUMBER(2,1), V VARCHAR2(1) NOT NULL)",
+    );
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let before = support::format2::raw_catalog_capture(files.main()).unwrap();
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    let sql = "INSERT INTO T VALUES (1, 9.99, '')";
+    let insert = connection.prepare(sql).unwrap();
+    let error = connection.execute(&insert, Parameters::none()).unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Type, Some(1438))
+    );
+    assert_eq!(
+        error.sql_location().unwrap().byte_offset(),
+        sql.find("9.99").unwrap()
+    );
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let after = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(after.tables["T"].next_rowid, before.tables["T"].next_rowid);
+    assert_eq!(after.indexes, before.indexes);
+}
+
+#[test]
+fn update_delete_and_late_failure_use_normalized_rows_across_reopen() {
+    let (files, database) = support::new_database("phase5-update-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(2,0) PRIMARY KEY, N NUMBER(3,1), V VARCHAR2(1) NOT NULL)",
+    );
+    support::execute_sql(&mut connection, "CREATE INDEX T_N ON T(N)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1, 1.1, 'A')");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (2, 99.9, 'B')");
+
+    let failing = connection.prepare("UPDATE T SET N = N * 10").unwrap();
+    let error = connection
+        .execute(&failing, Parameters::none())
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ErrorCode::Type, Some(1438))
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID,N,V FROM T ORDER BY ID"),
+        vec![
+            vec![
+                decimal_value(1, 0),
+                decimal_value(11, 1),
+                Value::Text("A".into())
+            ],
+            vec![
+                decimal_value(2, 0),
+                decimal_value(999, 1),
+                Value::Text("B".into()),
+            ],
+        ]
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID FROM T WHERE N = 1.1"),
+        vec![vec![decimal_value(1, 0)]]
+    );
+    assert!(support::collect(&mut connection, "SELECT ID FROM T WHERE N = 11").is_empty());
+
+    let update = connection
+        .prepare("UPDATE T SET N = :1, V = :2 WHERE ID = :3")
+        .unwrap();
+    connection
+        .execute(
+            &update,
+            Parameters::positional(&[
+                Value::Text("2.25".into()).into(),
+                Value::Text("C".into()).into(),
+                Value::Text("1".into()).into(),
+            ]),
+        )
+        .unwrap();
+    let delete = connection.prepare("DELETE FROM T WHERE N = :1").unwrap();
+    connection
+        .execute(
+            &delete,
+            Parameters::positional(&[Value::Text("2.30".into()).into()]),
+        )
+        .unwrap();
+    drop(connection);
+    drop(database);
+
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID,N,V FROM T ORDER BY ID"),
+        vec![vec![
+            decimal_value(2, 0),
+            decimal_value(999, 1),
+            Value::Text("B".into()),
+        ]]
+    );
+}
+
+#[test]
+fn empty_text_hits_not_null_but_empty_blob_and_space_survive() {
+    let (_files, database) = support::new_database("phase5-empty");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (V VARCHAR2(2) NOT NULL, R RAW(2))",
+    );
+    let insert = connection.prepare("INSERT INTO T VALUES (:1, :2)").unwrap();
+    let empty = [
+        Value::Text(String::new()).into(),
+        Value::Blob(Vec::new()).into(),
+    ];
+    let error = connection
+        .execute(&insert, Parameters::positional(&empty))
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Constraint, Some(1400))
+    );
+    let space = [
+        Value::Text(" ".into()).into(),
+        Value::Blob(Vec::new()).into(),
+    ];
+    connection
+        .execute(&insert, Parameters::positional(&space))
+        .unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT V,R FROM T"),
+        vec![vec![Value::Text(" ".into()), Value::Blob(Vec::new())]]
+    );
+}
+
+#[test]
+fn oracle_text_parameter_permission_is_limited_to_a_direct_assignment() {
+    let (_files, database) = support::new_database("phase5-direct-oracle-text");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+
+    let direct = connection.prepare("INSERT INTO T VALUES (:1)").unwrap();
+    connection
+        .execute(
+            &direct,
+            Parameters::positional(&[Value::Text("12.345".into()).into()]),
+        )
+        .unwrap();
+
+    let arithmetic = connection.prepare("INSERT INTO T VALUES (:1 + 1)").unwrap();
+    let error = connection
+        .execute(
+            &arithmetic,
+            Parameters::positional(&[Value::Text("12.345".into()).into()]),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), ora_sqllite::ErrorCode::Type);
+    assert!(
+        error
+            .to_string()
+            .contains("runtime parameter requires a compatible concrete type"),
+        "{error}"
+    );
+}
+
+#[test]
+fn oracle_join_parameters_normalize_before_an_empty_scan() {
+    let (_files, database) = support::new_database("phase5-join-parameter-normalization");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    let statement = connection
+        .prepare("SELECT A.N FROM T A INNER JOIN T B ON A.N = :1")
+        .unwrap();
+    let values = [Value::Text("not-a-number".into()).into()];
+    let error = match connection.query(&statement, Parameters::positional(&values)) {
+        Ok(_) => panic!("invalid Oracle JOIN parameter reached the empty scan"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ErrorCode::Type, Some(1722))
+    );
+}
+
+#[test]
+fn oracle_query_prescan_covers_every_expression_family_and_compatible_reuse() {
+    // Production break caught: omitting any post-WHERE expression family lets
+    // an invalid Oracle Text parameter reach an empty scan without conversion.
+    let (_files, database) = support::new_database("phase5-query-prescan-families");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    let invalid = [Value::Text("not-a-number".into()).into()];
+    for sql in [
+        "SELECT COUNT(*) FROM T GROUP BY N = :1",
+        "SELECT COUNT(N = :1) FROM T",
+        "SELECT N FROM T GROUP BY N HAVING N = :1",
+        "SELECT N = :1 FROM T",
+        "SELECT N FROM T ORDER BY N = :1",
+    ] {
+        let statement = connection.prepare(sql).unwrap();
+        let error = match connection.query(&statement, Parameters::positional(&invalid)) {
+            Ok(_) => panic!("invalid Oracle parameter bypassed pre-scan: {sql}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            (error.code(), error.oracle_code()),
+            (ErrorCode::Type, Some(1722)),
+            "{sql}"
+        );
+    }
+
+    let compatible = connection
+        .prepare("SELECT N = :1 FROM T WHERE N = :1 ORDER BY N = :1")
+        .unwrap();
+    let valid = [Value::Text("12.345".into()).into()];
+    let mut rows = connection
+        .query(&compatible, Parameters::positional(&valid))
+        .unwrap();
+    assert!(rows.next().unwrap().is_none());
+}
+
+#[test]
+fn mixed_oracle_and_legacy_parameter_contracts_are_rejected_before_scan() {
+    let (_files, database) = support::new_database("phase5-mixed-parameter-contracts");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2), D DECIMAL)");
+    let statement = connection
+        .prepare("SELECT :1 FROM T WHERE N = :1 AND D = :1")
+        .unwrap();
+    let values = [decimal_value(12_345, 3).into()];
+    let error = match connection.query(&statement, Parameters::positional(&values)) {
+        Ok(_) => panic!("one parameter was accepted with conflicting normalization contracts"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), ErrorCode::Type);
+}
+
+#[test]
+fn char_check_normalizes_its_persisted_constant() {
+    let (_files, database) = support::new_database("phase5-check-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (C CHAR(3) CHECK (C = 'A'))",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES ('A')");
+    assert_eq!(
+        support::collect(&mut connection, "SELECT C FROM T"),
+        vec![vec![Value::Text("A  ".into())]]
+    );
+}
+
+#[test]
+fn number_check_normalizes_its_persisted_constant() {
+    let (_files, database) = support::new_database("phase5-number-check-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (N NUMBER(4,2) CHECK (N = '12.345'))",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (12.345)");
+    assert_eq!(
+        support::collect(&mut connection, "SELECT N FROM T"),
+        vec![vec![decimal_value(1235, 2)]]
+    );
+}
+
+#[test]
+fn timestamp_with_time_zone_check_uses_utc_contract() {
+    let (_files, database) = support::new_database("phase5-tstz-check-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (TZ TIMESTAMP(9) WITH TIME ZONE CHECK (TZ = '2026-01-01 00:00:00 +00:00'))",
+    );
+    let insert = connection.prepare("INSERT INTO T VALUES (:1)").unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[timestamp_value(2026, 1, 1, 8, 0, 0, 0, Some(480)).into()]),
+        )
+        .unwrap();
+}
+
+#[test]
+fn oracle_comparisons_normalize_literals_by_column_contract() {
+    let (_files, database) = support::new_database("phase5-comparison-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (N NUMBER(5,2), D DATE, TS TIMESTAMP(9), TZ TIMESTAMP(9) WITH TIME ZONE)",
+    );
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (:1, :2, :3, :4)")
+        .unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                Value::Text("12.345".into()).into(),
+                Value::Date(OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap()).into(),
+                timestamp_value(2026, 1, 1, 8, 0, 0, 123_456_789, None).into(),
+                timestamp_value(2026, 1, 1, 8, 0, 0, 0, Some(480)).into(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT N FROM T WHERE N = '12.345'"),
+        vec![vec![decimal_value(1235, 2)]]
+    );
+    assert_eq!(
+        collect_with_params(
+            &mut connection,
+            "SELECT N FROM T WHERE N = :1",
+            &[Value::Text("12.345".into()).into()],
+        ),
+        vec![vec![decimal_value(1235, 2)]]
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT D FROM T WHERE D = '2026-01-01'"),
+        vec![vec![Value::Date(
+            OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap()
+        )]]
+    );
+    assert_eq!(
+        support::collect(
+            &mut connection,
+            "SELECT TS FROM T WHERE TS = '2026-01-01 08:00:00.123456789'"
+        ),
+        vec![vec![timestamp_value(
+            2026,
+            1,
+            1,
+            8,
+            0,
+            0,
+            123_456_789,
+            None
+        )]]
+    );
+    assert_eq!(
+        support::collect(
+            &mut connection,
+            "SELECT TZ FROM T WHERE TZ = '2026-01-01 00:00:00 +00:00'"
+        ),
+        vec![vec![timestamp_value(2026, 1, 1, 8, 0, 0, 0, Some(480))]]
+    );
+}
+
+#[test]
+fn oracle_comparisons_reject_legacy_mixes_and_different_families() {
+    let (_files, database) = support::new_database("phase5-comparison-reject");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (V INT64, N NUMBER(3,0), TS TIMESTAMP(9), TZ TIMESTAMP(9) WITH TIME ZONE)",
+    );
+    for sql in [
+        "SELECT N FROM T WHERE N = V",
+        "SELECT TS FROM T WHERE TS = TZ",
+    ] {
+        assert_eq!(
+            connection.prepare(sql).unwrap_err().code(),
+            ora_sqllite::ErrorCode::Type
+        );
+    }
+}
+
+#[test]
+fn timezone_index_uses_utc_prefix_but_rows_keep_offsets() {
+    let (_files, database) = support::new_database("phase5-tz-index");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (TS TIMESTAMP(9) WITH TIME ZONE UNIQUE)",
+    );
+    let insert = connection.prepare("INSERT INTO T VALUES (:1)").unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                timestamp_value(2026, 1, 1, 8, 0, 0, 123_456_789, Some(480)).into()
+            ]),
+        )
+        .unwrap();
+    let error = connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                timestamp_value(2026, 1, 1, 0, 0, 0, 123_456_789, Some(0)).into()
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Constraint, Some(1))
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT TS FROM T"),
+        vec![vec![timestamp_value(
+            2026,
+            1,
+            1,
+            8,
+            0,
+            0,
+            123_456_789,
+            Some(480),
+        )]]
+    );
+}
+
+#[test]
+fn scan_and_filter_share_number_char_and_timestamp_normalization() {
+    let (_files, database) = support::new_database("phase5-index-parity");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(4,0), N NUMBER(5,2), C CHAR(3), TZ TIMESTAMP(9) WITH TIME ZONE)",
+    );
+    for sql in [
+        "CREATE INDEX T_N ON T(N)",
+        "CREATE INDEX T_C ON T(C)",
+        "CREATE INDEX T_TZ ON T(TZ)",
+    ] {
+        support::execute_sql(&mut connection, sql);
+    }
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (1, 1.2, 'A', :1)")
+        .unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                timestamp_value(2026, 1, 1, 8, 0, 0, 100_000_000, Some(480)).into()
+            ]),
+        )
+        .unwrap();
+
+    for (indexed, scanned, value) in [
+        (
+            "SELECT ID FROM T WHERE N = :1",
+            "SELECT ID FROM T WHERE N = :1 OR FALSE",
+            Value::Text("1.20".into()),
+        ),
+        (
+            "SELECT ID FROM T WHERE C = :1",
+            "SELECT ID FROM T WHERE C = :1 OR FALSE",
+            Value::Text("A".into()),
+        ),
+        (
+            "SELECT ID FROM T WHERE TZ = :1",
+            "SELECT ID FROM T WHERE TZ = :1 OR FALSE",
+            Value::Text("2026-01-01 00:00:00.1 +00:00".into()),
+        ),
+    ] {
+        let parameters = [value.into()];
+        assert_eq!(
+            collect_with_params(&mut connection, indexed, &parameters),
+            collect_with_params(&mut connection, scanned, &parameters),
+        );
+    }
+}

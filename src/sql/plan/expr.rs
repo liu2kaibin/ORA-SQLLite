@@ -9,6 +9,7 @@ use crate::{
     Result, Value,
     api::{ParameterIdentifier, ParameterMetadata},
     error::SqlLocation,
+    oracle_type::OracleComparisonContract,
     sql::{
         SqlType,
         bound::{
@@ -105,6 +106,7 @@ pub(crate) enum ExecExprKind {
         left: Box<ExecExpr>,
         op: BoundBinaryOp,
         right: Box<ExecExpr>,
+        oracle_contract: Option<OracleComparisonContract>,
     },
     IsNull {
         expr: Box<ExecExpr>,
@@ -260,13 +262,18 @@ impl<'bound, 'map, 'sql> ExprCompiler<'bound, 'map, 'sql> {
                     op: *op,
                     expr: pop(&mut values)?,
                 },
-                BoundExprKind::Binary { op, .. } => {
+                BoundExprKind::Binary {
+                    op,
+                    oracle_contract,
+                    ..
+                } => {
                     let right = pop(&mut values)?;
                     let left = pop(&mut values)?;
                     ExecExprKind::Binary {
                         left,
                         op: *op,
                         right,
+                        oracle_contract: *oracle_contract,
                     }
                 }
                 BoundExprKind::IsNull { negated, .. } => ExecExprKind::IsNull {
@@ -396,8 +403,14 @@ fn aggregate_key(definition: &AggregateDefinition) -> u64 {
                 std::mem::discriminant(op).hash(&mut hash);
                 work.push(expr);
             }
-            ExecExprKind::Binary { left, op, right } => {
+            ExecExprKind::Binary {
+                left,
+                op,
+                right,
+                oracle_contract,
+            } => {
                 std::mem::discriminant(op).hash(&mut hash);
+                oracle_contract.hash(&mut hash);
                 work.push(right);
                 work.push(left);
             }
@@ -460,7 +473,7 @@ fn hash_value(value: &Value, hash: &mut impl Hasher) {
         Value::Date(value) => hash_date(*value, hash),
         Value::Timestamp(value) => {
             hash_date(value.date(), hash);
-            value.micros().hash(hash);
+            value.nanoseconds().hash(hash);
             value.offset_minutes().hash(hash);
         }
         Value::Bool(value) => value.hash(hash),
@@ -531,16 +544,18 @@ fn same_expression(left: &ExecExpr, right: &ExecExpr) -> bool {
                 left,
                 op,
                 right: child,
+                oracle_contract,
             } => {
                 let ExecExprKind::Binary {
                     left: other_left,
                     op: other_op,
                     right: other_right,
+                    oracle_contract: other_contract,
                 } = &right.kind
                 else {
                     return false;
                 };
-                if op != other_op {
+                if op != other_op || oracle_contract != other_contract {
                     return false;
                 }
                 work.push((left, other_left));
@@ -630,4 +645,35 @@ fn same_expression(left: &ExecExpr, right: &ExecExpr) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_plan_keys_include_submicrosecond_nanoseconds() {
+        // Production break caught: reducing timestamp literals to micros makes
+        // distinct p=7..9 aggregate expressions share an avoidable plan bucket.
+        let date = crate::OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap();
+        let definition = |nanos| AggregateDefinition {
+            function: BoundAggregateFunction::Min,
+            argument: Some(ExecExpr {
+                kind: ExecExprKind::Literal(Value::Timestamp(
+                    crate::OracleTimestamp::from_nanoseconds(date, nanos, None).unwrap(),
+                )),
+                data_type: SqlType::Timestamp,
+                nullable: false,
+                location: SqlLocation::new(0, 1, 1).unwrap(),
+            }),
+            data_type: SqlType::Timestamp,
+            nullable: false,
+            location: SqlLocation::new(0, 1, 1).unwrap(),
+        };
+
+        assert_ne!(
+            aggregate_key(&definition(123_456_001)),
+            aggregate_key(&definition(123_456_999))
+        );
+    }
 }

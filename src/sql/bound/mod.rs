@@ -12,7 +12,7 @@ pub(crate) use expr::{
 };
 pub(crate) use statement::{
     BoundAssignment, BoundColumn, BoundColumnDefinition, BoundConstraint, BoundStatement,
-    BoundStatementKind, BoundTable, CreatedNameDependency, SchemaDependency,
+    BoundStatementKind, BoundTable, BoundTypeDeclaration, CreatedNameDependency, SchemaDependency,
 };
 
 #[cfg(test)]

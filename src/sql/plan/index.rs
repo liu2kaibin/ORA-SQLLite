@@ -3,9 +3,13 @@ use std::{cmp::Reverse, collections::BTreeMap};
 use super::{ExecExpr, expr::ExprCompiler};
 use crate::{
     Result,
+    oracle_type::OracleTypeDescriptor,
     sql::{
         SqlType,
-        bound::{BoundBinaryOp, BoundExpr, BoundExprKind, BoundIndex, BoundSource, SourceId},
+        bound::{
+            BoundBinaryOp, BoundExpr, BoundExprKind, BoundIndex, BoundIndexColumn, BoundSource,
+            SourceId,
+        },
     },
     storage::catalog::types::{ColumnId, ColumnType, IndexId},
 };
@@ -47,14 +51,14 @@ impl RangeBoundPlan {
 
 #[derive(Clone)]
 pub(crate) struct IndexRangePlan {
-    column_type: ColumnType,
+    column: IndexColumnContract,
     lower: Option<RangeBoundPlan>,
     upper: Option<RangeBoundPlan>,
 }
 
 impl IndexRangePlan {
-    pub(crate) const fn column_type(&self) -> ColumnType {
-        self.column_type
+    pub(crate) const fn column(&self) -> IndexColumnContract {
+        self.column
     }
 
     pub(crate) fn lower(&self) -> Option<&RangeBoundPlan> {
@@ -66,11 +70,27 @@ impl IndexRangePlan {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct IndexColumnContract {
+    column_type: ColumnType,
+    oracle_type: Option<OracleTypeDescriptor>,
+}
+
+impl IndexColumnContract {
+    pub(crate) const fn column_type(self) -> ColumnType {
+        self.column_type
+    }
+
+    pub(crate) const fn oracle_type(self) -> Option<OracleTypeDescriptor> {
+        self.oracle_type
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct IndexAccessPlan {
     source: SourceId,
     index_id: IndexId,
-    equality: Box<[(ColumnType, EqualityValuePlan)]>,
+    equality: Box<[(IndexColumnContract, EqualityValuePlan)]>,
     range: Option<IndexRangePlan>,
 }
 
@@ -83,7 +103,7 @@ impl IndexAccessPlan {
         self.index_id
     }
 
-    pub(crate) fn equality(&self) -> &[(ColumnType, EqualityValuePlan)] {
+    pub(crate) fn equality(&self) -> &[(IndexColumnContract, EqualityValuePlan)] {
         &self.equality
     }
 
@@ -98,9 +118,9 @@ impl IndexAccessPlan {
         let equality = choice
             .equality
             .into_iter()
-            .map(|(column_type, value)| {
+            .map(|(column, value)| {
                 Ok((
-                    column_type,
+                    column,
                     match value {
                         ChoiceEquality::Expression(expression) => {
                             EqualityValuePlan::Expression(expressions.compile(expression)?)
@@ -115,7 +135,7 @@ impl IndexAccessPlan {
             .range
             .map(|range| {
                 Ok(IndexRangePlan {
-                    column_type: range.column_type,
+                    column: range.column,
                     lower: range
                         .lower
                         .map(|bound| {
@@ -153,7 +173,7 @@ enum ChoiceEquality<'a> {
 }
 
 struct ChoiceRange<'a> {
-    column_type: ColumnType,
+    column: IndexColumnContract,
     lower: Option<ChoiceRangeBound<'a>>,
     upper: Option<ChoiceRangeBound<'a>>,
 }
@@ -167,7 +187,7 @@ struct ChoiceRangeBound<'a> {
 pub(super) struct IndexChoice<'a> {
     source: SourceId,
     index_id: IndexId,
-    equality: Vec<(ColumnType, ChoiceEquality<'a>)>,
+    equality: Vec<(IndexColumnContract, ChoiceEquality<'a>)>,
     range: Option<ChoiceRange<'a>>,
 }
 
@@ -176,7 +196,7 @@ impl IndexChoice<'_> {
         self.index_id
     }
 
-    fn equality(&self) -> &[(ColumnType, ChoiceEquality<'_>)] {
+    fn equality(&self) -> &[(IndexColumnContract, ChoiceEquality<'_>)] {
         &self.equality
     }
 
@@ -236,11 +256,17 @@ fn extract_terms<'a>(source: SourceId, root: &'a BoundExpr) -> BTreeMap<ColumnId
                 left,
                 op: BoundBinaryOp::And,
                 right,
+                ..
             } => {
                 work.push(right);
                 work.push(left);
             }
-            BoundExprKind::Binary { left, op, right } => {
+            BoundExprKind::Binary {
+                left,
+                op,
+                right,
+                oracle_contract: _,
+            } => {
                 record_binary(&mut terms, source, left, *op, right);
             }
             BoundExprKind::IsNull {
@@ -388,10 +414,11 @@ fn searchable_expression(expression: &BoundExpr) -> bool {
     )
 }
 
-fn searchable_value(expr: &BoundExpr, target: ColumnType) -> bool {
+fn searchable_value(expr: &BoundExpr, target: IndexColumnContract) -> bool {
     searchable_expression(expr)
-        && (sql_type_matches(target, expr.sql_type)
-            || (target == ColumnType::Decimal && expr.sql_type == SqlType::Int64))
+        && (target.oracle_type().is_some()
+            || sql_type_matches(target.column_type(), expr.sql_type)
+            || (target.column_type() == ColumnType::Decimal && expr.sql_type == SqlType::Int64))
 }
 
 fn sql_type_matches(column_type: ColumnType, sql_type: SqlType) -> bool {
@@ -419,19 +446,19 @@ fn candidate<'a>(
     for column in index.columns() {
         let Some(value) = terms
             .get(&column.column_id())
-            .and_then(|terms| first_compatible_equality(terms, column.column_type()))
+            .and_then(|terms| first_compatible_equality(terms, index_column_contract(column)))
         else {
             break;
         };
         match value {
             ChoiceEquality::Expression(expression)
-                if searchable_value(expression, column.column_type()) =>
+                if searchable_value(expression, index_column_contract(column)) =>
             {
-                equality.push((column.column_type(), value));
+                equality.push((index_column_contract(column), value));
             }
             ChoiceEquality::IsNull => {
                 unique_point_form = false;
-                equality.push((column.column_type(), value));
+                equality.push((index_column_contract(column), value));
             }
             ChoiceEquality::Expression(_) => break,
         }
@@ -443,13 +470,13 @@ fn candidate<'a>(
             return None;
         }
         let terms = terms.get(&column.column_id())?;
-        let lower = first_compatible_bound(&terms.lower, column.column_type());
-        let upper = first_compatible_bound(&terms.upper, column.column_type());
+        let lower = first_compatible_bound(&terms.lower, index_column_contract(column));
+        let upper = first_compatible_bound(&terms.upper, index_column_contract(column));
         if lower.is_none() && upper.is_none() {
             None
         } else {
             Some(ChoiceRange {
-                column_type: column.column_type(),
+                column: index_column_contract(column),
                 lower,
                 upper,
             })
@@ -479,24 +506,31 @@ fn candidate<'a>(
     ))
 }
 
+fn index_column_contract(column: &BoundIndexColumn) -> IndexColumnContract {
+    IndexColumnContract {
+        column_type: column.column_type(),
+        oracle_type: column.oracle_type(),
+    }
+}
+
 fn first_compatible_equality<'a>(
     terms: &ColumnTerms<'a>,
-    column_type: ColumnType,
+    column: IndexColumnContract,
 ) -> Option<ChoiceEquality<'a>> {
     terms.equality.iter().copied().find(|value| match value {
-        ChoiceEquality::Expression(expression) => searchable_value(expression, column_type),
+        ChoiceEquality::Expression(expression) => searchable_value(expression, column),
         ChoiceEquality::IsNull => true,
     })
 }
 
 fn first_compatible_bound<'a>(
     bounds: &[ChoiceRangeBound<'a>],
-    column_type: ColumnType,
+    column: IndexColumnContract,
 ) -> Option<ChoiceRangeBound<'a>> {
     bounds
         .iter()
         .copied()
-        .find(|bound| searchable_value(bound.expression, column_type))
+        .find(|bound| searchable_value(bound.expression, column))
 }
 
 #[cfg(test)]
@@ -888,6 +922,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                oracle_contract: None,
             },
             SqlType::Bool,
             true,

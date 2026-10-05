@@ -1122,26 +1122,6 @@ fn phase_4b_sql_corpus() {
         ("SELECT ID + NAME FROM USERS", ErrorCode::Type),
         ("CREATE TABLE USERS (ID INT64)", ErrorCode::Bind),
         (
-            "CREATE TABLE ORACLE_TYPES (N NUMBER(10,2))",
-            ErrorCode::Unsupported,
-        ),
-        (
-            "CREATE TABLE ORACLE_VARCHAR (V VARCHAR2(10))",
-            ErrorCode::Unsupported,
-        ),
-        (
-            "CREATE TABLE ORACLE_CHAR (V CHAR(10))",
-            ErrorCode::Unsupported,
-        ),
-        (
-            "CREATE TABLE ORACLE_RAW (V RAW(10))",
-            ErrorCode::Unsupported,
-        ),
-        (
-            "CREATE TABLE ORACLE_TIME (V TIMESTAMP WITH TIME ZONE)",
-            ErrorCode::Unsupported,
-        ),
-        (
             "CREATE TABLE BAD_CHECK (NAME TEXT, CHECK (NAME))",
             ErrorCode::Type,
         ),

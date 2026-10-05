@@ -1,6 +1,7 @@
 use crate::{
     DbError, ErrorCode, Result,
     api::{ColumnMetadata, ParameterMetadata},
+    oracle_type::OracleTypeDescriptor,
     storage::catalog::{
         CatalogReader,
         types::{
@@ -318,8 +319,15 @@ pub(crate) struct BoundColumn {
     pub(crate) column_id: ColumnId,
     pub(crate) ordinal: u16,
     pub(crate) sql_type: crate::sql::SqlType,
+    pub(crate) oracle_type: Option<OracleTypeDescriptor>,
     pub(crate) nullable: bool,
     pub(crate) span: SqlSpan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundTypeDeclaration {
+    pub(crate) column_type: ColumnType,
+    pub(crate) oracle_type: Option<OracleTypeDescriptor>,
 }
 
 /// One target column and source expression in an UPDATE statement.
@@ -336,6 +344,7 @@ pub(crate) struct BoundColumnDefinition {
     pub(crate) name: CatalogName,
     pub(crate) ordinal: u16,
     pub(crate) column_type: ColumnType,
+    pub(crate) oracle_type: Option<OracleTypeDescriptor>,
     pub(crate) nullable: bool,
     pub(crate) span: SqlSpan,
 }

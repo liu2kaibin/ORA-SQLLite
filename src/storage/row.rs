@@ -58,7 +58,7 @@ impl RowCodec {
                 continue;
             }
 
-            let payload = encode_value(column.column_type(), value)?;
+            let payload = encode_column_value(column, value)?;
             payloads.push(Some(payload));
         }
 
@@ -213,7 +213,7 @@ impl RowCodec {
                     let value_bytes = payload
                         .get(offset..end)
                         .ok_or_else(|| corruption("row value range exceeds the payload"))?;
-                    values.push(decode_value(column.column_type(), value_bytes)?);
+                    values.push(decode_column_value(column, value_bytes)?);
                 }
             }
         }
@@ -265,7 +265,7 @@ fn validate_row_layout(
             continue;
         }
         payload_len = payload_len
-            .checked_add(encoded_value_len(column.column_type(), value)?)
+            .checked_add(encoded_value_len(column, value)?)
             .ok_or_else(|| type_error("row payload length overflows"))?;
     }
 
@@ -283,8 +283,22 @@ fn validate_row_layout(
     ))
 }
 
-fn encoded_value_len(column_type: ColumnType, value: &Value) -> Result<usize> {
-    match (column_type, value) {
+fn encoded_value_len(column: &ColumnDef, value: &Value) -> Result<usize> {
+    if column.oracle_type().is_none()
+        && matches!(
+            column.column_type(),
+            ColumnType::Timestamp | ColumnType::TimestampWithTimeZone
+        )
+        && matches!(
+            value,
+            Value::Timestamp(timestamp) if timestamp.nanoseconds() % 1_000 != 0
+        )
+    {
+        return Err(type_error(
+            "legacy Timestamp requires microsecond precision",
+        ));
+    }
+    match (column.column_type(), value) {
         (ColumnType::Int64, Value::Int64(_)) => Ok(INT64_LEN),
         (ColumnType::Decimal, Value::Decimal(_)) => Ok(DECIMAL_LEN),
         (ColumnType::Float64, Value::Float64(_)) => Ok(FLOAT64_LEN),
@@ -434,24 +448,86 @@ pub(super) fn encode_value(column_type: ColumnType, value: &Value) -> Result<Vec
         (ColumnType::Blob, Value::Blob(value)) => Ok(value.clone()),
         (ColumnType::Date, Value::Date(value)) => Ok(encode_date(*value)),
         (ColumnType::Timestamp, Value::Timestamp(value)) if value.offset_minutes().is_none() => {
-            let mut bytes = encode_date(value.date());
-            bytes.extend_from_slice(&value.micros().to_le_bytes());
-            Ok(bytes)
+            legacy_timestamp_fraction(*value)
+                .and_then(|fraction| encode_timestamp_fraction(column_type, *value, fraction))
         }
         (ColumnType::TimestampWithTimeZone, Value::Timestamp(value)) => {
-            let offset = value.offset_minutes().ok_or_else(type_mismatch)?;
-            let mut bytes = encode_date(value.date());
-            bytes.extend_from_slice(&value.micros().to_le_bytes());
-            bytes.extend_from_slice(&offset.to_le_bytes());
-            bytes.extend_from_slice(&0_u16.to_le_bytes());
-            Ok(bytes)
+            let fraction = legacy_timestamp_fraction(*value)?;
+            encode_timestamp_fraction(column_type, *value, fraction)
         }
         (ColumnType::Bool, Value::Bool(value)) => Ok(vec![u8::from(*value)]),
         _ => Err(type_mismatch()),
     }
 }
 
+pub(super) fn encode_column_value(column: &ColumnDef, value: &Value) -> Result<Vec<u8>> {
+    match (column.oracle_type(), column.column_type(), value) {
+        (
+            Some(crate::oracle_type::OracleTypeDescriptor::Timestamp { .. }),
+            ColumnType::Timestamp,
+            Value::Timestamp(timestamp),
+        ) if timestamp.offset_minutes().is_none() => {
+            encode_timestamp_fraction(column.column_type(), *timestamp, timestamp.nanoseconds())
+        }
+        (
+            Some(crate::oracle_type::OracleTypeDescriptor::TimestampWithTimeZone { .. }),
+            ColumnType::TimestampWithTimeZone,
+            Value::Timestamp(timestamp),
+        ) if timestamp.offset_minutes().is_some() => {
+            encode_timestamp_fraction(column.column_type(), *timestamp, timestamp.nanoseconds())
+        }
+        _ => encode_value(column.column_type(), value),
+    }
+}
+
+fn legacy_timestamp_fraction(timestamp: OracleTimestamp) -> Result<u32> {
+    if timestamp.nanoseconds() % 1_000 != 0 {
+        return Err(type_error(
+            "legacy Timestamp requires microsecond precision",
+        ));
+    }
+    Ok(timestamp.nanoseconds() / 1_000)
+}
+
+fn encode_timestamp_fraction(
+    column_type: ColumnType,
+    timestamp: OracleTimestamp,
+    fraction: u32,
+) -> Result<Vec<u8>> {
+    let mut bytes = encode_date(timestamp.date());
+    bytes.extend_from_slice(&fraction.to_le_bytes());
+    match column_type {
+        ColumnType::Timestamp if timestamp.offset_minutes().is_none() => Ok(bytes),
+        ColumnType::TimestampWithTimeZone => {
+            let offset = timestamp.offset_minutes().ok_or_else(type_mismatch)?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            Ok(bytes)
+        }
+        _ => Err(type_mismatch()),
+    }
+}
+
 pub(super) fn decode_value(column_type: ColumnType, bytes: &[u8]) -> Result<Value> {
+    decode_value_with_fraction_unit(column_type, bytes, false)
+}
+
+pub(super) fn decode_column_value(column: &ColumnDef, bytes: &[u8]) -> Result<Value> {
+    let nanoseconds = matches!(
+        column.oracle_type(),
+        Some(
+            crate::oracle_type::OracleTypeDescriptor::Timestamp { .. }
+                | crate::oracle_type::OracleTypeDescriptor::TimestampWithTimeZone { .. }
+        )
+    );
+    decode_value_with_fraction_unit(column.column_type(), bytes, nanoseconds)
+}
+
+fn decode_value_with_fraction_unit(
+    column_type: ColumnType,
+    bytes: &[u8],
+    nanoseconds: bool,
+) -> Result<Value> {
     match column_type {
         ColumnType::Int64 => {
             require_length(bytes, INT64_LEN)?;
@@ -471,20 +547,20 @@ pub(super) fn decode_value(column_type: ColumnType, bytes: &[u8]) -> Result<Valu
         }
         ColumnType::Blob => Ok(Value::Blob(bytes.to_vec())),
         ColumnType::Date => decode_date(bytes).map(Value::Date),
-        ColumnType::Timestamp => decode_timestamp(bytes, None, TIMESTAMP_LEN),
+        ColumnType::Timestamp => decode_timestamp(bytes, None, TIMESTAMP_LEN, nanoseconds),
         ColumnType::TimestampWithTimeZone => {
             require_length(bytes, TIMESTAMP_WITH_TIME_ZONE_LEN)?;
             let mut decoder = Decoder::new(bytes);
             let date_bytes = decoder.get_bytes(DATE_LEN)?;
             let date = decode_date(date_bytes)?;
-            let micros = decoder.get_u32()?;
+            let fraction = decoder.get_u32()?;
             let offset = decoder.get_i16()?;
             if decoder.get_u16()? != 0 {
                 return Err(corruption(
                     "timestamp with time zone reserved bytes are nonzero",
                 ));
             }
-            decode_timestamp_fields(date, micros, Some(offset))
+            decode_timestamp_fields(date, fraction, Some(offset), nanoseconds)
         }
         ColumnType::Bool => {
             require_length(bytes, BOOL_LEN)?;
@@ -541,17 +617,34 @@ fn decode_date(bytes: &[u8]) -> Result<OracleDate> {
         .map_err(|_| corruption("date payload fields are invalid"))
 }
 
-fn decode_timestamp(bytes: &[u8], offset: Option<i16>, exact_len: usize) -> Result<Value> {
+fn decode_timestamp(
+    bytes: &[u8],
+    offset: Option<i16>,
+    exact_len: usize,
+    nanoseconds: bool,
+) -> Result<Value> {
     require_length(bytes, exact_len)?;
     let mut decoder = Decoder::new(bytes);
     let date_bytes = decoder.get_bytes(DATE_LEN)?;
     let date = decode_date(date_bytes)?;
-    let micros = decoder.get_u32()?;
-    decode_timestamp_fields(date, micros, offset)
+    let fraction = decoder.get_u32()?;
+    decode_timestamp_fields(date, fraction, offset, nanoseconds)
 }
 
-fn decode_timestamp_fields(date: OracleDate, micros: u32, offset: Option<i16>) -> Result<Value> {
-    OracleTimestamp::new(date, micros, offset)
+fn decode_timestamp_fields(
+    date: OracleDate,
+    fraction: u32,
+    offset: Option<i16>,
+    nanoseconds: bool,
+) -> Result<Value> {
+    let nanos = if nanoseconds {
+        fraction
+    } else {
+        fraction
+            .checked_mul(1_000)
+            .ok_or_else(|| corruption("timestamp payload fields are invalid"))?
+    };
+    OracleTimestamp::from_nanoseconds(date, nanos, offset)
         .map(Value::Timestamp)
         .map_err(|_| corruption("timestamp payload fields are invalid"))
 }
@@ -583,9 +676,10 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::{
-        RowCodec, RowCodecValidation, classify_row_length, decode_rowid_key, decode_value,
-        encode_rowid_key, encode_value, preflight_row_layout,
+        RowCodec, RowCodecValidation, classify_row_length, decode_column_value, decode_rowid_key,
+        decode_value, encode_column_value, encode_rowid_key, encode_value, preflight_row_layout,
     };
+    use crate::oracle_type::OracleTypeDescriptor;
     use crate::storage::catalog::types::{
         CatalogName, ColumnDef, ColumnId, ColumnType, RowId, SchemaVersion, TableDef, TableId,
     };
@@ -628,6 +722,47 @@ mod tests {
         let (table, columns) = schema(&types);
         let values = vec![Value::Null; count];
         (table, columns, values)
+    }
+
+    fn timestamp(
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        nanos: u32,
+        offset: Option<i16>,
+    ) -> OracleTimestamp {
+        OracleTimestamp::from_nanoseconds(
+            OracleDate::new(year, month, day, hour, minute, second).unwrap(),
+            nanos,
+            offset,
+        )
+        .unwrap()
+    }
+
+    fn timestamp_column(descriptor: Option<OracleTypeDescriptor>) -> ColumnDef {
+        match descriptor {
+            Some(descriptor) => ColumnDef::new_oracle(
+                ColumnId::new(2).unwrap(),
+                TableId::new(1).unwrap(),
+                0,
+                false,
+                CatalogName::new("TS").unwrap(),
+                descriptor,
+            )
+            .unwrap(),
+            None => ColumnDef::new(
+                ColumnId::new(2).unwrap(),
+                TableId::new(1).unwrap(),
+                0,
+                ColumnType::Timestamp,
+                false,
+                CatalogName::new("TS").unwrap(),
+            )
+            .unwrap(),
+        }
     }
 
     fn assert_corruption(table: &TableDef, columns: &[ColumnDef], bytes: &[u8]) {
@@ -1228,6 +1363,66 @@ mod tests {
             decode_value(ColumnType::Timestamp, &bytes).unwrap(),
             Value::Timestamp(timestamp)
         );
+    }
+
+    #[test]
+    fn v1_timestamp_rows_keep_microsecond_bytes_and_v2_rows_store_nanoseconds() {
+        let legacy = timestamp(2026, 1, 2, 3, 4, 5, 123_456_000, None);
+        let legacy_column = timestamp_column(None);
+        let legacy_bytes = encode_column_value(&legacy_column, &Value::Timestamp(legacy)).unwrap();
+        assert_eq!(&legacy_bytes[8..12], &123_456_u32.to_le_bytes());
+        assert_eq!(
+            decode_column_value(&legacy_column, &legacy_bytes).unwrap(),
+            Value::Timestamp(legacy)
+        );
+
+        let precise = timestamp(2026, 1, 2, 3, 4, 5, 123_456_789, None);
+        let precise_column = timestamp_column(Some(OracleTypeDescriptor::timestamp(9).unwrap()));
+        let precise_bytes =
+            encode_column_value(&precise_column, &Value::Timestamp(precise)).unwrap();
+        assert_eq!(&precise_bytes[8..12], &123_456_789_u32.to_le_bytes());
+        assert_eq!(
+            decode_column_value(&precise_column, &precise_bytes).unwrap(),
+            Value::Timestamp(precise)
+        );
+
+        assert_eq!(
+            encode_column_value(&legacy_column, &Value::Timestamp(precise))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
+
+        let (table, columns) = schema(&[(ColumnType::Timestamp, false)]);
+        assert_eq!(
+            RowCodec::validate(
+                &table,
+                &columns,
+                &[Value::Timestamp(precise)],
+                MAX_ROW_BYTES,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+    }
+
+    #[test]
+    fn v2_timestamp_with_time_zone_uses_nanoseconds_without_changing_width() {
+        let column = ColumnDef::new_oracle(
+            ColumnId::new(2).unwrap(),
+            TableId::new(1).unwrap(),
+            0,
+            false,
+            CatalogName::new("TZ").unwrap(),
+            OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap(),
+        )
+        .unwrap();
+        let value = Value::Timestamp(timestamp(2026, 1, 2, 3, 4, 5, 987_654_321, Some(840)));
+        let bytes = encode_column_value(&column, &value).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(&bytes[8..12], &987_654_321_u32.to_le_bytes());
+        assert_eq!(decode_column_value(&column, &bytes).unwrap(), value);
     }
 
     #[test]

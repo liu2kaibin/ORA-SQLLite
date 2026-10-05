@@ -1746,7 +1746,7 @@ mod tests {
         let decoded =
             IndexKeyCodec::decode(&fixture.storage.schema.columns, &entry.physical).unwrap();
         assert_eq!(
-            decoded.values(),
+            decoded.values().expect("V1 components"),
             &[Value::Int64(7), Value::Text("A".into())]
         );
         assert_eq!(

@@ -61,12 +61,21 @@ pub(super) fn compile_check(
                 value: value.clone(),
                 result,
             },
-            BoundExprKind::NewTableColumn { ordinal } => CheckTemplateInstruction::Column {
+            BoundExprKind::NewTableColumn { ordinal, .. } => CheckTemplateInstruction::Column {
                 ordinal: *ordinal,
                 result,
             },
             BoundExprKind::Unary { op, .. } => CheckTemplateInstruction::Unary {
                 op: check_unary(*op),
+                result,
+            },
+            BoundExprKind::Binary {
+                op,
+                oracle_contract: Some(contract),
+                ..
+            } => CheckTemplateInstruction::OracleCompare {
+                op: check_binary(*op)?,
+                contract: *contract,
                 result,
             },
             BoundExprKind::Binary { op, .. } => CheckTemplateInstruction::Binary {
@@ -145,6 +154,18 @@ fn check_binary(op: BoundBinaryOp) -> Result<CheckBinaryOp> {
 }
 
 fn check_type(sql_type: SqlType, kind: &BoundExprKind) -> Result<CheckType> {
+    if let BoundExprKind::Literal(Value::Timestamp(timestamp)) = kind
+        && timestamp.offset_minutes().is_some()
+    {
+        return Ok(CheckType::TimestampWithTimeZone);
+    }
+    if let BoundExprKind::NewTableColumn {
+        oracle_type: Some(crate::oracle_type::OracleTypeDescriptor::TimestampWithTimeZone { .. }),
+        ..
+    } = kind
+    {
+        return Ok(CheckType::TimestampWithTimeZone);
+    }
     match sql_type {
         SqlType::Int64 => Ok(CheckType::Int64),
         SqlType::Decimal => Ok(CheckType::Decimal),

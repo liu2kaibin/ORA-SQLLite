@@ -406,6 +406,7 @@ fn validate_having_grouping(expression: &BoundExpr, group_index: &GroupIndex<'_>
                     | crate::sql::bound::BoundBinaryOp::And
                     | crate::sql::bound::BoundBinaryOp::Or,
                 right,
+                ..
             } => {
                 work.push(right);
                 work.push(left);
@@ -529,9 +530,13 @@ fn structural_key(root: &BoundExpr) -> u64 {
                 hasher.write_u64(column_id.get());
                 hasher.write_u64(u64::from(*ordinal));
             }
-            BoundExprKind::NewTableColumn { ordinal } => {
+            BoundExprKind::NewTableColumn {
+                ordinal,
+                oracle_type,
+            } => {
                 hasher.write_byte(10);
                 hasher.write_u64(u64::from(*ordinal));
+                hash_oracle_descriptor(&mut hasher, *oracle_type);
             }
             BoundExprKind::Parameter(identifier) => {
                 hasher.write_byte(2);
@@ -551,9 +556,15 @@ fn structural_key(root: &BoundExpr) -> u64 {
                 hasher.write_byte(unary_tag(*op));
                 work.push(expr);
             }
-            BoundExprKind::Binary { left, op, right } => {
+            BoundExprKind::Binary {
+                left,
+                op,
+                right,
+                oracle_contract,
+            } => {
                 hasher.write_byte(4);
                 hasher.write_byte(binary_tag(*op));
+                hash_oracle_contract(&mut hasher, *oracle_contract);
                 work.push(right);
                 work.push(left);
             }
@@ -679,7 +690,7 @@ fn hash_value(hasher: &mut StructuralHasher, value: &Value) {
         Value::Timestamp(value) => {
             hasher.write_byte(7);
             hash_date(hasher, value.date());
-            hasher.write_bytes(&value.micros().to_le_bytes());
+            hasher.write_bytes(&value.nanoseconds().to_le_bytes());
             match value.offset_minutes() {
                 Some(offset) => {
                     hasher.write_bool(true);
@@ -702,6 +713,61 @@ fn hash_date(hasher: &mut StructuralHasher, value: crate::OracleDate) {
     hasher.write_byte(value.hour());
     hasher.write_byte(value.minute());
     hasher.write_byte(value.second());
+}
+
+fn hash_oracle_contract(
+    hasher: &mut StructuralHasher,
+    contract: Option<crate::oracle_type::OracleComparisonContract>,
+) {
+    match contract {
+        Some(contract) => {
+            hasher.write_bool(true);
+            hash_oracle_descriptor(hasher, Some(contract.left()));
+            hash_oracle_descriptor(hasher, Some(contract.right()));
+        }
+        None => hasher.write_bool(false),
+    }
+}
+
+fn hash_oracle_descriptor(
+    hasher: &mut StructuralHasher,
+    descriptor: Option<crate::oracle_type::OracleTypeDescriptor>,
+) {
+    use crate::oracle_type::OracleTypeDescriptor;
+
+    match descriptor {
+        None => hasher.write_byte(0),
+        Some(OracleTypeDescriptor::Number { precision, scale }) => {
+            hasher.write_byte(1);
+            hasher.write_byte(precision);
+            hasher.write_byte(scale as u8);
+        }
+        Some(OracleTypeDescriptor::Varchar2 { length_chars }) => {
+            hasher.write_byte(2);
+            hasher.write_u64(u64::from(length_chars));
+        }
+        Some(OracleTypeDescriptor::Char { length_chars }) => {
+            hasher.write_byte(3);
+            hasher.write_u64(u64::from(length_chars));
+        }
+        Some(OracleTypeDescriptor::Raw { length_bytes }) => {
+            hasher.write_byte(4);
+            hasher.write_u64(u64::from(length_bytes));
+        }
+        Some(OracleTypeDescriptor::Date) => hasher.write_byte(5),
+        Some(OracleTypeDescriptor::Timestamp {
+            fractional_precision,
+        }) => {
+            hasher.write_byte(6);
+            hasher.write_byte(fractional_precision);
+        }
+        Some(OracleTypeDescriptor::TimestampWithTimeZone {
+            fractional_precision,
+        }) => {
+            hasher.write_byte(7);
+            hasher.write_byte(fractional_precision);
+        }
+    }
 }
 
 const fn sql_type_tag(sql_type: SqlType) -> u8 {
@@ -783,11 +849,13 @@ fn structurally_equal(left: &BoundExpr, right: &BoundExpr) -> bool {
             (
                 BoundExprKind::NewTableColumn {
                     ordinal: left_ordinal,
+                    oracle_type: left_oracle_type,
                 },
                 BoundExprKind::NewTableColumn {
                     ordinal: right_ordinal,
+                    oracle_type: right_oracle_type,
                 },
-            ) if left_ordinal == right_ordinal => {}
+            ) if left_ordinal == right_ordinal && left_oracle_type == right_oracle_type => {}
             (BoundExprKind::Parameter(left), BoundExprKind::Parameter(right)) if left == right => {}
             (
                 BoundExprKind::Unary {
@@ -804,13 +872,15 @@ fn structurally_equal(left: &BoundExpr, right: &BoundExpr) -> bool {
                     left: left_left,
                     op: left_op,
                     right: left_right,
+                    oracle_contract: left_contract,
                 },
                 BoundExprKind::Binary {
                     left: right_left,
                     op: right_op,
                     right: right_right,
+                    oracle_contract: right_contract,
                 },
-            ) if left_op == right_op => {
+            ) if left_op == right_op && left_contract == right_contract => {
                 work.push((left_right, right_right));
                 work.push((left_left, right_left));
             }
@@ -992,7 +1062,7 @@ fn bind_error(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::GroupIndex;
+    use super::{GroupIndex, structural_key};
     use crate::{
         Database, ErrorCode, Options, Parameters, Value,
         api::{ColumnMetadata, DataType},
@@ -1462,6 +1532,29 @@ mod tests {
         assert_eq!(index.buckets.len(), 1);
         assert!(index.contains(&integer(1)));
         assert!(!index.contains(&integer(2)));
+    }
+
+    #[test]
+    fn timestamp_structural_keys_include_submicrosecond_nanoseconds() {
+        // Production break caught: hashing only micros puts distinct p=7..9
+        // GROUP BY expressions into the same structural bucket.
+        let span = SqlSpan::new(0, 1).unwrap();
+        let date = crate::OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap();
+        let literal = |nanos| {
+            BoundExpr::new(
+                BoundExprKind::Literal(Value::Timestamp(
+                    crate::OracleTimestamp::from_nanoseconds(date, nanos, None).unwrap(),
+                )),
+                SqlType::Timestamp,
+                false,
+                span,
+            )
+        };
+
+        assert_ne!(
+            structural_key(&literal(123_456_001)),
+            structural_key(&literal(123_456_999))
+        );
     }
 
     #[test]

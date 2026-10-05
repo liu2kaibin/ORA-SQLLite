@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 use super::{
     PageRef,
     btree::{BTree, TreeKind},
-    features::{CATALOG_V1, INDEX_CONSTRAINT_V1, validate_feature_bits},
+    features::{CATALOG_V1, INDEX_CONSTRAINT_V1, ORACLE_TYPES_V1, validate_feature_bits},
     index::key::IndexKeyCodec,
     pager::{PageSource, ReadSnapshot, WriteBatch},
     validate::{
@@ -210,11 +210,11 @@ impl CatalogImage {
                     )?;
                 }
                 DecodedCatalogKey::ColumnDefinition(id) => {
-                    insert_unique(
-                        &mut image.columns,
-                        id,
-                        record::decode_column_definition(id, &value)?,
-                    )?;
+                    let column = record::decode_column_definition(id, &value)?;
+                    if column.oracle_type().is_some() {
+                        require_oracle_types_feature(feature_bits)?;
+                    }
+                    insert_unique(&mut image.columns, id, column)?;
                 }
                 DecodedCatalogKey::IndexName(name) => {
                     require_index_feature(feature_bits)?;
@@ -263,11 +263,13 @@ impl CatalogImage {
                 }
                 DecodedCatalogKey::ConstraintDefinition(id) => {
                     require_index_feature(feature_bits)?;
-                    insert_unique(
-                        &mut image.constraints,
-                        id,
-                        record::decode_constraint_definition(id, &value)?,
-                    )?;
+                    let constraint = record::decode_constraint_definition(id, &value)?;
+                    if constraint.kind() == ConstraintKind::Check
+                        && constraint.check_program().first() == Some(&2)
+                    {
+                        require_check_program_feature(feature_bits)?;
+                    }
+                    insert_unique(&mut image.constraints, id, constraint)?;
                 }
                 DecodedCatalogKey::TableConstraint {
                     table_id,
@@ -1453,6 +1455,13 @@ impl CatalogWriter {
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
             read_table_definition(tree, batch, column.table_id())?;
+            // The candidate may be decoded by `finish` before the relation
+            // layer reaches its final feature-bit aggregation. Enable the
+            // durable capability before inserting the V2 record so every
+            // candidate image already satisfies the reader contract.
+            if column.oracle_type().is_some() {
+                batch.enable_feature_bits(CATALOG_V1 | ORACLE_TYPES_V1)?;
+            }
             // ColumnDef's checked constructor enforces ordinal < MAX_COLUMNS.
             require_available_object(tree, batch, column.id().into())?;
             let name_key = key::column_name_key(column.table_id(), column.name())?;
@@ -2477,6 +2486,22 @@ fn require_index_feature(feature_bits: u64) -> Result<()> {
     Ok(())
 }
 
+fn require_oracle_types_feature(feature_bits: u64) -> Result<()> {
+    if feature_bits & ORACLE_TYPES_V1 == 0 {
+        return Err(corruption(
+            "Oracle V2 column definition requires ORACLE_TYPES_V1",
+        ));
+    }
+    Ok(())
+}
+
+fn require_check_program_feature(feature_bits: u64) -> Result<()> {
+    if feature_bits & ORACLE_TYPES_V1 == 0 {
+        return Err(corruption("CheckProgram V2 requires ORACLE_TYPES_V1"));
+    }
+    Ok(())
+}
+
 fn unsupported_legacy() -> DbError {
     DbError::new(
         ErrorCode::Unsupported,
@@ -2747,13 +2772,17 @@ mod tests {
             PageId, PageRef,
             btree::{BTree, TreeKind},
             constraint::program::{CheckProgramTemplate, CheckTemplateInstruction, CheckType},
-            features::CATALOG_V1,
+            features::{CATALOG_V1, ORACLE_TYPES_V1},
             file::OpenMode,
+            index::{IndexSpec, create_index},
             page::PageType,
             pager::{Pager, PagerConfig, WriteBatch},
             relation::{ColumnSpec, TableSpec, TableWrite, create_relation, drop_relation},
             row::{RowCodec, encode_rowid_key},
-            test_support::{TempDatabase, test_pager},
+            test_support::{
+                RecordingFaults, TempDatabase, phase5_abort_pager_initialization,
+                phase5_pager_initialization_trace, test_pager,
+            },
         },
     };
 
@@ -2998,6 +3027,356 @@ mod tests {
         writer.finish(&mut batch).unwrap();
         batch.commit().unwrap();
         (temp, pager, table.id())
+    }
+
+    fn create_first_oracle_table(pager: &Pager) -> Result<()> {
+        let mut batch = pager.begin_write()?;
+        let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+        let table_id = writer.allocate_object_id(&mut batch)?;
+        let root = BTree::create(&mut batch, TreeKind::Table)?.root();
+        let table = new_table(table_id.get(), root, 1, "T");
+        writer.insert_table_definition(&mut batch, &table)?;
+        let column_id = writer.allocate_object_id(&mut batch)?;
+        let column = ColumnDef::new_oracle(
+            ColumnId::new(column_id.get())?,
+            table.id(),
+            0,
+            true,
+            CatalogName::new("N")?,
+            crate::oracle_type::OracleTypeDescriptor::number(5, 2)?,
+        )?;
+        writer.insert_column_definition(&mut batch, &column)?;
+        batch.enable_feature_bits(CATALOG_V1 | ORACLE_TYPES_V1)?;
+        writer.finish(&mut batch)?;
+        batch.commit()
+    }
+
+    fn assert_first_oracle_create_is_atomic(pager: &Pager) {
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+        let post = snapshot.feature_bits() & ORACLE_TYPES_V1 != 0;
+        let table = catalog.find_table_by_name(&CatalogName::new("T").unwrap());
+        assert!(
+            (!post && table.is_none())
+                || (post
+                    && table.is_some()
+                    && catalog
+                        .columns_for_table(table.unwrap().id())
+                        .any(|column| column.name().as_str() == "N"
+                            && column.oracle_type().is_some())),
+            "recovered state must be the old catalog or a complete V2 table graph"
+        );
+    }
+
+    fn add_oracle_row_and_unique_index(pager: &Pager) -> Result<()> {
+        let mut batch = pager.begin_write()?;
+        let catalog = batch.catalog_reader()?;
+        let table = catalog
+            .find_table_by_name(&CatalogName::new("T")?)
+            .ok_or_else(|| corruption("V2 table is missing"))?
+            .clone();
+        let columns = catalog
+            .columns_for_table(table.id())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut writer = TableWrite::open(&mut batch, table.id())?;
+        writer.insert(
+            &mut batch,
+            &[crate::Value::Decimal(crate::Decimal::new(false, 2, 125)?)],
+        )?;
+        writer.finish(&mut batch)?;
+        create_index(
+            &mut batch,
+            &IndexSpec::new(CatalogName::new("UX_T_N")?, table.id(), columns, true)?,
+            64 * 1024 * 1024,
+        )?;
+        batch.commit()
+    }
+
+    fn assert_oracle_row_and_index_mutation_is_atomic(pager: &Pager) {
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+        let table = catalog
+            .find_table_by_name(&CatalogName::new("T").unwrap())
+            .unwrap();
+        let row = BTree::from_root(TreeKind::Table, table.root())
+            .get(&mut snapshot, &encode_rowid_key(RowId::new(1).unwrap()))
+            .unwrap();
+        let index = catalog.find_index_by_name(&CatalogName::new("UX_T_N").unwrap());
+        match (row, index) {
+            (None, None) => {}
+            (Some(_), Some(index)) => {
+                let columns = catalog
+                    .columns_for_index(index.id())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let value = crate::Value::Decimal(crate::Decimal::new(false, 2, 125).unwrap());
+                let key = IndexKeyCodec::encode(&columns, &[value], RowId::new(1).unwrap())
+                    .unwrap()
+                    .into_physical();
+                assert_eq!(
+                    BTree::from_root(TreeKind::Index, index.root())
+                        .get(&mut snapshot, &key)
+                        .unwrap(),
+                    Some(Vec::new()),
+                    "the recovered unique index must contain the physical Oracle NUMBER key"
+                );
+            }
+            _ => panic!("a V2 row and its unique index must recover together"),
+        }
+    }
+
+    #[test]
+    fn first_oracle_create_fault_matrix_recovers_only_old_or_complete_v2_catalogs() {
+        use crate::fault::FaultPoint;
+        use std::sync::Arc;
+
+        let (baseline_temp, baseline) = test_pager(4096).unwrap();
+        let baseline_faults = Arc::new(RecordingFaults::never());
+        let baseline = baseline.with_faults(baseline_faults.clone());
+        create_first_oracle_table(&baseline).unwrap();
+        let trace = baseline_faults.observed();
+        assert!(
+            trace.contains(&FaultPoint::BeforeWalSync)
+                && trace.contains(&FaultPoint::AfterWalSync)
+                && trace.contains(&FaultPoint::BeforeWalPublish)
+                && trace.contains(&FaultPoint::AfterWalPublish),
+            "first V2 CREATE must cross WAL sync and in-memory publication boundaries"
+        );
+        drop(baseline);
+        drop(baseline_temp);
+
+        for (index, point) in trace.iter().copied().enumerate() {
+            let (temp, pager) = test_pager(4096).unwrap();
+            let occurrence = trace[..=index]
+                .iter()
+                .filter(|&&seen| seen == point)
+                .count();
+            let pager = pager.with_faults(Arc::new(RecordingFaults::at(point, occurrence)));
+            let result = create_first_oracle_table(&pager);
+            if matches!(
+                point,
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish
+            ) {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    ErrorCode::Io,
+                    "{point:?}/{occurrence}"
+                );
+            }
+            drop(pager);
+            let reopened = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            assert_first_oracle_create_is_atomic(&reopened);
+        }
+    }
+
+    #[test]
+    fn first_v2_create_directory_boundaries_recover_an_empty_catalog_after_child_abort() {
+        use crate::fault::FaultPoint;
+
+        let trace_temp = TempDatabase::new("phase4c1-directory-case");
+        let trace = phase5_pager_initialization_trace(trace_temp.path());
+        assert!(
+            [
+                FaultPoint::BeforeMainDirectorySync,
+                FaultPoint::AfterMainDirectorySync,
+                FaultPoint::BeforeWalDirectorySync,
+                FaultPoint::AfterWalDirectorySync,
+            ]
+            .into_iter()
+            .all(|point| trace.contains(&point)),
+            "pager initialization must expose all directory durability boundaries"
+        );
+
+        for point in [
+            FaultPoint::BeforeMainDirectorySync,
+            FaultPoint::AfterMainDirectorySync,
+            FaultPoint::BeforeWalDirectorySync,
+            FaultPoint::AfterWalDirectorySync,
+        ] {
+            let occurrence = trace.iter().filter(|&&seen| seen == point).count();
+            assert_eq!(occurrence, 1, "unexpected {point:?} occurrence count");
+            let temp = TempDatabase::new("phase4c1-directory-case");
+            let path = temp.path().to_owned();
+            let mut command = crate::storage::test_support::phase_4c1_exact_crash_child_command(
+                "storage::catalog::tests::phase5_directory_initialization_crash_child",
+            );
+            command
+                .env("ORA_SQLLITE_PHASE5_DIRECTORY_PATH", &path)
+                .env("ORA_SQLLITE_PHASE5_DIRECTORY_POINT", format!("{point:?}"))
+                .env(
+                    "ORA_SQLLITE_PHASE5_DIRECTORY_TRACE",
+                    trace
+                        .iter()
+                        .map(|point| format!("{point:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            let output = command
+                .output()
+                .expect("reap Phase 5 directory crash child");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let marker = format!("PHASE5_ABORT initialize {point:?} 1");
+            assert!(
+                stderr.lines().any(|line| line == marker),
+                "wrong Phase 5 directory crash marker: {stderr}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(6), "child must abort");
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                output.status.code(),
+                Some(-1_073_740_791),
+                "child must abort with Windows fast-fail"
+            );
+
+            let pager = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+            assert_eq!(snapshot.feature_bits() & ORACLE_TYPES_V1, 0);
+            assert!(
+                catalog
+                    .find_table_by_name(&CatalogName::new("T").unwrap())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "only launched by first_v2_create_directory_boundaries_recover_an_empty_catalog_after_child_abort"]
+    fn phase5_directory_initialization_crash_child() {
+        use crate::fault::FaultPoint;
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("ORA_SQLLITE_PHASE5_DIRECTORY_PATH")
+                .expect("Phase 5 directory crash path is required"),
+        );
+        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(
+            std::fs::canonicalize(path.parent().expect("directory crash path has no parent"))
+                .unwrap(),
+            canonical_temp
+        );
+        assert!(
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(
+                    |name| name.contains("-phase4c1-directory-case-") && name.ends_with(".db")
+                )
+        );
+        assert!(!path.exists() && !crate::storage::wal::wal_path(&path).exists());
+        let parse = |name: &str| match name {
+            "BeforeMainExtend" => FaultPoint::BeforeMainExtend,
+            "AfterMainExtend" => FaultPoint::AfterMainExtend,
+            "BeforeMainPageWrite" => FaultPoint::BeforeMainPageWrite,
+            "AfterMainPageWrite" => FaultPoint::AfterMainPageWrite,
+            "BeforeMainSync" => FaultPoint::BeforeMainSync,
+            "AfterMainSync" => FaultPoint::AfterMainSync,
+            "BeforeMainDirectorySync" => FaultPoint::BeforeMainDirectorySync,
+            "AfterMainDirectorySync" => FaultPoint::AfterMainDirectorySync,
+            "BeforeWalDirectorySync" => FaultPoint::BeforeWalDirectorySync,
+            "AfterWalDirectorySync" => FaultPoint::AfterWalDirectorySync,
+            "BeforeSuperblockWrite" => FaultPoint::BeforeSuperblockWrite,
+            "AfterSuperblockWrite" => FaultPoint::AfterSuperblockWrite,
+            "BeforeWalRecordWrite" => FaultPoint::BeforeWalRecordWrite,
+            "AfterWalRecordWrite" => FaultPoint::AfterWalRecordWrite,
+            "AfterWalRecordHeaderPrefixWrite" => FaultPoint::AfterWalRecordHeaderPrefixWrite,
+            "AfterWalRecordPayloadPrefixWrite" => FaultPoint::AfterWalRecordPayloadPrefixWrite,
+            "BeforeWalPublish" => FaultPoint::BeforeWalPublish,
+            "AfterWalPublish" => FaultPoint::AfterWalPublish,
+            "BeforeWalHeaderWrite" => FaultPoint::BeforeWalHeaderWrite,
+            "AfterWalHeaderWrite" => FaultPoint::AfterWalHeaderWrite,
+            "BeforeWalSync" => FaultPoint::BeforeWalSync,
+            "AfterWalSync" => FaultPoint::AfterWalSync,
+            "BeforeWalTruncate" => FaultPoint::BeforeWalTruncate,
+            "AfterWalTruncate" => FaultPoint::AfterWalTruncate,
+            _ => panic!("invalid Phase 5 directory crash point"),
+        };
+        let point = parse(
+            &std::env::var("ORA_SQLLITE_PHASE5_DIRECTORY_POINT")
+                .expect("Phase 5 directory crash point is required"),
+        );
+        let trace = std::env::var("ORA_SQLLITE_PHASE5_DIRECTORY_TRACE")
+            .expect("Phase 5 directory crash trace is required")
+            .split(',')
+            .map(parse)
+            .collect::<Vec<_>>();
+        assert_eq!(trace.iter().filter(|&&seen| seen == point).count(), 1);
+        phase5_abort_pager_initialization(
+            &path,
+            trace,
+            point,
+            1,
+            "PHASE5_ABORT initialize".to_owned(),
+        );
+        panic!("configured Phase 5 directory crash point was not reached");
+    }
+
+    #[test]
+    fn v2_row_and_unique_index_faults_recover_as_one_mutation() {
+        use crate::fault::FaultPoint;
+        use std::sync::Arc;
+
+        let (fixture, fixture_pager) = test_pager(4096).unwrap();
+        create_first_oracle_table(&fixture_pager).unwrap();
+        let fixture_path = fixture.path().to_owned();
+        drop(fixture_pager);
+        for point in [
+            FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalPublish,
+            FaultPoint::AfterWalPublish,
+        ] {
+            let temp = TempDatabase::new("phase5-v2-row-index-fault");
+            std::fs::copy(&fixture_path, temp.path()).unwrap();
+            std::fs::copy(
+                crate::storage::wal::wal_path(&fixture_path),
+                crate::storage::wal::wal_path(temp.path()),
+            )
+            .unwrap();
+            let pager = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap()
+            .with_faults(Arc::new(RecordingFaults::at(point, 1)));
+            let result = add_oracle_row_and_unique_index(&pager);
+            if matches!(
+                point,
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish
+            ) {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code(), ErrorCode::Io, "{point:?}");
+            }
+            drop(pager);
+            let reopened = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            assert_oracle_row_and_index_mutation_is_atomic(&reopened);
+        }
     }
 
     #[test]
@@ -6723,7 +7102,7 @@ mod tests {
                     record_value_mut(
                         rows,
                         &constraint_definition_key(ConstraintId::new(50).unwrap()),
-                    )[64] = 2;
+                    )[64] = 3;
                 }),
             ),
             (
@@ -6837,6 +7216,26 @@ mod tests {
                 assert_eq!(error.code(), expected, "recovery: {label}");
             }
         }
+    }
+
+    #[test]
+    fn phase_5_check_program_v2_requires_oracle_types_feature() {
+        // Production break caught: accepting a V2 program without its durable
+        // capability bit lets an older reader reach V2 Oracle opcodes.
+        let candidate = raw_check_constraint_candidate_after_base_with_features(
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            |rows, _| {
+                record_value_mut(
+                    rows,
+                    &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                )[64] = 2;
+            },
+        );
+        assert_committed_constraint_candidate_rejected(
+            "V2 check program without ORACLE_TYPES_V1",
+            ErrorCode::Corruption,
+            candidate,
+        );
     }
 
     #[test]
@@ -7026,6 +7425,16 @@ mod tests {
     fn raw_check_constraint_candidate_after_base(
         mutate: impl FnOnce(&mut Records, PageRef),
     ) -> (TempDatabase, Pager) {
+        raw_check_constraint_candidate_after_base_with_features(
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            mutate,
+        )
+    }
+
+    fn raw_check_constraint_candidate_after_base_with_features(
+        feature_bits: u64,
+        mutate: impl FnOnce(&mut Records, PageRef),
+    ) -> (TempDatabase, Pager) {
         let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let base_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
@@ -7038,11 +7447,7 @@ mod tests {
         let mut rows = local_check_constraint_records(table_root);
         mutate(&mut rows, table_root);
         let catalog = raw_tree(&mut batch, rows);
-        publish_with_features(
-            &mut batch,
-            &catalog,
-            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
-        );
+        publish_with_features(&mut batch, &catalog, feature_bits);
         batch.commit().unwrap();
         (temp, pager)
     }

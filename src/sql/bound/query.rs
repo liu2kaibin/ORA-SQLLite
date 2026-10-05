@@ -2,6 +2,7 @@ use super::{BoundExpr, SchemaDependency};
 use crate::{
     DbError, ErrorCode, Result,
     api::ColumnMetadata,
+    oracle_type::OracleTypeDescriptor,
     sql::ast::{JoinKind, NullPlacement, OrderDirection},
     storage::catalog::types::{ColumnDef, ColumnId, ColumnType, IndexId, SchemaVersion, TableId},
 };
@@ -15,6 +16,7 @@ pub(crate) struct BoundIndexColumn {
     column_id: ColumnId,
     ordinal: u16,
     column_type: ColumnType,
+    oracle_type: Option<OracleTypeDescriptor>,
 }
 
 impl BoundIndexColumn {
@@ -23,11 +25,17 @@ impl BoundIndexColumn {
             column_id,
             ordinal,
             column_type,
+            oracle_type: None,
         }
     }
 
     pub(crate) fn from_column(column: &ColumnDef) -> Self {
-        Self::new(column.id(), column.ordinal(), column.column_type())
+        Self {
+            column_id: column.id(),
+            ordinal: column.ordinal(),
+            column_type: column.column_type(),
+            oracle_type: column.oracle_type(),
+        }
     }
 
     pub(crate) const fn column_id(&self) -> ColumnId {
@@ -40,6 +48,9 @@ impl BoundIndexColumn {
 
     pub(crate) const fn column_type(&self) -> ColumnType {
         self.column_type
+    }
+    pub(crate) const fn oracle_type(&self) -> Option<OracleTypeDescriptor> {
+        self.oracle_type
     }
 }
 

@@ -3,16 +3,18 @@ use std::collections::HashSet;
 use crate::{
     DbError, ErrorCode, Result,
     api::ColumnMetadata,
+    error::SqlLocation,
+    oracle_type::OracleTypeDescriptor,
     sql::{
         Identifier, SqlSpan, SqlType,
         ast::{
             AstStatement, Constraint, CreateIndex, CreateTable, Delete, ForeignKey, Insert,
-            TypeDeclaration, Update,
+            TypeDeclaration, TypeModifier, Update,
         },
         bound::{
             BoundAssignment, BoundColumn, BoundColumnDefinition, BoundConstraint, BoundExpr,
-            BoundExprKind, BoundStatement, BoundStatementKind, BoundTable, CreatedNameDependency,
-            SchemaDependency,
+            BoundExprKind, BoundStatement, BoundStatementKind, BoundTable, BoundTypeDeclaration,
+            CreatedNameDependency, SchemaDependency,
         },
     },
     storage::catalog::{
@@ -25,8 +27,8 @@ use crate::{
 };
 
 use super::{
-    BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_assignment_expr,
-    bind_expr, bind_query,
+    BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn,
+    bind_assignment_expr_for_column, bind_expr, bind_query,
 };
 
 /// Binds one parsed statement to an immutable catalog image.
@@ -155,7 +157,13 @@ fn bind_insert(
     let value_scope = NoColumnScope;
     let mut values = Vec::with_capacity(insert.values.len());
     for (value, target) in insert.values.iter().zip(&targets) {
-        let value = bind_assignment_expr(value, &value_scope, target.sql_type, parameters)?;
+        let value = bind_assignment_expr_for_column(
+            value,
+            &value_scope,
+            target.sql_type,
+            oracle_text_source_allowed(target.oracle_type),
+            parameters,
+        )?;
         require_scalar(&value, "INSERT VALUES")?;
         values.push(value);
     }
@@ -187,7 +195,13 @@ fn bind_update(
             return Err(bind_error("UPDATE target column is repeated"));
         }
         let target = bound_column(&resolved, assignment.column.span());
-        let value = bind_assignment_expr(&assignment.value, &scope, target.sql_type, parameters)?;
+        let value = bind_assignment_expr_for_column(
+            &assignment.value,
+            &scope,
+            target.sql_type,
+            oracle_text_source_allowed(target.oracle_type),
+            parameters,
+        )?;
         require_scalar(&value, "UPDATE assignment")?;
         assignments.push(BoundAssignment {
             target,
@@ -341,10 +355,12 @@ fn bind_column_definitions(create: &CreateTable) -> Result<Vec<BoundColumnDefini
         if !names.insert(name.as_str().to_owned()) {
             return Err(bind_error("CREATE TABLE contains a duplicate column name"));
         }
+        let declaration = bind_type_declaration(&column.data_type)?;
         columns.push(BoundColumnDefinition {
             name,
             ordinal,
-            column_type: bind_column_type(&column.data_type)?,
+            column_type: declaration.column_type,
+            oracle_type: declaration.oracle_type,
             nullable: true,
             span: column.span,
         });
@@ -352,33 +368,171 @@ fn bind_column_definitions(create: &CreateTable) -> Result<Vec<BoundColumnDefini
     Ok(columns)
 }
 
-fn bind_column_type(declaration: &TypeDeclaration) -> Result<ColumnType> {
+fn bind_type_declaration(declaration: &TypeDeclaration) -> Result<BoundTypeDeclaration> {
     if declaration.name.is_quoted() {
         return Err(DbError::new(
             ErrorCode::Unsupported,
             "quoted SQL type declarations are not supported by catalog V1",
         ));
     }
-    if !declaration.arguments.is_empty() || !declaration.modifiers.is_empty() {
-        return Err(DbError::new(
-            ErrorCode::Unsupported,
-            "catalog V1 cannot preserve SQL type arguments or modifiers",
+    let oracle_type = match declaration.name.as_str() {
+        "NUMBER" => {
+            require_no_modifiers(declaration)?;
+            if !(1..=2).contains(&declaration.arguments.len()) {
+                return Err(invalid_type_declaration(
+                    declaration,
+                    "NUMBER requires precision and optional scale",
+                ));
+            }
+            let precision = parse_type_argument::<u8>(declaration, 0)?;
+            let scale = if declaration.arguments.len() == 2 {
+                parse_type_argument::<i8>(declaration, 1)?
+            } else {
+                0
+            };
+            Some(
+                OracleTypeDescriptor::number(precision, scale)
+                    .map_err(|error| locate_type_error(error, declaration.span))?,
+            )
+        }
+        "VARCHAR2" => {
+            require_exact_shape(declaration, 1)?;
+            Some(
+                OracleTypeDescriptor::varchar2(parse_type_argument(declaration, 0)?)
+                    .map_err(|error| locate_type_error(error, declaration.span))?,
+            )
+        }
+        "CHAR" => {
+            require_exact_shape(declaration, 1)?;
+            Some(
+                OracleTypeDescriptor::char_type(parse_type_argument(declaration, 0)?)
+                    .map_err(|error| locate_type_error(error, declaration.span))?,
+            )
+        }
+        "RAW" => {
+            require_exact_shape(declaration, 1)?;
+            Some(
+                OracleTypeDescriptor::raw(parse_type_argument(declaration, 0)?)
+                    .map_err(|error| locate_type_error(error, declaration.span))?,
+            )
+        }
+        "DATE" => {
+            require_exact_shape(declaration, 0)?;
+            Some(OracleTypeDescriptor::date())
+        }
+        "TIMESTAMP" => {
+            if declaration.arguments.len() > 1 {
+                return Err(invalid_type_declaration(
+                    declaration,
+                    "TIMESTAMP accepts at most one fractional precision",
+                ));
+            }
+            let precision = if declaration.arguments.is_empty() {
+                6
+            } else {
+                parse_type_argument::<u8>(declaration, 0)?
+            };
+            match declaration.modifiers.as_slice() {
+                [] => Some(
+                    OracleTypeDescriptor::timestamp(precision)
+                        .map_err(|error| locate_type_error(error, declaration.span))?,
+                ),
+                [TypeModifier::WithTimeZone(_)] => Some(
+                    OracleTypeDescriptor::timestamp_with_time_zone(precision)
+                        .map_err(|error| locate_type_error(error, declaration.span))?,
+                ),
+                [TypeModifier::WithLocalTimeZone(_)] => {
+                    return Err(unsupported_type_declaration(
+                        declaration,
+                        "TIMESTAMP WITH LOCAL TIME ZONE is not supported",
+                    ));
+                }
+                _ => {
+                    return Err(invalid_type_declaration(
+                        declaration,
+                        "invalid TIMESTAMP time-zone modifier",
+                    ));
+                }
+            }
+        }
+        "INT64" | "DECIMAL" | "FLOAT64" | "TEXT" | "BLOB" | "BOOL" => {
+            require_exact_shape(declaration, 0)?;
+            None
+        }
+        _ => Err(unsupported_type_declaration(
+            declaration,
+            "SQL type is not supported",
+        ))?,
+    };
+    let column_type = match oracle_type {
+        Some(descriptor) => descriptor.physical_type(),
+        None => match declaration.name.as_str() {
+            "INT64" => ColumnType::Int64,
+            "DECIMAL" => ColumnType::Decimal,
+            "FLOAT64" => ColumnType::Float64,
+            "TEXT" => ColumnType::Text,
+            "BLOB" => ColumnType::Blob,
+            "BOOL" => ColumnType::Bool,
+            _ => unreachable!("non-Oracle declaration was matched above"),
+        },
+    };
+    Ok(BoundTypeDeclaration {
+        column_type,
+        oracle_type,
+    })
+}
+
+fn require_exact_shape(declaration: &TypeDeclaration, arguments: usize) -> Result<()> {
+    if declaration.arguments.len() != arguments || !declaration.modifiers.is_empty() {
+        return Err(invalid_type_declaration(
+            declaration,
+            "invalid SQL type arguments or modifiers",
         ));
     }
-    match declaration.name.as_str() {
-        "INT64" => Ok(ColumnType::Int64),
-        "DECIMAL" => Ok(ColumnType::Decimal),
-        "FLOAT64" => Ok(ColumnType::Float64),
-        "TEXT" => Ok(ColumnType::Text),
-        "BLOB" => Ok(ColumnType::Blob),
-        "DATE" => Ok(ColumnType::Date),
-        "TIMESTAMP" => Ok(ColumnType::Timestamp),
-        "BOOL" => Ok(ColumnType::Bool),
-        _ => Err(DbError::new(
-            ErrorCode::Unsupported,
-            "SQL type is not representable by catalog V1",
-        )),
+    Ok(())
+}
+
+fn require_no_modifiers(declaration: &TypeDeclaration) -> Result<()> {
+    if !declaration.modifiers.is_empty() {
+        return Err(invalid_type_declaration(
+            declaration,
+            "invalid SQL type modifier",
+        ));
     }
+    Ok(())
+}
+
+fn parse_type_argument<T>(declaration: &TypeDeclaration, index: usize) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    declaration
+        .arguments
+        .get(index)
+        .and_then(|argument| argument.text.parse().ok())
+        .ok_or_else(|| {
+            invalid_type_declaration(declaration, "SQL type argument must be an integer")
+        })
+}
+
+fn invalid_type_declaration(declaration: &TypeDeclaration, message: &'static str) -> DbError {
+    locate_type_error(
+        DbError::new(ErrorCode::Type, message).with_oracle_code(902),
+        declaration.span,
+    )
+}
+
+fn unsupported_type_declaration(declaration: &TypeDeclaration, message: &'static str) -> DbError {
+    locate_type_error(
+        DbError::new(ErrorCode::Unsupported, message).with_oracle_code(902),
+        declaration.span,
+    )
+}
+
+fn locate_type_error(error: DbError, span: SqlSpan) -> DbError {
+    let location = SqlLocation::new(span.start(), 1, span.start().saturating_add(1))
+        .expect("SQL span offsets produce a valid fallback location");
+    error.with_sql_location(location)
 }
 
 fn create_constraints(create: &CreateTable) -> Vec<&Constraint> {
@@ -423,7 +577,7 @@ fn bind_constraint(
             expression, span, ..
         } => {
             let mut expression = bind_condition(expression, scope, parameters)?;
-            mark_new_table_columns(&mut expression, scope.table_id)?;
+            mark_new_table_columns(&mut expression, scope.table_id, columns)?;
             require_scalar(&expression, "CHECK")?;
             Ok(BoundConstraint::Check {
                 name,
@@ -545,8 +699,8 @@ fn bind_foreign_key(
                 "FOREIGN KEY contains a duplicate referenced column",
             ));
         }
-        let local_type = columns[usize::from(ordinal)].column_type;
-        if !foreign_key_types_compatible(local_type, referenced_column.column_type()) {
+        let local_column = &columns[usize::from(ordinal)];
+        if !bound_foreign_key_columns_compatible(local_column, referenced_column) {
             return Err(DbError::new(
                 ErrorCode::Type,
                 "FOREIGN KEY child and parent column types are incompatible",
@@ -559,6 +713,7 @@ fn bind_foreign_key(
             column_id: referenced_column.id(),
             ordinal: referenced_column.ordinal(),
             sql_type: referenced_type,
+            oracle_type: referenced_column.oracle_type(),
             nullable: referenced_column.nullable(),
             span,
         });
@@ -587,6 +742,17 @@ fn bind_foreign_key(
 
 fn foreign_key_types_compatible(child: ColumnType, parent: ColumnType) -> bool {
     child == parent || matches!((child, parent), (ColumnType::Int64, ColumnType::Decimal))
+}
+
+fn bound_foreign_key_columns_compatible(
+    child: &BoundColumnDefinition,
+    parent: &crate::storage::catalog::types::ColumnDef,
+) -> bool {
+    match (child.oracle_type, parent.oracle_type()) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => foreign_key_types_compatible(child.column_type, parent.column_type()),
+        _ => false,
+    }
 }
 
 fn bind_create_index(
@@ -707,9 +873,22 @@ fn bound_column(column: &ResolvedColumn, span: SqlSpan) -> BoundColumn {
         column_id: column.column_id,
         ordinal: column.ordinal,
         sql_type: column.sql_type,
+        oracle_type: column.oracle_type,
         nullable: column.nullable,
         span,
     }
+}
+
+fn oracle_text_source_allowed(descriptor: Option<OracleTypeDescriptor>) -> bool {
+    matches!(
+        descriptor,
+        Some(
+            OracleTypeDescriptor::Number { .. }
+                | OracleTypeDescriptor::Date
+                | OracleTypeDescriptor::Timestamp { .. }
+                | OracleTypeDescriptor::TimestampWithTimeZone { .. }
+        )
+    )
 }
 
 fn table_dependency(table: BoundTable, database_uuid: [u8; 16]) -> SchemaDependency {
@@ -874,6 +1053,7 @@ impl NewTableScope {
                 column_id,
                 ordinal: column.ordinal,
                 sql_type: column_type_to_sql_type(column.column_type),
+                oracle_type: column.oracle_type,
                 nullable: column.nullable,
                 name: column.name.as_str().to_owned(),
             });
@@ -885,7 +1065,11 @@ impl NewTableScope {
     }
 }
 
-fn mark_new_table_columns(expression: &mut BoundExpr, table_id: TableId) -> Result<()> {
+fn mark_new_table_columns(
+    expression: &mut BoundExpr,
+    table_id: TableId,
+    columns: &[BoundColumnDefinition],
+) -> Result<()> {
     let mut work = vec![expression];
     while let Some(expression) = work.pop() {
         let local_ordinal = match &expression.kind {
@@ -903,7 +1087,14 @@ fn mark_new_table_columns(expression: &mut BoundExpr, table_id: TableId) -> Resu
             _ => None,
         };
         if let Some(ordinal) = local_ordinal {
-            expression.kind = BoundExprKind::NewTableColumn { ordinal };
+            let oracle_type = columns
+                .get(usize::from(ordinal))
+                .ok_or_else(|| bind_error("new-table CHECK column ordinal is invalid"))?
+                .oracle_type;
+            expression.kind = BoundExprKind::NewTableColumn {
+                ordinal,
+                oracle_type,
+            };
             continue;
         }
         match &mut expression.kind {
@@ -1544,7 +1735,7 @@ mod tests {
                 constraint,
                 BoundConstraint::Check {
                     expression: crate::sql::bound::BoundExpr {
-                        kind: crate::sql::bound::BoundExprKind::NewTableColumn { ordinal: 7 },
+                        kind: crate::sql::bound::BoundExprKind::NewTableColumn { ordinal: 7, .. },
                         ..
                     },
                     ..
@@ -1603,20 +1794,35 @@ mod tests {
     }
 
     #[test]
-    fn create_table_rejects_attributes_that_catalog_v1_cannot_preserve() {
-        // Production break caught: dropping declaration precision, length, or
-        // timezone attributes corrupts the schema contract before execution.
+    fn create_table_accepts_oracle_attributes_and_rejects_invalid_recognized_forms() {
+        // Production break caught: rejecting supported Oracle declarations or
+        // silently dropping invalid recognized attributes changes the schema contract.
         for sql in [
             "CREATE TABLE T_NUM (N NUMBER(10,2))",
             "CREATE TABLE T_VARCHAR (V VARCHAR2(30))",
-            "CREATE TABLE T_CORE_LENGTH (V TEXT(30))",
             "CREATE TABLE T_TIMESTAMP_ZONE (TS TIMESTAMP WITH TIME ZONE)",
         ] {
-            assert_eq!(
-                prepare_fixture(sql).unwrap_err().code(),
-                ErrorCode::Unsupported,
-                "{sql}"
-            );
+            assert!(prepare_fixture(sql).is_ok(), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE T_CORE_LENGTH (V TEXT(30))",
+            "CREATE TABLE T_BARE_NUMBER (N NUMBER)",
+            "CREATE TABLE T_BAD_NUMBER (N NUMBER(39))",
+            "CREATE TABLE T_BAD_TIMESTAMP (TS TIMESTAMP(10))",
+        ] {
+            let error = prepare_fixture(sql).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Type, "{sql}");
+            assert_eq!(error.oracle_code(), Some(902), "{sql}");
+            assert!(error.sql_location().is_some(), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE T_LOCAL_TIMESTAMP (TS TIMESTAMP WITH LOCAL TIME ZONE)",
+            "CREATE TABLE T_NCHAR (N NCHAR(10))",
+        ] {
+            let error = prepare_fixture(sql).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unsupported, "{sql}");
+            assert_eq!(error.oracle_code(), Some(902), "{sql}");
+            assert!(error.sql_location().is_some(), "{sql}");
         }
     }
 

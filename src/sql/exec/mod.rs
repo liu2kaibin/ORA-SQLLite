@@ -99,6 +99,7 @@ mod tests {
             .map(|(index, data_type)| ParameterMetadata {
                 identifier: ParameterIdentifier::Position(u16::try_from(index + 1).unwrap()),
                 data_type: *data_type,
+                allow_oracle_text_source: false,
             })
             .collect()
     }

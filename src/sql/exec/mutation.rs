@@ -1,7 +1,7 @@
 use crate::{
     DbError, ErrorCode, ExecutionResult, Parameters, Result, Statement,
+    oracle_type::normalize_for_column,
     sql::{
-        SqlType,
         bound::SourceId,
         plan::{
             CreateTablePlan, DeletePlan, InsertPlan, PlanKind, TableConstraintDefinition,
@@ -10,7 +10,7 @@ use crate::{
     },
     storage::{
         WriteBatch,
-        catalog::types::ObjectKind,
+        catalog::types::{ColumnDef, ColumnType, ObjectKind},
         constraint::ConstraintCatalog,
         index::{IndexSpec, create_index, drop_index},
         relation::{
@@ -168,7 +168,7 @@ fn execute_update(
                 return Ok(false);
             }
             let (values, assignment_bytes) =
-                evaluate_update_assignments(plan, &old, params, memory)?;
+                evaluate_update_assignments(plan, &relation, &old, params, memory)?;
             row_reserved = checked_add_bytes(row_reserved, assignment_bytes)?;
             memory.reserve(old_bytes)?;
             row_reserved = checked_add_bytes(row_reserved, old_bytes)?;
@@ -250,6 +250,7 @@ fn execute_update(
 
 fn evaluate_update_assignments(
     plan: &UpdatePlan,
+    relation: &Relation,
     old: &EvalRow,
     params: &ParameterFrame,
     memory: &mut WorkMemory,
@@ -263,10 +264,17 @@ fn evaluate_update_assignments(
     let result = (|| {
         let mut values = Vec::with_capacity(plan.assignments().len());
         for assignment in plan.assignments() {
-            let value = coerce_assignment(
-                eval(assignment.value(), old, params)?,
-                assignment.target().data_type(),
-            )?;
+            let column = relation
+                .columns()
+                .get(usize::from(assignment.target().ordinal()))
+                .ok_or_else(|| {
+                    DbError::new(
+                        ErrorCode::Internal,
+                        "UPDATE target ordinal is outside the relation schema",
+                    )
+                })?;
+            let value = normalize_column_value(column, eval(assignment.value(), old, params)?)
+                .map_err(|error| error.with_sql_location(assignment.value().location()))?;
             let payload = owned_value_payload_bytes(&value)?;
             let next = checked_add_bytes(bytes, payload)?;
             memory.reserve(payload)?;
@@ -412,15 +420,6 @@ fn checked_affected_count(affected: u64) -> Result<u64> {
     affected.checked_add(1).ok_or_else(resource_limit)
 }
 
-fn coerce_assignment(value: crate::Value, target: SqlType) -> Result<crate::Value> {
-    if target == SqlType::Decimal {
-        if let crate::Value::Int64(integer) = value {
-            return Ok(crate::Value::Decimal(int_decimal(integer)?));
-        }
-    }
-    Ok(value)
-}
-
 fn execute_insert(
     batch: &mut WriteBatch,
     plan: &InsertPlan,
@@ -436,9 +435,9 @@ fn execute_insert(
     let table_id = plan.table().table_id();
     let relation = Relation::open_from_batch(batch, table_id)?;
     let mut values = vec![crate::Value::Null; relation.column_count()];
+    let mut value_locations = vec![None; relation.column_count()];
     let empty_row = EvalRow::default();
     for (target, expression) in plan.targets().iter().zip(plan.values()) {
-        let value = coerce_assignment(eval(expression, &empty_row, params)?, target.data_type())?;
         let slot = values
             .get_mut(usize::from(target.ordinal()))
             .ok_or_else(|| {
@@ -447,7 +446,20 @@ fn execute_insert(
                     "INSERT target ordinal is outside the table schema",
                 )
             })?;
-        *slot = value;
+        *slot = eval(expression, &empty_row, params)?;
+        value_locations[usize::from(target.ordinal())] = Some(expression.location());
+    }
+    // Normalize the whole logical row before any constraint/index storage work.
+    // This includes omitted columns, whose implicit NULL must still obey V2
+    // nullability before a writer can allocate a ROWID.
+    for (ordinal, (column, value)) in relation.columns().iter().zip(values.iter_mut()).enumerate() {
+        let normalized =
+            normalize_column_value(column, std::mem::replace(value, crate::Value::Null));
+        *value = match (normalized, value_locations[ordinal]) {
+            (Ok(value), _) => value,
+            (Err(error), Some(location)) => return Err(error.with_sql_location(location)),
+            (Err(error), None) => return Err(error),
+        };
     }
     let max_row_bytes = usize::try_from(memory.remaining()).unwrap_or(usize::MAX);
     let constraints = {
@@ -460,6 +472,16 @@ fn execute_insert(
     writer.insert(batch, &values, max_row_bytes, memory)?;
     writer.finish(batch)?;
     Ok(ExecutionResult::new(1))
+}
+
+fn normalize_column_value(column: &ColumnDef, value: crate::Value) -> Result<crate::Value> {
+    let value = normalize_for_column(column, value)?;
+    if column.oracle_type().is_none() && column.column_type() == ColumnType::Decimal {
+        if let crate::Value::Int64(integer) = value {
+            return Ok(crate::Value::Decimal(int_decimal(integer)?));
+        }
+    }
+    Ok(value)
 }
 
 fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Result<ExecutionResult> {
@@ -493,12 +515,15 @@ fn execute_create_table(batch: &mut WriteBatch, plan: &CreateTablePlan) -> Resul
     let columns = plan
         .columns()
         .iter()
-        .map(|column| {
-            ColumnSpec::new(
+        .map(|column| match column.oracle_type() {
+            Some(descriptor) => {
+                ColumnSpec::new_oracle(column.name().clone(), descriptor, column.nullable())
+            }
+            None => ColumnSpec::new(
                 column.name().clone(),
                 column.column_type(),
                 column.nullable(),
-            )
+            ),
         })
         .collect();
     let spec = TableSpec::new(plan.name().clone(), columns)?;
@@ -1834,7 +1859,10 @@ mod tests {
             .unwrap()
             .clone();
 
-        for (statement, memory_limit) in [(&null_id, 64 * 1024 * 1024), (&oversized, 128)] {
+        for (statement, memory_limit, expected) in [
+            (&null_id, 64 * 1024 * 1024, ErrorCode::Type),
+            (&oversized, 128, ErrorCode::Type),
+        ] {
             let validated =
                 validate_write_execution(&mut batch, statement, Parameters::none(), memory_limit)
                     .unwrap();
@@ -1842,7 +1870,7 @@ mod tests {
                 execute_validated_write_plan(&mut batch, validated)
                     .unwrap_err()
                     .code(),
-                ErrorCode::Type
+                expected
             );
             let after = batch
                 .catalog_reader()

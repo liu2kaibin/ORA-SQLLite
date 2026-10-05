@@ -2149,7 +2149,7 @@ impl RecordingFaults {
         }
     }
 
-    fn at(point: FaultPoint, occurrence: usize) -> Self {
+    pub(crate) fn at(point: FaultPoint, occurrence: usize) -> Self {
         Self {
             fail_on: Some((point, occurrence)),
             observed: Mutex::new(Vec::new()),
@@ -2177,6 +2177,39 @@ pub(crate) fn phase_4c1_recording_crash_pager(path: &Path) -> (Pager, Arc<Record
     let faults = Arc::new(RecordingFaults::never());
     let pager = crash_open(path).with_faults(faults.clone());
     (pager, faults)
+}
+
+/// Records the full pager-creation path, including both main- and WAL-directory
+/// durability boundaries. This is only used by the Phase 5 subprocess witness.
+pub(crate) fn phase5_pager_initialization_trace(path: &Path) -> Vec<FaultPoint> {
+    let faults = Arc::new(RecordingFaults::never());
+    let pager = Pager::create_with_faults(path, PagerConfig::test_default(4096), faults.clone())
+        .expect("trace Phase 5 pager initialization");
+    drop(pager);
+    faults.observed()
+}
+
+/// Deliberately terminates a child process at one validated creation boundary.
+/// Its parent owns the path and verifies recovery after reaping the child.
+pub(crate) fn phase5_abort_pager_initialization(
+    path: &Path,
+    trace: Vec<FaultPoint>,
+    point: FaultPoint,
+    occurrence: usize,
+    marker: String,
+) {
+    let _pager = Pager::create_with_faults(
+        path,
+        PagerConfig::test_default(4096),
+        Arc::new(Phase4c1AbortAt {
+            trace,
+            point,
+            occurrence,
+            marker,
+            observed: Mutex::new(Vec::new()),
+        }),
+    )
+    .expect("initialize pager through configured Phase 5 crash point");
 }
 
 pub(crate) fn phase_4c1_aborting_crash_pager(
@@ -2820,7 +2853,9 @@ fn phase4c2a_pager_state_inner(
             let decoded = IndexKeyCodec::decode(&columns, &physical)?;
             entries.push(Phase4c2aIndexEntry {
                 physical,
-                logical: decoded.values().to_vec(),
+                logical: decoded.values().ok_or_else(|| {
+                    DbError::new(ErrorCode::Corruption, "UTC index key has no public values")
+                })?,
                 rowid: decoded.rowid().get(),
             });
         }

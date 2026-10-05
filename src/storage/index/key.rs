@@ -2,7 +2,10 @@
 use std::ops::Bound;
 
 use crate::storage::catalog::types::{ColumnDef, ColumnType, RowId};
-use crate::{DbError, Decimal, ErrorCode, OracleDate, OracleTimestamp, Result, Value};
+use crate::{
+    DbError, Decimal, ErrorCode, OracleDate, OracleTimestamp, Result, Value,
+    oracle_type::OracleTypeDescriptor,
+};
 
 pub(crate) const MAX_INDEX_KEY_BYTES: usize = 1024;
 // A final fixed-width component can cross the logical limit before the
@@ -38,13 +41,34 @@ impl EncodedIndexKey {
 
 #[derive(Debug)]
 pub(crate) struct DecodedIndexKey {
-    values: Box<[Value]>,
+    components: Box<[IndexScalar]>,
     rowid: RowId,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IndexScalar {
+    Value(Value),
+    /// UTC prefix values at the calendar edges can be one day outside the
+    /// public timestamp domain. They are valid physical index data, but are
+    /// deliberately not reconstructed as a user-visible timestamp.
+    UtcTimestamp {
+        day: i32,
+        nanos: u64,
+    },
+}
+
 impl DecodedIndexKey {
-    pub(crate) fn values(&self) -> &[Value] {
-        &self.values
+    pub(crate) fn values(&self) -> Option<Vec<Value>> {
+        self.components
+            .iter()
+            .map(|component| match component {
+                IndexScalar::Value(value) => Some(value.clone()),
+                IndexScalar::UtcTimestamp { .. } => None,
+            })
+            .collect()
+    }
+    pub(crate) fn components(&self) -> &[IndexScalar] {
+        &self.components
     }
     pub(crate) const fn rowid(&self) -> RowId {
         self.rowid
@@ -91,7 +115,7 @@ impl IndexKeyCodec {
                         return Ok(false);
                     }
                 }
-                encode_scalar(column.column_type(), value, &mut prefix)?;
+                encode_scalar(column, value, &mut prefix)?;
             }
             if prefix.len() > limit {
                 return Ok(false);
@@ -143,7 +167,7 @@ impl IndexKeyCodec {
                 contains_null = true;
             } else {
                 physical.push(0);
-                encode_scalar(column.column_type(), value, &mut physical)?;
+                encode_scalar(column, value, &mut physical)?;
             }
             check_encoded_size(physical.len())?;
         }
@@ -173,11 +197,11 @@ impl IndexKeyCodec {
         let mut reader = Reader {
             bytes: &bytes[..logical_len],
         };
-        let mut values = Vec::with_capacity(columns.len());
+        let mut components = Vec::with_capacity(columns.len());
         for column in columns {
-            values.push(match reader.byte()? {
-                0 => decode_scalar(column.column_type(), &mut reader)?,
-                1 => Value::Null,
+            components.push(match reader.byte()? {
+                0 => decode_scalar(column, &mut reader)?,
+                1 => IndexScalar::Value(Value::Null),
                 _ => return Err(corruption("invalid index key NULL flag")),
             });
         }
@@ -190,7 +214,7 @@ impl IndexKeyCodec {
         let rowid = RowId::new(u64::from_be_bytes(suffix.array()?))
             .map_err(|_| corruption("index key ROWID must be nonzero"))?;
         Ok(DecodedIndexKey {
-            values: values.into_boxed_slice(),
+            components: components.into_boxed_slice(),
             rowid,
         })
     }
@@ -242,7 +266,33 @@ fn check_encoded_size(logical_len: usize) -> Result<()> {
     Ok(())
 }
 
-fn encode_scalar(ty: ColumnType, value: &Value, out: &mut Vec<u8>) -> Result<()> {
+fn encode_scalar(column: &ColumnDef, value: &Value, out: &mut Vec<u8>) -> Result<()> {
+    match (column.oracle_type(), column.column_type(), value) {
+        (
+            Some(OracleTypeDescriptor::Timestamp { .. }),
+            ColumnType::Timestamp,
+            Value::Timestamp(timestamp),
+        ) if timestamp.offset_minutes().is_none() => {
+            encode_date(timestamp.date(), out);
+            out.extend_from_slice(&timestamp.nanoseconds().to_be_bytes());
+            return Ok(());
+        }
+        (
+            Some(OracleTypeDescriptor::TimestampWithTimeZone { .. }),
+            ColumnType::TimestampWithTimeZone,
+            Value::Timestamp(timestamp),
+        ) if timestamp.offset_minutes().is_some() => {
+            let (day, nanos) = timestamp.utc_day_and_nanos()?;
+            out.extend_from_slice(&((day as u32) ^ 0x8000_0000).to_be_bytes());
+            out.extend_from_slice(&nanos.to_be_bytes());
+            return Ok(());
+        }
+        _ => {}
+    }
+    encode_v1_scalar(column.column_type(), value, out)
+}
+
+fn encode_v1_scalar(ty: ColumnType, value: &Value, out: &mut Vec<u8>) -> Result<()> {
     match (ty, value) {
         (ColumnType::Int64, Value::Int64(value)) => {
             out.extend_from_slice(&(*value as u64 ^ (1_u64 << 63)).to_be_bytes())
@@ -388,8 +438,31 @@ impl Reader<'_> {
     }
 }
 
-fn decode_scalar(ty: ColumnType, reader: &mut Reader<'_>) -> Result<Value> {
-    Ok(match ty {
+fn decode_scalar(column: &ColumnDef, reader: &mut Reader<'_>) -> Result<IndexScalar> {
+    match (column.oracle_type(), column.column_type()) {
+        (Some(OracleTypeDescriptor::Timestamp { .. }), ColumnType::Timestamp) => {
+            let date = reader.date()?;
+            let nanos = u32::from_be_bytes(reader.array()?);
+            return Ok(IndexScalar::Value(Value::Timestamp(
+                OracleTimestamp::from_nanoseconds(date, nanos, None)
+                    .map_err(|_| corruption("invalid indexed Timestamp fields"))?,
+            )));
+        }
+        (
+            Some(OracleTypeDescriptor::TimestampWithTimeZone { .. }),
+            ColumnType::TimestampWithTimeZone,
+        ) => {
+            let day = (u32::from_be_bytes(reader.array::<4>()?) ^ 0x8000_0000) as i32;
+            let nanos = u64::from_be_bytes(reader.array()?);
+            if !(-1..=3_652_059).contains(&day) || nanos >= 86_400_000_000_000 {
+                return Err(corruption("invalid indexed UTC Timestamp fields"));
+            }
+            return Ok(IndexScalar::UtcTimestamp { day, nanos });
+        }
+        _ => {}
+    }
+    let ty = column.column_type();
+    Ok(IndexScalar::Value(match ty {
         ColumnType::Int64 => {
             Value::Int64((u64::from_be_bytes(reader.array()?) ^ (1_u64 << 63)) as i64)
         }
@@ -431,7 +504,7 @@ fn decode_scalar(ty: ColumnType, reader: &mut Reader<'_>) -> Result<Value> {
             1 => true,
             _ => return Err(corruption("invalid indexed Bool")),
         }),
-    })
+    }))
 }
 
 fn decode_decimal(reader: &mut Reader<'_>) -> Result<Decimal> {
@@ -495,7 +568,9 @@ mod tests {
     use crate::storage::catalog::types::{
         CatalogName, ColumnDef, ColumnId, ColumnType, RowId, TableId,
     };
-    use crate::{Decimal, ErrorCode, OracleDate, OracleTimestamp, Value};
+    use crate::{
+        Decimal, ErrorCode, OracleDate, OracleTimestamp, Value, oracle_type::OracleTypeDescriptor,
+    };
     use std::ops::Bound;
 
     fn columns(types: &[ColumnType]) -> Vec<ColumnDef> {
@@ -522,6 +597,160 @@ mod tests {
             std::slice::from_ref(value),
             RowId::new(rowid).unwrap(),
         )
+    }
+
+    fn oracle_timestamp_column(descriptor: OracleTypeDescriptor) -> ColumnDef {
+        ColumnDef::new_oracle(
+            ColumnId::new(1).unwrap(),
+            TableId::new(1).unwrap(),
+            0,
+            true,
+            CatalogName::new("TS").unwrap(),
+            descriptor,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn v2_timestamp_keys_keep_nanoseconds_and_tstz_uses_utc_prefixes() {
+        let local = oracle_timestamp_column(OracleTypeDescriptor::timestamp(9).unwrap());
+        for nanos in [0, 999_999_999] {
+            let value = Value::Timestamp(
+                OracleTimestamp::from_nanoseconds(date(2026, 1, 1, 0, 0, 0), nanos, None).unwrap(),
+            );
+            let encoded =
+                IndexKeyCodec::encode(&[local.clone()], &[value.clone()], RowId::new(1).unwrap())
+                    .unwrap();
+            assert_eq!(encoded.logical().len(), 1 + 7 + 4);
+            assert_eq!(
+                IndexKeyCodec::decode(&[local.clone()], encoded.physical())
+                    .unwrap()
+                    .values(),
+                Some(vec![value]),
+            );
+        }
+
+        let zoned =
+            oracle_timestamp_column(OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap());
+        let plus_eight = Value::Timestamp(
+            OracleTimestamp::from_nanoseconds(date(2026, 1, 1, 8, 0, 0), 123_456_789, Some(480))
+                .unwrap(),
+        );
+        let utc = Value::Timestamp(
+            OracleTimestamp::from_nanoseconds(date(2026, 1, 1, 0, 0, 0), 123_456_789, Some(0))
+                .unwrap(),
+        );
+        let left =
+            IndexKeyCodec::encode(&[zoned.clone()], &[plus_eight], RowId::new(1).unwrap()).unwrap();
+        let right =
+            IndexKeyCodec::encode(&[zoned.clone()], &[utc], RowId::new(2).unwrap()).unwrap();
+        assert_eq!(left.logical(), right.logical());
+        assert_eq!(
+            IndexKeyCodec::decode(&[zoned], left.physical())
+                .unwrap()
+                .components(),
+            &[IndexScalar::UtcTimestamp {
+                day: 739_616,
+                nanos: 123_456_789
+            }],
+        );
+    }
+
+    #[test]
+    fn v2_tstz_edge_days_and_corruption_checks_are_strict() {
+        let zoned =
+            oracle_timestamp_column(OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap());
+        let earliest = Value::Timestamp(
+            OracleTimestamp::from_nanoseconds(date(1, 1, 1, 0, 0, 0), 0, Some(840)).unwrap(),
+        );
+        let latest = Value::Timestamp(
+            OracleTimestamp::from_nanoseconds(
+                date(9999, 12, 31, 23, 59, 59),
+                999_999_999,
+                Some(-840),
+            )
+            .unwrap(),
+        );
+        for (value, component) in [
+            (
+                earliest,
+                IndexScalar::UtcTimestamp {
+                    day: -1,
+                    nanos: 36_000_000_000_000,
+                },
+            ),
+            (
+                latest,
+                IndexScalar::UtcTimestamp {
+                    day: 3_652_059,
+                    nanos: 50_399_999_999_999,
+                },
+            ),
+        ] {
+            let encoded =
+                IndexKeyCodec::encode(&[zoned.clone()], &[value], RowId::new(1).unwrap()).unwrap();
+            assert_eq!(
+                IndexKeyCodec::decode(&[zoned.clone()], encoded.physical())
+                    .unwrap()
+                    .components(),
+                &[component]
+            );
+            for length in 0..encoded.physical().len() {
+                assert_eq!(
+                    IndexKeyCodec::decode(&[zoned.clone()], &encoded.physical()[..length])
+                        .unwrap_err()
+                        .code(),
+                    ErrorCode::Corruption,
+                );
+            }
+        }
+        let valid = IndexKeyCodec::encode(
+            &[zoned.clone()],
+            &[Value::Timestamp(
+                OracleTimestamp::from_nanoseconds(date(2026, 1, 1, 0, 0, 0), 0, Some(0)).unwrap(),
+            )],
+            RowId::new(1).unwrap(),
+        )
+        .unwrap();
+        for mutation in [
+            (1..5, [0, 0, 0, 0].as_slice()),
+            (5..13, [255; 8].as_slice()),
+        ] {
+            let mut bytes = valid.physical().to_vec();
+            bytes[mutation.0].copy_from_slice(mutation.1);
+            assert_eq!(
+                IndexKeyCodec::decode(&[zoned.clone()], &bytes)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Corruption
+            );
+        }
+    }
+
+    #[test]
+    fn index_key_limit_accepts_1024_bytes_and_rejects_1025() {
+        let column = columns(&[ColumnType::Text]);
+        assert_eq!(
+            IndexKeyCodec::encode(
+                &column,
+                &[Value::Text("x".repeat(1013))],
+                RowId::new(1).unwrap()
+            )
+            .unwrap()
+            .physical()
+            .len(),
+            MAX_INDEX_KEY_BYTES,
+        );
+        assert_eq!(
+            IndexKeyCodec::encode(
+                &column,
+                &[Value::Text("x".repeat(1014))],
+                RowId::new(1).unwrap()
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::ResourceLimit,
+        );
     }
 
     fn decimal(negative: bool, scale: i8, magnitude: u128) -> Value {
@@ -758,13 +987,14 @@ mod tests {
                     let encoded = encode_for(ColumnType::Decimal, &value, 1).unwrap();
                     let cols = columns(&[ColumnType::Decimal]);
                     let decoded = IndexKeyCodec::decode(&cols, encoded.physical()).unwrap();
-                    assert_eq!(decoded.values(), &[canonical(&value)]);
+                    let values = decoded.values().expect("Decimal is reconstructible");
+                    assert_eq!(values, [canonical(&value)]);
                     assert_eq!(
-                        sql_total_cmp(&value, &decoded.values()[0]).unwrap(),
+                        sql_total_cmp(&value, &values[0]).unwrap(),
                         std::cmp::Ordering::Equal
                     );
                     assert_eq!(
-                        IndexKeyCodec::encode(&cols, decoded.values(), decoded.rowid())
+                        IndexKeyCodec::encode(&cols, &values, decoded.rowid())
                             .unwrap()
                             .physical(),
                         encoded.physical()
@@ -799,7 +1029,7 @@ mod tests {
         for ((values, rowid), key) in cases.iter().zip(encoded) {
             assert_eq!(key.contains_null(), values.contains(&Value::Null));
             let decoded = IndexKeyCodec::decode(&cols, key.physical()).unwrap();
-            assert_eq!(decoded.values(), values);
+            assert_eq!(decoded.values().expect("V1 components"), *values);
             assert_eq!(decoded.rowid().get(), *rowid);
         }
     }
@@ -1145,8 +1375,9 @@ mod tests {
             for value in values {
                 let encoded = encode_for(ty, &value, 1).unwrap();
                 let decoded = IndexKeyCodec::decode(&cols, encoded.physical()).unwrap();
-                assert_eq!(decoded.values(), &[canonical(&value)]);
-                if let Value::Float64(f) = decoded.values()[0] {
+                let values = decoded.values().expect("V1 components");
+                assert_eq!(values, [canonical(&value)]);
+                if let Value::Float64(f) = values[0] {
                     if f == 0.0 {
                         assert_eq!(f.to_bits(), 0);
                     }
@@ -1156,9 +1387,13 @@ mod tests {
                     mutated[index] ^= 255;
                     match IndexKeyCodec::decode(&cols, &mutated) {
                         Ok(decoded) => assert_eq!(
-                            IndexKeyCodec::encode(&cols, decoded.values(), decoded.rowid())
-                                .unwrap()
-                                .physical(),
+                            IndexKeyCodec::encode(
+                                &cols,
+                                &decoded.values().expect("V1 components"),
+                                decoded.rowid(),
+                            )
+                            .unwrap()
+                            .physical(),
                             mutated
                         ),
                         Err(error) => assert_eq!(error.code(), ErrorCode::Corruption),
@@ -1271,10 +1506,11 @@ mod tests {
             );
             for (value, encoded) in [(&left, encoded_left), (&right, encoded_right)] {
                 let decoded = IndexKeyCodec::decode(&columns(&[ty]), encoded.physical()).unwrap();
-                assert_eq!(decoded.values(), &[canonical(value)]);
+                let values = decoded.values().expect("V1 components");
+                assert_eq!(values, [canonical(value)]);
                 assert_eq!(decoded.rowid().get(), 1);
                 assert_eq!(
-                    IndexKeyCodec::encode(&columns(&[ty]), decoded.values(), decoded.rowid())
+                    IndexKeyCodec::encode(&columns(&[ty]), &values, decoded.rowid())
                         .unwrap()
                         .physical(),
                     encoded.physical()

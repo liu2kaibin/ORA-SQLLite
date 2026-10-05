@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, ops::Bound};
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
 
-use crate::{DbError, ErrorCode, Result, Value};
+use crate::{DbError, ErrorCode, Result, Value, oracle_type::OracleTypeDescriptor};
 
 #[cfg(test)]
 use super::catalog::{
@@ -26,6 +26,7 @@ use super::{
         ConstraintCatalog, ForeignKeyCatalog,
         program::{CheckMemory, CheckProgramTemplate},
     },
+    features::{CATALOG_V1, ORACLE_TYPES_V1},
     index::{IndexStorage, PreparedIndexEntry},
     pager::PageSource,
     row::{RowCodec, RowCodecValidation, decode_rowid_key, encode_rowid_key},
@@ -35,6 +36,7 @@ use super::{
 pub(crate) struct ColumnSpec {
     name: CatalogName,
     column_type: ColumnType,
+    oracle_type: Option<OracleTypeDescriptor>,
     nullable: bool,
 }
 
@@ -300,6 +302,20 @@ impl ColumnSpec {
         Self {
             name,
             column_type,
+            oracle_type: None,
+            nullable,
+        }
+    }
+
+    pub(crate) fn new_oracle(
+        name: CatalogName,
+        descriptor: OracleTypeDescriptor,
+        nullable: bool,
+    ) -> Self {
+        Self {
+            name,
+            column_type: descriptor.physical_type(),
+            oracle_type: Some(descriptor),
             nullable,
         }
     }
@@ -310,6 +326,10 @@ impl ColumnSpec {
 
     pub(crate) const fn column_type(&self) -> ColumnType {
         self.column_type
+    }
+
+    pub(crate) const fn oracle_type(&self) -> Option<OracleTypeDescriptor> {
+        self.oracle_type
     }
 
     pub(crate) const fn nullable(&self) -> bool {
@@ -1058,7 +1078,20 @@ impl ConstrainedTableWrite {
         exclude: Option<RowId>,
     ) -> Result<()> {
         for (index, entry) in self.indexes.iter().zip(entries) {
-            index.check_unique(batch, entry, exclude)?;
+            if let Err(error) = index.check_unique(batch, entry, exclude) {
+                // Only key constraints get the Oracle duplicate-key detail.
+                // CHECK and FK diagnostics continue to carry their established
+                // name/message without an invented Oracle code.
+                if error.code() == ErrorCode::Constraint
+                    && self
+                        .constraints
+                        .violation_name_for_index(index.id())
+                        .is_some()
+                {
+                    return Err(error.with_oracle_code(1));
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1087,7 +1120,22 @@ pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Resul
         let mut catalog = CatalogWriter::bootstrap(batch)?;
         let table_id = TableId::new(catalog.allocate_object_id(batch)?.get())?;
         let root = BTree::create(batch, TreeKind::Table)?.root();
-        let column_count = u16::try_from(spec.columns().len()).map_err(|_| {
+        let columns = spec
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, spec)| {
+                column_definition_from_spec(
+                    ColumnId::new(catalog.allocate_object_id(batch)?.get())?,
+                    table_id,
+                    u16::try_from(ordinal).map_err(|_| {
+                        DbError::new(ErrorCode::Type, "column ordinal does not fit the catalog")
+                    })?,
+                    spec,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let column_count = u16::try_from(columns.len()).map_err(|_| {
             DbError::new(
                 ErrorCode::Type,
                 "table column count does not fit the catalog",
@@ -1102,18 +1150,11 @@ pub(crate) fn create_relation(batch: &mut WriteBatch, spec: &TableSpec) -> Resul
             spec.name().clone(),
         )?;
         catalog.insert_table_definition(batch, &table)?;
-        for (ordinal, spec) in spec.columns().iter().enumerate() {
-            let column = ColumnDef::new(
-                ColumnId::new(catalog.allocate_object_id(batch)?.get())?,
-                table_id,
-                u16::try_from(ordinal).map_err(|_| {
-                    DbError::new(ErrorCode::Type, "column ordinal does not fit the catalog")
-                })?,
-                spec.column_type(),
-                spec.nullable(),
-                spec.name().clone(),
-            )?;
-            catalog.insert_column_definition(batch, &column)?;
+        for column in &columns {
+            catalog.insert_column_definition(batch, column)?;
+        }
+        if columns.iter().any(|column| column.oracle_type().is_some()) {
+            batch.enable_feature_bits(CATALOG_V1 | ORACLE_TYPES_V1)?;
         }
         catalog.finish(batch)?;
         Ok(table_id)
@@ -1148,15 +1189,13 @@ pub(crate) fn create_constrained_relation(
             .iter()
             .enumerate()
             .map(|(ordinal, column)| {
-                ColumnDef::new(
+                column_definition_from_spec(
                     ColumnId::new(catalog.allocate_object_id(batch)?.get())?,
                     table_id,
                     u16::try_from(ordinal).map_err(|_| {
                         DbError::new(ErrorCode::Type, "column ordinal does not fit the catalog")
                     })?,
-                    column.column_type(),
-                    column.nullable(),
-                    column.name().clone(),
+                    column,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1221,6 +1260,9 @@ pub(crate) fn create_constrained_relation(
         for bundle in &bundles {
             catalog.insert_constraint_bundle(batch, bundle)?;
         }
+        if columns.iter().any(|column| column.oracle_type().is_some()) {
+            batch.enable_feature_bits(CATALOG_V1 | ORACLE_TYPES_V1)?;
+        }
         let parent_tables = bundles
             .iter()
             .filter_map(|bundle| bundle.definition.parent_table_id())
@@ -1244,6 +1286,32 @@ pub(crate) fn create_constrained_relation(
             batch.restore_statement(checkpoint);
             Err(error)
         }
+    }
+}
+
+fn column_definition_from_spec(
+    id: ColumnId,
+    table_id: TableId,
+    ordinal: u16,
+    spec: &ColumnSpec,
+) -> Result<ColumnDef> {
+    match spec.oracle_type() {
+        Some(descriptor) => ColumnDef::new_oracle(
+            id,
+            table_id,
+            ordinal,
+            spec.nullable(),
+            spec.name().clone(),
+            descriptor,
+        ),
+        None => ColumnDef::new(
+            id,
+            table_id,
+            ordinal,
+            spec.column_type(),
+            spec.nullable(),
+            spec.name().clone(),
+        ),
     }
 }
 
@@ -1337,7 +1405,7 @@ fn prevalidate_foreign_key_target(
         ));
     }
     for (local_ordinal, parent_column) in local_ordinals.iter().zip(parent_columns) {
-        let child_type = child_table
+        let child_column = child_table
             .columns()
             .get(usize::from(*local_ordinal))
             .ok_or_else(|| {
@@ -1345,12 +1413,8 @@ fn prevalidate_foreign_key_target(
                     ErrorCode::Type,
                     "foreign-key child column ordinal is absent",
                 )
-            })?
-            .column_type();
-        let parent_type = parent_column.column_type();
-        if child_type != parent_type
-            && !(child_type == ColumnType::Int64 && parent_type == ColumnType::Decimal)
-        {
+            })?;
+        if !foreign_key_columns_compatible(child_column, parent_column) {
             return Err(DbError::new(
                 ErrorCode::SchemaChanged,
                 "prepared foreign key child and parent column types are incompatible",
@@ -1358,6 +1422,18 @@ fn prevalidate_foreign_key_target(
         }
     }
     Ok(())
+}
+
+fn foreign_key_columns_compatible(child: &ColumnSpec, parent: &ColumnDef) -> bool {
+    match (child.oracle_type(), parent.oracle_type()) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => {
+            child.column_type() == parent.column_type()
+                || (child.column_type() == ColumnType::Int64
+                    && parent.column_type() == ColumnType::Decimal)
+        }
+        _ => false,
+    }
 }
 
 fn required_object_count(spec: &ConstrainedTableSpec<'_>) -> Result<u64> {

@@ -2,6 +2,7 @@ use super::{ExecExpr, Locations, check, expr::ExprCompiler};
 use crate::{
     DbError, ErrorCode, Result,
     error::SqlLocation,
+    oracle_type::OracleTypeDescriptor,
     sql::{
         SqlType,
         bound::{
@@ -51,6 +52,7 @@ pub(crate) struct ColumnTarget {
     column_id: ColumnId,
     ordinal: u16,
     data_type: SqlType,
+    oracle_type: Option<OracleTypeDescriptor>,
     nullable: bool,
     location: SqlLocation,
 }
@@ -62,6 +64,7 @@ impl ColumnTarget {
             column_id: bound.column_id,
             ordinal: bound.ordinal,
             data_type: bound.sql_type,
+            oracle_type: bound.oracle_type,
             nullable: bound.nullable,
             location: expressions.location(bound.span)?,
         })
@@ -81,6 +84,9 @@ impl ColumnTarget {
     pub(crate) const fn nullable(&self) -> bool {
         self.nullable
     }
+    pub(crate) const fn oracle_type(&self) -> Option<OracleTypeDescriptor> {
+        self.oracle_type
+    }
     pub(crate) fn validate_catalog_column(&self, column: &ColumnDef) -> Result<()> {
         let logical_type = match column.column_type() {
             ColumnType::Int64 => SqlType::Int64,
@@ -96,6 +102,7 @@ impl ColumnTarget {
             || self.table_id != column.table_id()
             || self.ordinal != column.ordinal()
             || self.data_type != logical_type
+            || self.oracle_type != column.oracle_type()
             || self.nullable != column.nullable()
         {
             return Err(DbError::new(
@@ -303,6 +310,7 @@ pub(crate) struct ColumnDefinition {
     name: CatalogName,
     ordinal: u16,
     column_type: ColumnType,
+    oracle_type: Option<OracleTypeDescriptor>,
     nullable: bool,
     location: SqlLocation,
 }
@@ -316,6 +324,9 @@ impl ColumnDefinition {
     }
     pub(crate) const fn column_type(&self) -> ColumnType {
         self.column_type
+    }
+    pub(crate) const fn oracle_type(&self) -> Option<OracleTypeDescriptor> {
+        self.oracle_type
     }
     pub(crate) const fn nullable(&self) -> bool {
         self.nullable
@@ -381,6 +392,7 @@ impl CreateTablePlan {
                         name: column.name.clone(),
                         ordinal: column.ordinal,
                         column_type: column.column_type,
+                        oracle_type: column.oracle_type,
                         nullable: column.nullable,
                         location: locations.resolve(column.span)?,
                     })
@@ -552,6 +564,7 @@ pub(crate) fn validate_foreign_key_plan(
             || retained.table_id != parent_table.table_id
             || column.ordinal() != retained.ordinal
             || logical_column_type(column.column_type()) != retained.sql_type
+            || column.oracle_type() != retained.oracle_type
         {
             return Err(foreign_key_schema_changed(
                 "prepared foreign key parent column identity has changed",

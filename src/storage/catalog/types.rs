@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 
-use crate::{DbError, ErrorCode, Result, storage::PageRef};
+use crate::{DbError, ErrorCode, Result, oracle_type::OracleTypeDescriptor, storage::PageRef};
 
 const MAX_CATALOG_NAME_BYTES: usize = 1013;
 pub(super) const MAX_GLOBAL_CATALOG_NAME_BYTES: usize = 128;
@@ -227,6 +227,7 @@ pub(crate) struct ColumnDef {
     ordinal: u16,
     column_type: ColumnType,
     nullable: bool,
+    oracle_type: Option<OracleTypeDescriptor>,
     name: CatalogName,
 }
 
@@ -495,6 +496,33 @@ impl ColumnDef {
             ordinal,
             column_type,
             nullable,
+            oracle_type: None,
+            name,
+        })
+    }
+
+    pub(crate) fn new_oracle(
+        id: ColumnId,
+        table_id: TableId,
+        ordinal: u16,
+        nullable: bool,
+        name: CatalogName,
+        oracle_type: OracleTypeDescriptor,
+    ) -> Result<Self> {
+        let oracle_type = oracle_type.validate()?;
+        if ordinal >= MAX_COLUMNS {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "column ordinal must be below 1000",
+            ));
+        }
+        Ok(Self {
+            id,
+            table_id,
+            ordinal,
+            column_type: oracle_type.physical_type(),
+            nullable,
+            oracle_type: Some(oracle_type),
             name,
         })
     }
@@ -514,6 +542,9 @@ impl ColumnDef {
     pub(crate) const fn nullable(&self) -> bool {
         self.nullable
     }
+    pub(crate) const fn oracle_type(&self) -> Option<OracleTypeDescriptor> {
+        self.oracle_type
+    }
     pub(crate) const fn name(&self) -> &CatalogName {
         &self.name
     }
@@ -524,8 +555,138 @@ mod tests {
     use super::*;
     use crate::{
         ErrorCode,
+        oracle_type::OracleTypeDescriptor,
         storage::{PageId, PageRef},
     };
+
+    #[test]
+    fn oracle_descriptor_limits_and_physical_types_are_exact() {
+        let number = OracleTypeDescriptor::number(38, -38).unwrap();
+        assert_eq!(number.physical_type(), ColumnType::Decimal);
+        assert_eq!(number.precision(), Some(38));
+        assert_eq!(number.scale(), Some(-38));
+        assert!(OracleTypeDescriptor::number(1, 38).is_ok());
+        assert_eq!(
+            OracleTypeDescriptor::number(0, 0)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        assert_eq!(
+            OracleTypeDescriptor::number(39, 0)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        assert_eq!(
+            OracleTypeDescriptor::number(1, -39)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        assert_eq!(
+            OracleTypeDescriptor::number(1, 39)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        let varchar = OracleTypeDescriptor::varchar2(32_767).unwrap();
+        assert_eq!(varchar.physical_type(), ColumnType::Text);
+        assert_eq!(varchar.length_chars(), Some(32_767));
+        assert!(OracleTypeDescriptor::varchar2(1).is_ok());
+        assert_eq!(
+            OracleTypeDescriptor::varchar2(0).unwrap_err().oracle_code(),
+            Some(902)
+        );
+        assert_eq!(
+            OracleTypeDescriptor::varchar2(32_768)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        let char_type = OracleTypeDescriptor::char_type(2_000).unwrap();
+        assert_eq!(char_type.physical_type(), ColumnType::Text);
+        assert_eq!(char_type.length_chars(), Some(2_000));
+        assert!(OracleTypeDescriptor::char_type(1).is_ok());
+        assert_eq!(
+            OracleTypeDescriptor::char_type(0)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        assert_eq!(
+            OracleTypeDescriptor::char_type(2_001)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        let raw = OracleTypeDescriptor::raw(32_767).unwrap();
+        assert_eq!(raw.physical_type(), ColumnType::Blob);
+        assert_eq!(raw.length_bytes(), Some(32_767));
+        assert!(OracleTypeDescriptor::raw(1).is_ok());
+        for invalid_length in [0, 32_768] {
+            assert_eq!(
+                OracleTypeDescriptor::raw(invalid_length)
+                    .unwrap_err()
+                    .oracle_code(),
+                Some(902)
+            );
+        }
+        assert_eq!(
+            OracleTypeDescriptor::date().physical_type(),
+            ColumnType::Date
+        );
+        for precision in [0, 9] {
+            let timestamp = OracleTypeDescriptor::timestamp(precision).unwrap();
+            assert_eq!(timestamp.physical_type(), ColumnType::Timestamp);
+            assert_eq!(timestamp.fractional_precision(), Some(precision));
+            let timestamp_with_time_zone =
+                OracleTypeDescriptor::timestamp_with_time_zone(precision).unwrap();
+            assert_eq!(
+                timestamp_with_time_zone.physical_type(),
+                ColumnType::TimestampWithTimeZone
+            );
+            assert_eq!(
+                timestamp_with_time_zone.fractional_precision(),
+                Some(precision)
+            );
+        }
+        assert_eq!(
+            OracleTypeDescriptor::timestamp(10)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        assert_eq!(
+            OracleTypeDescriptor::timestamp_with_time_zone(10)
+                .unwrap_err()
+                .oracle_code(),
+            Some(902)
+        );
+        assert_eq!(OracleTypeDescriptor::date().precision(), None);
+        assert_eq!(OracleTypeDescriptor::date().scale(), None);
+        assert_eq!(OracleTypeDescriptor::date().length_chars(), None);
+        assert_eq!(OracleTypeDescriptor::date().length_bytes(), None);
+        assert_eq!(OracleTypeDescriptor::date().fractional_precision(), None);
+    }
+
+    #[test]
+    fn oracle_column_rejects_directly_forged_invalid_descriptor() {
+        let error = ColumnDef::new_oracle(
+            ColumnId::new(3).unwrap(),
+            TableId::new(2).unwrap(),
+            0,
+            false,
+            CatalogName::new("AMOUNT").unwrap(),
+            OracleTypeDescriptor::Number {
+                precision: 0,
+                scale: 0,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Type);
+        assert_eq!(error.oracle_code(), Some(902));
+    }
 
     #[test]
     fn stable_ids_reject_zero_and_require_explicit_kinds() {
@@ -697,6 +858,7 @@ mod tests {
         assert_eq!(column.ordinal(), 999);
         assert_eq!(column.column_type(), ColumnType::Int64);
         assert!(!column.nullable());
+        assert_eq!(column.oracle_type(), None);
         assert_eq!(column.name(), &column_name);
         assert_eq!(
             ColumnDef::new(
@@ -706,6 +868,32 @@ mod tests {
                 ColumnType::Int64,
                 true,
                 column_name
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::Type
+        );
+
+        let descriptor = OracleTypeDescriptor::number(12, 2).unwrap();
+        let oracle_column = ColumnDef::new_oracle(
+            column_id,
+            table_id,
+            1,
+            true,
+            CatalogName::new("AMOUNT").unwrap(),
+            descriptor,
+        )
+        .unwrap();
+        assert_eq!(oracle_column.column_type(), ColumnType::Decimal);
+        assert_eq!(oracle_column.oracle_type(), Some(descriptor));
+        assert_eq!(
+            ColumnDef::new_oracle(
+                column_id,
+                table_id,
+                1000,
+                true,
+                CatalogName::new("AMOUNT").unwrap(),
+                descriptor,
             )
             .unwrap_err()
             .code(),

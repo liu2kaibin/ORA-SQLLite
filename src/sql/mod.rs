@@ -53,7 +53,7 @@ pub(crate) use name::{Identifier, ParameterKey, ParameterStyle};
 )]
 pub(crate) use types::{SqlSpan, SqlType};
 
-use crate::{Result, storage::catalog::CatalogReader};
+use crate::{DbError, Result, error::SqlLocation, storage::catalog::CatalogReader};
 
 /// Parses and binds one SQL statement against an immutable catalog image.
 pub(crate) fn bind_sql(
@@ -63,5 +63,39 @@ pub(crate) fn bind_sql(
     database_uuid: [u8; 16],
 ) -> Result<bound::BoundStatement> {
     let statement = parser::parse_statement(sql, limits)?;
-    bind::bind_statement_with_limits(&statement, catalog, database_uuid, limits)
+    match bind::bind_statement_with_limits(&statement, catalog, database_uuid, limits) {
+        Ok(statement) => Ok(statement),
+        Err(error) => {
+            let Some(location) = error.sql_location() else {
+                return Err(error);
+            };
+            match source_location(sql, location.byte_offset()) {
+                Ok(location) => Err(error.with_sql_location(location)),
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+fn source_location(sql: &str, byte_offset: usize) -> Result<SqlLocation> {
+    let preceding_source = sql.get(..byte_offset).ok_or_else(|| {
+        DbError::new(
+            crate::ErrorCode::Internal,
+            "SQL source location is outside the original text",
+        )
+    })?;
+    let line = preceding_source
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| DbError::new(crate::ErrorCode::Internal, "SQL line overflow"))?;
+    let column = preceding_source
+        .rsplit_once('\n')
+        .map_or(preceding_source, |(_, line)| line)
+        .chars()
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| DbError::new(crate::ErrorCode::Internal, "SQL column overflow"))?;
+    SqlLocation::new(byte_offset, line, column)
 }

@@ -5,6 +5,7 @@ use crate::sql::{
 };
 use crate::{
     DbError, Decimal, ErrorCode, Result, Value,
+    oracle_type::{OracleComparisonContract, compare_for_contract, normalize_for_type},
     scalar::{self, ScalarBinaryOp, ScalarUnaryOp},
 };
 
@@ -83,10 +84,17 @@ fn eval_ready(
             .cloned()
             .ok_or_else(invalid_eval),
         ExecExprKind::Unary { op, .. } => unary(*op, pop(values)?),
-        ExecExprKind::Binary { op, .. } => {
+        ExecExprKind::Binary {
+            op,
+            oracle_contract,
+            ..
+        } => {
             let right = pop(values)?;
             let left = pop(values)?;
-            binary(*op, &left, &right)
+            match oracle_contract {
+                Some(contract) => binary_with_contract(*op, *contract, left, right),
+                None => binary(*op, &left, &right),
+            }
         }
         ExecExprKind::IsNull { negated, .. } => {
             Ok(Value::Bool(matches!(pop(values)?, Value::Null) != *negated))
@@ -180,6 +188,34 @@ fn binary(op: BoundBinaryOp, left: &Value, right: &Value) -> Result<Value> {
         left,
         right,
     )
+}
+
+fn binary_with_contract(
+    op: BoundBinaryOp,
+    contract: OracleComparisonContract,
+    left: Value,
+    right: Value,
+) -> Result<Value> {
+    let left = normalize_for_type(contract.left(), left)?;
+    let right = normalize_for_type(contract.right(), right)?;
+    if left == Value::Null || right == Value::Null {
+        return Ok(Value::Null);
+    }
+    let order = compare_for_contract(contract, &left, &right)?;
+    Ok(Value::Bool(match op {
+        BoundBinaryOp::Equal => order.is_eq(),
+        BoundBinaryOp::NotEqual => !order.is_eq(),
+        BoundBinaryOp::LessThan => order.is_lt(),
+        BoundBinaryOp::LessThanOrEqual => order.is_le(),
+        BoundBinaryOp::GreaterThan => order.is_gt(),
+        BoundBinaryOp::GreaterThanOrEqual => order.is_ge(),
+        _ => {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "Oracle contract attached to non-comparison",
+            ));
+        }
+    }))
 }
 
 pub(crate) fn decimal_arithmetic(op: BoundBinaryOp, a: Decimal, b: Decimal) -> Result<Decimal> {
