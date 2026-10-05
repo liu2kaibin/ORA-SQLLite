@@ -2149,7 +2149,7 @@ impl RecordingFaults {
         }
     }
 
-    fn at(point: FaultPoint, occurrence: usize) -> Self {
+    pub(crate) fn at(point: FaultPoint, occurrence: usize) -> Self {
         Self {
             fail_on: Some((point, occurrence)),
             observed: Mutex::new(Vec::new()),

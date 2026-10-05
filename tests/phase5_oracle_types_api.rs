@@ -1,7 +1,8 @@
 mod support;
 
 use ora_sqllite::{
-    Connection, Decimal, OracleDate, OracleTimestamp, ParameterValue, Parameters, Value,
+    Connection, Database, Decimal, ErrorCode, OracleDate, OracleTimestamp, ParameterValue,
+    Parameters, Value,
 };
 
 #[allow(dead_code, reason = "shared by later Phase 5 Oracle type API tests")]
@@ -47,10 +48,127 @@ fn creates_every_oracle_type_and_persists_its_arguments() {
     support::checkpoint_accepted_state(&files);
     let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
     assert_eq!(capture.feature_bits & 4, 4);
+    assert_eq!(capture.oracle_columns["T.N"].physical_type, 2);
     assert_eq!(capture.oracle_columns["T.N"].precision, 12);
     assert_eq!(capture.oracle_columns["T.N"].scale, 2);
     assert_eq!(capture.oracle_columns["T.V"].length, 20);
     assert_eq!(capture.oracle_columns["T.TS"].precision, 9);
+}
+
+#[test]
+fn v1_database_opens_without_rewrite_and_v1_v2_coexist_across_reopen() {
+    let (files, database) = support::new_database("phase5-format");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE LEGACY (ID INT64, TS TIMESTAMP)",
+    );
+    let insert = connection
+        .prepare("INSERT INTO LEGACY VALUES (1, :1)")
+        .unwrap();
+    let date = OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap();
+    let values = [Value::Timestamp(OracleTimestamp::new(date, 0, None).unwrap()).into()];
+    connection
+        .execute(&insert, Parameters::positional(&values))
+        .unwrap();
+    drop(connection);
+    drop(database);
+    let before = std::fs::read(files.main()).unwrap();
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID FROM LEGACY"),
+        vec![vec![Value::Int64(1)]]
+    );
+    drop(connection);
+    drop(reopened);
+    assert_eq!(std::fs::read(files.main()).unwrap(), before);
+
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE ORACLE_T (N NUMBER(5,2))");
+    drop(connection);
+    drop(reopened);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.feature_bits & 4, 4);
+    assert!(capture.tables.contains_key("LEGACY"));
+    assert!(capture.oracle_columns.contains_key("ORACLE_T.N"));
+    let reopened = support::reopen(&files);
+    let mut connection = reopened.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID FROM LEGACY"),
+        vec![vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn v2_column_records_require_bit_two_but_the_empty_post_drop_catalog_is_legal() {
+    let (files, database) = support::new_database("phase5-v2-feature-bit");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    support::format2::mutate_oracle_catalog_for_test(
+        &files,
+        support::format2::OracleCatalogMutation::ClearFeatureBit,
+    )
+    .unwrap();
+    assert_eq!(
+        Database::open(files.main(), support::scale_options())
+            .unwrap_err()
+            .code(),
+        ErrorCode::Corruption
+    );
+
+    let (files, database) = support::new_database("phase5-post-drop-feature-bit");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    support::execute_sql(&mut connection, "DROP TABLE T");
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(capture.feature_bits & 4, 4);
+    assert!(capture.oracle_columns.is_empty());
+    assert!(support::reopen(&files).connect().is_ok());
+}
+
+#[test]
+fn corrupted_v2_column_envelope_and_descriptor_have_stable_error_classes() {
+    for (label, mutation, expected) in [
+        (
+            "unknown-version",
+            support::format2::OracleCatalogMutation::SetColumnEnvelopeVersion(3),
+            ErrorCode::Unsupported,
+        ),
+        (
+            "invalid-descriptor",
+            support::format2::OracleCatalogMutation::SetOracleKind(5),
+            ErrorCode::Corruption,
+        ),
+        (
+            "invalid-reserved-flags",
+            support::format2::OracleCatalogMutation::SetOracleFlags(1),
+            ErrorCode::Corruption,
+        ),
+    ] {
+        let (files, database) = support::new_database(&format!("phase5-{label}"));
+        let mut connection = database.connect().unwrap();
+        support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+        drop(connection);
+        drop(database);
+        support::checkpoint_accepted_state(&files);
+        support::format2::mutate_oracle_catalog_for_test(&files, mutation).unwrap();
+        assert_eq!(
+            Database::open(files.main(), support::scale_options())
+                .unwrap_err()
+                .code(),
+            expected,
+            "{label}"
+        );
+    }
 }
 
 #[test]

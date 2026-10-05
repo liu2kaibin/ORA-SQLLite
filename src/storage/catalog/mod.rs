@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 use super::{
     PageRef,
     btree::{BTree, TreeKind},
-    features::{CATALOG_V1, INDEX_CONSTRAINT_V1, validate_feature_bits},
+    features::{CATALOG_V1, INDEX_CONSTRAINT_V1, ORACLE_TYPES_V1, validate_feature_bits},
     index::key::IndexKeyCodec,
     pager::{PageSource, ReadSnapshot, WriteBatch},
     validate::{
@@ -210,11 +210,11 @@ impl CatalogImage {
                     )?;
                 }
                 DecodedCatalogKey::ColumnDefinition(id) => {
-                    insert_unique(
-                        &mut image.columns,
-                        id,
-                        record::decode_column_definition(id, &value)?,
-                    )?;
+                    let column = record::decode_column_definition(id, &value)?;
+                    if column.oracle_type().is_some() {
+                        require_oracle_types_feature(feature_bits)?;
+                    }
+                    insert_unique(&mut image.columns, id, column)?;
                 }
                 DecodedCatalogKey::IndexName(name) => {
                     require_index_feature(feature_bits)?;
@@ -1453,6 +1453,13 @@ impl CatalogWriter {
     ) -> Result<()> {
         self.mutate(batch, |tree, batch| {
             read_table_definition(tree, batch, column.table_id())?;
+            // The candidate may be decoded by `finish` before the relation
+            // layer reaches its final feature-bit aggregation. Enable the
+            // durable capability before inserting the V2 record so every
+            // candidate image already satisfies the reader contract.
+            if column.oracle_type().is_some() {
+                batch.enable_feature_bits(CATALOG_V1 | ORACLE_TYPES_V1)?;
+            }
             // ColumnDef's checked constructor enforces ordinal < MAX_COLUMNS.
             require_available_object(tree, batch, column.id().into())?;
             let name_key = key::column_name_key(column.table_id(), column.name())?;
@@ -2477,6 +2484,15 @@ fn require_index_feature(feature_bits: u64) -> Result<()> {
     Ok(())
 }
 
+fn require_oracle_types_feature(feature_bits: u64) -> Result<()> {
+    if feature_bits & ORACLE_TYPES_V1 == 0 {
+        return Err(corruption(
+            "Oracle V2 column definition requires ORACLE_TYPES_V1",
+        ));
+    }
+    Ok(())
+}
+
 fn unsupported_legacy() -> DbError {
     DbError::new(
         ErrorCode::Unsupported,
@@ -2747,13 +2763,14 @@ mod tests {
             PageId, PageRef,
             btree::{BTree, TreeKind},
             constraint::program::{CheckProgramTemplate, CheckTemplateInstruction, CheckType},
-            features::CATALOG_V1,
+            features::{CATALOG_V1, ORACLE_TYPES_V1},
             file::OpenMode,
+            index::{IndexSpec, create_index},
             page::PageType,
             pager::{Pager, PagerConfig, WriteBatch},
             relation::{ColumnSpec, TableSpec, TableWrite, create_relation, drop_relation},
             row::{RowCodec, encode_rowid_key},
-            test_support::{TempDatabase, test_pager},
+            test_support::{RecordingFaults, TempDatabase, test_pager},
         },
     };
 
@@ -2998,6 +3015,188 @@ mod tests {
         writer.finish(&mut batch).unwrap();
         batch.commit().unwrap();
         (temp, pager, table.id())
+    }
+
+    fn create_first_oracle_table(pager: &Pager) -> Result<()> {
+        let mut batch = pager.begin_write()?;
+        let mut writer = CatalogWriter::bootstrap(&mut batch)?;
+        let table_id = writer.allocate_object_id(&mut batch)?;
+        let root = BTree::create(&mut batch, TreeKind::Table)?.root();
+        let table = new_table(table_id.get(), root, 1, "T");
+        writer.insert_table_definition(&mut batch, &table)?;
+        let column_id = writer.allocate_object_id(&mut batch)?;
+        let column = ColumnDef::new_oracle(
+            ColumnId::new(column_id.get())?,
+            table.id(),
+            0,
+            true,
+            CatalogName::new("N")?,
+            crate::oracle_type::OracleTypeDescriptor::number(5, 2)?,
+        )?;
+        writer.insert_column_definition(&mut batch, &column)?;
+        batch.enable_feature_bits(CATALOG_V1 | ORACLE_TYPES_V1)?;
+        writer.finish(&mut batch)?;
+        batch.commit()
+    }
+
+    fn assert_first_oracle_create_is_atomic(pager: &Pager) {
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+        let post = snapshot.feature_bits() & ORACLE_TYPES_V1 != 0;
+        let table = catalog.find_table_by_name(&CatalogName::new("T").unwrap());
+        assert!(
+            (!post && table.is_none())
+                || (post
+                    && table.is_some()
+                    && catalog
+                        .columns_for_table(table.unwrap().id())
+                        .any(|column| column.name().as_str() == "N"
+                            && column.oracle_type().is_some())),
+            "recovered state must be the old catalog or a complete V2 table graph"
+        );
+    }
+
+    fn add_oracle_row_and_unique_index(pager: &Pager) -> Result<()> {
+        let mut batch = pager.begin_write()?;
+        let catalog = batch.catalog_reader()?;
+        let table = catalog
+            .find_table_by_name(&CatalogName::new("T")?)
+            .ok_or_else(|| corruption("V2 table is missing"))?
+            .clone();
+        let columns = catalog
+            .columns_for_table(table.id())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut writer = TableWrite::open(&mut batch, table.id())?;
+        writer.insert(
+            &mut batch,
+            &[crate::Value::Decimal(crate::Decimal::new(false, 2, 125)?)],
+        )?;
+        writer.finish(&mut batch)?;
+        create_index(
+            &mut batch,
+            &IndexSpec::new(CatalogName::new("UX_T_N")?, table.id(), columns, true)?,
+            64 * 1024 * 1024,
+        )?;
+        batch.commit()
+    }
+
+    fn assert_oracle_row_and_index_mutation_is_atomic(pager: &Pager) {
+        let mut snapshot = pager.begin_read().unwrap();
+        let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+        let table = catalog
+            .find_table_by_name(&CatalogName::new("T").unwrap())
+            .unwrap();
+        let row = BTree::from_root(TreeKind::Table, table.root())
+            .get(&mut snapshot, &encode_rowid_key(RowId::new(1).unwrap()))
+            .unwrap();
+        let index = catalog.find_index_by_name(&CatalogName::new("UX_T_N").unwrap());
+        assert!(
+            (row.is_none() && index.is_none()) || (row.is_some() && index.is_some()),
+            "a V2 row and its unique index must recover together"
+        );
+    }
+
+    #[test]
+    fn first_oracle_create_fault_matrix_recovers_only_old_or_complete_v2_catalogs() {
+        use crate::fault::FaultPoint;
+        use std::sync::Arc;
+
+        let (baseline_temp, baseline) = test_pager(4096).unwrap();
+        let baseline_faults = Arc::new(RecordingFaults::never());
+        let baseline = baseline.with_faults(baseline_faults.clone());
+        create_first_oracle_table(&baseline).unwrap();
+        let trace = baseline_faults.observed();
+        assert!(
+            trace.contains(&FaultPoint::BeforeWalSync)
+                && trace.contains(&FaultPoint::AfterWalSync)
+                && trace.contains(&FaultPoint::BeforeWalPublish)
+                && trace.contains(&FaultPoint::AfterWalPublish),
+            "first V2 CREATE must cross WAL sync and in-memory publication boundaries"
+        );
+        drop(baseline);
+        drop(baseline_temp);
+
+        for (index, point) in trace.iter().copied().enumerate() {
+            let (temp, pager) = test_pager(4096).unwrap();
+            let occurrence = trace[..=index]
+                .iter()
+                .filter(|&&seen| seen == point)
+                .count();
+            let pager = pager.with_faults(Arc::new(RecordingFaults::at(point, occurrence)));
+            let result = create_first_oracle_table(&pager);
+            if matches!(
+                point,
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish
+            ) {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    ErrorCode::Io,
+                    "{point:?}/{occurrence}"
+                );
+            }
+            drop(pager);
+            let reopened = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            assert_first_oracle_create_is_atomic(&reopened);
+        }
+    }
+
+    #[test]
+    fn v2_row_and_unique_index_faults_recover_as_one_mutation() {
+        use crate::fault::FaultPoint;
+        use std::sync::Arc;
+
+        let (fixture, fixture_pager) = test_pager(4096).unwrap();
+        create_first_oracle_table(&fixture_pager).unwrap();
+        let fixture_path = fixture.path().to_owned();
+        drop(fixture_pager);
+        for point in [
+            FaultPoint::BeforeWalRecordWrite,
+            FaultPoint::AfterWalRecordWrite,
+            FaultPoint::BeforeWalSync,
+            FaultPoint::AfterWalSync,
+            FaultPoint::BeforeWalPublish,
+            FaultPoint::AfterWalPublish,
+        ] {
+            let temp = TempDatabase::new("phase5-v2-row-index-fault");
+            std::fs::copy(&fixture_path, temp.path()).unwrap();
+            std::fs::copy(
+                crate::storage::wal::wal_path(&fixture_path),
+                crate::storage::wal::wal_path(temp.path()),
+            )
+            .unwrap();
+            let pager = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap()
+            .with_faults(Arc::new(RecordingFaults::at(point, 1)));
+            let result = add_oracle_row_and_unique_index(&pager);
+            if matches!(
+                point,
+                FaultPoint::BeforeWalPublish | FaultPoint::AfterWalPublish
+            ) {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code(), ErrorCode::Io, "{point:?}");
+            }
+            drop(pager);
+            let reopened = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            assert_oracle_row_and_index_mutation_is_atomic(&reopened);
+        }
     }
 
     #[test]

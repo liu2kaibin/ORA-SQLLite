@@ -32,4 +32,4 @@ jobs:
       - name: Check all targets
         run: rustup run stable cargo check --all-targets
       - name: Run MVP API tests
-        run: rustup run stable cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api
+        run: rustup run stable cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api --test phase5_oracle_types_api
