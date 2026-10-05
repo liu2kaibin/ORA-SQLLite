@@ -466,8 +466,8 @@ fn execute_insert(
         let catalog = batch.catalog_reader()?;
         ConstraintCatalog::open(&catalog, table_id)?
     };
-    relation.validate_values(&values, max_row_bytes)?;
     constraints.validate_row(relation.columns(), &values, memory)?;
+    relation.validate_values(&values, max_row_bytes)?;
     let mut writer = ConstrainedTableWrite::open(batch, table_id)?;
     writer.insert(batch, &values, max_row_bytes, memory)?;
     writer.finish(batch)?;
@@ -476,12 +476,6 @@ fn execute_insert(
 
 fn normalize_column_value(column: &ColumnDef, value: crate::Value) -> Result<crate::Value> {
     let value = normalize_for_column(column, value)?;
-    if column.oracle_type().is_none() && !column.nullable() && value == crate::Value::Null {
-        return Err(DbError::new(
-            ErrorCode::Type,
-            "value does not match its bound column type",
-        ));
-    }
     if column.oracle_type().is_none() && column.column_type() == ColumnType::Decimal {
         if let crate::Value::Int64(integer) = value {
             return Ok(crate::Value::Decimal(int_decimal(integer)?));
