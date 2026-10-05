@@ -37,15 +37,25 @@ fn indentation(line: &str) -> usize {
     line.len() - line.trim_start_matches(' ').len()
 }
 
-fn indented_section<'a>(document: &'a str, header: &str, header_indent: usize) -> Vec<&'a str> {
+fn is_yaml_trivia(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
+fn indented_section<'a>(
+    document: &'a str,
+    header: &str,
+    header_indent: usize,
+) -> Result<Vec<&'a str>, String> {
     let expected_header = format!("{}{header}:", " ".repeat(header_indent));
     let mut lines = document.lines();
-    lines
-        .find(|line| *line == expected_header)
-        .unwrap_or_else(|| panic!("missing YAML section {header}"));
-    lines
-        .take_while(|line| line.trim().is_empty() || indentation(line) > header_indent)
-        .collect()
+    let found = lines.find(|line| *line == expected_header).is_some();
+    if !found {
+        return Err(format!("missing YAML section {header}"));
+    }
+    Ok(lines
+        .take_while(|line| is_yaml_trivia(line) || indentation(line) > header_indent)
+        .collect())
 }
 
 fn mapping_keys<'a>(
@@ -53,30 +63,30 @@ fn mapping_keys<'a>(
     header: &str,
     header_indent: usize,
     key_indent: usize,
-) -> Vec<&'a str> {
-    indented_section(document, header, header_indent)
+) -> Result<Vec<&'a str>, String> {
+    Ok(indented_section(document, header, header_indent)?
         .into_iter()
-        .filter(|line| indentation(line) == key_indent)
+        .filter(|line| !is_yaml_trivia(line) && indentation(line) == key_indent)
         .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key))
-        .collect()
+        .collect())
 }
 
-fn named_steps<'a>(document: &'a str, job: &str) -> Vec<&'a str> {
-    indented_section(document, job, 2)
+fn named_steps<'a>(document: &'a str, job: &str) -> Result<Vec<&'a str>, String> {
+    Ok(indented_section(document, job, 2)?
         .into_iter()
         .filter_map(|line| line.strip_prefix("      - name: "))
-        .collect()
+        .collect())
 }
 
-fn step_count(document: &str, job: &str) -> usize {
-    indented_section(document, job, 2)
+fn step_count(document: &str, job: &str) -> Result<usize, String> {
+    Ok(indented_section(document, job, 2)?
         .into_iter()
         .filter(|line| line.starts_with("      - "))
-        .count()
+        .count())
 }
 
-fn run_commands(document: &str, job: &str) -> Vec<String> {
-    let lines = indented_section(document, job, 2);
+fn run_commands(document: &str, job: &str) -> Result<Vec<String>, String> {
+    let lines = indented_section(document, job, 2)?;
     let mut commands = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
@@ -99,7 +109,164 @@ fn run_commands(document: &str, job: &str) -> Vec<String> {
         commands.push(command);
     }
 
-    commands
+    Ok(commands)
+}
+
+fn validate_release_preview(workflow: &str) -> Result<(), String> {
+    macro_rules! require {
+        ($condition:expr, $message:literal) => {
+            if !$condition {
+                return Err($message.to_owned());
+            }
+        };
+    }
+
+    require!(
+        mapping_keys(workflow, "on", 0, 2)? == ["workflow_dispatch"],
+        "workflow_dispatch must be the only trigger"
+    );
+    require!(
+        mapping_keys(workflow, "permissions", 0, 2)? == ["contents"],
+        "contents must be the only global permission"
+    );
+    require!(
+        indented_section(workflow, "permissions", 0)?
+            .into_iter()
+            .filter(|line| !is_yaml_trivia(line))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            == ["contents: read"],
+        "global contents permission must be read-only"
+    );
+    require!(
+        workflow
+            .lines()
+            .filter(|line| { !is_yaml_trivia(line) && line.trim().starts_with("permissions:") })
+            .collect::<Vec<_>>()
+            == ["permissions:"],
+        "job-level or inline permissions are forbidden"
+    );
+
+    require!(
+        mapping_keys(workflow, "jobs", 0, 2)? == ["stable", "msrv"],
+        "stable and msrv must be the only jobs"
+    );
+    for job in ["stable", "msrv"] {
+        require!(
+            mapping_keys(workflow, job, 2, 4)? == ["name", "runs-on", "timeout-minutes", "steps"],
+            "job shape differs from the approved contract"
+        );
+    }
+    require!(
+        named_steps(workflow, "stable")?
+            == [
+                "Install stable Rust",
+                "Check formatting",
+                "Check all targets",
+                "Build strict documentation",
+                "Run doctests",
+                "Run examples",
+                "Run focused public API tests",
+                "Verify package contents",
+                "Build source package",
+            ],
+        "stable steps differ from the approved contract"
+    );
+    require!(
+        named_steps(workflow, "msrv")?
+            == [
+                "Install Rust 1.85",
+                "Check all targets",
+                "Run examples",
+                "Run focused public API tests",
+            ],
+        "msrv steps differ from the approved contract"
+    );
+    require!(
+        step_count(workflow, "stable")? == 10 && step_count(workflow, "msrv")? == 5,
+        "unexpected workflow step"
+    );
+    require!(
+        workflow
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("- uses: ")
+                    .or_else(|| line.trim().strip_prefix("uses: "))
+            })
+            .collect::<Vec<_>>()
+            == ["actions/checkout@v4", "actions/checkout@v4"],
+        "checkout must be the only action"
+    );
+    require!(
+        run_commands(workflow, "stable")?
+            == [
+                "rustup toolchain install stable --profile minimal --component rustfmt",
+                "rustup run stable cargo fmt --all -- --check",
+                "rustup run stable cargo check --all-targets",
+                "rustup run stable cargo doc --no-deps",
+                "rustup run stable cargo test --doc",
+                "rustup run stable cargo run --example quickstart\nrustup run stable cargo run --example oracle_types",
+                "rustup run stable cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api --test phase5_oracle_types_api --test release_docs",
+                "./.github/scripts/verify-package.ps1",
+                "rustup run stable cargo package",
+            ]
+            .map(str::to_owned),
+        "stable commands differ from the approved contract"
+    );
+    require!(
+        run_commands(workflow, "msrv")?
+            == [
+                "rustup toolchain install 1.85.0 --profile minimal",
+                "rustup run 1.85.0 cargo check --all-targets",
+                "rustup run 1.85.0 cargo run --example quickstart\nrustup run 1.85.0 cargo run --example oracle_types",
+                "rustup run 1.85.0 cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api --test phase5_oracle_types_api --test release_docs",
+            ]
+            .map(str::to_owned),
+        "msrv commands differ from the approved contract"
+    );
+
+    for line in workflow.lines().filter(|line| !is_yaml_trivia(line)) {
+        let setting = line.trim().to_ascii_lowercase();
+        require!(
+            setting != "write-all"
+                && !setting.ends_with(": write")
+                && !setting.starts_with("permissions: write-all"),
+            "write permission is forbidden"
+        );
+    }
+
+    let lowercase = workflow.to_ascii_lowercase();
+    for forbidden in [
+        "pull_request_target",
+        "workflow_call",
+        "schedule:",
+        "secrets",
+        "actions/upload-artifact",
+        "--ignored",
+        "--include-ignored",
+        "deep ci",
+        "deep-ci",
+        "deep_ci",
+        "cargo publish",
+        "cargo login",
+        "npm publish",
+        "docker push",
+        "softprops/action-gh-release",
+        "actions/create-release",
+        "gh release",
+        "gh api repos/",
+        "git tag",
+        "git push",
+        "/releases",
+        "crates.io",
+    ] {
+        if lowercase.contains(forbidden) {
+            return Err(format!("forbidden release capability: {forbidden}"));
+        }
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -148,130 +315,33 @@ fn public_documentation_links_resolve() {
 #[test]
 fn release_preview_is_manual_read_only_and_never_publishes() {
     let workflow = read(".github/workflows/release-preview.yml");
+    validate_release_preview(&workflow).unwrap_or_else(|error| panic!("{error}"));
+}
 
-    assert_eq!(mapping_keys(&workflow, "on", 0, 2), ["workflow_dispatch"]);
-    assert_eq!(mapping_keys(&workflow, "permissions", 0, 2), ["contents"]);
-    assert_eq!(
-        indented_section(&workflow, "permissions", 0)
-            .into_iter()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::trim)
-            .collect::<Vec<_>>(),
-        ["contents: read"]
-    );
-    assert_eq!(
-        workflow
-            .lines()
-            .filter(|line| line.trim() == "permissions:")
-            .collect::<Vec<_>>(),
-        ["permissions:"]
-    );
+#[test]
+fn release_preview_validator_rejects_comment_hidden_and_inline_capabilities() {
+    let workflow = read(".github/workflows/release-preview.yml");
 
-    assert_eq!(mapping_keys(&workflow, "jobs", 0, 2), ["stable", "msrv"]);
-    for job in ["stable", "msrv"] {
-        assert_eq!(
-            mapping_keys(&workflow, job, 2, 4),
-            ["name", "runs-on", "timeout-minutes", "steps"]
-        );
-    }
-    assert_eq!(
-        named_steps(&workflow, "stable"),
-        [
-            "Install stable Rust",
-            "Check formatting",
-            "Check all targets",
-            "Build strict documentation",
-            "Run doctests",
-            "Run examples",
-            "Run focused public API tests",
-            "Verify package contents",
-            "Build source package",
-        ]
+    let hidden_push = workflow.replacen(
+        "  workflow_dispatch:\n",
+        "  workflow_dispatch:\n# low-indent comment\n  push:\n",
+        1,
     );
-    assert_eq!(
-        named_steps(&workflow, "msrv"),
-        [
-            "Install Rust 1.85",
-            "Check all targets",
-            "Run examples",
-            "Run focused public API tests",
-        ]
-    );
-    assert_eq!(step_count(&workflow, "stable"), 10);
-    assert_eq!(step_count(&workflow, "msrv"), 5);
-    assert_eq!(
-        workflow
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .strip_prefix("- uses: ")
-                    .or_else(|| line.trim().strip_prefix("uses: "))
-            })
-            .collect::<Vec<_>>(),
-        ["actions/checkout@v4", "actions/checkout@v4"]
-    );
-    assert_eq!(
-        run_commands(&workflow, "stable"),
-        [
-            "rustup toolchain install stable --profile minimal --component rustfmt",
-            "rustup run stable cargo fmt --all -- --check",
-            "rustup run stable cargo check --all-targets",
-            "rustup run stable cargo doc --no-deps",
-            "rustup run stable cargo test --doc",
-            "rustup run stable cargo run --example quickstart\nrustup run stable cargo run --example oracle_types",
-            "rustup run stable cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api --test phase5_oracle_types_api --test release_docs",
-            "./.github/scripts/verify-package.ps1",
-            "rustup run stable cargo package",
-        ]
-        .map(str::to_owned)
-    );
-    assert_eq!(
-        run_commands(&workflow, "msrv"),
-        [
-            "rustup toolchain install 1.85.0 --profile minimal",
-            "rustup run 1.85.0 cargo check --all-targets",
-            "rustup run 1.85.0 cargo run --example quickstart\nrustup run 1.85.0 cargo run --example oracle_types",
-            "rustup run 1.85.0 cargo test --test public_api --test phase4c_api --test phase4c2_constraint_api --test phase5_oracle_types_api --test release_docs",
-        ]
-        .map(str::to_owned)
-    );
+    assert!(validate_release_preview(&hidden_push).is_err());
 
-    for line in workflow.lines() {
-        let setting = line.trim().to_ascii_lowercase();
-        assert!(
-            setting != "write-all" && !setting.ends_with(": write"),
-            "write permission is forbidden: {setting}"
-        );
-    }
+    let hidden_release_job = format!(
+        "{workflow}\n# column-zero comment\n  release:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    );
+    assert!(validate_release_preview(&hidden_release_job).is_err());
 
-    let lowercase = workflow.to_ascii_lowercase();
-    for forbidden in [
-        "pull_request_target",
-        "workflow_call",
-        "schedule:",
-        "secrets",
-        "actions/upload-artifact",
-        "--ignored",
-        "--include-ignored",
-        "deep ci",
-        "deep-ci",
-        "deep_ci",
-        "cargo publish",
-        "cargo login",
-        "npm publish",
-        "docker push",
-        "softprops/action-gh-release",
-        "actions/create-release",
-        "gh release",
-        "gh api repos/",
-        "git tag",
-        "git push",
-        "/releases",
-        "crates.io",
-    ] {
-        assert!(
-            !lowercase.contains(forbidden),
-            "forbidden release capability: {forbidden}"
-        );
-    }
+    let hidden_job_permission =
+        format!("{workflow}\n# low-indent comment\n    permissions: write-all\n");
+    assert!(validate_release_preview(&hidden_job_permission).is_err());
+
+    let inline_permission = workflow.replacen(
+        "permissions:\n  contents: read",
+        "permissions: { contents: write }",
+        1,
+    );
+    assert!(validate_release_preview(&inline_permission).is_err());
 }
