@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::oracle_type::OracleTypeDescriptor;
 use crate::sql::bound::BoundSource;
-use crate::sql::plan::{ExecExpr, ExecExprKind, IndexAccessPlan, PlanKind, QueryPlan};
+use crate::sql::plan::{
+    ExecExpr, ExecExprKind, IndexAccessPlan, OrderExpression, PlanKind, QueryPlan,
+};
 use crate::storage::catalog::CatalogReader;
 use crate::{DbError, ErrorCode, Parameters, Result, Statement};
 
@@ -68,8 +70,75 @@ fn normalize_oracle_predicate_parameters(
     memory: &mut WorkMemory,
 ) -> Result<()> {
     let mut contracts = BTreeMap::new();
+    let mut normalized_uses = BTreeMap::new();
+    let mut total_uses = BTreeMap::new();
+    for join in query.joins() {
+        collect_oracle_parameter_contracts(
+            join.condition(),
+            &mut contracts,
+            &mut normalized_uses,
+            &mut total_uses,
+        )?;
+    }
     if let Some(selection) = query.selection() {
-        collect_oracle_parameter_contracts(selection, &mut contracts)?;
+        collect_oracle_parameter_contracts(
+            selection,
+            &mut contracts,
+            &mut normalized_uses,
+            &mut total_uses,
+        )?;
+    }
+    for expression in query.group_by() {
+        collect_oracle_parameter_contracts(
+            expression,
+            &mut contracts,
+            &mut normalized_uses,
+            &mut total_uses,
+        )?;
+    }
+    for aggregate in query.aggregates() {
+        if let Some(argument) = aggregate.argument() {
+            collect_oracle_parameter_contracts(
+                argument,
+                &mut contracts,
+                &mut normalized_uses,
+                &mut total_uses,
+            )?;
+        }
+    }
+    if let Some(having) = query.having() {
+        collect_oracle_parameter_contracts(
+            having,
+            &mut contracts,
+            &mut normalized_uses,
+            &mut total_uses,
+        )?;
+    }
+    for expression in query.projection() {
+        collect_oracle_parameter_contracts(
+            expression,
+            &mut contracts,
+            &mut normalized_uses,
+            &mut total_uses,
+        )?;
+    }
+    for item in query.order_by() {
+        if let OrderExpression::Expression(expression) = item.expression() {
+            collect_oracle_parameter_contracts(
+                expression,
+                &mut contracts,
+                &mut normalized_uses,
+                &mut total_uses,
+            )?;
+        }
+    }
+    for slot in contracts.keys() {
+        if normalized_uses.get(slot) != total_uses.get(slot) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "parameter has conflicting Oracle and legacy normalization contracts",
+            ));
+        }
     }
     params.normalize_oracle_slots(&contracts.into_iter().collect::<Vec<_>>(), memory)
 }
@@ -77,6 +146,8 @@ fn normalize_oracle_predicate_parameters(
 fn collect_oracle_parameter_contracts(
     expression: &ExecExpr,
     contracts: &mut BTreeMap<u16, OracleTypeDescriptor>,
+    normalized_uses: &mut BTreeMap<u16, usize>,
+    total_uses: &mut BTreeMap<u16, usize>,
 ) -> Result<()> {
     match expression.kind() {
         ExecExprKind::Binary {
@@ -86,36 +157,37 @@ fn collect_oracle_parameter_contracts(
             ..
         } => {
             if let Some(contract) = oracle_contract {
-                collect_direct_parameter(left, contract.left(), contracts)?;
-                collect_direct_parameter(right, contract.right(), contracts)?;
+                collect_direct_parameter(left, contract.left(), contracts, normalized_uses)?;
+                collect_direct_parameter(right, contract.right(), contracts, normalized_uses)?;
             }
-            collect_oracle_parameter_contracts(left, contracts)?;
-            collect_oracle_parameter_contracts(right, contracts)?;
+            collect_oracle_parameter_contracts(left, contracts, normalized_uses, total_uses)?;
+            collect_oracle_parameter_contracts(right, contracts, normalized_uses, total_uses)?;
         }
         ExecExprKind::Unary { expr, .. } | ExecExprKind::IsNull { expr, .. } => {
-            collect_oracle_parameter_contracts(expr, contracts)?;
+            collect_oracle_parameter_contracts(expr, contracts, normalized_uses, total_uses)?;
         }
         ExecExprKind::InList { expr, values, .. } => {
-            collect_oracle_parameter_contracts(expr, contracts)?;
+            collect_oracle_parameter_contracts(expr, contracts, normalized_uses, total_uses)?;
             for value in values {
-                collect_oracle_parameter_contracts(value, contracts)?;
+                collect_oracle_parameter_contracts(value, contracts, normalized_uses, total_uses)?;
             }
         }
         ExecExprKind::Between {
             expr, low, high, ..
         } => {
-            collect_oracle_parameter_contracts(expr, contracts)?;
-            collect_oracle_parameter_contracts(low, contracts)?;
-            collect_oracle_parameter_contracts(high, contracts)?;
+            collect_oracle_parameter_contracts(expr, contracts, normalized_uses, total_uses)?;
+            collect_oracle_parameter_contracts(low, contracts, normalized_uses, total_uses)?;
+            collect_oracle_parameter_contracts(high, contracts, normalized_uses, total_uses)?;
         }
         ExecExprKind::Like { expr, pattern, .. } => {
-            collect_oracle_parameter_contracts(expr, contracts)?;
-            collect_oracle_parameter_contracts(pattern, contracts)?;
+            collect_oracle_parameter_contracts(expr, contracts, normalized_uses, total_uses)?;
+            collect_oracle_parameter_contracts(pattern, contracts, normalized_uses, total_uses)?;
         }
-        ExecExprKind::Literal(_)
-        | ExecExprKind::Column { .. }
-        | ExecExprKind::Parameter { .. }
-        | ExecExprKind::Aggregate { .. } => {}
+        ExecExprKind::Literal(_) | ExecExprKind::Column { .. } | ExecExprKind::Aggregate { .. } => {
+        }
+        ExecExprKind::Parameter { slot } => {
+            *total_uses.entry(*slot).or_default() += 1;
+        }
     }
     Ok(())
 }
@@ -124,10 +196,12 @@ fn collect_direct_parameter(
     expression: &ExecExpr,
     descriptor: OracleTypeDescriptor,
     contracts: &mut BTreeMap<u16, OracleTypeDescriptor>,
+    normalized_uses: &mut BTreeMap<u16, usize>,
 ) -> Result<()> {
     let ExecExprKind::Parameter { slot } = expression.kind() else {
         return Ok(());
     };
+    *normalized_uses.entry(*slot).or_default() += 1;
     match contracts.insert(*slot, descriptor) {
         Some(existing) if existing != descriptor => Err(DbError::new(
             ErrorCode::Type,

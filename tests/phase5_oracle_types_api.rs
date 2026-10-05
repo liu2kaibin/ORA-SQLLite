@@ -249,13 +249,18 @@ fn raw_catalog_capture_rejects_out_of_range_oracle_descriptor_fields() {
 fn rejects_bare_number_and_local_timezone_before_catalog_mutation() {
     let (files, database) = support::new_database("phase5-types-reject");
     let mut connection = database.connect().unwrap();
-    for sql in [
-        "CREATE TABLE A (N NUMBER)",
-        "CREATE TABLE B (N NUMBER(0,0))",
-        "CREATE TABLE C (V VARCHAR2(0))",
-        "CREATE TABLE D (T TIMESTAMP(6) WITH LOCAL TIME ZONE)",
+    for (sql, expected_code) in [
+        ("CREATE TABLE A (N NUMBER)", ErrorCode::Type),
+        ("CREATE TABLE B (N NUMBER(0,0))", ErrorCode::Type),
+        ("CREATE TABLE C (V VARCHAR2(0))", ErrorCode::Type),
+        (
+            "CREATE TABLE D (T TIMESTAMP(6) WITH LOCAL TIME ZONE)",
+            ErrorCode::Unsupported,
+        ),
+        ("CREATE TABLE E (N NCHAR(10))", ErrorCode::Unsupported),
     ] {
         let error = connection.prepare(sql).unwrap_err();
+        assert_eq!(error.code(), expected_code, "{sql}: {error}");
         assert_eq!(error.oracle_code(), Some(902));
         assert!(error.sql_location().is_some());
     }
@@ -403,13 +408,16 @@ fn failed_normalization_leaves_rowid_and_indexes_unchanged() {
     let before = support::format2::raw_catalog_capture(files.main()).unwrap();
     let database = support::reopen(&files);
     let mut connection = database.connect().unwrap();
-    let insert = connection
-        .prepare("INSERT INTO T VALUES (1, 9.99, '')")
-        .unwrap();
+    let sql = "INSERT INTO T VALUES (1, 9.99, '')";
+    let insert = connection.prepare(sql).unwrap();
     let error = connection.execute(&insert, Parameters::none()).unwrap_err();
     assert_eq!(
         (error.code(), error.oracle_code()),
         (ora_sqllite::ErrorCode::Type, Some(1438))
+    );
+    assert_eq!(
+        error.sql_location().unwrap().byte_offset(),
+        sql.find("9.99").unwrap()
     );
     drop(connection);
     drop(database);
@@ -417,6 +425,82 @@ fn failed_normalization_leaves_rowid_and_indexes_unchanged() {
     let after = support::format2::raw_catalog_capture(files.main()).unwrap();
     assert_eq!(after.tables["T"].next_rowid, before.tables["T"].next_rowid);
     assert_eq!(after.indexes, before.indexes);
+}
+
+#[test]
+fn update_delete_and_late_failure_use_normalized_rows_across_reopen() {
+    let (files, database) = support::new_database("phase5-update-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(2,0) PRIMARY KEY, N NUMBER(3,1), V VARCHAR2(1) NOT NULL)",
+    );
+    support::execute_sql(&mut connection, "CREATE INDEX T_N ON T(N)");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1, 1.1, 'A')");
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (2, 99.9, 'B')");
+
+    let failing = connection.prepare("UPDATE T SET N = N * 10").unwrap();
+    let error = connection
+        .execute(&failing, Parameters::none())
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ErrorCode::Type, Some(1438))
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID,N,V FROM T ORDER BY ID"),
+        vec![
+            vec![
+                decimal_value(1, 0),
+                decimal_value(11, 1),
+                Value::Text("A".into())
+            ],
+            vec![
+                decimal_value(2, 0),
+                decimal_value(999, 1),
+                Value::Text("B".into()),
+            ],
+        ]
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID FROM T WHERE N = 1.1"),
+        vec![vec![decimal_value(1, 0)]]
+    );
+    assert!(support::collect(&mut connection, "SELECT ID FROM T WHERE N = 11").is_empty());
+
+    let update = connection
+        .prepare("UPDATE T SET N = :1, V = :2 WHERE ID = :3")
+        .unwrap();
+    connection
+        .execute(
+            &update,
+            Parameters::positional(&[
+                Value::Text("2.25".into()).into(),
+                Value::Text("C".into()).into(),
+                Value::Text("1".into()).into(),
+            ]),
+        )
+        .unwrap();
+    let delete = connection.prepare("DELETE FROM T WHERE N = :1").unwrap();
+    connection
+        .execute(
+            &delete,
+            Parameters::positional(&[Value::Text("2.30".into()).into()]),
+        )
+        .unwrap();
+    drop(connection);
+    drop(database);
+
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT ID,N,V FROM T ORDER BY ID"),
+        vec![vec![
+            decimal_value(2, 0),
+            decimal_value(999, 1),
+            Value::Text("B".into()),
+        ]]
+    );
 }
 
 #[test]
@@ -480,6 +564,41 @@ fn oracle_text_parameter_permission_is_limited_to_a_direct_assignment() {
             .contains("runtime parameter requires a compatible concrete type"),
         "{error}"
     );
+}
+
+#[test]
+fn oracle_join_parameters_normalize_before_an_empty_scan() {
+    let (_files, database) = support::new_database("phase5-join-parameter-normalization");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    let statement = connection
+        .prepare("SELECT A.N FROM T A INNER JOIN T B ON A.N = :1")
+        .unwrap();
+    let values = [Value::Text("not-a-number".into()).into()];
+    let error = match connection.query(&statement, Parameters::positional(&values)) {
+        Ok(_) => panic!("invalid Oracle JOIN parameter reached the empty scan"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ErrorCode::Type, Some(1722))
+    );
+}
+
+#[test]
+fn mixed_oracle_and_legacy_parameter_contracts_are_rejected_before_scan() {
+    let (_files, database) = support::new_database("phase5-mixed-parameter-contracts");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2), D DECIMAL)");
+    let statement = connection
+        .prepare("SELECT :1 FROM T WHERE N = :1 AND D = :1")
+        .unwrap();
+    let values = [decimal_value(12_345, 3).into()];
+    let error = match connection.query(&statement, Parameters::positional(&values)) {
+        Ok(_) => panic!("one parameter was accepted with conflicting normalization contracts"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), ErrorCode::Type);
 }
 
 #[test]

@@ -274,7 +274,7 @@ fn evaluate_update_assignments(
                     )
                 })?;
             let value = normalize_column_value(column, eval(assignment.value(), old, params)?)
-                .map_err(|error| error.with_sql_location(assignment.target().location()))?;
+                .map_err(|error| error.with_sql_location(assignment.value().location()))?;
             let payload = owned_value_payload_bytes(&value)?;
             let next = checked_add_bytes(bytes, payload)?;
             memory.reserve(payload)?;
@@ -435,7 +435,7 @@ fn execute_insert(
     let table_id = plan.table().table_id();
     let relation = Relation::open_from_batch(batch, table_id)?;
     let mut values = vec![crate::Value::Null; relation.column_count()];
-    let mut target_locations = vec![None; relation.column_count()];
+    let mut value_locations = vec![None; relation.column_count()];
     let empty_row = EvalRow::default();
     for (target, expression) in plan.targets().iter().zip(plan.values()) {
         let slot = values
@@ -447,7 +447,7 @@ fn execute_insert(
                 )
             })?;
         *slot = eval(expression, &empty_row, params)?;
-        target_locations[usize::from(target.ordinal())] = Some(target.location());
+        value_locations[usize::from(target.ordinal())] = Some(expression.location());
     }
     // Normalize the whole logical row before any constraint/index storage work.
     // This includes omitted columns, whose implicit NULL must still obey V2
@@ -455,7 +455,7 @@ fn execute_insert(
     for (ordinal, (column, value)) in relation.columns().iter().zip(values.iter_mut()).enumerate() {
         let normalized =
             normalize_column_value(column, std::mem::replace(value, crate::Value::Null));
-        *value = match (normalized, target_locations[ordinal]) {
+        *value = match (normalized, value_locations[ordinal]) {
             (Ok(value), _) => value,
             (Err(error), Some(location)) => return Err(error.with_sql_location(location)),
             (Err(error), None) => return Err(error),
@@ -1866,7 +1866,7 @@ mod tests {
             .clone();
 
         for (statement, memory_limit, expected) in [
-            (&null_id, 64 * 1024 * 1024, ErrorCode::Constraint),
+            (&null_id, 64 * 1024 * 1024, ErrorCode::Type),
             (&oversized, 128, ErrorCode::Type),
         ] {
             let validated =

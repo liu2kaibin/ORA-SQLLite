@@ -425,7 +425,7 @@ pub(crate) fn normalize_for_column(column: &ColumnDef, value: Value) -> Result<V
         Some(descriptor) => normalize_for_type(descriptor, value)?,
         None => value,
     };
-    if !column.nullable() && normalized == Value::Null {
+    if column.oracle_type().is_some() && !column.nullable() && normalized == Value::Null {
         return Err(DbError::oracle(
             ErrorCode::Constraint,
             1400,

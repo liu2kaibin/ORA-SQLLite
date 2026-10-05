@@ -441,6 +441,12 @@ fn bind_type_declaration(declaration: &TypeDeclaration) -> Result<BoundTypeDecla
                     OracleTypeDescriptor::timestamp_with_time_zone(precision)
                         .map_err(|error| locate_type_error(error, declaration.span))?,
                 ),
+                [TypeModifier::WithLocalTimeZone(_)] => {
+                    return Err(unsupported_type_declaration(
+                        declaration,
+                        "TIMESTAMP WITH LOCAL TIME ZONE is not supported",
+                    ));
+                }
                 _ => {
                     return Err(invalid_type_declaration(
                         declaration,
@@ -453,9 +459,9 @@ fn bind_type_declaration(declaration: &TypeDeclaration) -> Result<BoundTypeDecla
             require_exact_shape(declaration, 0)?;
             None
         }
-        _ => Err(DbError::new(
-            ErrorCode::Unsupported,
-            "SQL type is not representable by catalog V1",
+        _ => Err(unsupported_type_declaration(
+            declaration,
+            "SQL type is not supported",
         ))?,
     };
     let column_type = match oracle_type {
@@ -512,6 +518,13 @@ where
 fn invalid_type_declaration(declaration: &TypeDeclaration, message: &'static str) -> DbError {
     locate_type_error(
         DbError::new(ErrorCode::Type, message).with_oracle_code(902),
+        declaration.span,
+    )
+}
+
+fn unsupported_type_declaration(declaration: &TypeDeclaration, message: &'static str) -> DbError {
+    locate_type_error(
+        DbError::new(ErrorCode::Unsupported, message).with_oracle_code(902),
         declaration.span,
     )
 }
@@ -1796,10 +1809,18 @@ mod tests {
             "CREATE TABLE T_BARE_NUMBER (N NUMBER)",
             "CREATE TABLE T_BAD_NUMBER (N NUMBER(39))",
             "CREATE TABLE T_BAD_TIMESTAMP (TS TIMESTAMP(10))",
-            "CREATE TABLE T_LOCAL_TIMESTAMP (TS TIMESTAMP WITH LOCAL TIME ZONE)",
         ] {
             let error = prepare_fixture(sql).unwrap_err();
             assert_eq!(error.code(), ErrorCode::Type, "{sql}");
+            assert_eq!(error.oracle_code(), Some(902), "{sql}");
+            assert!(error.sql_location().is_some(), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE T_LOCAL_TIMESTAMP (TS TIMESTAMP WITH LOCAL TIME ZONE)",
+            "CREATE TABLE T_NCHAR (N NCHAR(10))",
+        ] {
+            let error = prepare_fixture(sql).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unsupported, "{sql}");
             assert_eq!(error.oracle_code(), Some(902), "{sql}");
             assert!(error.sql_location().is_some(), "{sql}");
         }

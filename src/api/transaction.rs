@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_late_wide_update_never_uses_unbounded_diagnostic_validation() {
+    fn invalid_wide_update_normalizes_before_diagnostic_validation() {
         // Production break caught: retrying validation with usize::MAX and
         // cloning/encoding one whole candidate row per assignment bypasses the
         // statement budget while diagnosing the final invalid assignment.
@@ -558,8 +558,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Type);
         let validation_limits = take_value_validation_limits_for_test();
-        assert_eq!(validation_limits.len(), 1);
-        assert_ne!(validation_limits[0], usize::MAX);
+        assert!(validation_limits.is_empty());
         assert_eq!(batch_table_contents(&mut transaction, "T"), before);
         transaction.rollback().unwrap();
     }
