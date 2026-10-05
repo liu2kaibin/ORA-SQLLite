@@ -66,6 +66,8 @@ pub enum OracleCatalogMutation {
     SetColumnEnvelopeVersion(u8),
     SetOracleKind(u8),
     SetOracleFlags(u8),
+    SetOracleScale(i8),
+    SetOracleLength(u32),
 }
 
 pub fn mutate_oracle_catalog_for_test(
@@ -85,7 +87,7 @@ pub fn mutate_oracle_catalog_for_test(
                 restamp_superblock(slot)?;
             }
         }
-        mutation => mutate_first_v2_column_definition(&mut bytes, &header, mutation)?,
+        mutation => mutate_first_v2_column_definition(&mut bytes, &header, None, mutation)?,
     }
     fs::write(files.main(), bytes).map_err(|error| format!("write database: {error}"))
 }
@@ -93,6 +95,7 @@ pub fn mutate_oracle_catalog_for_test(
 fn mutate_first_v2_column_definition(
     bytes: &mut [u8],
     header: &Header,
+    expected_kind: Option<u8>,
     mutation: OracleCatalogMutation,
 ) -> Result<(), String> {
     for page_id in 1..header.page_count {
@@ -130,17 +133,38 @@ fn mutate_first_v2_column_definition(
             if value.get(0..2) != Some(&[0x14, 2]) {
                 continue;
             }
+            if expected_kind.is_some_and(|kind| value.get(28) != Some(&kind)) {
+                continue;
+            }
             match mutation {
                 OracleCatalogMutation::ClearFeatureBit => unreachable!("handled above"),
                 OracleCatalogMutation::SetColumnEnvelopeVersion(version) => value[1] = version,
                 OracleCatalogMutation::SetOracleKind(kind) => value[28] = kind,
                 OracleCatalogMutation::SetOracleFlags(flags) => value[31] = flags,
+                OracleCatalogMutation::SetOracleScale(scale) => value[30] = scale as u8,
+                OracleCatalogMutation::SetOracleLength(length) => {
+                    value[32..36].copy_from_slice(&length.to_le_bytes())
+                }
             }
             restamp_page(page)?;
             return Ok(());
         }
     }
     Err("owned database has no inline V2 column definition".into())
+}
+
+pub fn mutate_oracle_column_for_test(
+    files: &TestFiles,
+    expected_kind: u8,
+    mutation: OracleCatalogMutation,
+) -> Result<(), String> {
+    let mut bytes = fs::read(files.main()).map_err(|error| format!("read database: {error}"))?;
+    let header = select_header(&bytes)?;
+    if matches!(mutation, OracleCatalogMutation::ClearFeatureBit) {
+        return Err("feature-bit mutation does not target a column".into());
+    }
+    mutate_first_v2_column_definition(&mut bytes, &header, Some(expected_kind), mutation)?;
+    fs::write(files.main(), bytes).map_err(|error| format!("write database: {error}"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1616,14 +1640,32 @@ fn valid_raw_oracle_descriptor(
     length: u32,
 ) -> bool {
     match kind {
-        1 => physical_type == 2 && (1..=38).contains(&precision) && length == 0,
-        2 => physical_type == 4 && precision == 0 && scale == 0 && length != 0,
-        3 => physical_type == 4 && precision == 0 && scale == 0 && length != 0,
-        4 => physical_type == 5 && precision == 0 && scale == 0 && length != 0,
+        1 => {
+            physical_type == 2
+                && (1..=38).contains(&precision)
+                && (-38..=38).contains(&scale)
+                && length == 0
+        }
+        2 => physical_type == 4 && precision == 0 && scale == 0 && (1..=32_767).contains(&length),
+        3 => physical_type == 4 && precision == 0 && scale == 0 && (1..=2_000).contains(&length),
+        4 => physical_type == 5 && precision == 0 && scale == 0 && (1..=32_767).contains(&length),
         5 => physical_type == 6 && precision == 0 && scale == 0 && length == 0,
         6 => physical_type == 7 && scale == 0 && length == 0 && precision <= 9,
         7 => physical_type == 8 && scale == 0 && length == 0 && precision <= 9,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod raw_oracle_descriptor_tests {
+    use super::valid_raw_oracle_descriptor;
+
+    #[test]
+    fn rejects_out_of_range_numeric_and_sized_raw_descriptors() {
+        assert!(!valid_raw_oracle_descriptor(2, 1, 5, 39, 0));
+        assert!(!valid_raw_oracle_descriptor(4, 2, 0, 0, 32_768));
+        assert!(!valid_raw_oracle_descriptor(4, 3, 0, 0, 2_001));
+        assert!(!valid_raw_oracle_descriptor(5, 4, 0, 0, 32_768));
     }
 }
 

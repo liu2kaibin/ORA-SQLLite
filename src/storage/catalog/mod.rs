@@ -2770,7 +2770,10 @@ mod tests {
             pager::{Pager, PagerConfig, WriteBatch},
             relation::{ColumnSpec, TableSpec, TableWrite, create_relation, drop_relation},
             row::{RowCodec, encode_rowid_key},
-            test_support::{RecordingFaults, TempDatabase, test_pager},
+            test_support::{
+                RecordingFaults, TempDatabase, phase5_abort_pager_initialization,
+                phase5_pager_initialization_trace, test_pager,
+            },
         },
     };
 
@@ -3091,10 +3094,27 @@ mod tests {
             .get(&mut snapshot, &encode_rowid_key(RowId::new(1).unwrap()))
             .unwrap();
         let index = catalog.find_index_by_name(&CatalogName::new("UX_T_N").unwrap());
-        assert!(
-            (row.is_none() && index.is_none()) || (row.is_some() && index.is_some()),
-            "a V2 row and its unique index must recover together"
-        );
+        match (row, index) {
+            (None, None) => {}
+            (Some(_), Some(index)) => {
+                let columns = catalog
+                    .columns_for_index(index.id())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let value = crate::Value::Decimal(crate::Decimal::new(false, 2, 125).unwrap());
+                let key = IndexKeyCodec::encode(&columns, &[value], RowId::new(1).unwrap())
+                    .unwrap()
+                    .into_physical();
+                assert_eq!(
+                    BTree::from_root(TreeKind::Index, index.root())
+                        .get(&mut snapshot, &key)
+                        .unwrap(),
+                    Some(Vec::new()),
+                    "the recovered unique index must contain the physical Oracle NUMBER key"
+                );
+            }
+            _ => panic!("a V2 row and its unique index must recover together"),
+        }
     }
 
     #[test]
@@ -3146,6 +3166,157 @@ mod tests {
             .unwrap();
             assert_first_oracle_create_is_atomic(&reopened);
         }
+    }
+
+    #[test]
+    fn first_v2_create_directory_boundaries_recover_an_empty_catalog_after_child_abort() {
+        use crate::fault::FaultPoint;
+
+        let trace_temp = TempDatabase::new("phase4c1-directory-case");
+        let trace = phase5_pager_initialization_trace(trace_temp.path());
+        assert!(
+            [
+                FaultPoint::BeforeMainDirectorySync,
+                FaultPoint::AfterMainDirectorySync,
+                FaultPoint::BeforeWalDirectorySync,
+                FaultPoint::AfterWalDirectorySync,
+            ]
+            .into_iter()
+            .all(|point| trace.contains(&point)),
+            "pager initialization must expose all directory durability boundaries"
+        );
+
+        for point in [
+            FaultPoint::BeforeMainDirectorySync,
+            FaultPoint::AfterMainDirectorySync,
+            FaultPoint::BeforeWalDirectorySync,
+            FaultPoint::AfterWalDirectorySync,
+        ] {
+            let occurrence = trace.iter().filter(|&&seen| seen == point).count();
+            assert_eq!(occurrence, 1, "unexpected {point:?} occurrence count");
+            let temp = TempDatabase::new("phase4c1-directory-case");
+            let path = temp.path().to_owned();
+            let mut command = crate::storage::test_support::phase_4c1_exact_crash_child_command(
+                "storage::catalog::tests::phase5_directory_initialization_crash_child",
+            );
+            command
+                .env("ORA_SQLLITE_PHASE5_DIRECTORY_PATH", &path)
+                .env("ORA_SQLLITE_PHASE5_DIRECTORY_POINT", format!("{point:?}"))
+                .env(
+                    "ORA_SQLLITE_PHASE5_DIRECTORY_TRACE",
+                    trace
+                        .iter()
+                        .map(|point| format!("{point:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            let output = command
+                .output()
+                .expect("reap Phase 5 directory crash child");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let marker = format!("PHASE5_ABORT initialize {point:?} 1");
+            assert!(
+                stderr.lines().any(|line| line == marker),
+                "wrong Phase 5 directory crash marker: {stderr}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(6), "child must abort");
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                output.status.code(),
+                Some(-1_073_740_791),
+                "child must abort with Windows fast-fail"
+            );
+
+            let pager = Pager::open(
+                temp.path(),
+                OpenMode::ReadWrite,
+                PagerConfig::test_default(4096),
+            )
+            .unwrap();
+            let mut snapshot = pager.begin_read().unwrap();
+            let catalog = CatalogReader::open_empty_or_v1(&mut snapshot).unwrap();
+            assert_eq!(snapshot.feature_bits() & ORACLE_TYPES_V1, 0);
+            assert!(
+                catalog
+                    .find_table_by_name(&CatalogName::new("T").unwrap())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "only launched by first_v2_create_directory_boundaries_recover_an_empty_catalog_after_child_abort"]
+    fn phase5_directory_initialization_crash_child() {
+        use crate::fault::FaultPoint;
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("ORA_SQLLITE_PHASE5_DIRECTORY_PATH")
+                .expect("Phase 5 directory crash path is required"),
+        );
+        let canonical_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(
+            std::fs::canonicalize(path.parent().expect("directory crash path has no parent"))
+                .unwrap(),
+            canonical_temp
+        );
+        assert!(
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(
+                    |name| name.contains("-phase4c1-directory-case-") && name.ends_with(".db")
+                )
+        );
+        assert!(!path.exists() && !crate::storage::wal::wal_path(&path).exists());
+        let parse = |name: &str| match name {
+            "BeforeMainExtend" => FaultPoint::BeforeMainExtend,
+            "AfterMainExtend" => FaultPoint::AfterMainExtend,
+            "BeforeMainPageWrite" => FaultPoint::BeforeMainPageWrite,
+            "AfterMainPageWrite" => FaultPoint::AfterMainPageWrite,
+            "BeforeMainSync" => FaultPoint::BeforeMainSync,
+            "AfterMainSync" => FaultPoint::AfterMainSync,
+            "BeforeMainDirectorySync" => FaultPoint::BeforeMainDirectorySync,
+            "AfterMainDirectorySync" => FaultPoint::AfterMainDirectorySync,
+            "BeforeWalDirectorySync" => FaultPoint::BeforeWalDirectorySync,
+            "AfterWalDirectorySync" => FaultPoint::AfterWalDirectorySync,
+            "BeforeSuperblockWrite" => FaultPoint::BeforeSuperblockWrite,
+            "AfterSuperblockWrite" => FaultPoint::AfterSuperblockWrite,
+            "BeforeWalRecordWrite" => FaultPoint::BeforeWalRecordWrite,
+            "AfterWalRecordWrite" => FaultPoint::AfterWalRecordWrite,
+            "AfterWalRecordHeaderPrefixWrite" => FaultPoint::AfterWalRecordHeaderPrefixWrite,
+            "AfterWalRecordPayloadPrefixWrite" => FaultPoint::AfterWalRecordPayloadPrefixWrite,
+            "BeforeWalPublish" => FaultPoint::BeforeWalPublish,
+            "AfterWalPublish" => FaultPoint::AfterWalPublish,
+            "BeforeWalHeaderWrite" => FaultPoint::BeforeWalHeaderWrite,
+            "AfterWalHeaderWrite" => FaultPoint::AfterWalHeaderWrite,
+            "BeforeWalSync" => FaultPoint::BeforeWalSync,
+            "AfterWalSync" => FaultPoint::AfterWalSync,
+            "BeforeWalTruncate" => FaultPoint::BeforeWalTruncate,
+            "AfterWalTruncate" => FaultPoint::AfterWalTruncate,
+            _ => panic!("invalid Phase 5 directory crash point"),
+        };
+        let point = parse(
+            &std::env::var("ORA_SQLLITE_PHASE5_DIRECTORY_POINT")
+                .expect("Phase 5 directory crash point is required"),
+        );
+        let trace = std::env::var("ORA_SQLLITE_PHASE5_DIRECTORY_TRACE")
+            .expect("Phase 5 directory crash trace is required")
+            .split(',')
+            .map(parse)
+            .collect::<Vec<_>>();
+        assert_eq!(trace.iter().filter(|&&seen| seen == point).count(), 1);
+        phase5_abort_pager_initialization(
+            &path,
+            trace,
+            point,
+            1,
+            "PHASE5_ABORT initialize".to_owned(),
+        );
+        panic!("configured Phase 5 directory crash point was not reached");
     }
 
     #[test]

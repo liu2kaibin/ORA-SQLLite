@@ -203,7 +203,7 @@ impl Pager {
         Self::create_with_faults(path, config, Arc::new(crate::fault::NoFaults))
     }
 
-    fn create_with_faults(
+    pub(crate) fn create_with_faults(
         path: &Path,
         config: PagerConfig,
         faults: Arc<dyn FaultInjector>,

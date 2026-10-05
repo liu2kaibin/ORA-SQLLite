@@ -103,6 +103,38 @@ fn v1_database_opens_without_rewrite_and_v1_v2_coexist_across_reopen() {
 }
 
 #[test]
+fn v1_and_v2_columns_share_one_table_across_checkpoint_and_reopen() {
+    let (files, database) = support::new_database("phase5-mixed-columns");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE MIXED (I INT64, N NUMBER(5,2))",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO MIXED VALUES (7, 12.50)");
+    drop(connection);
+    drop(database);
+
+    support::checkpoint_accepted_state(&files);
+    let capture = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(
+        capture.tables["MIXED"]
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["I", "N"]
+    );
+    assert_eq!(capture.oracle_columns["MIXED.N"].kind, 1);
+
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT I, N FROM MIXED"),
+        vec![vec![Value::Int64(7), decimal_value(1_250, 2)]]
+    );
+}
+
+#[test]
 fn v2_column_records_require_bit_two_but_the_empty_post_drop_catalog_is_legal() {
     let (files, database) = support::new_database("phase5-v2-feature-bit");
     let mut connection = database.connect().unwrap();
@@ -167,6 +199,48 @@ fn corrupted_v2_column_envelope_and_descriptor_have_stable_error_classes() {
                 .code(),
             expected,
             "{label}"
+        );
+    }
+}
+
+#[test]
+fn raw_catalog_capture_rejects_out_of_range_oracle_descriptor_fields() {
+    for (label, declaration, kind, mutation) in [
+        (
+            "number-scale",
+            "N NUMBER(5,2)",
+            1,
+            support::format2::OracleCatalogMutation::SetOracleScale(39),
+        ),
+        (
+            "varchar2-length",
+            "V VARCHAR2(1)",
+            2,
+            support::format2::OracleCatalogMutation::SetOracleLength(32_768),
+        ),
+        (
+            "char-length",
+            "C CHAR(1)",
+            3,
+            support::format2::OracleCatalogMutation::SetOracleLength(2_001),
+        ),
+        (
+            "raw-length",
+            "R RAW(1)",
+            4,
+            support::format2::OracleCatalogMutation::SetOracleLength(32_768),
+        ),
+    ] {
+        let (files, database) = support::new_database(&format!("phase5-raw-{label}"));
+        let mut connection = database.connect().unwrap();
+        support::execute_sql(&mut connection, &format!("CREATE TABLE T ({declaration})"));
+        drop(connection);
+        drop(database);
+        support::checkpoint_accepted_state(&files);
+        support::format2::mutate_oracle_column_for_test(&files, kind, mutation).unwrap();
+        assert!(
+            support::format2::raw_catalog_capture(files.main()).is_err(),
+            "raw capture accepted {label}"
         );
     }
 }
