@@ -182,6 +182,11 @@ impl Connection {
     /// The statement's database identity and retained schema dependencies are revalidated before
     /// execution. Passing a row-producing query returns [`ErrorCode::Type`]. SQL transaction-control
     /// statements update this connection's SQL transaction state.
+    ///
+    /// Validation or execution errors returned before durability publish no changes. A commit/WAL
+    /// I/O error can instead occur after durable sync, so the commit outcome is uncertain; the
+    /// connection may require reopen, which marks uncertainty rather than success. Reopen so
+    /// recovery runs, then reconcile the observed database state before retrying the business write.
     pub fn execute(
         &mut self,
         statement: &Statement,

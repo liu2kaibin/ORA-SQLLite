@@ -33,6 +33,36 @@ fn repository_relative_links(markdown: &str) -> Vec<&str> {
     links
 }
 
+fn rustdoc_before(source: &str, signature: &str) -> String {
+    let prefix = source
+        .split_once(signature)
+        .unwrap_or_else(|| panic!("missing function signature {signature}"))
+        .0;
+    let mut lines = prefix
+        .lines()
+        .rev()
+        .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with("///"))
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn assert_commit_failure_guidance(surface: &str, text: &str) {
+    let text = text.to_ascii_lowercase();
+    assert!(
+        text.contains("outcome is uncertain"),
+        "{surface} must identify an uncertain commit outcome"
+    );
+    assert!(
+        text.contains("reopen") && text.contains("recovery"),
+        "{surface} must require reopen/recovery"
+    );
+    assert!(
+        text.contains("reconcile") && text.contains("before retry"),
+        "{surface} must require state reconciliation before retry"
+    );
+}
+
 const RELEASE_PREVIEW_WORKFLOW: &str = r#"name: Release Preview
 
 on:
@@ -129,6 +159,39 @@ fn compatibility_uses_qualified_states_and_names_wire_incompatibility() {
     assert!(matrix.contains("not Oracle wire compatible"));
     assert!(matrix.contains("single process"));
     assert!(matrix.contains("fixed offsets"));
+}
+
+#[test]
+fn commit_failure_guidance_prevents_blind_write_retries() {
+    let connection = read("src/api/connection.rs");
+    let transaction = read("src/api/transaction.rs");
+    let getting_started = read("docs/getting-started.md");
+    let compatibility = read("docs/oracle-compatibility.md");
+
+    assert_commit_failure_guidance(
+        "Connection::execute rustdoc",
+        &rustdoc_before(&connection, "    pub fn execute("),
+    );
+    assert_commit_failure_guidance(
+        "WriteTransaction::commit rustdoc",
+        &rustdoc_before(&transaction, "    pub fn commit("),
+    );
+    let transaction_lifecycle = getting_started
+        .split_once("## Use snapshots and explicit writes")
+        .expect("missing transaction lifecycle section")
+        .1
+        .split_once("\n## ")
+        .expect("transaction lifecycle section must have a following section")
+        .0;
+    assert_commit_failure_guidance(
+        "getting-started transaction guidance",
+        transaction_lifecycle,
+    );
+    let auto_commit = compatibility
+        .lines()
+        .find(|line| line.starts_with("| Auto-commit |"))
+        .expect("missing Auto-commit compatibility row");
+    assert_commit_failure_guidance("compatibility Auto-commit row", auto_commit);
 }
 
 #[test]

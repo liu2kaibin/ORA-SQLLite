@@ -158,6 +158,10 @@ impl<'connection> WriteTransaction<'connection> {
     ///
     /// A failed commit returns its structured error. This is distinct from calling
     /// [`rollback`](Self::rollback), which explicitly requests that the batch be discarded.
+    /// Validation or execution errors returned before durability publish no changes, but a
+    /// commit/WAL I/O error can occur after durable sync, so the commit outcome is uncertain rather
+    /// than known successful or rolled back. Reopen the database so recovery runs, then reconcile
+    /// the observed database state before retrying the business write.
     pub fn commit(mut self) -> Result<()> {
         self.take_batch()?.commit()
     }
