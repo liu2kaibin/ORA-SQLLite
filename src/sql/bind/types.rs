@@ -710,50 +710,11 @@ pub(crate) fn bind_assignment_expr_for_column(
 }
 
 fn register_oracle_text_sources(expression: &AstExpr, context: &mut ParameterCollector) {
-    let mut work = vec![expression];
-    while let Some(expression) = work.pop() {
-        match &expression.kind {
-            AstExprKind::Parameter(key) => {
-                context.allow_oracle_text_source(parameter_identifier(key))
-            }
-            AstExprKind::Unary {
-                op: UnaryOp::Positive | UnaryOp::Negative,
-                expr,
-            } => work.push(expr),
-            AstExprKind::Binary {
-                left,
-                op:
-                    BinaryOp::Add
-                    | BinaryOp::Subtract
-                    | BinaryOp::Multiply
-                    | BinaryOp::Divide
-                    | BinaryOp::Modulo,
-                right,
-            } => {
-                work.push(right);
-                work.push(left);
-            }
-            AstExprKind::Aggregate {
-                function: AggregateFunction::Min | AggregateFunction::Max,
-                argument: AggregateArgument::Expr(expr),
-                ..
-            } => work.push(expr),
-            AstExprKind::Null
-            | AstExprKind::Bool(_)
-            | AstExprKind::Integer(_)
-            | AstExprKind::Decimal(_)
-            | AstExprKind::Float(_)
-            | AstExprKind::Text(_)
-            | AstExprKind::Blob(_)
-            | AstExprKind::Column(_)
-            | AstExprKind::Unary { .. }
-            | AstExprKind::Binary { .. }
-            | AstExprKind::IsNull { .. }
-            | AstExprKind::InList { .. }
-            | AstExprKind::Between { .. }
-            | AstExprKind::Like { .. }
-            | AstExprKind::Aggregate { .. } => {}
-        }
+    // A parameter gains this exception only when it is the expression stored
+    // in the V2 target column. Nested arithmetic/aggregate inputs are instead
+    // evaluated before the column boundary and must retain ordinary typing.
+    if let AstExprKind::Parameter(key) = &expression.kind {
+        context.allow_oracle_text_source(parameter_identifier(key));
     }
 }
 

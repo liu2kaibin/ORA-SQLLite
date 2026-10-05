@@ -259,3 +259,33 @@ fn empty_text_hits_not_null_but_empty_blob_and_space_survive() {
         vec![vec![Value::Text(" ".into()), Value::Blob(Vec::new())]]
     );
 }
+
+#[test]
+fn oracle_text_parameter_permission_is_limited_to_a_direct_assignment() {
+    let (_files, database) = support::new_database("phase5-direct-oracle-text");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+
+    let direct = connection.prepare("INSERT INTO T VALUES (:1)").unwrap();
+    connection
+        .execute(
+            &direct,
+            Parameters::positional(&[Value::Text("12.345".into()).into()]),
+        )
+        .unwrap();
+
+    let arithmetic = connection.prepare("INSERT INTO T VALUES (:1 + 1)").unwrap();
+    let error = connection
+        .execute(
+            &arithmetic,
+            Parameters::positional(&[Value::Text("12.345".into()).into()]),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), ora_sqllite::ErrorCode::Type);
+    assert!(
+        error
+            .to_string()
+            .contains("runtime parameter requires a compatible concrete type"),
+        "{error}"
+    );
+}
