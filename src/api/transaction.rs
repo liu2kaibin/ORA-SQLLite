@@ -8,7 +8,11 @@ use crate::{
 
 use super::{Connection, Statement, statement::prepare_with_catalog};
 
-/// A stable, read-only view of committed database state.
+/// A read-only transaction that owns a fixed snapshot of committed database state.
+///
+/// The snapshot does not advance when other connections commit. The transaction mutably borrows
+/// its connection until dropped, and a [`Rows`] stream mutably borrows the transaction until that
+/// stream is dropped.
 pub struct ReadTransaction<'connection> {
     snapshot: ReadSnapshot,
     sql_limits: SqlLimits,
@@ -33,13 +37,15 @@ impl<'connection> ReadTransaction<'connection> {
         }
     }
 
-    /// Prepares one SQL statement against this transaction's fixed snapshot.
+    /// Prepares one owned SQL statement against this transaction's fixed snapshot.
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
         let catalog = self.snapshot.catalog_reader()?;
         prepare_with_catalog(sql, &self.sql_limits, &catalog, self.database_uuid)
     }
 
     /// Starts a pull-based query against this transaction's fixed snapshot.
+    ///
+    /// The returned [`Rows`] keeps this transaction borrowed until dropped.
     pub fn query<'rows>(
         &'rows mut self,
         statement: &Statement,
@@ -66,6 +72,10 @@ impl fmt::Debug for ReadTransaction<'_> {
 }
 
 /// An exclusive database write that rolls back unless explicitly committed.
+///
+/// This transaction owns a private write batch and mutably borrows its connection. [`commit`](Self::commit)
+/// publishes the batch, [`rollback`](Self::rollback) explicitly discards it and reports any rollback
+/// error, and dropping an unfinished transaction attempts rollback without publishing changes.
 pub struct WriteTransaction<'connection> {
     batch: Option<WriteBatch>,
     sql_limits: SqlLimits,
@@ -91,6 +101,10 @@ impl<'connection> WriteTransaction<'connection> {
     }
 
     /// Executes a non-row-producing statement in this transaction's write batch.
+    ///
+    /// Statement identity and schema dependencies are revalidated before mutation. Ordinary
+    /// statement errors roll back that statement's changes; fatal errors make the transaction
+    /// rollback-only.
     pub fn execute(
         &mut self,
         statement: &Statement,
@@ -101,13 +115,16 @@ impl<'connection> WriteTransaction<'connection> {
         execute_write_batch(batch, statement, parameters, memory_limit)
     }
 
-    /// Prepares one SQL statement against this write batch's catalog view.
+    /// Prepares one owned SQL statement against this write batch's current catalog view.
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
         let catalog = self.batch_mut()?.catalog_reader()?;
         prepare_with_catalog(sql, &self.sql_limits, &catalog, self.database_uuid)
     }
 
     /// Starts a pull-based query against this transaction's current write batch.
+    ///
+    /// The returned [`Rows`] keeps this transaction borrowed until dropped. A fatal stream error
+    /// makes the transaction rollback-only.
     pub fn query<'rows>(
         &'rows mut self,
         statement: &Statement,
@@ -137,12 +154,17 @@ impl<'connection> WriteTransaction<'connection> {
         }
     }
 
-    /// Commits this transaction.
+    /// Consumes the transaction and publishes its complete write batch atomically.
+    ///
+    /// A failed commit returns its structured error. This is distinct from calling
+    /// [`rollback`](Self::rollback), which explicitly requests that the batch be discarded.
     pub fn commit(mut self) -> Result<()> {
         self.take_batch()?.commit()
     }
 
-    /// Rolls this transaction back without publishing changes.
+    /// Consumes the transaction and explicitly rolls it back without publishing changes.
+    ///
+    /// Unlike the best-effort rollback performed by `Drop`, this method reports rollback failure.
     pub fn rollback(mut self) -> Result<()> {
         self.take_batch()?.rollback()
     }

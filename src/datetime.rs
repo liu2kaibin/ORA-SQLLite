@@ -1,5 +1,9 @@
 use crate::{DbError, ErrorCode, Result};
 
+/// An Oracle-compatible proleptic Gregorian date and whole-second time.
+///
+/// Years are limited to `1..=9999`; leap years use Gregorian rules. This value has no time-zone
+/// offset and no fractional-second component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleDate {
     year: u16,
@@ -11,6 +15,10 @@ pub struct OracleDate {
 }
 
 impl OracleDate {
+    /// Constructs a checked date and time.
+    ///
+    /// Valid fields are year `1..=9999`, month `1..=12`, a day valid for that month, hour
+    /// `0..=23`, and minute and second `0..=59`. Invalid input returns [`ErrorCode::Type`].
     pub fn new(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Result<Self> {
         if !(1..=9999).contains(&year) {
             return Err(type_error("year must be between 1 and 9999"));
@@ -50,31 +58,41 @@ impl OracleDate {
         })
     }
 
+    /// Returns the year in `1..=9999`.
     pub const fn year(self) -> u16 {
         self.year
     }
 
+    /// Returns the month in `1..=12`.
     pub const fn month(self) -> u8 {
         self.month
     }
 
+    /// Returns the one-based day of the month.
     pub const fn day(self) -> u8 {
         self.day
     }
 
+    /// Returns the hour in `0..=23`.
     pub const fn hour(self) -> u8 {
         self.hour
     }
 
+    /// Returns the minute in `0..=59`.
     pub const fn minute(self) -> u8 {
         self.minute
     }
 
+    /// Returns the second in `0..=59`.
     pub const fn second(self) -> u8 {
         self.second
     }
 }
 
+/// An Oracle-compatible timestamp with nanosecond precision and an optional fixed offset.
+///
+/// The fractional component is nanoseconds within the second. An offset, when present, is a fixed
+/// number of minutes in `-840..=840`; no daylight-saving or named-zone rules are applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleTimestamp {
     date: OracleDate,
@@ -83,6 +101,10 @@ pub struct OracleTimestamp {
 }
 
 impl OracleTimestamp {
+    /// Constructs a checked timestamp from microseconds within the second.
+    ///
+    /// `micros` must be in `0..1_000_000` and `offset_minutes`, when present, must be in
+    /// `-840..=840`. Invalid input returns [`ErrorCode::Type`].
     pub fn new(date: OracleDate, micros: u32, offset_minutes: Option<i16>) -> Result<Self> {
         let nanos = micros
             .checked_mul(1_000)
@@ -90,6 +112,10 @@ impl OracleTimestamp {
         Self::from_nanoseconds(date, nanos, offset_minutes)
     }
 
+    /// Constructs a checked timestamp from nanoseconds within the second.
+    ///
+    /// `nanos` must be in `0..1_000_000_000` and `offset_minutes`, when present, must be in
+    /// `-840..=840`. Invalid input returns [`ErrorCode::Type`].
     pub fn from_nanoseconds(
         date: OracleDate,
         nanos: u32,
@@ -109,18 +135,22 @@ impl OracleTimestamp {
         })
     }
 
+    /// Returns the calendar date and whole-second time.
     pub const fn date(self) -> OracleDate {
         self.date
     }
 
+    /// Returns the fractional second truncated to microseconds.
     pub const fn micros(self) -> u32 {
         self.nanos / 1_000
     }
 
+    /// Returns nanoseconds within the second, in `0..1_000_000_000`.
     pub const fn nanoseconds(self) -> u32 {
         self.nanos
     }
 
+    /// Returns the optional fixed offset in minutes.
     pub const fn offset_minutes(self) -> Option<i16> {
         self.offset_minutes
     }

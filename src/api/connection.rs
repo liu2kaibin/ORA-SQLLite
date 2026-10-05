@@ -32,7 +32,13 @@ enum ConnectionStateKind {
     NeedsReopen,
 }
 
-/// A single database session used to start transactions.
+/// A synchronous database session used to prepare and execute statements.
+///
+/// Preparing and executing mutates session state and therefore requires `&mut self`. A
+/// [`ReadTransaction`] or [`WriteTransaction`] mutably borrows the connection, permitting only one
+/// active borrowing transaction at a time. A [`Rows`] stream returned directly by this session
+/// likewise keeps the session borrowed until the stream is exhausted and dropped, or simply
+/// dropped early.
 pub struct Connection {
     pager: Pager,
     sql_limits: SqlLimits,
@@ -83,6 +89,8 @@ impl Connection {
     }
 
     /// Prepares one SQL statement against the connection's current catalog view.
+    ///
+    /// Preparation enforces the configured [`SqlLimits`] and returns a fully owned [`Statement`].
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
         if self.state_kind() == ConnectionStateKind::SqlWrite {
             self.ensure_sql_write_usable()?;
@@ -106,6 +114,9 @@ impl Connection {
     }
 
     /// Starts a pull-based query at the connection's current transaction view.
+    ///
+    /// The statement's database identity and retained schema dependencies are revalidated before
+    /// execution. The returned [`Rows`] keeps this connection mutably borrowed until dropped.
     pub fn query<'connection>(
         &'connection mut self,
         statement: &Statement,
@@ -167,6 +178,10 @@ impl Connection {
     }
 
     /// Executes a non-row-producing statement in this connection.
+    ///
+    /// The statement's database identity and retained schema dependencies are revalidated before
+    /// execution. Passing a row-producing query returns [`ErrorCode::Type`]. SQL transaction-control
+    /// statements update this connection's SQL transaction state.
     pub fn execute(
         &mut self,
         statement: &Statement,
@@ -227,7 +242,10 @@ impl Connection {
         ))
     }
 
-    /// Starts an exclusive write transaction.
+    /// Starts an exclusive write transaction that borrows this connection.
+    ///
+    /// Returns [`ErrorCode::Busy`] if another database writer is active and
+    /// [`ErrorCode::Unsupported`] when the database was opened read-only.
     pub fn begin_write(&mut self) -> Result<WriteTransaction<'_>> {
         if self.state_kind() != ConnectionStateKind::Idle {
             return Err(transaction_state_error());
