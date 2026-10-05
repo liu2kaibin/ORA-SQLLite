@@ -66,7 +66,7 @@ impl ParameterFrame {
         }
         // Validate the entire input before budget reservation or owned value copies.
         for (meta, supplied) in metadata.iter().zip(&supplied) {
-            validate_parameter(meta.data_type(), supplied)?;
+            validate_parameter(meta.data_type(), meta.allow_oracle_text_source, supplied)?;
         }
         let bytes = owned_values_bytes(supplied.iter().map(|value| value.value()))?;
         memory.reserve(bytes)?;
@@ -113,7 +113,11 @@ fn normalize_name(name: &str) -> Result<String> {
     Ok(name)
 }
 
-fn validate_parameter(expected: Option<DataType>, supplied: &ParameterValue) -> Result<()> {
+fn validate_parameter(
+    expected: Option<DataType>,
+    allow_oracle_text_source: bool,
+    supplied: &ParameterValue,
+) -> Result<()> {
     let actual = match supplied {
         ParameterValue::TypedNull(DataType::Null | DataType::Unknown) => {
             return Err(parameter_type_error());
@@ -137,7 +141,9 @@ fn validate_parameter(expected: Option<DataType>, supplied: &ParameterValue) -> 
     match (expected, actual) {
         (Some(DataType::Null | DataType::Unknown), _) | (None, None) => Err(parameter_type_error()),
         (Some(target), Some(source))
-            if target != source && !(target == DataType::Decimal && source == DataType::Int64) =>
+            if target != source
+                && !(target == DataType::Decimal && source == DataType::Int64)
+                && !(allow_oracle_text_source && source == DataType::Text) =>
         {
             Err(parameter_type_error())
         }
@@ -178,10 +184,12 @@ mod tests {
             ParameterMetadata {
                 identifier: ParameterIdentifier::Name("B".into()),
                 data_type: None,
+                allow_oracle_text_source: false,
             },
             ParameterMetadata {
                 identifier: ParameterIdentifier::Name("A".into()),
                 data_type: None,
+                allow_oracle_text_source: false,
             },
         ];
         let mut values = [
@@ -260,6 +268,7 @@ mod tests {
                 .map(|identifier| ParameterMetadata {
                     identifier,
                     data_type: None,
+                    allow_oracle_text_source: false,
                 })
                 .collect();
             assert_eq!(
@@ -349,6 +358,36 @@ mod tests {
                 ErrorCode::Type
             );
         }
+    }
+
+    #[test]
+    fn oracle_target_text_sources_are_retained_but_legacy_decimal_rejects_them() {
+        // Production break caught: accepting Text for every DECIMAL parameter
+        // would weaken legacy binding, while eagerly converting this Oracle
+        // source would bypass the target column's precision/scale contract.
+        let identifier = ParameterIdentifier::Position(1);
+        let oracle = [ParameterMetadata {
+            identifier: identifier.clone(),
+            data_type: Some(DataType::Decimal),
+            allow_oracle_text_source: true,
+        }];
+        let text = [Value::Text("12.345".into()).into()];
+        assert_eq!(
+            bind(&oracle, Parameters::positional(&text)).unwrap().get(0),
+            &Value::Text("12.345".into())
+        );
+
+        let legacy = [ParameterMetadata {
+            identifier,
+            data_type: Some(DataType::Decimal),
+            allow_oracle_text_source: false,
+        }];
+        assert_eq!(
+            bind(&legacy, Parameters::positional(&text))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Type
+        );
     }
 
     #[test]

@@ -3,11 +3,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::{
     DbError, Decimal, ErrorCode, Result, Value,
     api::{ParameterIdentifier, ParameterMetadata},
+    oracle_type::OracleTypeDescriptor,
     sql::{
         ParameterKey, SqlSpan, SqlType,
         ast::{AggregateArgument, AggregateFunction, AstExpr, AstExprKind, BinaryOp, UnaryOp},
         bound::{BoundAggregateFunction, BoundBinaryOp, BoundExpr, BoundExprKind, BoundUnaryOp},
     },
+    storage::catalog::types::ColumnId,
 };
 
 use super::ColumnResolver;
@@ -20,6 +22,8 @@ pub(crate) struct ParameterCollector {
     // parameter leaf. Keep their caps pending to preserve actual SQL
     // first-occurrence ordering in `entries`.
     pending_assignment_caps: HashMap<ParameterIdentifier, SqlType>,
+    pending_oracle_text_sources: HashSet<ParameterIdentifier>,
+    oracle_columns: HashMap<ColumnId, OracleTypeDescriptor>,
     parents: Vec<usize>,
     ranks: Vec<u8>,
     numeric_aggregate_links: HashSet<(usize, usize)>,
@@ -40,6 +44,8 @@ impl Default for ParameterCollector {
             entries: Vec::new(),
             positions: HashMap::new(),
             pending_assignment_caps: HashMap::new(),
+            pending_oracle_text_sources: HashSet::new(),
+            oracle_columns: HashMap::new(),
             parents: Vec::new(),
             ranks: Vec::new(),
             numeric_aggregate_links: HashSet::new(),
@@ -59,6 +65,7 @@ struct ParameterEntry {
     sql_type: SqlType,
     // The narrowest source type that remains safe for every DML assignment.
     assignment_cap: Option<SqlType>,
+    allow_oracle_text_source: bool,
     first_offset: usize,
 }
 
@@ -128,6 +135,7 @@ impl ParameterCollector {
             return Ok(entry.sql_type);
         }
         let assignment_cap = self.pending_assignment_caps.remove(&identifier);
+        let allow_oracle_text_source = self.pending_oracle_text_sources.remove(&identifier);
         let sql_type = match assignment_cap {
             Some(assignment_cap) => parameter_type_with_assignment_cap(constraint, assignment_cap)?,
             None => constraint,
@@ -140,9 +148,40 @@ impl ParameterCollector {
             identifier,
             sql_type,
             assignment_cap,
+            allow_oracle_text_source,
             first_offset: usize::MAX,
         });
         Ok(sql_type)
+    }
+
+    fn allow_oracle_text_source(&mut self, identifier: ParameterIdentifier) {
+        if let Some(index) = self.positions.get(&identifier).copied() {
+            self.entries[index].allow_oracle_text_source = true;
+        } else {
+            self.pending_oracle_text_sources.insert(identifier);
+        }
+    }
+
+    fn register_oracle_column(
+        &mut self,
+        column_id: ColumnId,
+        descriptor: Option<OracleTypeDescriptor>,
+    ) {
+        if let Some(descriptor) = descriptor {
+            self.oracle_columns.insert(column_id, descriptor);
+        }
+    }
+
+    fn allows_oracle_text_source_for_column(&self, column_id: ColumnId) -> bool {
+        matches!(
+            self.oracle_columns.get(&column_id),
+            Some(
+                OracleTypeDescriptor::Number { .. }
+                    | OracleTypeDescriptor::Date
+                    | OracleTypeDescriptor::Timestamp { .. }
+                    | OracleTypeDescriptor::TimestampWithTimeZone { .. }
+            )
+        )
     }
 
     fn constrain_assignment_identifier(
@@ -193,7 +232,13 @@ impl ParameterCollector {
         }
         self.entries
             .into_iter()
-            .map(|entry| ParameterMetadata::inferred(entry.identifier, entry.sql_type))
+            .map(|entry| {
+                ParameterMetadata::inferred(
+                    entry.identifier,
+                    entry.sql_type,
+                    entry.allow_oracle_text_source,
+                )
+            })
             .collect()
     }
 
@@ -414,6 +459,7 @@ pub(crate) fn bind_expr(
                     )),
                     AstExprKind::Column(parts) => {
                         let column = scope.resolve_column(parts)?;
+                        context.register_oracle_column(column.column_id, column.oracle_type);
                         values.push(BoundExpr::new(
                             BoundExprKind::Column {
                                 source_id: column.source_id,
@@ -636,7 +682,23 @@ pub(crate) fn bind_assignment_expr(
     target: SqlType,
     context: &mut ParameterCollector,
 ) -> Result<BoundExpr> {
+    bind_assignment_expr_for_column(expr, scope, target, false, context)
+}
+
+/// Binds a DML value and records the one Oracle-only exception to ordinary
+/// parameter type compatibility. The raw Text remains in the frame so the
+/// target column is the sole conversion boundary during mutation.
+pub(crate) fn bind_assignment_expr_for_column(
+    expr: &AstExpr,
+    scope: &impl ColumnResolver,
+    target: SqlType,
+    allow_oracle_text_source: bool,
+    context: &mut ParameterCollector,
+) -> Result<BoundExpr> {
     register_assignment_parameter_caps(expr, target, context)?;
+    if allow_oracle_text_source {
+        register_oracle_text_sources(expr, context);
+    }
     let mut expression = bind_expr(expr, scope, None, context)?;
     if !assignment_type_is_compatible(expression.sql_type, target) {
         return Err(type_error(
@@ -645,6 +707,54 @@ pub(crate) fn bind_assignment_expr(
     }
     apply_expected(&mut expression, target, context)?;
     Ok(expression)
+}
+
+fn register_oracle_text_sources(expression: &AstExpr, context: &mut ParameterCollector) {
+    let mut work = vec![expression];
+    while let Some(expression) = work.pop() {
+        match &expression.kind {
+            AstExprKind::Parameter(key) => {
+                context.allow_oracle_text_source(parameter_identifier(key))
+            }
+            AstExprKind::Unary {
+                op: UnaryOp::Positive | UnaryOp::Negative,
+                expr,
+            } => work.push(expr),
+            AstExprKind::Binary {
+                left,
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo,
+                right,
+            } => {
+                work.push(right);
+                work.push(left);
+            }
+            AstExprKind::Aggregate {
+                function: AggregateFunction::Min | AggregateFunction::Max,
+                argument: AggregateArgument::Expr(expr),
+                ..
+            } => work.push(expr),
+            AstExprKind::Null
+            | AstExprKind::Bool(_)
+            | AstExprKind::Integer(_)
+            | AstExprKind::Decimal(_)
+            | AstExprKind::Float(_)
+            | AstExprKind::Text(_)
+            | AstExprKind::Blob(_)
+            | AstExprKind::Column(_)
+            | AstExprKind::Unary { .. }
+            | AstExprKind::Binary { .. }
+            | AstExprKind::IsNull { .. }
+            | AstExprKind::InList { .. }
+            | AstExprKind::Between { .. }
+            | AstExprKind::Like { .. }
+            | AstExprKind::Aggregate { .. } => {}
+        }
+    }
 }
 
 fn assignment_type_is_compatible(source: SqlType, target: SqlType) -> bool {
@@ -839,6 +949,18 @@ fn finish_binary(
         ));
     }
 
+    if matches!(
+        op,
+        BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual
+    ) {
+        mark_oracle_comparison_text_source(&left, &right, context);
+        mark_oracle_comparison_text_source(&right, &left, context);
+    }
     context.link_common([&left, &right])?;
     let common = left.sql_type.unify(right.sql_type)?;
     apply_expected(&mut left, common, context)?;
@@ -876,6 +998,22 @@ fn finish_binary(
         nullable,
         span,
     ))
+}
+
+fn mark_oracle_comparison_text_source(
+    column: &BoundExpr,
+    parameter: &BoundExpr,
+    context: &mut ParameterCollector,
+) {
+    let BoundExprKind::Column { column_id, .. } = column.kind else {
+        return;
+    };
+    let BoundExprKind::Parameter(ref identifier) = parameter.kind else {
+        return;
+    };
+    if context.allows_oracle_text_source_for_column(column_id) {
+        context.allow_oracle_text_source(identifier.clone());
+    }
 }
 
 fn finish_aggregate(

@@ -142,3 +142,120 @@ fn invalid_oracle_declaration_reports_exact_multiline_unicode_location() {
     assert_eq!(location.line(), 2);
     assert_eq!(location.column(), 5);
 }
+
+#[test]
+fn crud_uses_one_normalized_row_for_literals_and_parameters() {
+    let (_files, database) = support::new_database("phase5-crud");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(4,0) PRIMARY KEY, N NUMBER(5,2), C CHAR(3), V VARCHAR2(3), R RAW(2))",
+    );
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (:1, :2, :3, :4, :5)")
+        .unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                Value::Text("1".into()).into(),
+                Value::Text("12.345".into()).into(),
+                Value::Text("A".into()).into(),
+                Value::Text("表A".into()).into(),
+                Value::Blob(vec![0, 255]).into(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT N,C,V,R FROM T"),
+        vec![vec![
+            decimal_value(1235, 2),
+            Value::Text("A  ".into()),
+            Value::Text("表A".into()),
+            Value::Blob(vec![0, 255]),
+        ]]
+    );
+}
+
+#[test]
+fn primary_key_conflicts_keep_the_constraint_name_and_gain_ora_00001() {
+    let (_files, database) = support::new_database("phase5-unique-ora");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(3,0) CONSTRAINT PK_T PRIMARY KEY)",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (1)");
+    let duplicate = connection.prepare("INSERT INTO T VALUES (1)").unwrap();
+    let error = connection
+        .execute(&duplicate, Parameters::none())
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Constraint, Some(1))
+    );
+    assert!(error.to_string().contains("PK_T"));
+}
+
+#[test]
+fn failed_normalization_leaves_rowid_and_indexes_unchanged() {
+    let (files, database) = support::new_database("phase5-rollback");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(2,0) PRIMARY KEY, N NUMBER(2,1), V VARCHAR2(1) NOT NULL)",
+    );
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let before = support::format2::raw_catalog_capture(files.main()).unwrap();
+    let database = support::reopen(&files);
+    let mut connection = database.connect().unwrap();
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (1, 9.99, '')")
+        .unwrap();
+    let error = connection.execute(&insert, Parameters::none()).unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Type, Some(1438))
+    );
+    drop(connection);
+    drop(database);
+    support::checkpoint_accepted_state(&files);
+    let after = support::format2::raw_catalog_capture(files.main()).unwrap();
+    assert_eq!(after.tables["T"].next_rowid, before.tables["T"].next_rowid);
+    assert_eq!(after.indexes, before.indexes);
+}
+
+#[test]
+fn empty_text_hits_not_null_but_empty_blob_and_space_survive() {
+    let (_files, database) = support::new_database("phase5-empty");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (V VARCHAR2(2) NOT NULL, R RAW(2))",
+    );
+    let insert = connection.prepare("INSERT INTO T VALUES (:1, :2)").unwrap();
+    let empty = [
+        Value::Text(String::new()).into(),
+        Value::Blob(Vec::new()).into(),
+    ];
+    let error = connection
+        .execute(&insert, Parameters::positional(&empty))
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Constraint, Some(1400))
+    );
+    let space = [
+        Value::Text(" ".into()).into(),
+        Value::Blob(Vec::new()).into(),
+    ];
+    connection
+        .execute(&insert, Parameters::positional(&space))
+        .unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT V,R FROM T"),
+        vec![vec![Value::Text(" ".into()), Value::Blob(Vec::new())]]
+    );
+}

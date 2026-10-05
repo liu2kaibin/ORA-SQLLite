@@ -27,8 +27,8 @@ use crate::{
 };
 
 use super::{
-    BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn, bind_assignment_expr,
-    bind_expr, bind_query,
+    BindingScope, ColumnResolver, ParameterCollector, ResolvedColumn,
+    bind_assignment_expr_for_column, bind_expr, bind_query,
 };
 
 /// Binds one parsed statement to an immutable catalog image.
@@ -157,7 +157,13 @@ fn bind_insert(
     let value_scope = NoColumnScope;
     let mut values = Vec::with_capacity(insert.values.len());
     for (value, target) in insert.values.iter().zip(&targets) {
-        let value = bind_assignment_expr(value, &value_scope, target.sql_type, parameters)?;
+        let value = bind_assignment_expr_for_column(
+            value,
+            &value_scope,
+            target.sql_type,
+            oracle_text_source_allowed(target.oracle_type),
+            parameters,
+        )?;
         require_scalar(&value, "INSERT VALUES")?;
         values.push(value);
     }
@@ -189,7 +195,13 @@ fn bind_update(
             return Err(bind_error("UPDATE target column is repeated"));
         }
         let target = bound_column(&resolved, assignment.column.span());
-        let value = bind_assignment_expr(&assignment.value, &scope, target.sql_type, parameters)?;
+        let value = bind_assignment_expr_for_column(
+            &assignment.value,
+            &scope,
+            target.sql_type,
+            oracle_text_source_allowed(target.oracle_type),
+            parameters,
+        )?;
         require_scalar(&value, "UPDATE assignment")?;
         assignments.push(BoundAssignment {
             target,
@@ -852,6 +864,18 @@ fn bound_column(column: &ResolvedColumn, span: SqlSpan) -> BoundColumn {
         nullable: column.nullable,
         span,
     }
+}
+
+fn oracle_text_source_allowed(descriptor: Option<OracleTypeDescriptor>) -> bool {
+    matches!(
+        descriptor,
+        Some(
+            OracleTypeDescriptor::Number { .. }
+                | OracleTypeDescriptor::Date
+                | OracleTypeDescriptor::Timestamp { .. }
+                | OracleTypeDescriptor::TimestampWithTimeZone { .. }
+        )
+    )
 }
 
 fn table_dependency(table: BoundTable, database_uuid: [u8; 16]) -> SchemaDependency {

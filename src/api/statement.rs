@@ -183,6 +183,7 @@ mod tests {
             parameters: vec![ParameterMetadata {
                 identifier: ParameterIdentifier::Position(1),
                 data_type: Some(DataType::Int64),
+                allow_oracle_text_source: false,
             }],
             columns: vec![ColumnMetadata {
                 name: "ID".to_owned(),

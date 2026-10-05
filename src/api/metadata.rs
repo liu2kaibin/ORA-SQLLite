@@ -44,12 +44,16 @@ pub enum ParameterIdentifier {
 pub struct ParameterMetadata {
     pub(crate) identifier: ParameterIdentifier,
     pub(crate) data_type: Option<DataType>,
+    /// Text is retained only when a V2 Oracle NUMBER/DATE/TIMESTAMP use will
+    /// normalize it at execution. This is deliberately not public metadata.
+    pub(crate) allow_oracle_text_source: bool,
 }
 
 impl ParameterMetadata {
     pub(crate) const fn inferred(
         identifier: ParameterIdentifier,
         sql_type: crate::sql::SqlType,
+        allow_oracle_text_source: bool,
     ) -> Self {
         let data_type = match sql_type {
             crate::sql::SqlType::Null | crate::sql::SqlType::Unknown => None,
@@ -58,6 +62,7 @@ impl ParameterMetadata {
         Self {
             identifier,
             data_type,
+            allow_oracle_text_source,
         }
     }
 

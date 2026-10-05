@@ -1078,7 +1078,20 @@ impl ConstrainedTableWrite {
         exclude: Option<RowId>,
     ) -> Result<()> {
         for (index, entry) in self.indexes.iter().zip(entries) {
-            index.check_unique(batch, entry, exclude)?;
+            if let Err(error) = index.check_unique(batch, entry, exclude) {
+                // Only key constraints get the Oracle duplicate-key detail.
+                // CHECK and FK diagnostics continue to carry their established
+                // name/message without an invented Oracle code.
+                if error.code() == ErrorCode::Constraint
+                    && self
+                        .constraints
+                        .violation_name_for_index(index.id())
+                        .is_some()
+                {
+                    return Err(error.with_oracle_code(1));
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
