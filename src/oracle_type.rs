@@ -1,7 +1,9 @@
 use crate::{
     DbError, Decimal, ErrorCode, Result, Value,
+    scalar::decimal_cmp,
     storage::catalog::types::{ColumnDef, ColumnType},
 };
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OracleTypeDescriptor {
@@ -12,6 +14,260 @@ pub(crate) enum OracleTypeDescriptor {
     Date,
     Timestamp { fractional_precision: u8 },
     TimestampWithTimeZone { fractional_precision: u8 },
+}
+
+/// The immutable Oracle semantics selected by binding a comparison.  Both
+/// sides are retained so persisted CHECK bytecode cannot accidentally inherit
+/// a later catalog interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OracleComparisonContract {
+    left: Option<OracleTypeDescriptor>,
+    right: Option<OracleTypeDescriptor>,
+}
+
+impl OracleComparisonContract {
+    pub(crate) fn new(
+        left: Option<OracleTypeDescriptor>,
+        right: Option<OracleTypeDescriptor>,
+    ) -> Result<Self> {
+        let (Some(left_descriptor), Some(right_descriptor)) = (left, right) else {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "Oracle comparison requires descriptors on both operands",
+            ));
+        };
+        left_descriptor.validate()?;
+        right_descriptor.validate()?;
+        if !comparison_family_is_compatible(left_descriptor, right_descriptor) {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "Oracle comparison operands have incompatible type families",
+            ));
+        }
+        Ok(Self { left, right })
+    }
+
+    pub(crate) const fn left(self) -> OracleTypeDescriptor {
+        match self.left {
+            Some(descriptor) => descriptor,
+            None => unreachable!(),
+        }
+    }
+
+    pub(crate) const fn right(self) -> OracleTypeDescriptor {
+        match self.right {
+            Some(descriptor) => descriptor,
+            None => unreachable!(),
+        }
+    }
+}
+
+pub(crate) fn compare_for_contract(
+    contract: OracleComparisonContract,
+    left: &Value,
+    right: &Value,
+) -> Result<Ordering> {
+    let left_descriptor = contract.left();
+    let right_descriptor = contract.right();
+    match (left_descriptor, right_descriptor) {
+        (OracleTypeDescriptor::Number { .. }, OracleTypeDescriptor::Number { .. }) => {
+            let left = decimal_for_comparison(left)?;
+            let right = decimal_for_comparison(right)?;
+            decimal_cmp(left, right)
+        }
+        (OracleTypeDescriptor::Varchar2 { .. }, OracleTypeDescriptor::Varchar2 { .. })
+        | (OracleTypeDescriptor::Char { .. }, OracleTypeDescriptor::Varchar2 { .. })
+        | (OracleTypeDescriptor::Varchar2 { .. }, OracleTypeDescriptor::Char { .. }) => {
+            Ok(text_for_comparison(left)?.cmp(text_for_comparison(right)?))
+        }
+        (
+            OracleTypeDescriptor::Char {
+                length_chars: left_length,
+            },
+            OracleTypeDescriptor::Char {
+                length_chars: right_length,
+            },
+        ) => {
+            let length = usize::try_from(left_length.max(right_length))
+                .map_err(|_| comparison_type_error())?;
+            let left = pad_to_char_length(text_for_comparison(left)?, length);
+            let right = pad_to_char_length(text_for_comparison(right)?, length);
+            Ok(left.cmp(&right))
+        }
+        (OracleTypeDescriptor::Date, OracleTypeDescriptor::Date) => {
+            let Value::Date(left) = left else {
+                return Err(comparison_type_error());
+            };
+            let Value::Date(right) = right else {
+                return Err(comparison_type_error());
+            };
+            Ok(date_fields(*left).cmp(&date_fields(*right)))
+        }
+        (OracleTypeDescriptor::Timestamp { .. }, OracleTypeDescriptor::Timestamp { .. }) => {
+            let left = local_timestamp_fields(left)?;
+            let right = local_timestamp_fields(right)?;
+            Ok(left.cmp(&right))
+        }
+        (
+            OracleTypeDescriptor::TimestampWithTimeZone { .. },
+            OracleTypeDescriptor::TimestampWithTimeZone { .. },
+        ) => {
+            let left = utc_timestamp_fields(left)?;
+            let right = utc_timestamp_fields(right)?;
+            Ok(left.cmp(&right))
+        }
+        _ => Err(comparison_type_error()),
+    }
+}
+
+pub(crate) fn encode_comparison_descriptor(descriptor: OracleTypeDescriptor) -> [u8; 8] {
+    let (kind, precision, scale, length) = match descriptor {
+        OracleTypeDescriptor::Number { precision, scale } => (1, precision, scale as u8, 0),
+        OracleTypeDescriptor::Varchar2 { length_chars } => (2, 0, 0, length_chars),
+        OracleTypeDescriptor::Char { length_chars } => (3, 0, 0, length_chars),
+        OracleTypeDescriptor::Raw { length_bytes } => (4, 0, 0, length_bytes),
+        OracleTypeDescriptor::Date => (5, 0, 0, 0),
+        OracleTypeDescriptor::Timestamp {
+            fractional_precision,
+        } => (6, fractional_precision, 0, 0),
+        OracleTypeDescriptor::TimestampWithTimeZone {
+            fractional_precision,
+        } => (7, fractional_precision, 0, 0),
+    };
+    let mut bytes = [0; 8];
+    bytes[..4].copy_from_slice(&[kind, precision, scale, 0]);
+    bytes[4..].copy_from_slice(&length.to_le_bytes());
+    bytes
+}
+
+pub(crate) fn decode_comparison_descriptor(bytes: &[u8]) -> Result<OracleTypeDescriptor> {
+    let [kind, precision, scale, reserved, length @ ..] = bytes else {
+        return Err(DbError::new(
+            ErrorCode::Type,
+            "Oracle descriptor has invalid length",
+        ));
+    };
+    if *reserved != 0 || length.len() != 4 {
+        return Err(DbError::new(
+            ErrorCode::Type,
+            "Oracle descriptor reserved bytes are invalid",
+        ));
+    }
+    let length = u32::from_le_bytes(
+        length
+            .try_into()
+            .map_err(|_| DbError::new(ErrorCode::Type, "Oracle descriptor length is invalid"))?,
+    );
+    match (*kind, *precision, *scale, length) {
+        (1, precision, scale, 0) => OracleTypeDescriptor::number(precision, scale as i8),
+        (2, 0, 0, length) => OracleTypeDescriptor::varchar2(length),
+        (3, 0, 0, length) => OracleTypeDescriptor::char_type(length),
+        (4, 0, 0, length) => OracleTypeDescriptor::raw(length),
+        (5, 0, 0, 0) => Ok(OracleTypeDescriptor::date()),
+        (6, precision, 0, 0) => OracleTypeDescriptor::timestamp(precision),
+        (7, precision, 0, 0) => OracleTypeDescriptor::timestamp_with_time_zone(precision),
+        _ => Err(DbError::new(
+            ErrorCode::Type,
+            "Oracle descriptor is invalid",
+        )),
+    }
+}
+
+fn comparison_family_is_compatible(
+    left: OracleTypeDescriptor,
+    right: OracleTypeDescriptor,
+) -> bool {
+    matches!(
+        (left, right),
+        (
+            OracleTypeDescriptor::Number { .. },
+            OracleTypeDescriptor::Number { .. }
+        ) | (
+            OracleTypeDescriptor::Varchar2 { .. },
+            OracleTypeDescriptor::Varchar2 { .. }
+        ) | (
+            OracleTypeDescriptor::Char { .. },
+            OracleTypeDescriptor::Char { .. }
+        ) | (
+            OracleTypeDescriptor::Char { .. },
+            OracleTypeDescriptor::Varchar2 { .. }
+        ) | (
+            OracleTypeDescriptor::Varchar2 { .. },
+            OracleTypeDescriptor::Char { .. }
+        ) | (OracleTypeDescriptor::Date, OracleTypeDescriptor::Date)
+            | (
+                OracleTypeDescriptor::Timestamp { .. },
+                OracleTypeDescriptor::Timestamp { .. }
+            )
+            | (
+                OracleTypeDescriptor::TimestampWithTimeZone { .. },
+                OracleTypeDescriptor::TimestampWithTimeZone { .. }
+            )
+    )
+}
+
+fn decimal_for_comparison(value: &Value) -> Result<Decimal> {
+    match value {
+        Value::Decimal(value) => Ok(*value),
+        Value::Int64(value) => {
+            Decimal::new(value.is_negative(), 0, u128::from(value.unsigned_abs()))
+        }
+        _ => Err(comparison_type_error()),
+    }
+}
+
+fn text_for_comparison(value: &Value) -> Result<&str> {
+    match value {
+        Value::Text(value) => Ok(value),
+        _ => Err(comparison_type_error()),
+    }
+}
+
+fn pad_to_char_length(value: &str, length: usize) -> String {
+    let mut padded = value.to_owned();
+    padded.extend(std::iter::repeat_n(
+        ' ',
+        length.saturating_sub(value.chars().count()),
+    ));
+    padded
+}
+
+fn date_fields(date: crate::OracleDate) -> (u16, u8, u8, u8, u8, u8) {
+    (
+        date.year(),
+        date.month(),
+        date.day(),
+        date.hour(),
+        date.minute(),
+        date.second(),
+    )
+}
+
+fn local_timestamp_fields(value: &Value) -> Result<((u16, u8, u8, u8, u8, u8), u32)> {
+    let Value::Timestamp(value) = value else {
+        return Err(comparison_type_error());
+    };
+    if value.offset_minutes().is_some() {
+        return Err(comparison_type_error());
+    }
+    Ok((date_fields(value.date()), value.nanoseconds()))
+}
+
+fn utc_timestamp_fields(value: &Value) -> Result<(i32, u64)> {
+    let Value::Timestamp(value) = value else {
+        return Err(comparison_type_error());
+    };
+    if value.offset_minutes().is_none() {
+        return Err(comparison_type_error());
+    }
+    value.utc_day_and_nanos()
+}
+
+fn comparison_type_error() -> DbError {
+    DbError::new(
+        ErrorCode::Type,
+        "values do not match the Oracle comparison contract",
+    )
 }
 
 impl OracleTypeDescriptor {
@@ -488,7 +744,12 @@ fn invalid_declaration(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OracleTypeDescriptor, normalize_for_column, normalize_for_type, round_timestamp};
+    use std::cmp::Ordering;
+
+    use super::{
+        OracleComparisonContract, OracleTypeDescriptor, compare_for_contract, normalize_for_column,
+        normalize_for_type, round_timestamp,
+    };
     use crate::{
         Decimal, ErrorCode, OracleDate, OracleTimestamp, Value,
         storage::catalog::types::{CatalogName, ColumnDef, ColumnId, TableId},
@@ -496,6 +757,44 @@ mod tests {
 
     fn decimal_value(negative: bool, magnitude: u128, scale: i8) -> Value {
         Value::Decimal(Decimal::new(negative, scale, magnitude).unwrap())
+    }
+
+    #[test]
+    fn oracle_comparisons_are_contract_aware_without_changing_legacy_timestamp() {
+        let char2 = OracleTypeDescriptor::char_type(2).unwrap();
+        let char3 = OracleTypeDescriptor::char_type(3).unwrap();
+        let char_contract = OracleComparisonContract::new(Some(char2), Some(char3)).unwrap();
+        assert_eq!(
+            compare_for_contract(
+                char_contract,
+                &Value::Text("A ".into()),
+                &Value::Text("A  ".into()),
+            )
+            .unwrap(),
+            Ordering::Equal
+        );
+
+        let date = OracleDate::new(2026, 1, 1, 8, 0, 0).unwrap();
+        let offset =
+            Value::Timestamp(OracleTimestamp::from_nanoseconds(date, 0, Some(480)).unwrap());
+        let utc = Value::Timestamp(
+            OracleTimestamp::from_nanoseconds(
+                OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap(),
+                0,
+                Some(0),
+            )
+            .unwrap(),
+        );
+        let descriptor = OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap();
+        let contract = OracleComparisonContract::new(Some(descriptor), Some(descriptor)).unwrap();
+        assert_eq!(
+            compare_for_contract(contract, &offset, &utc).unwrap(),
+            Ordering::Equal
+        );
+        assert_ne!(
+            crate::scalar::sql_total_cmp(&offset, &utc).unwrap(),
+            Ordering::Equal
+        );
     }
 
     #[test]

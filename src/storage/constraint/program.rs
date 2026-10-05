@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use crate::storage::catalog::types::{ColumnDef, ColumnId, ColumnType, MAX_CHECK_PROGRAM_BYTES};
 use crate::{
     DbError, Decimal, ErrorCode, OracleDate, OracleTimestamp, Result, Value,
+    oracle_type::{
+        OracleComparisonContract, OracleTypeDescriptor, compare_for_contract,
+        decode_comparison_descriptor, encode_comparison_descriptor, normalize_for_type,
+    },
     scalar::{self, ScalarBinaryOp, ScalarUnaryOp, TruthValue},
 };
 
@@ -123,6 +127,11 @@ pub(crate) enum CheckTemplateInstruction {
     },
     Binary {
         op: CheckBinaryOp,
+        result: CheckType,
+    },
+    OracleCompare {
+        op: CheckBinaryOp,
+        contract: OracleComparisonContract,
         result: CheckType,
     },
     IsNull {
@@ -314,6 +323,11 @@ impl CheckProgram {
                         let left = pop(&mut values)?;
                         scalar::eval_binary(map_binary(op), &left, &right)?
                     }
+                    Kind::OracleCompare(op, contract) => {
+                        let right = pop(&mut values)?;
+                        let left = pop(&mut values)?;
+                        oracle_binary(op, contract, left, right)?
+                    }
                     Kind::IsNull(negated) => {
                         Value::Bool(matches!(pop(&mut values)?, Value::Null) != negated)
                     }
@@ -392,6 +406,7 @@ enum Kind {
     Literal(Value),
     Unary(CheckUnaryOp),
     Binary(CheckBinaryOp),
+    OracleCompare(CheckBinaryOp, OracleComparisonContract),
     IsNull(bool),
     In(bool, u16),
     Between(bool),
@@ -443,6 +458,11 @@ fn template_shape(instruction: &CheckTemplateInstruction) -> Result<(Kind, Check
         }
         CheckTemplateInstruction::Unary { op, result } => (Kind::Unary(*op), *result, 1),
         CheckTemplateInstruction::Binary { op, result } => (Kind::Binary(*op), *result, 2),
+        CheckTemplateInstruction::OracleCompare {
+            op,
+            contract,
+            result,
+        } => (Kind::OracleCompare(*op, *contract), *result, 2),
         CheckTemplateInstruction::IsNull { negated, result } => {
             (Kind::IsNull(*negated), *result, 1)
         }
@@ -488,6 +508,22 @@ fn encode_instruction(
         )),
         CheckTemplateInstruction::Binary { op, result } => {
             Ok((binary_opcode(*op), *result, 2, Vec::new()))
+        }
+        CheckTemplateInstruction::OracleCompare {
+            op,
+            contract,
+            result,
+        } => {
+            if version != VERSION_V2 {
+                return Err(DbError::new(
+                    ErrorCode::Internal,
+                    "Oracle comparison requires check program V2",
+                ));
+            }
+            let mut payload = Vec::with_capacity(16);
+            payload.extend_from_slice(&encode_comparison_descriptor(contract.left()));
+            payload.extend_from_slice(&encode_comparison_descriptor(contract.right()));
+            Ok((oracle_compare_opcode(*op)?, *result, 2, payload))
         }
         CheckTemplateInstruction::IsNull { negated, result } => {
             Ok((if *negated { 0x31 } else { 0x30 }, *result, 1, Vec::new()))
@@ -567,6 +603,18 @@ fn decode_instruction(reader: &mut Reader<'_>, version: u8) -> Result<Instructio
         0x11 => Kind::Unary(CheckUnaryOp::Minus),
         0x12 => Kind::Unary(CheckUnaryOp::Not),
         0x20..=0x26 | 0x28..=0x2d => Kind::Binary(opcode_binary(opcode)?),
+        0x50..=0x55 => {
+            if version != VERSION_V2 || operands != 2 || payload.len() != 16 {
+                return Err(corruption("Oracle comparison instruction shape is invalid"));
+            }
+            let left = decode_comparison_descriptor(&payload[..8])
+                .map_err(|_| corruption("Oracle comparison left descriptor is invalid"))?;
+            let right = decode_comparison_descriptor(&payload[8..])
+                .map_err(|_| corruption("Oracle comparison right descriptor is invalid"))?;
+            let contract = OracleComparisonContract::new(Some(left), Some(right))
+                .map_err(|_| corruption("Oracle comparison descriptors are incompatible"))?;
+            Kind::OracleCompare(oracle_opcode_binary(opcode)?, contract)
+        }
         0x30 => Kind::IsNull(false),
         0x31 => Kind::IsNull(true),
         0x40 => Kind::In(
@@ -587,7 +635,11 @@ fn decode_instruction(reader: &mut Reader<'_>, version: u8) -> Result<Instructio
         0x45 => Kind::Like(true),
         _ => return Err(corruption("check program opcode is invalid")),
     };
-    if !matches!(kind, Kind::Column(_) | Kind::Literal(_)) && !payload.is_empty() {
+    if !matches!(
+        kind,
+        Kind::Column(_) | Kind::Literal(_) | Kind::OracleCompare(_, _)
+    ) && !payload.is_empty()
+    {
         return Err(corruption("operator payload must be empty"));
     }
     Ok(Instruction {
@@ -712,6 +764,17 @@ fn validate_instruction(
             require(instruction.result, expected)?;
             Some(instruction.result)
         }
+        Kind::OracleCompare(_, contract) => {
+            if instruction.operands != 2 {
+                return Err(corruption("Oracle comparison operand count is invalid"));
+            }
+            let right = pop_type(stack)?;
+            let left = pop_type(stack)?;
+            require(left, check_type_for_descriptor(contract.left()))?;
+            require(right, check_type_for_descriptor(contract.right()))?;
+            require(instruction.result, CheckType::Bool)?;
+            Some(instruction.result)
+        }
         Kind::IsNull(_) => {
             if instruction.operands != 1 {
                 return Err(corruption("IS NULL operand count is invalid"));
@@ -772,6 +835,7 @@ fn validate_instruction(
                 | CheckBinaryOp::GreaterThan
                 | CheckBinaryOp::GreaterThanOrEqual,
             )
+            | Kind::OracleCompare(_, _)
             | Kind::IsNull(_)
             | Kind::In(_, _)
             | Kind::Between(_)
@@ -815,6 +879,45 @@ fn comparison_compatible(left: CheckType, right: CheckType) -> bool {
         || (matches!(left, CheckType::Int64 | CheckType::Decimal)
             && matches!(right, CheckType::Int64 | CheckType::Decimal))
 }
+fn check_type_for_descriptor(descriptor: OracleTypeDescriptor) -> CheckType {
+    match descriptor {
+        OracleTypeDescriptor::Number { .. } => CheckType::Decimal,
+        OracleTypeDescriptor::Varchar2 { .. } | OracleTypeDescriptor::Char { .. } => {
+            CheckType::Text
+        }
+        OracleTypeDescriptor::Raw { .. } => CheckType::Blob,
+        OracleTypeDescriptor::Date => CheckType::Date,
+        OracleTypeDescriptor::Timestamp { .. } => CheckType::Timestamp,
+        OracleTypeDescriptor::TimestampWithTimeZone { .. } => CheckType::TimestampWithTimeZone,
+    }
+}
+fn oracle_binary(
+    op: CheckBinaryOp,
+    contract: OracleComparisonContract,
+    left: Value,
+    right: Value,
+) -> Result<Value> {
+    let left = normalize_for_type(contract.left(), left)?;
+    let right = normalize_for_type(contract.right(), right)?;
+    if left == Value::Null || right == Value::Null {
+        return Ok(Value::Null);
+    }
+    let order = compare_for_contract(contract, &left, &right)?;
+    Ok(Value::Bool(match op {
+        CheckBinaryOp::Equal => order.is_eq(),
+        CheckBinaryOp::NotEqual => !order.is_eq(),
+        CheckBinaryOp::LessThan => order.is_lt(),
+        CheckBinaryOp::LessThanOrEqual => order.is_le(),
+        CheckBinaryOp::GreaterThan => order.is_gt(),
+        CheckBinaryOp::GreaterThanOrEqual => order.is_ge(),
+        _ => {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "Oracle contract attached to non-comparison",
+            ));
+        }
+    }))
+}
 fn binary_opcode(op: CheckBinaryOp) -> u8 {
     match op {
         CheckBinaryOp::Add => 0x20,
@@ -832,6 +935,22 @@ fn binary_opcode(op: CheckBinaryOp) -> u8 {
         CheckBinaryOp::GreaterThanOrEqual => 0x2d,
     }
 }
+fn oracle_compare_opcode(op: CheckBinaryOp) -> Result<u8> {
+    Ok(match op {
+        CheckBinaryOp::Equal => 0x50,
+        CheckBinaryOp::NotEqual => 0x51,
+        CheckBinaryOp::LessThan => 0x52,
+        CheckBinaryOp::LessThanOrEqual => 0x53,
+        CheckBinaryOp::GreaterThan => 0x54,
+        CheckBinaryOp::GreaterThanOrEqual => 0x55,
+        _ => {
+            return Err(DbError::new(
+                ErrorCode::Type,
+                "Oracle comparison operator is invalid",
+            ));
+        }
+    })
+}
 fn opcode_binary(opcode: u8) -> Result<CheckBinaryOp> {
     match opcode {
         0x20 => Ok(CheckBinaryOp::Add),
@@ -848,6 +967,17 @@ fn opcode_binary(opcode: u8) -> Result<CheckBinaryOp> {
         0x2c => Ok(CheckBinaryOp::GreaterThan),
         0x2d => Ok(CheckBinaryOp::GreaterThanOrEqual),
         _ => Err(corruption("binary opcode is invalid")),
+    }
+}
+fn oracle_opcode_binary(opcode: u8) -> Result<CheckBinaryOp> {
+    match opcode {
+        0x50 => Ok(CheckBinaryOp::Equal),
+        0x51 => Ok(CheckBinaryOp::NotEqual),
+        0x52 => Ok(CheckBinaryOp::LessThan),
+        0x53 => Ok(CheckBinaryOp::LessThanOrEqual),
+        0x54 => Ok(CheckBinaryOp::GreaterThan),
+        0x55 => Ok(CheckBinaryOp::GreaterThanOrEqual),
+        _ => Err(corruption("Oracle comparison opcode is invalid")),
     }
 }
 fn map_unary(op: CheckUnaryOp) -> ScalarUnaryOp {
@@ -883,13 +1013,14 @@ fn required_program_version(instructions: &[CheckTemplateInstruction]) -> u8 {
 }
 
 fn instruction_requires_v2(instruction: &CheckTemplateInstruction) -> bool {
-    matches!(
-        instruction,
-        CheckTemplateInstruction::Literal {
-            value: Value::Timestamp(timestamp),
-            ..
-        } if timestamp.nanoseconds() % 1_000 != 0
-    )
+    matches!(instruction, CheckTemplateInstruction::OracleCompare { .. })
+        || matches!(
+            instruction,
+            CheckTemplateInstruction::Literal {
+                value: Value::Timestamp(timestamp),
+                ..
+            } if timestamp.nanoseconds() % 1_000 != 0
+        )
 }
 
 fn encode_scalar(value: &Value, version: u8) -> Result<Vec<u8>> {
@@ -1236,6 +1367,51 @@ mod tests {
             TruthValue::False
         );
         assert_eq!(memory.used, 0);
+    }
+
+    #[test]
+    fn oracle_comparison_opcodes_select_v2_and_validate_descriptor_payloads() {
+        let v1 = CheckProgramTemplate::new(vec![CheckTemplateInstruction::Literal {
+            value: Value::Bool(true),
+            result: CheckType::Bool,
+        }])
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+        assert_eq!(v1.as_bytes()[0], VERSION);
+
+        let char_type = OracleTypeDescriptor::char_type(3).unwrap();
+        let contract = OracleComparisonContract::new(Some(char_type), Some(char_type)).unwrap();
+        let v2 = CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Text("A  ".into()),
+                result: CheckType::Text,
+            },
+            CheckTemplateInstruction::Literal {
+                value: Value::Text("A  ".into()),
+                result: CheckType::Text,
+            },
+            CheckTemplateInstruction::OracleCompare {
+                op: CheckBinaryOp::Equal,
+                contract,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap()
+        .resolve(&[])
+        .unwrap();
+        assert_eq!(v2.as_bytes()[0], VERSION_V2);
+        assert_eq!(v2.as_bytes()[40], 0x50);
+        assert_eq!(&v2.as_bytes()[44..48], &16_u32.to_le_bytes());
+
+        let mut reserved = v2.as_bytes().to_vec();
+        reserved[51] = 1;
+        assert_eq!(
+            CheckProgram::from_bytes(reserved.into())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
     }
 
     #[test]

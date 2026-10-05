@@ -176,7 +176,9 @@ fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
                 BoundUnaryOp::Positive if expr.sql_type == SqlType::Unknown => return false,
                 BoundUnaryOp::Positive | BoundUnaryOp::Not => work.push(expr),
             },
-            BoundExprKind::Binary { left, op, right } => match op {
+            BoundExprKind::Binary {
+                left, op, right, ..
+            } => match op {
                 BoundBinaryOp::Add
                 | BoundBinaryOp::Subtract
                 | BoundBinaryOp::Multiply

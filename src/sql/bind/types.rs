@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::{
     DbError, Decimal, ErrorCode, Result, Value,
     api::{ParameterIdentifier, ParameterMetadata},
-    oracle_type::OracleTypeDescriptor,
+    oracle_type::{OracleComparisonContract, OracleTypeDescriptor, normalize_for_type},
     sql::{
         ParameterKey, SqlSpan, SqlType,
         ast::{AggregateArgument, AggregateFunction, AstExpr, AstExprKind, BinaryOp, UnaryOp},
@@ -303,6 +303,7 @@ impl ParameterCollector {
                         | BoundBinaryOp::Modulo,
                     left,
                     right,
+                    ..
                 } => {
                     work.push((left, aggregate_result));
                     work.push((right, aggregate_result));
@@ -903,29 +904,13 @@ fn finish_binary(
                 left: Box::new(left),
                 op: map_binary_op(op),
                 right: Box::new(right),
+                oracle_contract: None,
             },
             SqlType::Bool,
             nullable,
             span,
         ));
     }
-
-    if matches!(
-        op,
-        BinaryOp::Equal
-            | BinaryOp::NotEqual
-            | BinaryOp::LessThan
-            | BinaryOp::LessThanOrEqual
-            | BinaryOp::GreaterThan
-            | BinaryOp::GreaterThanOrEqual
-    ) {
-        mark_oracle_comparison_text_source(&left, &right, context);
-        mark_oracle_comparison_text_source(&right, &left, context);
-    }
-    context.link_common([&left, &right])?;
-    let common = left.sql_type.unify(right.sql_type)?;
-    apply_expected(&mut left, common, context)?;
-    apply_expected(&mut right, common, context)?;
 
     let comparison = matches!(
         op,
@@ -936,6 +921,26 @@ fn finish_binary(
             | BinaryOp::GreaterThan
             | BinaryOp::GreaterThanOrEqual
     );
+    if comparison {
+        mark_oracle_comparison_text_source(&left, &right, context);
+        mark_oracle_comparison_text_source(&right, &left, context);
+    }
+    let oracle_contract = if comparison {
+        derive_oracle_comparison_contract(&left, &right, context)?
+    } else {
+        None
+    };
+    let common = if oracle_contract.is_some() {
+        normalize_oracle_literal(&mut left, oracle_contract.unwrap().left())?;
+        normalize_oracle_literal(&mut right, oracle_contract.unwrap().right())?;
+        left.sql_type
+    } else {
+        context.link_common([&left, &right])?;
+        let common = left.sql_type.unify(right.sql_type)?;
+        apply_expected(&mut left, common, context)?;
+        apply_expected(&mut right, common, context)?;
+        common
+    };
     let (sql_type, nullable) = if comparison {
         if common == SqlType::Blob && !matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
             return Err(type_error("Blob supports only equality comparisons"));
@@ -954,11 +959,77 @@ fn finish_binary(
             left: Box::new(left),
             op: map_binary_op(op),
             right: Box::new(right),
+            oracle_contract,
         },
         sql_type,
         nullable,
         span,
     ))
+}
+
+fn derive_oracle_comparison_contract(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    context: &ParameterCollector,
+) -> Result<Option<OracleComparisonContract>> {
+    let left_descriptor = oracle_descriptor(left, context);
+    let right_descriptor = oracle_descriptor(right, context);
+    if left_descriptor.is_none() && right_descriptor.is_none() {
+        return Ok(None);
+    }
+    if is_column_expression(left)
+        && is_column_expression(right)
+        && (left_descriptor.is_none() || right_descriptor.is_none())
+    {
+        return Err(type_error("Oracle and legacy columns cannot be compared"));
+    }
+    let target = left_descriptor
+        .or(right_descriptor)
+        .ok_or_else(bind_internal_error)?;
+    OracleComparisonContract::new(
+        Some(left_descriptor.unwrap_or(target)),
+        Some(right_descriptor.unwrap_or(target)),
+    )
+    .map(Some)
+}
+
+fn oracle_descriptor(
+    expression: &BoundExpr,
+    context: &ParameterCollector,
+) -> Option<OracleTypeDescriptor> {
+    match expression.kind {
+        BoundExprKind::Column { column_id, .. } => context.oracle_columns.get(&column_id).copied(),
+        _ => None,
+    }
+}
+
+fn is_column_expression(expression: &BoundExpr) -> bool {
+    matches!(
+        expression.kind,
+        BoundExprKind::Column { .. } | BoundExprKind::NewTableColumn { .. }
+    )
+}
+
+fn normalize_oracle_literal(
+    expression: &mut BoundExpr,
+    descriptor: OracleTypeDescriptor,
+) -> Result<()> {
+    if let BoundExprKind::Literal(value) = &mut expression.kind {
+        *value = normalize_for_type(descriptor, value.clone())?;
+        expression.sql_type = oracle_descriptor_sql_type(descriptor);
+    }
+    Ok(())
+}
+
+const fn oracle_descriptor_sql_type(descriptor: OracleTypeDescriptor) -> SqlType {
+    match descriptor {
+        OracleTypeDescriptor::Number { .. } => SqlType::Decimal,
+        OracleTypeDescriptor::Varchar2 { .. } | OracleTypeDescriptor::Char { .. } => SqlType::Text,
+        OracleTypeDescriptor::Raw { .. } => SqlType::Blob,
+        OracleTypeDescriptor::Date => SqlType::Date,
+        OracleTypeDescriptor::Timestamp { .. }
+        | OracleTypeDescriptor::TimestampWithTimeZone { .. } => SqlType::Timestamp,
+    }
 }
 
 fn mark_oracle_comparison_text_source(
@@ -1082,6 +1153,7 @@ fn apply_expected(
                     | BoundBinaryOp::Divide
                     | BoundBinaryOp::Modulo,
                 right,
+                ..
             } => {
                 work.push((right, common));
                 work.push((left, common));

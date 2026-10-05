@@ -289,3 +289,134 @@ fn oracle_text_parameter_permission_is_limited_to_a_direct_assignment() {
         "{error}"
     );
 }
+
+#[test]
+fn char_check_normalizes_its_persisted_constant() {
+    let (_files, database) = support::new_database("phase5-check-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (C CHAR(3) CHECK (C = 'A'))",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES ('A')");
+    assert_eq!(
+        support::collect(&mut connection, "SELECT C FROM T"),
+        vec![vec![Value::Text("A  ".into())]]
+    );
+}
+
+#[test]
+fn number_check_normalizes_its_persisted_constant() {
+    let (_files, database) = support::new_database("phase5-number-check-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (N NUMBER(4,2) CHECK (N = '12.345'))",
+    );
+    support::execute_sql(&mut connection, "INSERT INTO T VALUES (12.345)");
+    assert_eq!(
+        support::collect(&mut connection, "SELECT N FROM T"),
+        vec![vec![decimal_value(1235, 2)]]
+    );
+}
+
+#[test]
+fn timestamp_with_time_zone_check_uses_utc_contract() {
+    let (_files, database) = support::new_database("phase5-tstz-check-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (TZ TIMESTAMP(9) WITH TIME ZONE CHECK (TZ = '2026-01-01 00:00:00 +00:00'))",
+    );
+    let insert = connection.prepare("INSERT INTO T VALUES (:1)").unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[timestamp_value(2026, 1, 1, 8, 0, 0, 0, Some(480)).into()]),
+        )
+        .unwrap();
+}
+
+#[test]
+fn oracle_comparisons_normalize_literals_by_column_contract() {
+    let (_files, database) = support::new_database("phase5-comparison-contract");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (N NUMBER(5,2), D DATE, TS TIMESTAMP(9), TZ TIMESTAMP(9) WITH TIME ZONE)",
+    );
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (:1, :2, :3, :4)")
+        .unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                Value::Text("12.345".into()).into(),
+                Value::Date(OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap()).into(),
+                timestamp_value(2026, 1, 1, 8, 0, 0, 123_456_789, None).into(),
+                timestamp_value(2026, 1, 1, 8, 0, 0, 0, Some(480)).into(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        support::collect(&mut connection, "SELECT N FROM T WHERE N = '12.345'"),
+        vec![vec![decimal_value(1235, 2)]]
+    );
+    assert_eq!(
+        collect_with_params(
+            &mut connection,
+            "SELECT N FROM T WHERE N = :1",
+            &[Value::Text("12.345".into()).into()],
+        ),
+        vec![vec![decimal_value(1235, 2)]]
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT D FROM T WHERE D = '2026-01-01'"),
+        vec![vec![Value::Date(
+            OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap()
+        )]]
+    );
+    assert_eq!(
+        support::collect(
+            &mut connection,
+            "SELECT TS FROM T WHERE TS = '2026-01-01 08:00:00.123456789'"
+        ),
+        vec![vec![timestamp_value(
+            2026,
+            1,
+            1,
+            8,
+            0,
+            0,
+            123_456_789,
+            None
+        )]]
+    );
+    assert_eq!(
+        support::collect(
+            &mut connection,
+            "SELECT TZ FROM T WHERE TZ = '2026-01-01 00:00:00 +00:00'"
+        ),
+        vec![vec![timestamp_value(2026, 1, 1, 8, 0, 0, 0, Some(480))]]
+    );
+}
+
+#[test]
+fn oracle_comparisons_reject_legacy_mixes_and_different_families() {
+    let (_files, database) = support::new_database("phase5-comparison-reject");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (V INT64, N NUMBER(3,0), TS TIMESTAMP(9), TZ TIMESTAMP(9) WITH TIME ZONE)",
+    );
+    for sql in [
+        "SELECT N FROM T WHERE N = V",
+        "SELECT TS FROM T WHERE TS = TZ",
+    ] {
+        assert_eq!(
+            connection.prepare(sql).unwrap_err().code(),
+            ora_sqllite::ErrorCode::Type
+        );
+    }
+}

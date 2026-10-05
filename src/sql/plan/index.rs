@@ -236,11 +236,17 @@ fn extract_terms<'a>(source: SourceId, root: &'a BoundExpr) -> BTreeMap<ColumnId
                 left,
                 op: BoundBinaryOp::And,
                 right,
+                ..
             } => {
                 work.push(right);
                 work.push(left);
             }
-            BoundExprKind::Binary { left, op, right } => {
+            BoundExprKind::Binary {
+                left,
+                op,
+                right,
+                oracle_contract: None,
+            } => {
                 record_binary(&mut terms, source, left, *op, right);
             }
             BoundExprKind::IsNull {
@@ -888,6 +894,7 @@ mod tests {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+                oracle_contract: None,
             },
             SqlType::Bool,
             true,

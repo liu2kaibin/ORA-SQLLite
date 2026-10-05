@@ -564,7 +564,7 @@ fn bind_constraint(
             expression, span, ..
         } => {
             let mut expression = bind_condition(expression, scope, parameters)?;
-            mark_new_table_columns(&mut expression, scope.table_id)?;
+            mark_new_table_columns(&mut expression, scope.table_id, columns)?;
             require_scalar(&expression, "CHECK")?;
             Ok(BoundConstraint::Check {
                 name,
@@ -1052,7 +1052,11 @@ impl NewTableScope {
     }
 }
 
-fn mark_new_table_columns(expression: &mut BoundExpr, table_id: TableId) -> Result<()> {
+fn mark_new_table_columns(
+    expression: &mut BoundExpr,
+    table_id: TableId,
+    columns: &[BoundColumnDefinition],
+) -> Result<()> {
     let mut work = vec![expression];
     while let Some(expression) = work.pop() {
         let local_ordinal = match &expression.kind {
@@ -1070,7 +1074,14 @@ fn mark_new_table_columns(expression: &mut BoundExpr, table_id: TableId) -> Resu
             _ => None,
         };
         if let Some(ordinal) = local_ordinal {
-            expression.kind = BoundExprKind::NewTableColumn { ordinal };
+            let oracle_type = columns
+                .get(usize::from(ordinal))
+                .ok_or_else(|| bind_error("new-table CHECK column ordinal is invalid"))?
+                .oracle_type;
+            expression.kind = BoundExprKind::NewTableColumn {
+                ordinal,
+                oracle_type,
+            };
             continue;
         }
         match &mut expression.kind {
@@ -1711,7 +1722,7 @@ mod tests {
                 constraint,
                 BoundConstraint::Check {
                     expression: crate::sql::bound::BoundExpr {
-                        kind: crate::sql::bound::BoundExprKind::NewTableColumn { ordinal: 7 },
+                        kind: crate::sql::bound::BoundExprKind::NewTableColumn { ordinal: 7, .. },
                         ..
                     },
                     ..

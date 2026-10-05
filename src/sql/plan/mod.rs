@@ -1108,7 +1108,10 @@ mod tests {
         let BoundStatementKind::Query { query } = &mut bound.kind else {
             panic!("query")
         };
-        query.projection[0].kind = BoundExprKind::NewTableColumn { ordinal: 0 };
+        query.projection[0].kind = BoundExprKind::NewTableColumn {
+            ordinal: 0,
+            oracle_type: None,
+        };
         assert_eq!(
             Plan::from_bound(&bound, "SELECT ID FROM USERS")
                 .unwrap_err()
