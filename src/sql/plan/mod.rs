@@ -18,7 +18,7 @@ use crate::{
     storage::catalog::types::TableId,
 };
 pub(crate) use expr::{AggregateDefinition, ExecExpr, ExecExprKind};
-pub(crate) use index::IndexAccessPlan;
+pub(crate) use index::{IndexAccessPlan, IndexColumnContract};
 pub(crate) use mutation::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, InsertPlan,
     TableConstraintDefinition, UpdatePlan, validate_foreign_key_plan,

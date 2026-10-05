@@ -177,7 +177,10 @@ fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
                 BoundUnaryOp::Positive | BoundUnaryOp::Not => work.push(expr),
             },
             BoundExprKind::Binary {
-                left, op, right, ..
+                left,
+                op,
+                right,
+                oracle_contract,
             } => match op {
                 BoundBinaryOp::Add
                 | BoundBinaryOp::Subtract
@@ -192,7 +195,9 @@ fn index_scan_preserves_expression_evaluation(bound: &BoundQuery) -> bool {
                 | BoundBinaryOp::GreaterThanOrEqual => {
                     // Unknown parameters are validated independently; binding
                     // has not proved their runtime comparison types compatible.
-                    if left.sql_type == SqlType::Unknown || right.sql_type == SqlType::Unknown {
+                    if oracle_contract.is_none()
+                        && (left.sql_type == SqlType::Unknown || right.sql_type == SqlType::Unknown)
+                    {
                         return false;
                     }
                     work.push(left);

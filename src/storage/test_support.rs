@@ -2820,7 +2820,9 @@ fn phase4c2a_pager_state_inner(
             let decoded = IndexKeyCodec::decode(&columns, &physical)?;
             entries.push(Phase4c2aIndexEntry {
                 physical,
-                logical: decoded.values().to_vec(),
+                logical: decoded.values().ok_or_else(|| {
+                    DbError::new(ErrorCode::Corruption, "UTC index key has no public values")
+                })?,
                 rowid: decoded.rowid().get(),
             });
         }

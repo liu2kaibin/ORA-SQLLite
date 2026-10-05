@@ -420,3 +420,99 @@ fn oracle_comparisons_reject_legacy_mixes_and_different_families() {
         );
     }
 }
+
+#[test]
+fn timezone_index_uses_utc_prefix_but_rows_keep_offsets() {
+    let (_files, database) = support::new_database("phase5-tz-index");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (TS TIMESTAMP(9) WITH TIME ZONE UNIQUE)",
+    );
+    let insert = connection.prepare("INSERT INTO T VALUES (:1)").unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                timestamp_value(2026, 1, 1, 8, 0, 0, 123_456_789, Some(480)).into()
+            ]),
+        )
+        .unwrap();
+    let error = connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                timestamp_value(2026, 1, 1, 0, 0, 0, 123_456_789, Some(0)).into()
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        (error.code(), error.oracle_code()),
+        (ora_sqllite::ErrorCode::Constraint, Some(1))
+    );
+    assert_eq!(
+        support::collect(&mut connection, "SELECT TS FROM T"),
+        vec![vec![timestamp_value(
+            2026,
+            1,
+            1,
+            8,
+            0,
+            0,
+            123_456_789,
+            Some(480),
+        )]]
+    );
+}
+
+#[test]
+fn scan_and_filter_share_number_char_and_timestamp_normalization() {
+    let (_files, database) = support::new_database("phase5-index-parity");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(
+        &mut connection,
+        "CREATE TABLE T (ID NUMBER(4,0), N NUMBER(5,2), C CHAR(3), TZ TIMESTAMP(9) WITH TIME ZONE)",
+    );
+    for sql in [
+        "CREATE INDEX T_N ON T(N)",
+        "CREATE INDEX T_C ON T(C)",
+        "CREATE INDEX T_TZ ON T(TZ)",
+    ] {
+        support::execute_sql(&mut connection, sql);
+    }
+    let insert = connection
+        .prepare("INSERT INTO T VALUES (1, 1.2, 'A', :1)")
+        .unwrap();
+    connection
+        .execute(
+            &insert,
+            Parameters::positional(&[
+                timestamp_value(2026, 1, 1, 8, 0, 0, 100_000_000, Some(480)).into()
+            ]),
+        )
+        .unwrap();
+
+    for (indexed, scanned, value) in [
+        (
+            "SELECT ID FROM T WHERE N = :1",
+            "SELECT ID FROM T WHERE N = :1 OR FALSE",
+            Value::Text("1.20".into()),
+        ),
+        (
+            "SELECT ID FROM T WHERE C = :1",
+            "SELECT ID FROM T WHERE C = :1 OR FALSE",
+            Value::Text("A".into()),
+        ),
+        (
+            "SELECT ID FROM T WHERE TZ = :1",
+            "SELECT ID FROM T WHERE TZ = :1 OR FALSE",
+            Value::Text("2026-01-01 00:00:00.1 +00:00".into()),
+        ),
+    ] {
+        let parameters = [value.into()];
+        assert_eq!(
+            collect_with_params(&mut connection, indexed, &parameters),
+            collect_with_params(&mut connection, scanned, &parameters),
+        );
+    }
+}

@@ -1,6 +1,7 @@
+use crate::oracle_type::normalize_for_type;
 use crate::sql::{
     bound::{BoundSource, SourceId},
-    plan::IndexAccessPlan,
+    plan::{IndexAccessPlan, IndexColumnContract},
 };
 use crate::storage::{
     catalog::types::ColumnType,
@@ -191,16 +192,16 @@ fn evaluate_bounds(
 ) -> Result<Option<IndexScanRange>> {
     let row = EvalRow::default();
     let mut equality = Vec::with_capacity(access.equality().len());
-    for (column_type, value) in access.equality() {
-        if value.is_null() {
+    for (column, value_plan) in access.equality() {
+        if value_plan.is_null() {
             equality.push(Value::Null);
         } else {
-            let expression = value.expression().ok_or_else(invalid_bound)?;
+            let expression = value_plan.expression().ok_or_else(invalid_bound)?;
             let value = eval(expression, &row, params)?;
             if matches!(value, Value::Null) {
                 return Ok(None);
             }
-            equality.push(normalize_bound(value, *column_type)?);
+            equality.push(normalize_bound(value, *column, value_plan.is_literal())?);
         }
     }
     let mut range = IndexScanRange {
@@ -219,7 +220,7 @@ fn evaluate_bounds(
                     return Ok(None);
                 }
                 *output = Some(IndexScanBound {
-                    value: normalize_bound(value, template.column_type())?,
+                    value: normalize_bound(value, template.column(), bound.is_literal())?,
                     inclusive: bound.inclusive(),
                 });
             }
@@ -228,7 +229,19 @@ fn evaluate_bounds(
     Ok(Some(range))
 }
 
-fn normalize_bound(value: Value, column_type: ColumnType) -> Result<Value> {
+fn normalize_bound(
+    value: Value,
+    column: IndexColumnContract,
+    literal_is_already_normalized: bool,
+) -> Result<Value> {
+    match column.oracle_type() {
+        Some(_) if literal_is_already_normalized => Ok(value),
+        Some(descriptor) => normalize_for_type(descriptor, value),
+        None => normalize_legacy_bound(value, column.column_type()),
+    }
+}
+
+fn normalize_legacy_bound(value: Value, column_type: ColumnType) -> Result<Value> {
     let valid = match (column_type, &value) {
         (ColumnType::Decimal, Value::Int64(value)) => {
             return Decimal::new(*value < 0, 0, u128::from(value.unsigned_abs()))
@@ -297,6 +310,99 @@ mod tests {
             paths.iter().all(|path| *path == "IndexScan"),
             "wrong access path: {paths:?}"
         );
+    }
+
+    #[test]
+    fn oracle_contract_bounds_use_index_scan_and_forced_table_scan_equivalently() {
+        let temp = TempDatabase::new("oracle-contract-index-path");
+        let database = Database::create(temp.path(), Options::default()).unwrap();
+        let mut connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE T (ID NUMBER(4,0), N NUMBER(5,2), C CHAR(3), TZ TIMESTAMP(9) WITH TIME ZONE)",
+            "CREATE INDEX T_N ON T(N)",
+            "CREATE INDEX T_C ON T(C)",
+            "CREATE INDEX T_TZ ON T(TZ)",
+        ] {
+            execute(&mut connection, sql);
+        }
+        let insert = connection
+            .prepare("INSERT INTO T VALUES (1, 1.2, 'A', :1)")
+            .unwrap();
+        connection
+            .execute(
+                &insert,
+                Parameters::positional(&[Value::Timestamp(
+                    crate::OracleTimestamp::from_nanoseconds(
+                        crate::OracleDate::new(2026, 1, 1, 8, 0, 0).unwrap(),
+                        100_000_000,
+                        Some(480),
+                    )
+                    .unwrap(),
+                )
+                .into()]),
+            )
+            .unwrap();
+        for (indexed, forced, parameter) in [
+            (
+                "SELECT ID FROM T WHERE N = :1",
+                "SELECT ID FROM T WHERE N = :1 OR FALSE",
+                Value::Text("1.20".into()),
+            ),
+            (
+                "SELECT ID FROM T WHERE C = :1",
+                "SELECT ID FROM T WHERE C = :1 OR FALSE",
+                Value::Text("A".into()),
+            ),
+            (
+                "SELECT ID FROM T WHERE TZ = :1",
+                "SELECT ID FROM T WHERE TZ = :1 OR FALSE",
+                Value::Timestamp(
+                    crate::OracleTimestamp::from_nanoseconds(
+                        crate::OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap(),
+                        100_000_000,
+                        Some(0),
+                    )
+                    .unwrap(),
+                ),
+            ),
+        ] {
+            let run = |connection: &mut Connection, sql: &str| {
+                let statement = connection.prepare(sql).unwrap();
+                if sql == indexed {
+                    let crate::sql::plan::PlanKind::Query(query) = statement.plan().kind() else {
+                        panic!("query plan");
+                    };
+                    assert!(
+                        query.index_access().is_some(),
+                        "Oracle contract predicate must be indexable"
+                    );
+                }
+                let mut rows = connection
+                    .query(
+                        &statement,
+                        Parameters::positional(&[parameter.clone().into()]),
+                    )
+                    .unwrap();
+                let mut output = Vec::new();
+                while let Some(row) = rows.next().unwrap() {
+                    output.push(row.values().to_vec());
+                }
+                output
+            };
+            let _ = take_access_paths();
+            let indexed_rows = run(&mut connection, indexed);
+            assert_eq!(
+                indexed_rows,
+                vec![vec![Value::Decimal(
+                    crate::Decimal::new(false, 0, 1).unwrap()
+                )]]
+            );
+            assert_index_path();
+            let _ = take_access_paths();
+            assert_eq!(run(&mut connection, forced), indexed_rows);
+            let paths = take_access_paths();
+            assert!(!paths.is_empty() && paths.iter().all(|path| *path == "TableScan"));
+        }
     }
 
     fn arithmetic_query_fixture() -> (TempDatabase, Database) {
