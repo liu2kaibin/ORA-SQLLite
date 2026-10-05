@@ -75,3 +75,24 @@ fn public_documentation_links_resolve() {
         }
     }
 }
+
+#[test]
+fn release_preview_is_manual_read_only_and_never_publishes() {
+    let workflow = read(".github/workflows/release-preview.yml");
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("contents: read"));
+    for forbidden in [
+        "push:",
+        "pull_request:",
+        "contents: write",
+        "cargo publish",
+        "softprops/action-gh-release",
+        "gh release",
+        "git tag",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "forbidden release capability: {forbidden}"
+        );
+    }
+}
