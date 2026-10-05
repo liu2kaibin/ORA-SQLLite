@@ -78,23 +78,33 @@ impl OracleDate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleTimestamp {
     date: OracleDate,
-    micros: u32,
+    nanos: u32,
     offset_minutes: Option<i16>,
 }
 
 impl OracleTimestamp {
     pub fn new(date: OracleDate, micros: u32, offset_minutes: Option<i16>) -> Result<Self> {
-        if micros > 999_999 {
-            return Err(type_error("microseconds must be between 0 and 999999"));
-        }
+        let nanos = micros
+            .checked_mul(1_000)
+            .ok_or_else(|| type_error("microseconds exceed timestamp range"))?;
+        Self::from_nanoseconds(date, nanos, offset_minutes)
+    }
 
+    pub fn from_nanoseconds(
+        date: OracleDate,
+        nanos: u32,
+        offset_minutes: Option<i16>,
+    ) -> Result<Self> {
+        if nanos >= 1_000_000_000 {
+            return Err(type_error("nanoseconds must be below one second"));
+        }
         if offset_minutes.is_some_and(|offset| !(-840..=840).contains(&offset)) {
             return Err(type_error("offset minutes must be between -840 and 840"));
         }
 
         Ok(Self {
             date,
-            micros,
+            nanos,
             offset_minutes,
         })
     }
@@ -104,12 +114,81 @@ impl OracleTimestamp {
     }
 
     pub const fn micros(self) -> u32 {
-        self.micros
+        self.nanos / 1_000
+    }
+
+    pub const fn nanoseconds(self) -> u32 {
+        self.nanos
     }
 
     pub const fn offset_minutes(self) -> Option<i16> {
         self.offset_minutes
     }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by later Phase 5 timestamp comparison and index tasks"
+    )]
+    pub(crate) fn utc_day_and_nanos(self) -> Result<(i32, u64)> {
+        const NANOS_PER_SECOND: i64 = 1_000_000_000;
+        const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
+        const NANOS_PER_DAY: i64 = 24 * 60 * NANOS_PER_MINUTE;
+
+        let date = self.date;
+        let day =
+            i64::from(days_before_year(date.year()) + days_before_month(date.year(), date.month()))
+                + i64::from(date.day())
+                - 1;
+        let second_of_day = i64::from(date.hour()) * 3_600
+            + i64::from(date.minute()) * 60
+            + i64::from(date.second());
+        let local_nanos = second_of_day * NANOS_PER_SECOND + i64::from(self.nanos);
+        let utc_nanos =
+            local_nanos - i64::from(self.offset_minutes.unwrap_or(0)) * NANOS_PER_MINUTE;
+        let utc_day = day + utc_nanos.div_euclid(NANOS_PER_DAY);
+        let nanos_of_day = utc_nanos.rem_euclid(NANOS_PER_DAY);
+        Ok((
+            i32::try_from(utc_day).map_err(|_| type_error("UTC day exceeds timestamp range"))?,
+            u64::try_from(nanos_of_day).map_err(|_| type_error("UTC nanoseconds are invalid"))?,
+        ))
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by utc_day_and_nanos in later Phase 5 tasks"
+)]
+const fn days_before_year(year: u16) -> u32 {
+    let prior = year as u32 - 1;
+    prior * 365 + prior / 4 - prior / 100 + prior / 400
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by utc_day_and_nanos in later Phase 5 tasks"
+)]
+const fn days_before_month(year: u16, month: u8) -> u32 {
+    let before = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => 0,
+    };
+    before
+        + if month > 2 && is_leap_year(year) {
+            1
+        } else {
+            0
+        }
 }
 
 const fn is_leap_year(year: u16) -> bool {
@@ -138,6 +217,55 @@ mod tests {
         assert!(OracleTimestamp::new(date, 999_999, Some(840)).is_ok());
         assert!(OracleTimestamp::new(date, 1_000_000, None).is_err());
         assert!(OracleTimestamp::new(date, 0, Some(841)).is_err());
+    }
+
+    #[test]
+    fn nanoseconds_preserve_the_old_microsecond_api_and_offset_limits() {
+        let date = OracleDate::new(2026, 1, 2, 3, 4, 5).unwrap();
+        let old = OracleTimestamp::new(date, 123_456, Some(480)).unwrap();
+        assert_eq!(old.nanoseconds(), 123_456_000);
+        assert_eq!(old.micros(), 123_456);
+
+        let precise = OracleTimestamp::from_nanoseconds(date, 123_456_789, None).unwrap();
+        assert_eq!(precise.nanoseconds(), 123_456_789);
+        assert_eq!(precise.micros(), 123_456);
+        assert!(OracleTimestamp::from_nanoseconds(date, 999_999_999, None).is_ok());
+        assert!(OracleTimestamp::from_nanoseconds(date, 1_000_000_000, None).is_err());
+        assert!(OracleTimestamp::from_nanoseconds(date, 0, Some(840)).is_ok());
+        assert!(OracleTimestamp::from_nanoseconds(date, 0, Some(-840)).is_ok());
+        assert!(OracleTimestamp::from_nanoseconds(date, 0, Some(841)).is_err());
+        assert!(OracleTimestamp::from_nanoseconds(date, 0, Some(-841)).is_err());
+    }
+
+    #[test]
+    fn utc_day_and_nanos_preserves_instant_across_calendar_boundaries() {
+        let local = OracleTimestamp::from_nanoseconds(
+            OracleDate::new(2026, 1, 1, 0, 30, 0).unwrap(),
+            123_456_789,
+            Some(60),
+        )
+        .unwrap();
+        let utc = OracleTimestamp::from_nanoseconds(
+            OracleDate::new(2025, 12, 31, 23, 30, 0).unwrap(),
+            123_456_789,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(
+            local.utc_day_and_nanos().unwrap(),
+            utc.utc_day_and_nanos().unwrap()
+        );
+
+        let earliest = OracleTimestamp::from_nanoseconds(
+            OracleDate::new(1, 1, 1, 0, 0, 0).unwrap(),
+            0,
+            Some(840),
+        )
+        .unwrap();
+        assert_eq!(
+            earliest.utc_day_and_nanos().unwrap(),
+            (-1, 36_000_000_000_000)
+        );
     }
 
     #[test]

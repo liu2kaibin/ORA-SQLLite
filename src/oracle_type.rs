@@ -152,11 +152,11 @@ pub(crate) fn normalize_for_type(descriptor: OracleTypeDescriptor, value: Value)
         OracleTypeDescriptor::Raw { length_bytes } => normalize_raw(value, length_bytes),
         OracleTypeDescriptor::Date => normalize_date(value),
         OracleTypeDescriptor::Timestamp {
-            fractional_precision: _,
-        } => normalize_timestamp(value, false),
+            fractional_precision,
+        } => normalize_timestamp(value, fractional_precision, false),
         OracleTypeDescriptor::TimestampWithTimeZone {
-            fractional_precision: _,
-        } => normalize_timestamp(value, true),
+            fractional_precision,
+        } => normalize_timestamp(value, fractional_precision, true),
     }
 }
 
@@ -246,29 +246,217 @@ fn normalize_raw(value: Value, length_bytes: u32) -> Result<Value> {
     Ok(Value::Blob(bytes))
 }
 
-#[allow(
-    dead_code,
-    reason = "date parsing and normalization are implemented by phase 5 task 4"
-)]
 fn normalize_date(value: Value) -> Result<Value> {
     match value {
         Value::Date(_) => Ok(value),
+        Value::Text(text) => parse_date_text(&text).map(Value::Date),
         _ => Err(type_shape_error("DATE")),
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "timestamp parsing and normalization are implemented by phase 5 task 4"
-)]
-fn normalize_timestamp(value: Value, with_time_zone: bool) -> Result<Value> {
-    match &value {
+fn normalize_timestamp(
+    value: Value,
+    fractional_precision: u8,
+    with_time_zone: bool,
+) -> Result<Value> {
+    match value {
         Value::Timestamp(timestamp) if timestamp.offset_minutes().is_some() == with_time_zone => {
-            Ok(value)
+            round_timestamp(timestamp, fractional_precision).map(Value::Timestamp)
         }
+        Value::Text(text) => parse_timestamp_text(&text, with_time_zone)
+            .and_then(|timestamp| round_timestamp(timestamp, fractional_precision))
+            .map(Value::Timestamp),
         _ if with_time_zone => Err(type_shape_error("TIMESTAMP WITH TIME ZONE")),
         _ => Err(type_shape_error("TIMESTAMP")),
     }
+}
+
+fn parse_date_text(text: &str) -> Result<crate::OracleDate> {
+    let bytes = text.as_bytes();
+    match bytes.len() {
+        10 => parse_date_fields(bytes, false),
+        19 => parse_date_fields(bytes, true),
+        _ => Err(datetime_literal_error()),
+    }
+}
+
+fn parse_date_fields(bytes: &[u8], with_time: bool) -> Result<crate::OracleDate> {
+    let expected_len = if with_time { 19 } else { 10 };
+    if bytes.len() != expected_len
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (with_time && (bytes[10] != b' ' || bytes[13] != b':' || bytes[16] != b':'))
+    {
+        return Err(datetime_literal_error());
+    }
+    let year = parse_ascii_digits(bytes, 0, 4)? as u16;
+    let month = parse_ascii_digits(bytes, 5, 2)? as u8;
+    let day = parse_ascii_digits(bytes, 8, 2)? as u8;
+    let (hour, minute, second) = if with_time {
+        (
+            parse_ascii_digits(bytes, 11, 2)? as u8,
+            parse_ascii_digits(bytes, 14, 2)? as u8,
+            parse_ascii_digits(bytes, 17, 2)? as u8,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    crate::OracleDate::new(year, month, day, hour, minute, second)
+        .map_err(|_| datetime_literal_error())
+}
+
+fn parse_timestamp_text(text: &str, with_time_zone: bool) -> Result<crate::OracleTimestamp> {
+    let bytes = text.as_bytes();
+    let (local, offset) = if with_time_zone {
+        if bytes.len() < 26 {
+            return Err(datetime_literal_error());
+        }
+        let split = bytes.len() - 7;
+        if bytes[split] != b' ' {
+            return Err(datetime_literal_error());
+        }
+        (
+            &bytes[..split],
+            Some(parse_fixed_offset(&bytes[split + 1..])?),
+        )
+    } else {
+        (bytes, None)
+    };
+
+    if local.len() < 19 {
+        return Err(datetime_literal_error());
+    }
+    let date = parse_date_fields(&local[..19], true)?;
+    let nanos = match local.len() {
+        19 => 0,
+        21..=29 if local[19] == b'.' => {
+            let digits = &local[20..];
+            let value = parse_ascii_digits(digits, 0, digits.len())?;
+            let padding = u32::try_from(9 - digits.len()).map_err(|_| datetime_literal_error())?;
+            value
+                .checked_mul(10_u32.pow(padding))
+                .ok_or_else(datetime_literal_error)?
+        }
+        _ => return Err(datetime_literal_error()),
+    };
+    crate::OracleTimestamp::from_nanoseconds(date, nanos, offset)
+        .map_err(|_| datetime_literal_error())
+}
+
+fn parse_fixed_offset(bytes: &[u8]) -> Result<i16> {
+    if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+        return Err(datetime_literal_error());
+    }
+    let hours = parse_ascii_digits(bytes, 1, 2)? as i16;
+    let minutes = parse_ascii_digits(bytes, 4, 2)? as i16;
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
+        return Err(datetime_literal_error());
+    }
+    let total = hours * 60 + minutes;
+    Ok(if bytes[0] == b'-' { -total } else { total })
+}
+
+fn parse_ascii_digits(bytes: &[u8], start: usize, len: usize) -> Result<u32> {
+    let digits = bytes
+        .get(start..start.checked_add(len).ok_or_else(datetime_literal_error)?)
+        .ok_or_else(datetime_literal_error)?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(datetime_literal_error());
+    }
+    digits.iter().try_fold(0_u32, |value, byte| {
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u32::from(byte - b'0')))
+            .ok_or_else(datetime_literal_error)
+    })
+}
+
+pub(crate) fn round_timestamp(
+    timestamp: crate::OracleTimestamp,
+    fractional_precision: u8,
+) -> Result<crate::OracleTimestamp> {
+    if fractional_precision > 9 {
+        return Err(datetime_literal_error());
+    }
+    let divisor = 10_u32.pow(u32::from(9 - fractional_precision));
+    let nanos = timestamp.nanoseconds();
+    let remainder = nanos % divisor;
+    let mut rounded = nanos - remainder;
+    if remainder != 0 && remainder >= divisor / 2 {
+        rounded = rounded
+            .checked_add(divisor)
+            .ok_or_else(datetime_literal_error)?;
+    }
+    let date = if rounded == 1_000_000_000 {
+        rounded = 0;
+        next_second(timestamp.date())?
+    } else {
+        timestamp.date()
+    };
+    crate::OracleTimestamp::from_nanoseconds(date, rounded, timestamp.offset_minutes())
+        .map_err(|_| datetime_literal_error())
+}
+
+fn next_second(date: crate::OracleDate) -> Result<crate::OracleDate> {
+    if date.second() < 59 {
+        return crate::OracleDate::new(
+            date.year(),
+            date.month(),
+            date.day(),
+            date.hour(),
+            date.minute(),
+            date.second() + 1,
+        );
+    }
+    if date.minute() < 59 {
+        return crate::OracleDate::new(
+            date.year(),
+            date.month(),
+            date.day(),
+            date.hour(),
+            date.minute() + 1,
+            0,
+        );
+    }
+    if date.hour() < 23 {
+        return crate::OracleDate::new(
+            date.year(),
+            date.month(),
+            date.day(),
+            date.hour() + 1,
+            0,
+            0,
+        );
+    }
+    let (year, month, day) = next_day(date.year(), date.month(), date.day())?;
+    crate::OracleDate::new(year, month, day, 0, 0, 0).map_err(|_| datetime_literal_error())
+}
+
+fn next_day(year: u16, month: u8, day: u8) -> Result<(u16, u8, u8)> {
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => return Err(datetime_literal_error()),
+    };
+    if day < days_in_month {
+        Ok((year, month, day + 1))
+    } else if month < 12 {
+        Ok((year, month + 1, 1))
+    } else if year < 9999 {
+        Ok((year + 1, 1, 1))
+    } else {
+        Err(datetime_literal_error())
+    }
+}
+
+fn datetime_literal_error() -> DbError {
+    DbError::oracle(
+        ErrorCode::Type,
+        1861,
+        "literal does not match the DATE or TIMESTAMP format",
+    )
 }
 
 #[allow(
@@ -300,9 +488,9 @@ fn invalid_declaration(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OracleTypeDescriptor, normalize_for_column, normalize_for_type};
+    use super::{OracleTypeDescriptor, normalize_for_column, normalize_for_type, round_timestamp};
     use crate::{
-        Decimal, ErrorCode, Value,
+        Decimal, ErrorCode, OracleDate, OracleTimestamp, Value,
         storage::catalog::types::{CatalogName, ColumnDef, ColumnId, TableId},
     };
 
@@ -474,6 +662,149 @@ mod tests {
         let raw_shape = normalize_for_type(raw, Value::Text("00".into())).unwrap_err();
         assert_eq!(raw_shape.code(), ErrorCode::Type);
         assert!(raw_shape.to_string().contains("RAW(2)"));
+    }
+
+    fn timestamp(
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        nanos: u32,
+        offset: Option<i16>,
+    ) -> OracleTimestamp {
+        OracleTimestamp::from_nanoseconds(
+            OracleDate::new(year, month, day, hour, minute, second).unwrap(),
+            nanos,
+            offset,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn date_text_accepts_only_the_two_approved_ascii_forms() {
+        let date = OracleDate::new(2026, 10, 5, 0, 0, 0).unwrap();
+        assert_eq!(
+            normalize_for_type(
+                OracleTypeDescriptor::date(),
+                Value::Text("2026-10-05".into()),
+            )
+            .unwrap(),
+            Value::Date(date)
+        );
+        assert_eq!(
+            normalize_for_type(
+                OracleTypeDescriptor::date(),
+                Value::Text("2026-10-05 23:59:58".into()),
+            )
+            .unwrap(),
+            Value::Date(OracleDate::new(2026, 10, 5, 23, 59, 58).unwrap())
+        );
+        for text in [
+            "2026-1-05",
+            "2026/10/05",
+            "2026-10-05T00:00:00",
+            " 2026-10-05",
+            "2026-10-05 ",
+            "２０２６-10-05",
+            "2025-02-29",
+        ] {
+            let error = normalize_for_type(OracleTypeDescriptor::date(), Value::Text(text.into()))
+                .unwrap_err();
+            assert_eq!(
+                (error.code(), error.oracle_code()),
+                (ErrorCode::Type, Some(1861))
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_text_rounds_half_away_and_preserves_fixed_offset() {
+        let timestamp_type = OracleTypeDescriptor::timestamp(6).unwrap();
+        assert_eq!(
+            normalize_for_type(
+                timestamp_type,
+                Value::Text("2026-01-02 03:04:05.1234565".into()),
+            )
+            .unwrap(),
+            Value::Timestamp(timestamp(2026, 1, 2, 3, 4, 5, 123_457_000, None))
+        );
+        assert_eq!(
+            normalize_for_type(
+                OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap(),
+                Value::Text("2026-01-02 03:04:05.1 -14:00".into()),
+            )
+            .unwrap(),
+            Value::Timestamp(timestamp(2026, 1, 2, 3, 4, 5, 100_000_000, Some(-840),))
+        );
+        let direct = timestamp(2026, 1, 2, 3, 4, 5, 123_456_789, Some(480));
+        assert_eq!(
+            normalize_for_type(
+                OracleTypeDescriptor::timestamp_with_time_zone(4).unwrap(),
+                Value::Timestamp(direct),
+            )
+            .unwrap(),
+            Value::Timestamp(timestamp(2026, 1, 2, 3, 4, 5, 123_500_000, Some(480),))
+        );
+    }
+
+    #[test]
+    fn timestamp_text_rejects_unapproved_shapes_fractions_and_offsets() {
+        let plain = OracleTypeDescriptor::timestamp(9).unwrap();
+        for text in [
+            "2026-01-02",
+            "2026-01-02T03:04:05",
+            "2026-01-02 03:04:05.",
+            "2026-01-02 03:04:05.1234567890",
+            "2026-01-02 03:04:05 +00:00",
+            "2026-01-02 03:04:05Z",
+        ] {
+            assert_eq!(
+                normalize_for_type(plain, Value::Text(text.into()))
+                    .unwrap_err()
+                    .oracle_code(),
+                Some(1861)
+            );
+        }
+
+        let zoned = OracleTypeDescriptor::timestamp_with_time_zone(9).unwrap();
+        for text in [
+            "2026-01-02 03:04:05",
+            "2026-01-02 03:04:05 +14:01",
+            "2026-01-02 03:04:05 -14:01",
+            "2026-01-02 03:04:05 +15:00",
+            "2026-01-02 03:04:05 UTC",
+        ] {
+            assert_eq!(
+                normalize_for_type(zoned, Value::Text(text.into()))
+                    .unwrap_err()
+                    .oracle_code(),
+                Some(1861)
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_rounding_carries_across_the_calendar_and_checks_maximum() {
+        let rounded =
+            round_timestamp(timestamp(2024, 12, 31, 23, 59, 59, 999_999_999, None), 0).unwrap();
+        assert_eq!(
+            rounded.date(),
+            OracleDate::new(2025, 1, 1, 0, 0, 0).unwrap()
+        );
+        assert_eq!(rounded.nanoseconds(), 0);
+
+        let leap =
+            round_timestamp(timestamp(2024, 2, 28, 23, 59, 59, 999_999_999, Some(60)), 0).unwrap();
+        assert_eq!(leap.date(), OracleDate::new(2024, 2, 29, 0, 0, 0).unwrap());
+        assert_eq!(leap.offset_minutes(), Some(60));
+
+        let maximum = timestamp(9999, 12, 31, 23, 59, 59, 999_999_999, None);
+        assert_eq!(
+            round_timestamp(maximum, 0).unwrap_err().oracle_code(),
+            Some(1861)
+        );
     }
 
     #[test]

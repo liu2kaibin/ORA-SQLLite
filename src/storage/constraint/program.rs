@@ -7,6 +7,7 @@ use crate::{
 };
 
 const VERSION: u8 = 1;
+const VERSION_V2: u8 = 2;
 const HEADER_LEN: usize = 8;
 const INSTRUCTION_HEADER_LEN: usize = 8;
 const VALUE_BODY_BYTES: u64 = std::mem::size_of::<Value>() as u64;
@@ -171,8 +172,9 @@ impl CheckProgramTemplate {
         })
     }
     pub(crate) fn resolve(&self, columns: &[ColumnId]) -> Result<CheckProgram> {
+        let version = required_program_version(&self.instructions);
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&[VERSION, 0]);
+        bytes.extend_from_slice(&[version, 0]);
         bytes.extend_from_slice(
             &u32::try_from(self.instructions.len())
                 .map_err(|_| resource_limit())?
@@ -180,7 +182,8 @@ impl CheckProgramTemplate {
         );
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         for instruction in self.instructions.iter() {
-            let (opcode, result, operands, payload) = encode_instruction(instruction, columns)?;
+            let (opcode, result, operands, payload) =
+                encode_instruction(instruction, columns, version)?;
             push_instruction(&mut bytes, opcode, result, operands, &payload)?;
         }
         if bytes.len() > MAX_CHECK_PROGRAM_BYTES {
@@ -210,15 +213,16 @@ impl CheckProgram {
     }
     fn validate_types(&self, columns: Option<&[ColumnDef]>) -> Result<CheckType> {
         let mut reader = Reader::new(&self.bytes);
-        if reader.u8()? != VERSION {
-            return if self.bytes.first().copied().is_some_and(|v| v > VERSION) {
-                Err(DbError::new(
+        let version = reader.u8()?;
+        match version {
+            VERSION | VERSION_V2 => {}
+            value if value > VERSION_V2 => {
+                return Err(DbError::new(
                     ErrorCode::Unsupported,
                     "check program version is newer than this implementation",
-                ))
-            } else {
-                Err(corruption("check program version is invalid"))
-            };
+                ));
+            }
+            _ => return Err(corruption("check program version is invalid")),
         }
         if reader.u8()? != 0 {
             return Err(corruption("check program reserved byte is nonzero"));
@@ -240,7 +244,7 @@ impl CheckProgram {
         let mut stack = Vec::new();
         stack.try_reserve(count).map_err(|_| resource_limit())?;
         for _ in 0..count {
-            let instruction = decode_instruction(&mut reader)?;
+            let instruction = decode_instruction(&mut reader, version)?;
             validate_instruction(&instruction, &mut stack, columns)?;
         }
         if reader.remaining() != 0 {
@@ -277,6 +281,7 @@ impl CheckProgram {
         let mut account = Account::new(memory);
         let result = (|| {
             let mut reader = Reader::new(&self.bytes);
+            let version = self.bytes[0];
             reader.skip(HEADER_LEN)?;
             let count = usize::try_from(reader.u32_at(2)?)
                 .map_err(|_| corruption("instruction count exceeds platform"))?;
@@ -292,7 +297,7 @@ impl CheckProgram {
             let mut values = Vec::new();
             values.try_reserve(count).map_err(|_| resource_limit())?;
             for _ in 0..count {
-                let instruction = decode_instruction(&mut reader)?;
+                let instruction = decode_instruction(&mut reader, version)?;
                 let value = match instruction.kind {
                     Kind::Column(id) => {
                         let ordinal = *by_id
@@ -459,6 +464,7 @@ fn template_shape(instruction: &CheckTemplateInstruction) -> Result<(Kind, Check
 fn encode_instruction(
     instruction: &CheckTemplateInstruction,
     columns: &[ColumnId],
+    version: u8,
 ) -> Result<(u8, CheckType, u16, Vec<u8>)> {
     match instruction {
         CheckTemplateInstruction::Column { ordinal, result } => {
@@ -468,7 +474,7 @@ fn encode_instruction(
             Ok((1, *result, 0, id.get().to_be_bytes().to_vec()))
         }
         CheckTemplateInstruction::Literal { value, result } => {
-            Ok((2, *result, 0, encode_scalar(value)?))
+            Ok((2, *result, 0, encode_scalar(value, version)?))
         }
         CheckTemplateInstruction::Unary { op, result } => Ok((
             match op {
@@ -530,7 +536,7 @@ fn push_instruction(
     bytes.extend_from_slice(payload);
     Ok(())
 }
-fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction> {
+fn decode_instruction(reader: &mut Reader<'_>, version: u8) -> Result<Instruction> {
     let opcode = reader.u8()?;
     let result = CheckType::decode(reader.u8()?)?;
     let operands = reader.u16()?;
@@ -555,7 +561,7 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction> {
             if operands != 0 {
                 return Err(corruption("literal operand count is invalid"));
             }
-            Kind::Literal(decode_scalar(payload)?)
+            Kind::Literal(decode_scalar(payload, version)?)
         }
         0x10 => Kind::Unary(CheckUnaryOp::Plus),
         0x11 => Kind::Unary(CheckUnaryOp::Minus),
@@ -868,7 +874,25 @@ fn map_binary(op: CheckBinaryOp) -> ScalarBinaryOp {
         CheckBinaryOp::GreaterThanOrEqual => ScalarBinaryOp::GreaterThanOrEqual,
     }
 }
-fn encode_scalar(value: &Value) -> Result<Vec<u8>> {
+fn required_program_version(instructions: &[CheckTemplateInstruction]) -> u8 {
+    if instructions.iter().any(instruction_requires_v2) {
+        VERSION_V2
+    } else {
+        VERSION
+    }
+}
+
+fn instruction_requires_v2(instruction: &CheckTemplateInstruction) -> bool {
+    matches!(
+        instruction,
+        CheckTemplateInstruction::Literal {
+            value: Value::Timestamp(timestamp),
+            ..
+        } if timestamp.nanoseconds() % 1_000 != 0
+    )
+}
+
+fn encode_scalar(value: &Value, version: u8) -> Result<Vec<u8>> {
     scalar::validate_value(value)?;
     let (tag, body) = match value {
         Value::Null => (0, Vec::new()),
@@ -884,7 +908,18 @@ fn encode_scalar(value: &Value) -> Result<Vec<u8>> {
         Value::Date(value) => (6, encode_date(*value)),
         Value::Timestamp(value) => {
             let mut bytes = encode_date(value.date());
-            bytes.extend_from_slice(&value.micros().to_le_bytes());
+            let fraction = if version == VERSION {
+                if value.nanoseconds() % 1_000 != 0 {
+                    return Err(DbError::new(
+                        ErrorCode::Type,
+                        "check program V1 Timestamp requires microsecond precision",
+                    ));
+                }
+                value.nanoseconds() / 1_000
+            } else {
+                value.nanoseconds()
+            };
+            bytes.extend_from_slice(&fraction.to_le_bytes());
             if let Some(offset) = value.offset_minutes() {
                 bytes.extend_from_slice(&offset.to_le_bytes());
                 bytes.extend_from_slice(&0_u16.to_le_bytes());
@@ -904,7 +939,7 @@ fn encode_scalar(value: &Value) -> Result<Vec<u8>> {
     result.extend_from_slice(&body);
     Ok(result)
 }
-fn decode_scalar(payload: &[u8]) -> Result<Value> {
+fn decode_scalar(payload: &[u8], version: u8) -> Result<Value> {
     let mut reader = Reader::new(payload);
     let tag = reader.u8()?;
     let len =
@@ -944,15 +979,15 @@ fn decode_scalar(payload: &[u8]) -> Result<Value> {
         ),
         5 => Value::Blob(body.to_vec()),
         6 => Value::Date(decode_date(body)?),
-        7 => Value::Timestamp(decode_timestamp(body, None)?),
+        7 => Value::Timestamp(decode_timestamp(body, None, version)?),
         8 => {
             if body.len() != 16 || body[14] != 0 || body[15] != 0 {
                 return Err(corruption("timestamp time zone scalar is invalid"));
             }
             let date = decode_date(&body[..8])?;
-            let micros = u32::from_le_bytes(array(&body[8..12])?);
+            let fraction = u32::from_le_bytes(array(&body[8..12])?);
             let offset = i16::from_le_bytes(array(&body[12..14])?);
-            OracleTimestamp::new(date, micros, Some(offset))
+            decode_timestamp_fields(date, fraction, Some(offset), version)
                 .map(Value::Timestamp)
                 .map_err(|_| corruption("timestamp scalar fields are invalid"))?
         }
@@ -992,16 +1027,33 @@ fn decode_date(bytes: &[u8]) -> Result<OracleDate> {
     )
     .map_err(|_| corruption("date scalar fields are invalid"))
 }
-fn decode_timestamp(bytes: &[u8], offset: Option<i16>) -> Result<OracleTimestamp> {
+fn decode_timestamp(bytes: &[u8], offset: Option<i16>, version: u8) -> Result<OracleTimestamp> {
     if bytes.len() != 12 {
         return Err(corruption("timestamp scalar is invalid"));
     }
-    OracleTimestamp::new(
+    decode_timestamp_fields(
         decode_date(&bytes[..8])?,
         u32::from_le_bytes(array(&bytes[8..])?),
         offset,
+        version,
     )
-    .map_err(|_| corruption("timestamp scalar fields are invalid"))
+}
+
+fn decode_timestamp_fields(
+    date: OracleDate,
+    fraction: u32,
+    offset: Option<i16>,
+    version: u8,
+) -> Result<OracleTimestamp> {
+    let nanos = match version {
+        VERSION => fraction
+            .checked_mul(1_000)
+            .ok_or_else(|| corruption("timestamp scalar fields are invalid"))?,
+        VERSION_V2 => fraction,
+        _ => return Err(corruption("check program version is invalid")),
+    };
+    OracleTimestamp::from_nanoseconds(date, nanos, offset)
+        .map_err(|_| corruption("timestamp scalar fields are invalid"))
 }
 fn array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     bytes
@@ -1140,11 +1192,69 @@ mod tests {
         .resolve(&[ColumnId::new(42).unwrap()])
         .unwrap()
     }
+
+    fn timestamp_literal(nanos: u32) -> CheckProgram {
+        let date = OracleDate::new(2026, 1, 2, 3, 4, 5).unwrap();
+        let timestamp = OracleTimestamp::from_nanoseconds(date, nanos, None).unwrap();
+        CheckProgramTemplate::new(vec![
+            CheckTemplateInstruction::Literal {
+                value: Value::Timestamp(timestamp),
+                result: CheckType::Timestamp,
+            },
+            CheckTemplateInstruction::IsNull {
+                negated: false,
+                result: CheckType::Bool,
+            },
+        ])
+        .unwrap()
+        .resolve(&[])
+        .unwrap()
+    }
     #[test]
     fn check_program_v1_has_stable_postorder_bytes_and_column_ids() {
         let program = program();
         assert_eq!(&program.as_bytes()[..8], &[1, 0, 3, 0, 0, 0, 0, 0]);
         assert_eq!(program.validate(&columns()).unwrap(), CheckType::Bool);
+    }
+
+    #[test]
+    fn timestamp_literals_use_v2_only_for_sub_microsecond_precision() {
+        let legacy = timestamp_literal(123_456_000);
+        assert_eq!(legacy.as_bytes()[0], 1);
+        assert_eq!(&legacy.as_bytes()[29..33], &123_456_u32.to_le_bytes());
+
+        let precise = timestamp_literal(123_456_789);
+        assert_eq!(precise.as_bytes()[0], 2);
+        assert_eq!(&precise.as_bytes()[29..33], &123_456_789_u32.to_le_bytes());
+        let decoded = CheckProgram::from_bytes(precise.as_bytes().into()).unwrap();
+        let mut memory = Memory {
+            limit: 10_000,
+            used: 0,
+        };
+        assert_eq!(
+            decoded.evaluate(&[], &[], &mut memory).unwrap(),
+            TruthValue::False
+        );
+        assert_eq!(memory.used, 0);
+    }
+
+    #[test]
+    fn malformed_v2_timestamp_literals_are_controlled_corruption() {
+        let mut invalid_nanos = timestamp_literal(123_456_789).as_bytes().to_vec();
+        invalid_nanos[29..33].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
+        assert_eq!(
+            CheckProgram::from_bytes(invalid_nanos.into())
+                .unwrap_err()
+                .code(),
+            ErrorCode::Corruption
+        );
+
+        let mut future = timestamp_literal(123_456_789).as_bytes().to_vec();
+        future[0] = 3;
+        assert_eq!(
+            CheckProgram::from_bytes(future.into()).unwrap_err().code(),
+            ErrorCode::Unsupported
+        );
     }
     #[test]
     fn every_check_program_byte_truncation_is_corruption() {
@@ -1205,7 +1315,7 @@ mod tests {
     fn malformed_versions_headers_opcodes_and_scalar_values_are_rejected() {
         let bytes = program().as_bytes().to_vec();
         let mut future = bytes.clone();
-        future[0] = VERSION + 1;
+        future[0] = VERSION_V2 + 1;
         assert_eq!(
             CheckProgram::from_bytes(future.into()).unwrap_err().code(),
             ErrorCode::Unsupported

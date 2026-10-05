@@ -1,11 +1,30 @@
 mod support;
 
-use ora_sqllite::{Connection, Decimal, ParameterValue, Parameters, Value};
+use ora_sqllite::{
+    Connection, Decimal, OracleDate, OracleTimestamp, ParameterValue, Parameters, Value,
+};
 
+#[allow(dead_code, reason = "shared by later Phase 5 Oracle type API tests")]
 fn decimal_value(magnitude: u128, scale: i8) -> Value {
     Value::Decimal(Decimal::new(false, scale, magnitude).unwrap())
 }
 
+#[allow(dead_code, reason = "shared by later Phase 5 timestamp API tests")]
+fn timestamp_value(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanos: u32,
+    offset: Option<i16>,
+) -> Value {
+    let date = OracleDate::new(year, month, day, hour, minute, second).unwrap();
+    Value::Timestamp(OracleTimestamp::from_nanoseconds(date, nanos, offset).unwrap())
+}
+
+#[allow(dead_code, reason = "shared by later Phase 5 Oracle type API tests")]
 fn collect_with_params(
     connection: &mut Connection,
     sql: &str,
