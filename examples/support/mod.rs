@@ -91,7 +91,33 @@ impl Drop for OwnedExampleDatabase {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::{File, OpenOptions},
+        io::{ErrorKind, Write},
+        path::{Path, PathBuf},
+    };
+
     use super::OwnedExampleDatabase;
+
+    fn acquire_owned_sibling_fixture(parent: &Path) -> (PathBuf, File) {
+        for suffix in 0..32 {
+            let candidate = parent.join(format!(
+                "ora-sqllite-sibling-{}-{suffix}",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => return (candidate, file),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("acquire sibling fixture: {error}"),
+            }
+        }
+
+        panic!("could not acquire a unique sibling fixture after 32 attempts");
+    }
 
     #[test]
     fn owned_database_stays_below_the_system_temp_directory() {
@@ -112,10 +138,35 @@ mod tests {
     }
 
     #[test]
+    fn sibling_fixture_skips_existing_paths_without_changing_them() {
+        let (owned, database) = OwnedExampleDatabase::create("sibling-fixture-test").unwrap();
+        let collision = owned
+            .directory()
+            .join(format!("ora-sqllite-sibling-{}-0", std::process::id()));
+        let mut collision_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&collision)
+            .unwrap();
+        collision_file.write_all(b"caller").unwrap();
+        drop(collision_file);
+
+        let (sibling, file) = acquire_owned_sibling_fixture(owned.directory());
+        drop(file);
+
+        assert_ne!(sibling, collision);
+        assert_eq!(std::fs::read(&collision).unwrap(), b"caller");
+
+        std::fs::remove_file(sibling).unwrap();
+        std::fs::remove_file(collision).unwrap();
+        drop(database);
+    }
+
+    #[test]
     fn cleanup_removes_owned_files_but_preserves_a_sibling() {
-        let sibling =
-            std::env::temp_dir().join(format!("ora-sqllite-sibling-{}", std::process::id()));
-        std::fs::write(&sibling, b"keep").unwrap();
+        let (sibling, mut sibling_file) = acquire_owned_sibling_fixture(&std::env::temp_dir());
+        sibling_file.write_all(b"keep").unwrap();
+        drop(sibling_file);
         {
             let (owned, database) = OwnedExampleDatabase::create("cleanup-test").unwrap();
             assert!(owned.main_path().exists());
