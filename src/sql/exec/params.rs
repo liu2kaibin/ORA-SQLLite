@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use super::{
     WorkMemory,
     expr::{int_decimal, validate_value},
-    memory::owned_values_bytes,
+    memory::{checked_add_bytes, owned_value_payload_bytes, owned_values_bytes, resource_limit},
 };
 use crate::sql::{ParameterKey, SqlSpan};
 use crate::{
@@ -108,27 +108,118 @@ impl ParameterFrame {
         slots: &[(u16, OracleTypeDescriptor)],
         memory: &mut WorkMemory,
     ) -> Result<()> {
-        let mut values = self.values.to_vec();
-        for (slot, descriptor) in slots {
-            let target = values.get_mut(usize::from(*slot)).ok_or_else(|| {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let scratch_bytes = normalization_scratch_bytes(&self.values, slots)?;
+        memory.reserve(scratch_bytes)?;
+        let normalized = (|| {
+            let mut values = Vec::new();
+            values
+                .try_reserve(slots.len())
+                .map_err(|_| resource_limit())?;
+            for (slot, descriptor) in slots {
+                let target = self.values.get(usize::from(*slot)).ok_or_else(|| {
+                    DbError::new(
+                        ErrorCode::Internal,
+                        "parameter slot is absent from its frame",
+                    )
+                })?;
+                values.push(normalize_for_type(*descriptor, target.clone())?);
+            }
+            Ok::<_, DbError>(values)
+        })();
+        let normalized = match normalized {
+            Ok(values) => values,
+            Err(error) => {
+                memory.release(scratch_bytes)?;
+                return Err(error);
+            }
+        };
+
+        let old_bytes = owned_values_bytes(self.values.iter())?;
+        let mut new_bytes = old_bytes;
+        for ((slot, _), normalized) in slots.iter().zip(&normalized) {
+            let target = self.values.get(usize::from(*slot)).ok_or_else(|| {
                 DbError::new(
                     ErrorCode::Internal,
                     "parameter slot is absent from its frame",
                 )
             })?;
-            *target = normalize_for_type(*descriptor, target.clone())?;
+            new_bytes = new_bytes
+                .checked_sub(owned_value_payload_bytes(target)?)
+                .ok_or_else(|| {
+                    DbError::new(ErrorCode::Internal, "parameter memory accounting underflow")
+                })?;
+            new_bytes = checked_add_bytes(new_bytes, owned_value_payload_bytes(normalized)?)?;
         }
-        let old_bytes = owned_values_bytes(self.values.iter())?;
-        let new_bytes = owned_values_bytes(values.iter())?;
+
+        for ((slot, _), normalized) in slots.iter().zip(normalized) {
+            let target = self.values.get_mut(usize::from(*slot)).ok_or_else(|| {
+                DbError::new(
+                    ErrorCode::Internal,
+                    "parameter slot is absent from its frame",
+                )
+            })?;
+            *target = normalized;
+        }
+        memory.release(scratch_bytes)?;
         if new_bytes > old_bytes {
+            // Scratch included each normalized payload, so converting this
+            // amount from transient to retained accounting cannot exceed it.
             memory.reserve(new_bytes - old_bytes)?;
-        }
-        self.values = values.into_boxed_slice();
-        if old_bytes > new_bytes {
+        } else if old_bytes > new_bytes {
             memory.release(old_bytes - new_bytes)?;
         }
         Ok(())
     }
+}
+
+fn normalization_scratch_bytes(
+    values: &[Value],
+    slots: &[(u16, OracleTypeDescriptor)],
+) -> Result<u64> {
+    let mut bytes = 32_u64;
+    let value_bytes = std::mem::size_of::<Value>() as u64;
+    let mut previous = None;
+    for (slot, descriptor) in slots {
+        if previous.is_some_and(|prior| prior >= *slot) {
+            return Err(DbError::new(
+                ErrorCode::Internal,
+                "Oracle parameter slots are not strictly ordered",
+            ));
+        }
+        previous = Some(*slot);
+        let value = values.get(usize::from(*slot)).ok_or_else(|| {
+            DbError::new(
+                ErrorCode::Internal,
+                "parameter slot is absent from its frame",
+            )
+        })?;
+        bytes = checked_add_bytes(bytes, value_bytes)?;
+        bytes = checked_add_bytes(bytes, normalization_scratch_payload(*descriptor, value)?)?;
+    }
+    Ok(bytes)
+}
+
+fn normalization_scratch_payload(descriptor: OracleTypeDescriptor, value: &Value) -> Result<u64> {
+    let source_bytes = owned_value_payload_bytes(value)?;
+    let (OracleTypeDescriptor::Char { length_chars }, Value::Text(text)) = (descriptor, value)
+    else {
+        return Ok(source_bytes);
+    };
+    if text.is_empty() {
+        return Ok(source_bytes);
+    }
+    let character_count = text.chars().count();
+    let target_chars = usize::try_from(length_chars).map_err(|_| resource_limit())?;
+    if character_count > target_chars {
+        return Ok(source_bytes);
+    }
+    checked_add_bytes(
+        source_bytes,
+        u64::try_from(target_chars - character_count).map_err(|_| resource_limit())?,
+    )
 }
 
 fn normalize_name(name: &str) -> Result<String> {
@@ -450,5 +541,60 @@ mod tests {
             ErrorCode::Type
         );
         assert_eq!(memory.used(), required);
+    }
+
+    #[test]
+    fn oracle_slot_normalization_enforces_touched_scratch_at_exact_boundary() {
+        // Production breaks caught: reserving after normalization lets the
+        // touched NUMBER copy bypass the ceiling, while cloning the entire
+        // frame makes an unrelated large slot consume scratch budget.
+        let untouched = "u".repeat(128 * 1024);
+        let number = format!("{}1", "0".repeat(64 * 1024));
+        let values = [
+            Value::Text(untouched.clone()).into(),
+            Value::Text(number.clone()).into(),
+        ];
+        let metadata = [
+            ParameterMetadata {
+                identifier: ParameterIdentifier::Position(1),
+                data_type: Some(DataType::Text),
+                allow_oracle_text_source: false,
+            },
+            ParameterMetadata {
+                identifier: ParameterIdentifier::Position(2),
+                data_type: Some(DataType::Decimal),
+                allow_oracle_text_source: true,
+            },
+        ];
+        let frame_bytes = owned_values_bytes(values.iter().map(ParameterValue::value)).unwrap();
+        let touched_scratch = owned_values_bytes([values[1].value()]).unwrap();
+        let descriptor = OracleTypeDescriptor::number(1, 0).unwrap();
+
+        for (limit, accepted) in [
+            (frame_bytes + touched_scratch - 1, false),
+            (frame_bytes + touched_scratch, true),
+        ] {
+            let mut memory = WorkMemory::new(limit).unwrap();
+            let mut frame =
+                ParameterFrame::bind(&metadata, Parameters::positional(&values), &mut memory)
+                    .unwrap();
+            let result = frame.normalize_oracle_slots(&[(1, descriptor)], &mut memory);
+            if accepted {
+                result.unwrap();
+                assert_eq!(frame.get(0), &Value::Text(untouched.clone()));
+                assert_eq!(
+                    frame.get(1),
+                    &Value::Decimal(Decimal::new(false, 0, 1).unwrap())
+                );
+                assert_eq!(
+                    memory.used(),
+                    owned_values_bytes([frame.get(0), frame.get(1)]).unwrap()
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code(), ErrorCode::ResourceLimit);
+                assert_eq!(frame.get(1), &Value::Text(number.clone()));
+                assert_eq!(memory.used(), frame_bytes);
+            }
+        }
     }
 }

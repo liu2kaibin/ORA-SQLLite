@@ -263,11 +263,13 @@ impl CatalogImage {
                 }
                 DecodedCatalogKey::ConstraintDefinition(id) => {
                     require_index_feature(feature_bits)?;
-                    insert_unique(
-                        &mut image.constraints,
-                        id,
-                        record::decode_constraint_definition(id, &value)?,
-                    )?;
+                    let constraint = record::decode_constraint_definition(id, &value)?;
+                    if constraint.kind() == ConstraintKind::Check
+                        && constraint.check_program().first() == Some(&2)
+                    {
+                        require_check_program_feature(feature_bits)?;
+                    }
+                    insert_unique(&mut image.constraints, id, constraint)?;
                 }
                 DecodedCatalogKey::TableConstraint {
                     table_id,
@@ -2489,6 +2491,13 @@ fn require_oracle_types_feature(feature_bits: u64) -> Result<()> {
         return Err(corruption(
             "Oracle V2 column definition requires ORACLE_TYPES_V1",
         ));
+    }
+    Ok(())
+}
+
+fn require_check_program_feature(feature_bits: u64) -> Result<()> {
+    if feature_bits & ORACLE_TYPES_V1 == 0 {
+        return Err(corruption("CheckProgram V2 requires ORACLE_TYPES_V1"));
     }
     Ok(())
 }
@@ -7093,7 +7102,7 @@ mod tests {
                     record_value_mut(
                         rows,
                         &constraint_definition_key(ConstraintId::new(50).unwrap()),
-                    )[64] = 2;
+                    )[64] = 3;
                 }),
             ),
             (
@@ -7207,6 +7216,26 @@ mod tests {
                 assert_eq!(error.code(), expected, "recovery: {label}");
             }
         }
+    }
+
+    #[test]
+    fn phase_5_check_program_v2_requires_oracle_types_feature() {
+        // Production break caught: accepting a V2 program without its durable
+        // capability bit lets an older reader reach V2 Oracle opcodes.
+        let candidate = raw_check_constraint_candidate_after_base_with_features(
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            |rows, _| {
+                record_value_mut(
+                    rows,
+                    &constraint_definition_key(ConstraintId::new(50).unwrap()),
+                )[64] = 2;
+            },
+        );
+        assert_committed_constraint_candidate_rejected(
+            "V2 check program without ORACLE_TYPES_V1",
+            ErrorCode::Corruption,
+            candidate,
+        );
     }
 
     #[test]
@@ -7396,6 +7425,16 @@ mod tests {
     fn raw_check_constraint_candidate_after_base(
         mutate: impl FnOnce(&mut Records, PageRef),
     ) -> (TempDatabase, Pager) {
+        raw_check_constraint_candidate_after_base_with_features(
+            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
+            mutate,
+        )
+    }
+
+    fn raw_check_constraint_candidate_after_base_with_features(
+        feature_bits: u64,
+        mutate: impl FnOnce(&mut Records, PageRef),
+    ) -> (TempDatabase, Pager) {
         let (temp, pager) = test_pager(4096).unwrap();
         let mut batch = pager.begin_write().unwrap();
         let base_root = BTree::create(&mut batch, TreeKind::Table).unwrap().root();
@@ -7408,11 +7447,7 @@ mod tests {
         let mut rows = local_check_constraint_records(table_root);
         mutate(&mut rows, table_root);
         let catalog = raw_tree(&mut batch, rows);
-        publish_with_features(
-            &mut batch,
-            &catalog,
-            CATALOG_V1 | super::super::features::INDEX_CONSTRAINT_V1,
-        );
+        publish_with_features(&mut batch, &catalog, feature_bits);
         batch.commit().unwrap();
         (temp, pager)
     }

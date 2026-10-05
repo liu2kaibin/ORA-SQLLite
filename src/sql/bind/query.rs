@@ -690,7 +690,7 @@ fn hash_value(hasher: &mut StructuralHasher, value: &Value) {
         Value::Timestamp(value) => {
             hasher.write_byte(7);
             hash_date(hasher, value.date());
-            hasher.write_bytes(&value.micros().to_le_bytes());
+            hasher.write_bytes(&value.nanoseconds().to_le_bytes());
             match value.offset_minutes() {
                 Some(offset) => {
                     hasher.write_bool(true);
@@ -1062,7 +1062,7 @@ fn bind_error(message: &'static str) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::GroupIndex;
+    use super::{GroupIndex, structural_key};
     use crate::{
         Database, ErrorCode, Options, Parameters, Value,
         api::{ColumnMetadata, DataType},
@@ -1532,6 +1532,29 @@ mod tests {
         assert_eq!(index.buckets.len(), 1);
         assert!(index.contains(&integer(1)));
         assert!(!index.contains(&integer(2)));
+    }
+
+    #[test]
+    fn timestamp_structural_keys_include_submicrosecond_nanoseconds() {
+        // Production break caught: hashing only micros puts distinct p=7..9
+        // GROUP BY expressions into the same structural bucket.
+        let span = SqlSpan::new(0, 1).unwrap();
+        let date = crate::OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap();
+        let literal = |nanos| {
+            BoundExpr::new(
+                BoundExprKind::Literal(Value::Timestamp(
+                    crate::OracleTimestamp::from_nanoseconds(date, nanos, None).unwrap(),
+                )),
+                SqlType::Timestamp,
+                false,
+                span,
+            )
+        };
+
+        assert_ne!(
+            structural_key(&literal(123_456_001)),
+            structural_key(&literal(123_456_999))
+        );
     }
 
     #[test]

@@ -59,15 +59,28 @@ impl Decimal {
             return Err(invalid_number(precision, scale));
         }
 
-        let mut digits = Vec::with_capacity(body.len());
         let mut saw_digit = false;
         let mut saw_point = false;
+        let mut digit_count = 0_usize;
+        let mut leading_zeros = 0_usize;
+        let mut saw_nonzero = false;
         let mut fractional_digits = 0_usize;
         for &byte in body {
             match byte {
                 b'0'..=b'9' => {
                     saw_digit = true;
-                    digits.push(byte - b'0');
+                    digit_count = digit_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_number(precision, scale))?;
+                    if !saw_nonzero {
+                        if byte == b'0' {
+                            leading_zeros = leading_zeros
+                                .checked_add(1)
+                                .ok_or_else(|| invalid_number(precision, scale))?;
+                        } else {
+                            saw_nonzero = true;
+                        }
+                    }
                     if saw_point {
                         fractional_digits = fractional_digits
                             .checked_add(1)
@@ -82,26 +95,72 @@ impl Decimal {
             return Err(invalid_number(precision, scale));
         }
 
-        let first_nonzero = digits
-            .iter()
-            .position(|digit| *digit != 0)
-            .unwrap_or(digits.len());
-        let significant = &digits[first_nonzero..];
-        let shift = if scale >= 0 {
+        let significant_digits = digit_count - leading_zeros;
+        if significant_digits == 0 {
+            return Decimal::new(false, scale, 0);
+        }
+        let (kept_digits, appended_zeros, rounding_index) = if scale >= 0 {
             let target_fractional = usize::from(scale.unsigned_abs());
             if target_fractional >= fractional_digits {
-                DecimalShift::Append(target_fractional - fractional_digits)
+                (
+                    significant_digits,
+                    target_fractional - fractional_digits,
+                    None,
+                )
             } else {
-                DecimalShift::Discard(fractional_digits - target_fractional)
+                discard_shape(significant_digits, fractional_digits - target_fractional)
             }
         } else {
-            DecimalShift::Discard(
-                fractional_digits
-                    .checked_add(usize::from(scale.unsigned_abs()))
-                    .ok_or_else(|| invalid_number(precision, scale))?,
-            )
+            let discarded = fractional_digits
+                .checked_add(usize::from(scale.unsigned_abs()))
+                .ok_or_else(|| invalid_number(precision, scale))?;
+            discard_shape(significant_digits, discarded)
         };
-        quantize_digits(negative, significant, shift, precision, scale)
+        if kept_digits.saturating_add(appended_zeros) > usize::from(precision) {
+            return Err(precision_overflow(precision, scale));
+        }
+
+        let mut skipped_zeros = 0_usize;
+        let mut significant_index = 0_usize;
+        let mut magnitude = 0_u128;
+        let mut round_up = false;
+        for &byte in body {
+            let b'0'..=b'9' = byte else {
+                continue;
+            };
+            if skipped_zeros < leading_zeros {
+                skipped_zeros += 1;
+                continue;
+            }
+            let digit = byte - b'0';
+            if significant_index < kept_digits {
+                magnitude = magnitude
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(u128::from(digit)))
+                    .ok_or_else(|| precision_overflow(precision, scale))?;
+            } else if rounding_index == Some(significant_index) {
+                round_up = digit >= 5;
+                break;
+            }
+            significant_index += 1;
+        }
+        if appended_zeros != 0 {
+            let exponent =
+                u32::try_from(appended_zeros).map_err(|_| precision_overflow(precision, scale))?;
+            magnitude = magnitude
+                .checked_mul(
+                    10_u128
+                        .checked_pow(exponent)
+                        .ok_or_else(|| precision_overflow(precision, scale))?,
+                )
+                .ok_or_else(|| precision_overflow(precision, scale))?;
+        }
+        if round_up {
+            magnitude = magnitude
+                .checked_add(1)
+                .ok_or_else(|| precision_overflow(precision, scale))?;
+        }
+        finish_quantized(negative, magnitude, precision, scale)
     }
 
     #[allow(
@@ -212,6 +271,37 @@ fn digits_to_u128(digits: &[u8]) -> Option<u128> {
             .checked_mul(10)
             .and_then(|value| value.checked_add(u128::from(*digit)))
     })
+}
+
+#[allow(
+    dead_code,
+    reason = "Oracle normalization is wired into execution by later phase 5 tasks"
+)]
+fn discard_shape(significant_digits: usize, discarded: usize) -> (usize, usize, Option<usize>) {
+    if discarded < significant_digits {
+        let kept = significant_digits - discarded;
+        (kept, 0, Some(kept))
+    } else if discarded == significant_digits {
+        (0, 0, Some(0))
+    } else {
+        (0, 0, None)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "Oracle normalization is wired into execution by later phase 5 tasks"
+)]
+fn finish_quantized(negative: bool, magnitude: u128, precision: u8, scale: i8) -> Result<Decimal> {
+    let digits_after_rounding = if magnitude == 0 {
+        1
+    } else {
+        magnitude.ilog10() as usize + 1
+    };
+    if magnitude != 0 && digits_after_rounding > usize::from(precision) {
+        return Err(precision_overflow(precision, scale));
+    }
+    Decimal::new(negative, scale, magnitude).map_err(|_| precision_overflow(precision, scale))
 }
 
 #[allow(

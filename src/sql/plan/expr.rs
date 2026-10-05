@@ -473,7 +473,7 @@ fn hash_value(value: &Value, hash: &mut impl Hasher) {
         Value::Date(value) => hash_date(*value, hash),
         Value::Timestamp(value) => {
             hash_date(value.date(), hash);
-            value.micros().hash(hash);
+            value.nanoseconds().hash(hash);
             value.offset_minutes().hash(hash);
         }
         Value::Bool(value) => value.hash(hash),
@@ -645,4 +645,35 @@ fn same_expression(left: &ExecExpr, right: &ExecExpr) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_plan_keys_include_submicrosecond_nanoseconds() {
+        // Production break caught: reducing timestamp literals to micros makes
+        // distinct p=7..9 aggregate expressions share an avoidable plan bucket.
+        let date = crate::OracleDate::new(2026, 1, 1, 0, 0, 0).unwrap();
+        let definition = |nanos| AggregateDefinition {
+            function: BoundAggregateFunction::Min,
+            argument: Some(ExecExpr {
+                kind: ExecExprKind::Literal(Value::Timestamp(
+                    crate::OracleTimestamp::from_nanoseconds(date, nanos, None).unwrap(),
+                )),
+                data_type: SqlType::Timestamp,
+                nullable: false,
+                location: SqlLocation::new(0, 1, 1).unwrap(),
+            }),
+            data_type: SqlType::Timestamp,
+            nullable: false,
+            location: SqlLocation::new(0, 1, 1).unwrap(),
+        };
+
+        assert_ne!(
+            aggregate_key(&definition(123_456_001)),
+            aggregate_key(&definition(123_456_999))
+        );
+    }
 }

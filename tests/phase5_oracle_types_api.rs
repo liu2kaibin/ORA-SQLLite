@@ -586,6 +586,43 @@ fn oracle_join_parameters_normalize_before_an_empty_scan() {
 }
 
 #[test]
+fn oracle_query_prescan_covers_every_expression_family_and_compatible_reuse() {
+    // Production break caught: omitting any post-WHERE expression family lets
+    // an invalid Oracle Text parameter reach an empty scan without conversion.
+    let (_files, database) = support::new_database("phase5-query-prescan-families");
+    let mut connection = database.connect().unwrap();
+    support::execute_sql(&mut connection, "CREATE TABLE T (N NUMBER(5,2))");
+    let invalid = [Value::Text("not-a-number".into()).into()];
+    for sql in [
+        "SELECT COUNT(*) FROM T GROUP BY N = :1",
+        "SELECT COUNT(N = :1) FROM T",
+        "SELECT N FROM T GROUP BY N HAVING N = :1",
+        "SELECT N = :1 FROM T",
+        "SELECT N FROM T ORDER BY N = :1",
+    ] {
+        let statement = connection.prepare(sql).unwrap();
+        let error = match connection.query(&statement, Parameters::positional(&invalid)) {
+            Ok(_) => panic!("invalid Oracle parameter bypassed pre-scan: {sql}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            (error.code(), error.oracle_code()),
+            (ErrorCode::Type, Some(1722)),
+            "{sql}"
+        );
+    }
+
+    let compatible = connection
+        .prepare("SELECT N = :1 FROM T WHERE N = :1 ORDER BY N = :1")
+        .unwrap();
+    let valid = [Value::Text("12.345".into()).into()];
+    let mut rows = connection
+        .query(&compatible, Parameters::positional(&valid))
+        .unwrap();
+    assert!(rows.next().unwrap().is_none());
+}
+
+#[test]
 fn mixed_oracle_and_legacy_parameter_contracts_are_rejected_before_scan() {
     let (_files, database) = support::new_database("phase5-mixed-parameter-contracts");
     let mut connection = database.connect().unwrap();
