@@ -160,8 +160,10 @@ impl<'connection> WriteTransaction<'connection> {
     /// [`rollback`](Self::rollback), which explicitly requests that the batch be discarded.
     /// Validation or execution errors returned before durability publish no changes, but a
     /// commit/WAL I/O error can occur after durable sync, so the commit outcome is uncertain rather
-    /// than known successful or rolled back. Reopen the database so recovery runs, then reconcile
-    /// the observed database state before retrying the business write.
+    /// than known successful or rolled back. Drop the owning [`Database`](crate::Database) and all
+    /// handles, then reopen it with [`Database::open`](crate::Database::open) so recovery runs;
+    /// [`Database::connect`](crate::Database::connect) is not recovery. Reconcile the observed
+    /// database state before retrying the business write.
     pub fn commit(mut self) -> Result<()> {
         self.take_batch()?.commit()
     }

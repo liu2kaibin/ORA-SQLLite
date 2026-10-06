@@ -48,7 +48,8 @@ fn rustdoc_before(source: &str, signature: &str) -> String {
 }
 
 fn assert_commit_failure_guidance(surface: &str, text: &str) {
-    let text = text.to_ascii_lowercase();
+    let text = text.to_ascii_lowercase().replace("///", " ");
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         text.contains("outcome is uncertain"),
         "{surface} must identify an uncertain commit outcome"
@@ -60,6 +61,18 @@ fn assert_commit_failure_guidance(surface: &str, text: &str) {
     assert!(
         text.contains("reconcile") && text.contains("before retry"),
         "{surface} must require state reconciliation before retry"
+    );
+    assert!(
+        text.contains("drop the owning") && text.contains("all handles"),
+        "{surface} must require dropping the owning Database and all handles"
+    );
+    assert!(
+        text.contains("database::open"),
+        "{surface} must require recovery through Database::open"
+    );
+    assert!(
+        text.contains("database::connect") && text.contains("is not recovery"),
+        "{surface} must state that Database::connect is not recovery"
     );
 }
 

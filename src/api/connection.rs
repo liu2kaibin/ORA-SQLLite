@@ -185,8 +185,11 @@ impl Connection {
     ///
     /// Validation or execution errors returned before durability publish no changes. A commit/WAL
     /// I/O error can instead occur after durable sync, so the commit outcome is uncertain; the
-    /// connection may require reopen, which marks uncertainty rather than success. Reopen so
-    /// recovery runs, then reconcile the observed database state before retrying the business write.
+    /// connection may require reopen, which marks uncertainty rather than success. Drop the owning
+    /// [`Database`](crate::Database) and all handles, then reopen it with
+    /// [`Database::open`](crate::Database::open) so recovery runs;
+    /// [`Database::connect`](crate::Database::connect) is not recovery. Reconcile the observed
+    /// database state before retrying the business write.
     pub fn execute(
         &mut self,
         statement: &Statement,
