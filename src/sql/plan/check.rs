@@ -154,10 +154,10 @@ fn check_binary(op: BoundBinaryOp) -> Result<CheckBinaryOp> {
 }
 
 fn check_type(sql_type: SqlType, kind: &BoundExprKind) -> Result<CheckType> {
-    if let BoundExprKind::Literal(Value::Timestamp(timestamp)) = kind
-        && timestamp.offset_minutes().is_some()
-    {
-        return Ok(CheckType::TimestampWithTimeZone);
+    if let BoundExprKind::Literal(Value::Timestamp(timestamp)) = kind {
+        if timestamp.offset_minutes().is_some() {
+            return Ok(CheckType::TimestampWithTimeZone);
+        }
     }
     if let BoundExprKind::NewTableColumn {
         oracle_type: Some(crate::oracle_type::OracleTypeDescriptor::TimestampWithTimeZone { .. }),
