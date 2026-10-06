@@ -286,19 +286,18 @@ fn extract_terms<'a>(source: SourceId, root: &'a BoundExpr) -> BTreeMap<ColumnId
                 high,
                 negated: false,
             } => {
-                if let Some(column_id) = column_id(expr, source)
-                    && searchable_expression(low)
-                    && searchable_expression(high)
-                {
-                    let entry = terms.entry(column_id).or_insert_with(default_terms);
-                    entry.record_lower(ChoiceRangeBound {
-                        expression: low,
-                        inclusive: true,
-                    });
-                    entry.record_upper(ChoiceRangeBound {
-                        expression: high,
-                        inclusive: true,
-                    });
+                if let Some(column_id) = column_id(expr, source) {
+                    if searchable_expression(low) && searchable_expression(high) {
+                        let entry = terms.entry(column_id).or_insert_with(default_terms);
+                        entry.record_lower(ChoiceRangeBound {
+                            expression: low,
+                            inclusive: true,
+                        });
+                        entry.record_upper(ChoiceRangeBound {
+                            expression: high,
+                            inclusive: true,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -323,35 +322,35 @@ fn record_binary<'a>(
     right: &'a BoundExpr,
 ) {
     if op == BoundBinaryOp::Equal {
-        if let Some(column_id) = column_id(left, source)
-            && searchable_expression(right)
-        {
-            terms
-                .entry(column_id)
-                .or_insert_with(default_terms)
-                .record_equality(ChoiceEquality::Expression(right));
+        if let Some(column_id) = column_id(left, source) {
+            if searchable_expression(right) {
+                terms
+                    .entry(column_id)
+                    .or_insert_with(default_terms)
+                    .record_equality(ChoiceEquality::Expression(right));
+                return;
+            }
+        }
+        if let Some(column_id) = column_id(right, source) {
+            if searchable_expression(left) {
+                terms
+                    .entry(column_id)
+                    .or_insert_with(default_terms)
+                    .record_equality(ChoiceEquality::Expression(left));
+            }
+        }
+        return;
+    }
+    if let Some(column_id) = column_id(left, source) {
+        if searchable_expression(right) {
+            record_comparison(terms, column_id, op, right);
             return;
         }
-        if let Some(column_id) = column_id(right, source)
-            && searchable_expression(left)
-        {
-            terms
-                .entry(column_id)
-                .or_insert_with(default_terms)
-                .record_equality(ChoiceEquality::Expression(left));
+    }
+    if let Some(column_id) = column_id(right, source) {
+        if searchable_expression(left) {
+            record_comparison(terms, column_id, reverse_comparison(op), left);
         }
-        return;
-    }
-    if let Some(column_id) = column_id(left, source)
-        && searchable_expression(right)
-    {
-        record_comparison(terms, column_id, op, right);
-        return;
-    }
-    if let Some(column_id) = column_id(right, source)
-        && searchable_expression(left)
-    {
-        record_comparison(terms, column_id, reverse_comparison(op), left);
     }
 }
 
