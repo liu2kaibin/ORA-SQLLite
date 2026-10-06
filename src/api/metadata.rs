@@ -3,15 +3,25 @@ use crate::storage::catalog::types::{ColumnId, TableId};
 /// A stable logical SQL type exposed by prepared-statement metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
+    /// The SQL `NULL` pseudo-type.
     Null,
+    /// A type that could not be inferred during preparation.
     Unknown,
+    /// A signed 64-bit integer.
     Int64,
+    /// An exact base-10 [`crate::Decimal`].
     Decimal,
+    /// An IEEE-754 double-precision floating-point value.
     Float64,
+    /// UTF-8 text.
     Text,
+    /// Binary data.
     Blob,
+    /// An [`crate::OracleDate`].
     Date,
+    /// An [`crate::OracleTimestamp`].
     Timestamp,
+    /// A Boolean value.
     Bool,
 }
 
@@ -35,7 +45,9 @@ impl DataType {
 /// The normalized identity of a bind parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ParameterIdentifier {
+    /// A one-based positional parameter number.
     Position(u16),
+    /// A normalized named parameter without its SQL sigil.
     Name(String),
 }
 
@@ -66,10 +78,14 @@ impl ParameterMetadata {
         }
     }
 
+    /// Returns the normalized positional or named identity of this parameter.
     pub fn identifier(&self) -> &ParameterIdentifier {
         &self.identifier
     }
 
+    /// Returns the inferred concrete type, or `None` when preparation could not infer one.
+    ///
+    /// `None` does not itself mean that a supplied value is SQL `NULL`.
     pub const fn data_type(&self) -> Option<DataType> {
         self.data_type
     }
@@ -102,18 +118,22 @@ impl ColumnMetadata {
         }
     }
 
+    /// Returns the result-column name exposed by the prepared statement.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the logical type of values in this result column.
     pub const fn data_type(&self) -> DataType {
         self.data_type
     }
 
+    /// Returns whether this result column can contain SQL `NULL`.
     pub const fn nullable(&self) -> bool {
         self.nullable
     }
 
+    /// Returns the stable catalog table identifier when this is a direct source column.
     pub const fn source_table_id(&self) -> Option<u64> {
         match self.source_table_id {
             Some(id) => Some(id.get()),
@@ -121,6 +141,7 @@ impl ColumnMetadata {
         }
     }
 
+    /// Returns the stable catalog column identifier when this is a direct source column.
     pub const fn source_column_id(&self) -> Option<u64> {
         match self.source_column_id {
             Some(id) => Some(id.get()),

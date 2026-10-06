@@ -18,6 +18,9 @@ impl ExecutionResult {
         Self::new(rows_affected)
     }
 
+    /// Returns the number of rows changed by the statement.
+    ///
+    /// Statements that do not change rows report zero.
     pub const fn rows_affected(&self) -> u64 {
         self.rows_affected
     }

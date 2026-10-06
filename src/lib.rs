@@ -1,5 +1,36 @@
 #![forbid(unsafe_code)]
-#![doc = "ORA-SQLLite: a lightweight embedded database with an Oracle-compatible CRUD dialect."]
+#![deny(missing_docs)]
+//! ORA-SQLLite is a lightweight embedded database with an Oracle-compatible CRUD dialect.
+//!
+//! A [`Database`] is a cloneable handle to shared in-process database state. Create or open a
+//! database, obtain a synchronous [`Connection`], prepare owned [`Statement`] values, and then
+//! execute them with [`Parameters`]. Explicit read and write transactions borrow their connection
+//! so that only one transaction can be active through that connection at a time.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use ora_sqllite::{Database, Options, Parameters, Value};
+//!
+//! let path = std::env::temp_dir().join("ora-sqllite-example.db");
+//! let database = Database::create(&path, Options::default())?;
+//! let mut connection = database.connect()?;
+//!
+//! let create = connection.prepare("CREATE TABLE PEOPLE (ID INT64, NAME TEXT)")?;
+//! connection.execute(&create, Parameters::none())?;
+//!
+//! let insert = connection.prepare("INSERT INTO PEOPLE (ID, NAME) VALUES (:1, :2)")?;
+//! let values = [Value::Int64(1).into(), Value::Text("Ada".into()).into()];
+//! connection.execute(&insert, Parameters::positional(&values))?;
+//!
+//! let query = connection.prepare("SELECT ID, NAME FROM PEOPLE")?;
+//! let mut rows = connection.query(&query, Parameters::none())?;
+//! while let Some(row) = rows.next()? {
+//!     println!("{:?}", row.values());
+//! }
+//!
+//! # Ok::<(), ora_sqllite::DbError>(())
+//! ```
 
 mod api;
 mod datetime;

@@ -2,6 +2,10 @@ use crate::{DbError, ErrorCode, Result};
 
 const MAX_MAGNITUDE: u128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
 
+/// An exact decimal with up to 38 magnitude digits and a scale from -38 through 38.
+///
+/// The represented value is `magnitude × 10^-scale`, negated when [`Decimal::negative`] is true.
+/// Zero is always normalized to non-negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decimal {
     negative: bool,
@@ -10,6 +14,10 @@ pub struct Decimal {
 }
 
 impl Decimal {
+    /// Constructs a checked decimal from its sign, scale, and unsigned magnitude.
+    ///
+    /// Returns [`ErrorCode::Type`] if `scale` is outside `-38..=38` or `magnitude` contains more
+    /// than 38 decimal digits. A zero magnitude clears `negative`.
     pub fn new(negative: bool, scale: i8, magnitude: u128) -> Result<Self> {
         if !(-38..=38).contains(&scale) {
             return Err(DbError::new(
@@ -32,14 +40,17 @@ impl Decimal {
         })
     }
 
+    /// Returns whether the nonzero value is negative.
     pub const fn negative(&self) -> bool {
         self.negative
     }
 
+    /// Returns the base-10 scale in the inclusive range `-38..=38`.
     pub const fn scale(&self) -> i8 {
         self.scale
     }
 
+    /// Returns the unsigned coefficient, which contains at most 38 decimal digits.
     pub const fn magnitude(&self) -> u128 {
         self.magnitude
     }

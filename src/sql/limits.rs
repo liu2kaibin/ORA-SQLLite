@@ -8,6 +8,10 @@ const DEFAULT_MAX_PARAMETERS: u16 = 65_535;
 const DEFAULT_MAX_JOINS: u16 = 64;
 
 /// Resource bounds enforced while preparing a SQL statement.
+///
+/// Defaults are 1,048,576 SQL bytes, 100,000 tokens, 100,000 AST nodes, 128 levels of
+/// nesting, 65,535 parameters, and 64 joins. All limits apply to connections created from a
+/// [`crate::Database`] opened or created with the containing [`crate::Options`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SqlLimits {
     max_sql_bytes: u32,
@@ -32,48 +36,65 @@ impl Default for SqlLimits {
 }
 
 impl SqlLimits {
+    /// Returns the maximum UTF-8 byte length of one SQL statement.
     pub const fn max_sql_bytes(&self) -> u32 {
         self.max_sql_bytes
     }
 
+    /// Returns the maximum number of lexical tokens in one SQL statement.
     pub const fn max_tokens(&self) -> u32 {
         self.max_tokens
     }
 
+    /// Returns the maximum number of owned AST or retained bound-expression nodes.
     pub const fn max_ast_nodes(&self) -> u32 {
         self.max_ast_nodes
     }
 
+    /// Returns the maximum parser and AST nesting depth.
     pub const fn max_nesting(&self) -> u16 {
         self.max_nesting
     }
 
+    /// Returns the maximum number of distinct bind parameters.
     pub const fn max_parameters(&self) -> u16 {
         self.max_parameters
     }
 
+    /// Returns the maximum number of joins.
     pub const fn max_joins(&self) -> u16 {
         self.max_joins
     }
 
+    /// Sets the maximum SQL byte length to a value in `1..=u32::MAX`.
+    ///
+    /// Returns [`ErrorCode::Internal`] when the value is zero or exceeds the implementation bound.
     pub fn with_max_sql_bytes(mut self, value: usize) -> Result<Self> {
         self.max_sql_bytes = checked_u32_limit(value, "maximum SQL bytes")?;
         Ok(self)
     }
 
+    /// Sets the maximum token count to a value in `1..=u32::MAX`.
+    ///
+    /// Returns [`ErrorCode::Internal`] when the value is zero or exceeds the implementation bound.
     pub fn with_max_tokens(mut self, value: usize) -> Result<Self> {
         self.max_tokens = checked_u32_limit(value, "maximum token count")?;
         Ok(self)
     }
 
-    /// Bounds owned AST nodes and, independently, retained bound-expression nodes
-    /// (including every column produced by wildcard expansion).
+    /// Sets the maximum owned AST node count to a value in `1..=u32::MAX`.
+    ///
+    /// The limit independently bounds retained bound-expression nodes, including every column
+    /// produced by wildcard expansion. Returns [`ErrorCode::Internal`] when the value is zero or
+    /// exceeds the implementation bound.
     pub fn with_max_ast_nodes(mut self, value: usize) -> Result<Self> {
         self.max_ast_nodes = checked_u32_limit(value, "maximum AST node count")?;
         Ok(self)
     }
 
     /// Sets the shared parser/AST nesting limit, from 1 through the hard maximum 256.
+    ///
+    /// Returns [`ErrorCode::Internal`] outside that range.
     pub fn with_max_nesting(mut self, value: usize) -> Result<Self> {
         // The upstream parser and conversion adapter have bounded recursive frames.
         // Larger values would no longer be covered by the parser stack guarantee.
@@ -84,11 +105,17 @@ impl SqlLimits {
         Ok(self)
     }
 
+    /// Sets the maximum parameter count to a value in `1..=u16::MAX`.
+    ///
+    /// Returns [`ErrorCode::Internal`] when the value is zero or exceeds the implementation bound.
     pub fn with_max_parameters(mut self, value: usize) -> Result<Self> {
         self.max_parameters = checked_u16_limit(value, "maximum parameter count")?;
         Ok(self)
     }
 
+    /// Sets the maximum join count to a value in `1..=u16::MAX`.
+    ///
+    /// Returns [`ErrorCode::Internal`] when the value is zero or exceeds the implementation bound.
     pub fn with_max_joins(mut self, value: usize) -> Result<Self> {
         self.max_joins = checked_u16_limit(value, "maximum join count")?;
         Ok(self)

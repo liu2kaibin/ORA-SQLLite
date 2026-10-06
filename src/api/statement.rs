@@ -8,7 +8,11 @@ use crate::{
 
 use super::{ColumnMetadata, ParameterMetadata};
 
-/// An immutable prepared statement and its stable public metadata.
+/// An owned, immutable prepared plan with stable public metadata.
+///
+/// The parameter and result-column metadata is fixed at preparation. Execution revalidates the
+/// statement's database identity and retained schema dependencies; a mismatch returns
+/// [`crate::ErrorCode::SchemaChanged`]. Clones share the immutable bound statement and plan.
 #[derive(Clone)]
 pub struct Statement {
     bound: Arc<BoundStatement>,
@@ -87,10 +91,12 @@ impl Statement {
         })
     }
 
+    /// Returns stable bind-parameter metadata in logical parameter order.
     pub fn parameters(&self) -> &[ParameterMetadata] {
         &self.parameters
     }
 
+    /// Returns stable result-column metadata in output order.
     pub fn columns(&self) -> &[ColumnMetadata] {
         &self.columns
     }

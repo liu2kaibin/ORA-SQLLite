@@ -33,7 +33,10 @@ pub(crate) fn generate_database_uuid(source: &dyn UuidSource) -> Result<[u8; 16]
     Ok(uuid)
 }
 
-/// A cloneable handle to an embedded database.
+/// A cloneable owner of shared in-process embedded-database state.
+///
+/// Clones refer to the same pager, cache, writer coordination, and published state. Each call to
+/// [`Database::connect`] creates an independent synchronous session over that shared state.
 #[derive(Clone)]
 pub struct Database {
     pub(super) pager: Pager,
@@ -51,12 +54,19 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
-    /// Creates a new database without replacing an existing path.
+    /// Exclusively creates a new database and never overwrites an existing path.
+    ///
+    /// The database is created writable regardless of [`Options::access_mode`]. Invalid create-time
+    /// options return their documented structured error; an existing path or other file-system
+    /// failure returns [`ErrorCode::Io`].
     pub fn create(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         Self::create_with_uuid_source(path, options, &OsUuidSource)
     }
 
-    /// Opens an existing database without creating a missing path.
+    /// Opens an existing database and never creates a missing path.
+    ///
+    /// The on-disk page size is authoritative, while runtime limits and access mode come from
+    /// `options`. File-system failures, including a missing path, return [`ErrorCode::Io`].
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let mode = match options.access_mode() {
             AccessMode::ReadWrite => OpenMode::ReadWrite,
@@ -71,7 +81,7 @@ impl Database {
         })
     }
 
-    /// Creates an independent session for this database.
+    /// Creates an independent synchronous session for this database.
     pub fn connect(&self) -> Result<Connection> {
         Ok(Connection::new(
             self.pager.clone(),

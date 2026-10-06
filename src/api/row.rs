@@ -6,7 +6,10 @@ use crate::sql::exec::{
 use crate::storage::{ReadSnapshot, WriteBatch};
 use crate::{Result, Value};
 
-/// One row returned by statement execution.
+/// One owned row returned by statement execution.
+///
+/// Values follow the prepared statement's column order and represent SQL `NULL` as
+/// [`Value::Null`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     values: Box<[Value]>,
@@ -24,18 +27,22 @@ impl Row {
         Self::new(values)
     }
 
+    /// Returns the number of values in this row.
     pub const fn len(&self) -> usize {
         self.values.len()
     }
 
+    /// Returns `true` when this row has no values.
     pub const fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
+    /// Returns the value at zero-based `index`, or `None` when it is out of range.
     pub fn get(&self, index: usize) -> Option<&Value> {
         self.values.get(index)
     }
 
+    /// Returns all values in column order.
     pub fn values(&self) -> &[Value] {
         &self.values
     }
@@ -48,6 +55,10 @@ enum RowsStorage<'a> {
 }
 
 /// A pull-based result stream that owns each returned row.
+///
+/// The stream keeps its originating connection or transaction borrowed until it is exhausted and
+/// dropped, or simply dropped early. Dropping a stream is the supported way to stop before reading
+/// all rows.
 pub struct Rows<'a> {
     storage: RowsStorage<'a>,
     root: Box<dyn OutputOperator>,
@@ -88,6 +99,10 @@ impl<'a> Rows<'a> {
         clippy::should_implement_trait,
         reason = "the streaming API returns Result<Option<Row>>, which cannot implement Iterator::next"
     )]
+    /// Advances the stream and returns the next owned row.
+    ///
+    /// Returns `Ok(None)` after the result is exhausted. A fatal error from a write-transaction
+    /// stream makes that transaction rollback-only.
     pub fn next(&mut self) -> Result<Option<Row>> {
         let projected = {
             let storage = match &mut self.storage {

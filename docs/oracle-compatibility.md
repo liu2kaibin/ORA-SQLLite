@@ -1,0 +1,40 @@
+# Oracle compatibility matrix
+
+ORA-SQLLite implements an Oracle-inspired embedded SQL subset. It is not Oracle wire compatible and does not claim general Oracle Database compatibility.
+
+States have precise meanings: **Supported** is an implemented public contract; **Partial** is an implemented subset whose restriction is stated in the row; **Unsupported** is intentionally absent or rejected.
+
+| Area | State | Supported contract | Oracle difference |
+|---|---|---|---|
+| `NUMBER` | **Partial** | `NUMBER(p[,s])` with `p` in `1..=38`, `s` in `-38..=38`, deterministic decimal half-away-from-zero quantization, and `Int64`, `Decimal`, or strict ASCII numeric Text input. | Unconstrained `NUMBER` and NLS numeric input are unsupported; binary `Float64` is not implicitly converted. |
+| `VARCHAR2` | **Partial** | `VARCHAR2(n)` for `n` in `1..=32767`, measured in Unicode scalar values; non-empty Text is preserved without truncation. | No BYTE/CHAR length qualifier, collation, character-set, or NLS semantics. |
+| `CHAR` | **Partial** | `CHAR(n)` for `n` in `1..=2000`, measured in Unicode scalar values and right-padded with U+0020. | No BYTE/CHAR length qualifier, collation, character-set, or NLS semantics. |
+| `RAW` | **Partial** | `RAW(n)` for `n` in `1..=32767`; accepts Blob parameters and even-length `X'ABCD'` literals. | No implicit Text conversion, `HEXTORAW`, `UTL_RAW`, or character-set conversion. |
+| `DATE` | **Partial** | Year through second fields using `Value::Date`, strict `YYYY-MM-DD`, or strict `YYYY-MM-DD HH:MM:SS` input. | No fractional seconds, timezone, NLS date parsing, or session calendar behavior. |
+| `TIMESTAMP` | **Partial** | `TIMESTAMP[(p)]` with `p` in `0..=9`; nanosecond storage and half-away-from-zero fractional rounding. | Accepts only unzoned `Value::Timestamp` or strict ISO-like Text; no NLS formats. |
+| `TIMESTAMP WITH TIME ZONE` (TSTZ) | **Partial** | Precision `0..=9`; row values preserve authored fixed offsets, while comparison, uniqueness, and range indexes use the UTC instant. | Only fixed offsets from `-14:00` through `+14:00`; no named zones, daylight-saving rules, `WITH LOCAL TIME ZONE`, or NLS formats. |
+| `INSERT` | **Partial** | Single-table `INSERT ... VALUES` with optional target columns, literals, expressions, and positional or named parameters. | No `INSERT ... SELECT`, `RETURNING`, multi-table insert, or sequence-backed values. |
+| `SELECT` | **Partial** | Explicit projections, `*`, `table.*`, `DISTINCT`, filters, supported joins, grouping, aggregates, and ordering. | No subqueries, CTEs, set operations, windows, hierarchical queries, or `SELECT FOR UPDATE`. |
+| `UPDATE` / `DELETE` | **Partial** | Single-table mutation with supported expressions and predicates; each statement is atomic and reports affected rows. | No joined DML, subqueries, `RETURNING`, or `MERGE`; target discovery is a ROWID table scan. |
+| Predicates and expressions | **Partial** | Arithmetic; comparisons; `AND`, `OR`, `NOT`; `IS [NOT] NULL`; non-empty `IN`; `[NOT] BETWEEN`; `[NOT] LIKE`; parentheses. | No `CASE`, `CAST`, subquery expressions, string concatenation, date arithmetic, or general implicit Oracle conversion. |
+| Joins | **Partial** | Explicit `INNER JOIN` and `LEFT [OUTER] JOIN ... ON`. | No `RIGHT`, `FULL`, `CROSS`, `NATURAL`, or `USING` joins, and no index join execution. |
+| Grouping and aggregates | **Partial** | `GROUP BY`, `HAVING`, and `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with bounded work memory. | No analytic/window functions, rollup/cube/grouping sets, temporary-disk spill, or nested aggregates. |
+| Ordering | **Partial** | `ORDER BY` expressions, projection aliases, and positive projection ordinals; no row order is promised without `ORDER BY`. | No optimizer order elimination or Oracle-wide collation/NLS ordering contract. |
+| Explicit indexes | **Partial** | Ordinary and unique `CREATE INDEX`/`DROP INDEX`; eligible single-table SELECT uses a leading equality/`IS NULL` prefix and at most one range on the next indexed column. | No cost optimizer, statistics, covering/index-only scan, expression index, online index operation, or index join; other predicates fall back to table scan. |
+| Primary key and unique constraints | **Partial** | Immediate, named or generated `PRIMARY KEY` and `UNIQUE` constraints backed by system-owned unique indexes. | Defined only by `CREATE TABLE`; no deferred mode, key-exchange buffering, or independent system-index management. |
+| Not-null constraints | **Supported** | `NOT NULL` is enforced before row and index encoding and reports the constraint category. | Defined only by `CREATE TABLE`; there is no `ALTER TABLE`. |
+| Check constraints | **Partial** | Persistent typed checks over same-row columns, constants, supported arithmetic, Boolean logic, comparisons, `IS NULL`, `IN`, `BETWEEN`, and `LIKE`; TRUE or NULL passes. | No parameters, aggregates, functions, other-table references, deferred evaluation, or `ALTER TABLE`. |
+| Foreign-key constraints | **Partial** | Immediate composite or scalar foreign keys reference a declared primary/unique key; child writes and parent update/delete use restrict semantics, and a NULL child component passes. | No self-reference, cycles, deferral, cascade/set-null actions, `ALTER TABLE`, or reference to a merely explicit unique index. |
+| Explicit transactions | **Partial** | Rust read snapshots, Rust write transactions, and SQL `BEGIN`/`COMMIT`/`ROLLBACK`; writes read their own changes and only an explicit commit publishes a Rust write transaction. | No nesting, savepoints, distributed transactions, isolation-level selection, or multiple concurrent writers. |
+| Auto-commit | **Supported** | Successful DDL/DML through an idle `Connection` commits one complete write batch. Validation or execution errors returned before durability publish no changes; after a commit/WAL I/O error, the commit outcome is uncertain. Drop the owning `Database` and all handles, then reopen it with `Database::open` so recovery runs; `Database::connect` is not recovery. Reconcile the observed database state before retrying the business write. | This is an embedded single-writer transaction boundary, not an Oracle server session. |
+| `NULL` and empty Text | **Partial** | SQL NULL is `Value::Null`; Oracle-oriented assignment normalizes `Value::Text("")` to NULL, while empty Blob and whitespace Text remain values. | The rule is applied at the documented embedded value boundary; broader Oracle expression and NLS conversion rules are absent. |
+| Sequences | **Unsupported** | No sequence object or `NEXTVAL`/`CURRVAL`. | Applications must generate keys or values themselves. |
+| Pagination | **Unsupported** | No pagination syntax. | `OFFSET`, `FETCH`, `LIMIT`, and `ROWNUM` are rejected or absent. |
+| Oracle scalar functions | **Unsupported** | No Oracle scalar-function set. | Functions such as `NVL`, `TO_CHAR`, `TO_DATE`, `HEXTORAW`, and `SYSDATE` are absent; only the five documented aggregates are implemented. |
+| `DUAL` | **Unsupported** | No special `DUAL` relation. | Constant expressions do not gain Oracle's synthetic one-row table behavior. |
+| PL/SQL | **Unsupported** | No procedural execution engine. | Anonymous blocks, packages, procedures, functions, and triggers are absent. |
+| CLI, network, and Oracle protocol | **Unsupported** | The public surface is an in-process synchronous Rust library. | No CLI, listener, network server, client protocol, or Oracle wire compatibility. |
+| Users, roles, schemas, and tablespaces | **Unsupported** | Database access is controlled by the owning process and filesystem. | No Oracle users, roles, grants, multi-schema namespace, or tablespace administration. |
+| File ownership and concurrency | **Supported** | A single process owns the main/WAL pair; shared `Database` handles allow multiple readers and one writer. | A second process receives `Busy`; there is no client/server or cluster concurrency model. |
+
+For API lifecycles and error handling, continue with [Getting started](getting-started.md). The current release evidence is in the [`v0.1.0` notes](releases/v0.1.0.md).

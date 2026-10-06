@@ -5,6 +5,21 @@ edition = "2024"
 rust-version = "1.85"
 description = "A lightweight embedded database with an Oracle-compatible CRUD dialect"
 repository = "https://github.com/liu2kaibin/ORA-SQLLite"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["database", "embedded", "oracle", "sql", "rust"]
+categories = ["database-implementations"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/docs/getting-started.md",
+    "/docs/oracle-compatibility.md",
+    "/docs/releases/v0.1.0.md",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 [dependencies]
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
