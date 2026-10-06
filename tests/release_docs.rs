@@ -48,7 +48,18 @@ fn rustdoc_before(source: &str, signature: &str) -> String {
 }
 
 fn assert_commit_failure_guidance(surface: &str, text: &str) {
-    let text = text.to_ascii_lowercase().replace("///", " ");
+    let text = text
+        .to_ascii_lowercase()
+        .replace("///", " ")
+        .replace(
+            "[`database::open`](crate::database::open)",
+            "database::open",
+        )
+        .replace(
+            "[`database::connect`](crate::database::connect)",
+            "database::connect",
+        )
+        .replace('`', "");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         text.contains("outcome is uncertain"),
@@ -67,12 +78,12 @@ fn assert_commit_failure_guidance(surface: &str, text: &str) {
         "{surface} must require dropping the owning Database and all handles"
     );
     assert!(
-        text.contains("database::open"),
-        "{surface} must require recovery through Database::open"
+        text.contains("reopen it with database::open so recovery runs"),
+        "{surface} must bind reopen/recovery to Database::open"
     );
     assert!(
-        text.contains("database::connect") && text.contains("is not recovery"),
-        "{surface} must state that Database::connect is not recovery"
+        text.contains("database::connect is not recovery"),
+        "{surface} must bind the not-recovery warning to Database::connect"
     );
 }
 
@@ -205,6 +216,21 @@ fn commit_failure_guidance_prevents_blind_write_retries() {
         .find(|line| line.starts_with("| Auto-commit |"))
         .expect("missing Auto-commit compatibility row");
     assert_commit_failure_guidance("compatibility Auto-commit row", auto_commit);
+}
+
+#[test]
+fn commit_failure_guidance_rejects_inverted_recovery_methods() {
+    let inverted = "The commit outcome is uncertain. Drop the owning Database and all handles, \
+        then reopen it with Database::connect so recovery runs; Database::open is not recovery. \
+        Reconcile the observed database state before retrying the business write.";
+
+    let result = std::panic::catch_unwind(|| {
+        assert_commit_failure_guidance("inverted recovery fixture", inverted);
+    });
+    assert!(
+        result.is_err(),
+        "commit guidance validator accepted inverted recovery methods"
+    );
 }
 
 #[test]
