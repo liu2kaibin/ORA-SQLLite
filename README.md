@@ -51,7 +51,17 @@ The examples create uniquely owned temporary databases, reopen them, verify resu
 ```console
 cargo run --example quickstart
 cargo run --example oracle_types
+cargo run --example worker_ledger
 ```
+
+## Real-world showcase
+
+ORA-SQLLite powers **[worker-ledger](https://github.com/liu2kaibin/worker-ledger)** — an embedded personal finance and time ledger dashboard:
+- **Exact Decimal Arithmetic**: Uses `NUMBER(12, 2)` and `NUMBER(8, 2)` to eliminate floating-point rounding errors on monetary amounts and work-hour conversions.
+- **Single-File Durability**: Relies on ORA-SQLLite's synchronous single-file + WAL transactions for 100% private local data storage.
+- **Oracle SQL Subset in Practice**: Demonstrates real-world CRUD patterns (parameterized bindings with `:1, :2`, two-phase upserts, and snapshot queries) under concurrent HTTP/LAN requests.
+
+See the runnable showcase in [`examples/worker_ledger.rs`](examples/worker_ledger.rs).
 
 ## Operating model and limits
 

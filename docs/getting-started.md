@@ -1,6 +1,6 @@
 # Getting started
 
-ORA-SQLLite is a synchronous embedded Rust library. The examples below use only symbols exported by `ora_sqllite`; the complete executable flows are in [`quickstart.rs`](../examples/quickstart.rs) and [`oracle_types.rs`](../examples/oracle_types.rs).
+ORA-SQLLite is a synchronous embedded Rust library. The examples below use only symbols exported by `ora_sqllite`; the complete executable flows are in [`quickstart.rs`](../examples/quickstart.rs), [`oracle_types.rs`](../examples/oracle_types.rs), and [`worker_ledger.rs`](../examples/worker_ledger.rs).
 
 ## Create, open, and own the files
 
